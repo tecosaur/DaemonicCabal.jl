@@ -21,7 +21,7 @@ Description=Julia ($(@__MODULE__).jl) server daemon
 [Service]
 Type=simple
 ExecStart=$(first(worker_cmd.exec)) --startup-file=no --project="$(dirname(@__DIR__))" -e "using $(@__MODULE__); $(@__MODULE__).start()"
-Environment="JULIA_DAEMON_SERVER=$MAIN_SOCKET"
+Environment="JULIA_DAEMON_SERVER=$(mainsocket())"
 Environment="JULIA_DAEMON_WORKER_EXECUTABLE=$(first(worker_cmd.exec))"
 $(if !haskey(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS")
     "Environment=\"JULIA_DAEMON_WORKER_MAXCLIENTS=$DEFAULT_WORKER_MAXCLIENTS\"\n"
