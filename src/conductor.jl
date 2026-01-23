@@ -55,7 +55,12 @@ function start()
     try
         @log "Preparing worker environment"
         ensure_worker_env()
-        @log "Running on $socket"
+        revise_setting = if haskey(ENV, "JULIA_DAEMON_REVISE")
+            "JULIA_DAEMON_REVISE=$(ENV["JULIA_DAEMON_REVISE"])"
+        else
+            "revise: no (default)"
+        end
+        @log "Running on $socket ($revise_setting)"
         @async create_reserve_worker()
         while true
             serveonce(server)
