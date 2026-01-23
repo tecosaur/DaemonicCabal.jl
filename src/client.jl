@@ -22,6 +22,13 @@ Client specific switches:
  --revise[=yes|no*]         Enable or disable Revise.jl integration
  --restart                  Kill workers for the project and exit
  --session                  Reuse the worker process and state
+
+Daemon management (systemd):
+
+ systemctl --user start julia-daemon
+ systemctl --user stop julia-daemon
+ systemctl --user restart julia-daemon
+ systemctl --user status julia-daemon
 """
 
 struct Client
@@ -149,6 +156,13 @@ const SWITCH_SHORT_MAPPING = Dict(
     "-L" => "--load")
 
 """
+Switches that don't take a value (boolean flags).
+"""
+const SWITCH_NO_VALUE = Set([
+    "-i", "-v", "--version", "-h", "--help",
+    "--restart", "--session", "-q", "--quiet"])
+
+"""
     splitargs!(allargs::Vector{<:AbstractString})
 Split a vector of args into a tuple of:
 - switches that apply to the julia(client) invocation
@@ -171,15 +185,21 @@ function splitargs!(args::Vector{String})
             if occursin('=', arg)
                 switch, value = split(arg, '=', limit=2)
                 push!(switches, (switch, value))
+            elseif arg in SWITCH_NO_VALUE
+                push!(switches, (arg, ""))
             else
                 push!(switches, (arg, if isempty(args) "" else popfirst!(args) end))
             end
         elseif startswith(arg, "-") && length(arg) > 1
             thearg = get(SWITCH_SHORT_MAPPING, arg[1:2], arg[1:2])
-            push!(switches, (thearg, if length(arg) > 2
-                                 arg[3:end]
-                             elseif isempty(args) ""
-                             else popfirst!(args) end))
+            if arg[1:2] in SWITCH_NO_VALUE || thearg in SWITCH_NO_VALUE
+                push!(switches, (thearg, length(arg) > 2 ? arg[3:end] : ""))
+            else
+                push!(switches, (thearg, if length(arg) > 2
+                                     arg[3:end]
+                                 elseif isempty(args) ""
+                                 else popfirst!(args) end))
+            end
         else
             programfile = arg
         end
