@@ -52,6 +52,13 @@ function start()
     socket = mainsocket()
     server = create_server(socket)
 
+    @log """Starting Julia Daemon Counductor. Configuration:
+         - Worker command: $(get(ENV, "JULIA_DAEMON_WORKER_EXECUTABLE", joinpath(Sys.BINDIR, "/julia"))) $(get(ENV, "JULIA_DAEMON_WORKER_ARGS", ""))
+         - Max clients per worker: $(get(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS", string(DEFAULT_WORKER_MAXCLIENTS)))
+         - Worker TTL: $(get(ENV, "JULIA_DAEMON_WORKER_TTL", string(DEFAULT_WORKER_TTL))) seconds
+         - Revise integration: $(get(ENV, "JULIA_DAEMON_REVISE", "off"))
+         """
+
     try
         @log "Preparing worker environment"
         ensure_worker_env()
