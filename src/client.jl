@@ -22,6 +22,10 @@ Client specific switches:
  --revise[=yes|no*]         Enable or disable Revise.jl integration
  --restart                  Kill workers for the project and exit
  --session                  Reuse the worker process and state
+
+Daemon management (systemd):
+
+ systemctl --user {start | stop | restart | status} julia-daemon
 """
 
 struct Client
