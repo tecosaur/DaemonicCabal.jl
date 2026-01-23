@@ -149,6 +149,13 @@ const SWITCH_SHORT_MAPPING = Dict(
     "-L" => "--load")
 
 """
+Switches that don't take a value (boolean flags).
+"""
+const SWITCH_NO_VALUE =
+    ("-i", "-v", "--version", "-h", "--help",
+     "--restart", "--session", "-q", "--quiet")
+
+"""
     splitargs!(allargs::Vector{<:AbstractString})
 Split a vector of args into a tuple of:
 - switches that apply to the julia(client) invocation
@@ -171,15 +178,22 @@ function splitargs!(args::Vector{String})
             if occursin('=', arg)
                 switch, value = split(arg, '=', limit=2)
                 push!(switches, (switch, value))
+            elseif arg in SWITCH_NO_VALUE
+                push!(switches, (arg, ""))
             else
                 push!(switches, (arg, if isempty(args) "" else popfirst!(args) end))
             end
         elseif startswith(arg, "-") && length(arg) > 1
             thearg = get(SWITCH_SHORT_MAPPING, arg[1:2], arg[1:2])
-            push!(switches, (thearg, if length(arg) > 2
-                                 arg[3:end]
-                             elseif isempty(args) ""
-                             else popfirst!(args) end))
+            push!(switches, if thearg in SWITCH_NO_VALUE || isempty(args)
+                      thearg, ""
+                  else
+                      thearg, if length(arg) > 2
+                           arg[3:end]
+                      else
+                          popfirst!(args)
+                      end
+                  end)
         else
             programfile = arg
         end
