@@ -366,7 +366,8 @@ fn run_ioring() !void {
             const cqe = try ring.copy_cqe();
 
             if (cqe.res < 0 and cqe.user_data != @intFromEnum(Location.stdin)) {
-                std.debug.panic("Oh no, something went wrong within io_uring.\n", .{}); }
+                std.debug.print("\n[juliaclient] Worker connection lost. Try: juliaclient --restart\n", .{});
+                std.process.exit(1); }
 
             switch (cqe.user_data) {
                 @intFromEnum(Location.stdout) => {
