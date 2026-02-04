@@ -1,7 +1,7 @@
 name = "DaemonicCabal"
 uuid = "17525775-44bb-48b7-b857-e2300d3b9f41"
 authors = ["TEC <git@tecosaur.net>"]
-version = "0.3.0"
+version = "0.4.0"
 
 [deps]
 BaseDirs = "18cc8868-cbac-4acf-b575-c8ff214dc66f"

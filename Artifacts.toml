@@ -1,8 +1,16 @@
-[client]
+[[execbundle]]
 arch = "x86_64"
 os = "linux"
-git-tree-sha1 = "b0621f678662f9a4d5f8323bb46a63a3e34cc59d"
+git-tree-sha1 = "506684d2ba535d2d040aada9ece147e4c3391109"
 
-    [[client.download]]
-    url = "https://github.com/tecosaur/DaemonConductor.jl/releases/download/0.3.0/client.tar.gz"
-    sha256 = "36f348b25a80d2a02e6bfbe96475e544af20f925b2e3747143c7de0a69d7ae64"
+    [[execbundle.download]]
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.4.0/linux-x86_64.tar.gz"
+    sha256 = "daf29cb62be4354acd6074e2a4acbf8624b5f40257eaf6b712c7e5e3a8ca0a9f"
+[[execbundle]]
+arch = "aarch64"
+os = "linux"
+git-tree-sha1 = "c2842f00de4cff7d7a0e20251cf8b80b8735e5b6"
+
+    [[execbundle.download]]
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.4.0/linux-aarch64.tar.gz"
+    sha256 = "9ae5d41c52b52dadccb7b19436c465fd0969015aee7035fbb55681f82dbe5404"
