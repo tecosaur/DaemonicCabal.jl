@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
+# SPDX-License-Identifier: MPL-2.0
+
 # * Set up REPL-related overrides
 # Within `REPL`, `check_open` is called on our `stdout` IOContext,
 # and we need to add this method to make it work.

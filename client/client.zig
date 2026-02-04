@@ -1,5 +1,6 @@
-// Written for Zig 0.16
-// Compile with: zig/zig build-exe -target x86_64-linux -fstrip -O ReleaseSmall -fsingle-threaded -fPIE client/client.zig
+// SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
+// SPDX-License-Identifier: MPL-2.0
+
 const std = @import("std");
 const Io = std.Io;
 const posix = std.posix;

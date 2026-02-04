@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
+# SPDX-License-Identifier: MPL-2.0
+
 precompile(Tuple{typeof(try_load_revise)})
 precompile(Tuple{typeof(queue_ttl_check)})
 precompile(Tuple{typeof(perform_ttl_check), Base.Timer})

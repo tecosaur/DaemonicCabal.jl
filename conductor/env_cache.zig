@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
+// SPDX-License-Identifier: MPL-2.0
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const worker = @import("worker.zig");

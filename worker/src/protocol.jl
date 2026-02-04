@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
+# SPDX-License-Identifier: MPL-2.0
+
 # Binary protocol for Conductor ↔ Worker communication
 
 const PROTOCOL_MAGIC = 0x4A445701  # "JDW\x01" little-endian
