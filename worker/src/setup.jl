@@ -1,10 +1,27 @@
 const STATE = (
     ctime = time(),
-    clients = Vector{Tuple{Float64, NamedTuple}}(),
+    worker_number = Ref(-1),
+    clients = Vector{Tuple{Float64, ClientInfo}}(),
+    client_tasks = Dict{Int, Task}(),
     project = Ref(""),
     lastclient = Ref(time()),
     lock = SpinLock(),
-    soft_exit = Ref(false))
+    soft_exit = Ref(false),
+    conductor_conn = Ref{Union{IO, Nothing}}(nothing),
+    conductor_socket = Ref(""),
+    standby_sockets = Ref{Union{Nothing, NTuple{2, Pair{Sockets.PipeServer, String}}}}(nothing),
+    standby_module = Ref{Union{Nothing, Module}}(nothing))
+
+# Configuration (set during runworker from environment)
+RUNTIME_DIR::String = ""
+MAX_CLIENTS::Int = 1
+WORKER_TTL::Int = 0
+
+# Exiting
+
+struct DaemonClientExit <: Exception code::Int end
+
+real_exit(n::Int) = ccall(:jl_exit, Union{}, (Int32,), n)
 
 # Revise
 
@@ -20,170 +37,40 @@ end
 # TTL checking
 
 function queue_ttl_check()
-    ttl = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_TTL", "0"))
-    if ttl > 0
-        Timer(perform_ttl_check, ttl)
+    if WORKER_TTL > 0
+        Timer(perform_ttl_check, WORKER_TTL)
     end
 end
 
 function perform_ttl_check(::Timer)
-    ttl = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_TTL", "0"))
-    if ttl > 0 && time() - lock(() -> STATE.lastclient[], STATE.lock) < ttl
-        exit(0)
+    if WORKER_TTL > 0 && time() - (@lock STATE.lock STATE.lastclient[]) >= WORKER_TTL
+        send_worker_exit(STATE.conductor_socket[])
+        real_exit(0)
     end
 end
 
-# * Set up REPL-related overrides
-# Within `REPL`, `check_open` is called on our `stdout` IOContext,
-# and we need to add this method to make it work.
-# Core.eval(mod, :(Base.check_open(ioc::IOContext) = Base.check_open(ioc.io)))
-
-# Client evaluation
-
-function prepare_module(client::NamedTuple)
-    mod = if getval(client.switches, "--session", "no") ∈ ("yes", "true", "1", "")
-        Main
-    else
-        Module(:Main)
+# Kill client tasks whose PIDs are not in the active set (conductor thinks they're gone)
+function kill_stuck_clients(active_pids::Set{Int})
+    orphan_tasks = @lock STATE.lock [
+        task for (pid, task) in STATE.client_tasks
+        if pid ∉ active_pids && !istaskdone(task)
+    ]
+    for task in orphan_tasks
+        Base.schedule(task, InterruptException(); error=true)
     end
-    # MainInclude (taken from base/client.jl)
-    maininclude = quote
-        baremodule MainInclude
-        using ..Base
-        include(mapexpr::Function, fname::AbstractString) = Base._include(mapexpr, $mod, fname)
-        function include(fname::AbstractString)
-            isa(fname, String) || (fname = Base.convert(String, fname)::String)
-            Base._include(identity, $mod, fname)
-        end
-        eval(x) = Core.eval($mod, x)
-        end
-        import .MainInclude: eval, include
+    for task in orphan_tasks
+        try wait(task) catch end
     end
-    maininclude.head = :toplevel # Module must be in a :toplevel Expr.
-    Core.eval(mod, maininclude)
-    # Exit
-    Core.eval(mod, :(struct SystemExit <: Exception code::Int end))
-    Core.eval(mod, :(exit() = throw(SystemExit(0))))
-    Core.eval(mod, :(exit(n) = throw(SystemExit(n))))
-    # State
-    Core.eval(mod, :(cd($client.cwd)))
-    if !isempty(client.args)
-        Core.eval(mod, :(ARGS = $(client.args)))
-    end
-    if getval(client.switches, "--revise", get(ENV, "JULIA_DAEMON_REVISE", "no")) ∈ ("yes", "true", "1", "")
-        if isdefined(Main, :Revise)
-            Main.Revise.revise()
-        end
-    end
-    mod
-end
-
-function getval(pairlist, key, default)
-    index = findfirst(p -> first(p) == key, pairlist)
-    if isnothing(index) default else last(pairlist[index]) end
 end
 
 # Basically a bootleg version of `exec_options`.
-function runclient(client::NamedTuple, stdio::Base.PipeEndpoint, signals::Base.PipeEndpoint)
-    signal_exit(n) = write(signals, "\x01exit\x02", string(n), "\x04")
+# Note: client is already registered in STATE.clients before this is called
+const SIGNAL_EXIT = 0x01
+const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
+const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
 
-    lock(STATE.lock) do
-        push!(STATE.clients, (time(), client))
-    end
-
-    hascolor = getval(client.switches, "--color",
-                        ifelse(startswith(getval(client.env, "TERM", ""),
-                                        "xterm"),
-                                "yes", "")) == "yes"
-    stdiox = IOContext(stdio, :color => hascolor)
-    mod = prepare_module(client)
-
-    try
-        withenv(client.env...) do
-            redirect_stdio(stdin=stdiox, stdout=stdiox, stderr=stdiox) do
-                runclient(mod, client; signal_exit, stdout=stdiox)
-            end
-        end
-    catch err
-        etype = typeof(err)
-        if nameof(etype) == :SystemExit && parentmodule(etype) == mod
-            signal_exit(err.code)
-        elseif isopen(stdio)
-            # TODO trim the stacktrace
-            Base.invokelatest(
-                Base.display_error,
-                stdiox,
-                Base.scrub_repl_backtrace(
-                    current_exceptions()))
-            signal_exit(1)
-        end
-        close(stdio)
-    finally
-        lock(STATE.lock) do
-            client_index = findfirst(e -> last(e) === client, STATE.clients)::Int
-            deleteat!(STATE.clients, client_index)
-            STATE.lastclient[] = time()
-            if STATE.soft_exit[]
-                exit(0)
-            end
-        end
-        queue_ttl_check()
-    end
-end
-
-function runclient(mod::Module, client::NamedTuple; signal_exit::Function, stdout::IO=stdout)
-    runrepl = "-i" ∈ client.switches ||
-        (isnothing(client.programfile) && "--eval" ∉ first.(client.switches) &&
-         "--print" ∉ first.(client.switches))
-    for (switch, value) in client.switches
-        if switch == "--eval"
-            Core.eval(mod, Base.parse_input_line(value))
-        elseif switch == "--print"
-            res = Core.eval(mod, Base.parse_input_line(value))
-            Base.invokelatest(show, stdout, res)
-            println()
-        elseif switch == "--load"
-            Base.include(mod, value)
-        end
-    end
-    if !isnothing(client.programfile)
-        try
-            if client.programfile == "-"
-                Base.include_string(mod, read(stdin, String), "stdin")
-            else
-                Base.include(mod, client.programfile)
-            end
-        catch
-            Core.eval(mod, quote
-                          Base.invokelatest(
-                              Base.display_error,
-                              Base.scrub_repl_backtrace(
-                                  current_exceptions()))
-                          if !$(runrepl)
-                              exit(1)
-                          end
-                      end)
-        end
-    end
-    if runrepl
-        interactiveinput = runrepl && client.tty
-        hascolor = get(stdout, :color, false)
-        quiet = "-q" in first.(client.switches) || "--quiet" in first.(client.switches)
-        banner = Symbol(getval(client.switches, "--banner", ifelse(interactiveinput, "yes", "no")))
-        histfile = getval(client.switches, "--history-file", "yes") != "no"
-        replcall = if VERSION < v"1.11"
-            :(Base.run_main_repl($interactiveinput, $quiet, $(banner != :no), $histfile, $hascolor))
-        elseif VERSION < v"1.12"
-            :(Base.run_main_repl($interactiveinput, $quiet, $(QuoteNode(banner)), $histfile, $hascolor))
-        else
-            :(Base.run_main_repl($interactiveinput, $quiet, $(QuoteNode(banner)), $histfile))
-        end
-        Core.eval(mod, quote
-                      setglobal!(Base, :have_color, $hascolor)
-                      $replcall
-                    end)
-    end
-    signal_exit(0)
+function send_signal(io::IO, id::UInt8, data::Vector{UInt8})
+    write(io, id, UInt16(length(data)), data)
 end
 
 # Copied from `init_active_project()` in `base/initdefs.jl`.
@@ -197,46 +84,134 @@ end
 
 # Worker management
 
-function newconnection(oldconn::Base.PipeEndpoint, n::Int=1)
-    try
-        servers = Sockets.PipeServer[]
-        for i in 1:n
-            sockfile = string("worker-", WORKER_ID[], '-',
-                              String(rand('a':'z', 8)), ".sock")
-            path = BaseDirs.runtime("julia-daemon", sockfile)
-            push!(servers, Sockets.listen(path))
-            serialize(oldconn, (:socket, path))
-        end
-        map(accept, servers)
-    catch err
-        if err isa InterruptException # Can occur when client disconnects partway through
-            @info "Interrupt during connection setup"
-            fill(nothing, n)
-        else
-            rethrow(err)
+function create_socket()::Pair{Sockets.PipeServer, String}
+    sockfile = string("worker-", WORKER_ID[], '-', String(rand('a':'z', 8)), ".sock")
+    path = joinpath(RUNTIME_DIR, sockfile)
+    Sockets.listen(path) => path
+end
+
+# Get sockets for a new client, using standby if available
+function get_client_sockets()::NTuple{2, Pair{Sockets.PipeServer, String}}
+    sockets = @lock STATE.lock begin
+        s = STATE.standby_sockets[]
+        STATE.standby_sockets[] = nothing
+        s
+    end
+    isnothing(sockets) ? (create_socket(), create_socket()) : sockets
+end
+
+# Ensure standby sockets exist (called after client disconnect or on startup)
+function ensure_standby_sockets()
+    @lock STATE.lock begin
+        if isnothing(STATE.standby_sockets[])
+            STATE.standby_sockets[] = (create_socket(), create_socket())
         end
     end
 end
 
-function runworker(socketpath::String)
+function runworker(socketpath::String, worker_number::Int=-1)
+    # Disable Julia's default SIGINT handling which throws uncatchable InterruptException
+    # This allows us to exit cleanly when the conductor shuts down
+    Base.exit_on_sigint(false)
     conn = Sockets.connect(socketpath)
-    while ((signal, msg) = deserialize(conn)) |> !isnothing
-        if signal == :client
-            stdio, signals = newconnection(conn, 2)
-            !isnothing(signals) &&
-                Threads.@spawn runclient($msg, $stdio, $signals)
-        elseif signal == :eval
-            serialize(conn, Core.eval(@__MODULE__, msg))
-        elseif signal == :softexit # Exit when all clients complete
-            lock(STATE.lock) do
-                if isempty(STATE.clients)
-                    exit(0)
-                else
-                    STATE.soft_exit[] = true
+    STATE.conductor_conn[] = conn
+    # Configuration from environment
+    STATE.worker_number[] = worker_number
+    global RUNTIME_DIR = dirname(socketpath)
+    global MAX_CLIENTS = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS", "1"))
+    global WORKER_TTL = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_TTL", "0"))
+    STATE.conductor_socket[] = joinpath(RUNTIME_DIR, "conductor.sock")
+    ensure_standby_sockets()
+    ensure_standby_module()
+    try
+        verify_magic(conn)
+        while isopen(conn)
+            header = read_header(conn)
+            if header.msg_type == MSG_TYPE.ping
+                active = @lock STATE.lock length(STATE.clients)
+                send_pong(conn, active)
+            elseif header.msg_type == MSG_TYPE.set_project
+                project = read_set_project(conn, header.payload_len)
+                try
+                    set_project(project)
+                    STATE.project[] = project
+                    send_project_ok(conn)
+                catch err
+                    send_error(conn, ERR_CODE.project_not_found,
+                               "Failed to set project: $(sprint(showerror, err))")
                 end
+            elseif header.msg_type == MSG_TYPE.client_run
+                client = read_client_run(conn, header.payload_len)
+                # Check capacity first (force flag bypasses limit for labeled sessions)
+                active_count = @lock STATE.lock length(STATE.clients)
+                if !client.force && MAX_CLIENTS > 0 && active_count >= MAX_CLIENTS
+                    # Reject: send empty paths with current count
+                    send_sockets(conn, "", "", active_count)
+                else
+                    try
+                        (stdio_server, stdio_path), (signals_server, signals_path) = get_client_sockets()
+                        # Register client and get count (before sending response)
+                        active_count = @lock STATE.lock begin
+                            push!(STATE.clients, (time(), client))
+                            length(STATE.clients)
+                        end
+                        send_sockets(conn, stdio_path, signals_path, active_count)
+                        # Accept connections and spawn client handler
+                        stdio = accept(stdio_server)
+                        signals = accept(signals_server)
+                        # Clean up server sockets (paths remain for client to connect)
+                        close(stdio_server)
+                        close(signals_server)
+                        task = Threads.@spawn try
+                            runclient(client, stdio, signals)
+                        catch
+                            isopen(stdio) && rethrow()
+                        end
+                        @lock STATE.lock STATE.client_tasks[client.pid] = task
+                    catch err
+                        send_error(conn, ERR_CODE.internal_error,
+                                   "Failed to start client: $(sprint(showerror, err))")
+                    end
+                end
+            elseif header.msg_type == MSG_TYPE.query_state
+                active, last_ts, soft_exit = @lock STATE.lock (
+                    length(STATE.clients),
+                    round(Int, STATE.lastclient[]),
+                    STATE.soft_exit[]
+                )
+                send_state(conn, active, last_ts, soft_exit)
+            elseif header.msg_type == MSG_TYPE.soft_exit
+                @lock STATE.lock begin
+                    if isempty(STATE.clients)
+                        ccall(:_exit, Cvoid, (Cint,), 0)
+                    else
+                        STATE.soft_exit[] = true
+                    end
+                end
+            elseif header.msg_type == MSG_TYPE.sync_clients
+                # Read list of PIDs that conductor believes are active
+                pid_count = read(conn, UInt16)
+                active_pids = Set{Int}()
+                for _ in 1:pid_count
+                    push!(active_pids, Int(read(conn, UInt32)))
+                end
+                kill_stuck_clients(active_pids)
+                remaining = @lock STATE.lock length(STATE.clients)
+                send_ack(conn, remaining)
+            else
+                # Skip unknown message payload
+                read(conn, header.payload_len)
+                send_error(conn, ERR_CODE.invalid_message,
+                           "Unknown message type: $(header.msg_type)")
             end
-        else
-            println(conn, "Unknown signal: $signal")
         end
+    catch err
+        if !(err isa EOFError || err isa Base.IOError || err isa InterruptException)
+            @error "Worker error" exception=(err, catch_backtrace())
+        end
+    finally
+        # Ensure clean exit - this handles cases where the conductor disconnects
+        # or sends SIGINT during shutdown
+        real_exit(0)
     end
 end

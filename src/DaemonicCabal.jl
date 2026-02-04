@@ -1,7 +1,16 @@
+module DaemonicCabal
+
+using BaseDirs
 using Pkg.Artifacts
 
+const CLIENT_NAME = "juliaclient"
 const DEFAULT_WORKER_TTL = 2*60*60 # 2h
 const DEFAULT_WORKER_MAXCLIENTS = 1
+
+mainsocket() = get(ENV, "JULIA_DAEMON_SERVER",
+                   BaseDirs.runtime("julia-daemon", "conductor.sock"))
+
+julia_env() = [k => v for (k, v) in ENV if startswith(k, "JULIA_")]
 
 @static if Sys.islinux()
     const SYSTEMD_SERVICE_NAME = "julia-daemon"
@@ -10,23 +19,28 @@ const DEFAULT_WORKER_MAXCLIENTS = 1
     # adapt to environment changes that affect the config path.
     systemd_service_file_path() =
         BaseDirs.User.config("systemd", "user", SYSTEMD_SERVICE_NAME * ".service",
-                        create=true)
+                             create=true)
 
     function systemd_service_file_content()
-        worker_cmd = worker_command("")
+        worker_executable = something(
+            get(ENV, "JULIA_DAEMON_WORKER_EXECUTABLE", nothing),
+            Sys.which("julia"),
+            joinpath(Sys.BINDIR, "julia"))
+        worker_args = get(ENV, "JULIA_DAEMON_WORKER_ARGS", "--startup-file=no")
         """
 [Unit]
-Description=Julia ($(@__MODULE__).jl) server daemon
+Description=Julia ($(@__MODULE__).jl) daemon conductor service
 
 [Service]
 Type=simple
-ExecStart=$(first(worker_cmd.exec)) --startup-file=no --project="$(dirname(@__DIR__))" -e "using $(@__MODULE__); $(@__MODULE__).start()"
+ExecStart=$(joinpath(artifact"execbundle", "julia-conductor"))
 Environment="JULIA_DAEMON_SERVER=$(mainsocket())"
-Environment="JULIA_DAEMON_WORKER_EXECUTABLE=$(first(worker_cmd.exec))"
+Environment="JULIA_DAEMON_WORKER_EXECUTABLE=$(worker_executable)"
+Environment="JULIA_DAEMON_WORKER_PROJECT=$(joinpath(dirname(@__DIR__), "worker"))"
 $(if !haskey(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS")
     "Environment=\"JULIA_DAEMON_WORKER_MAXCLIENTS=$DEFAULT_WORKER_MAXCLIENTS\"\n"
 else "" end)\
-Environment="JULIA_DAEMON_WORKER_ARGS=$(join(worker_cmd.exec[3:end-2], ' '))"
+Environment="JULIA_DAEMON_WORKER_ARGS=$(worker_args)"
 $(if !haskey(ENV, "JULIA_DAEMON_WORKER_TTL")
     "Environment=\"JULIA_DAEMON_WORKER_TTL=$DEFAULT_WORKER_TTL\"\n"
 else "" end)\
@@ -67,8 +81,8 @@ More specifically this:
         end
         binpath = BaseDirs.User.bin(CLIENT_NAME)
         @info "Installing client binary to $binpath"
-        ispath(binpath) && rm(binpath)
-        symlink(joinpath(artifact"client", "client"), binpath)
+        (ispath(binpath) || islink(binpath)) && rm(binpath)
+        symlink(joinpath(artifact"execbundle", "juliaclient"), binpath)
         chmod(binpath, 0o555)
         @info "Done"
     end
@@ -108,4 +122,31 @@ Undo `install()`.
         @error "This functionality is currently only implemented for Linux.\n" *
             "If you're up for it, consider making a PR to add support for $(Sys.KERNEL) 🙂"
     end
+end
+
+BaseDirs.@promise_no_assign @doc """
+    DaemonicCabal
+
+# Setup
+
+Install this package anywhere and run `DaemonicCabal.install()`. Re-run this
+command after updating `DaemonicCabal`, the configuration env vars, or Julia
+itself.
+
+# Configuration
+
+When the daemon starts, it pays attention to the following environmental variables:
+- `JULIA_DAEMON_SERVER` [`$(BaseDirs.runtime("julia-daemon", "conductor.sock"))`] \n
+  The socket to connect to.
+- `JULIA_DAEMON_WORKER_MAXCLIENTS` [`$DEFAULT_WORKER_MAXCLIENTS`]\n
+  The maximum number of clients a worker may be attached to at once. Set to `0`
+  to disable.
+- `JULIA_DAEMON_WORKER_ARGS` [`--startup-file=no`] \n
+  Arguments passed to the Julia worker processes.
+- `JULIA_DAEMON_WORKER_EXECUTABLE` [`$(joinpath(Sys.BINDIR, "julia"))`] \n
+  Path to the Julia executable used by the workers.
+- `JULIA_DAEMON_WORKER_TTL` [`$DEFAULT_WORKER_TTL`] \n
+  Number of seconds a worker should be kept alive for after the last client disconnects.
+""" DaemonicCabal
+
 end

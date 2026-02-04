@@ -1,8 +1,9 @@
-#+title: DaemonConductor
+#+title: DaemonicCabal.jl
 
-Run a script many times, compile it once.
+/Run a script many times, compile it once./
 
-=DaemonConductor= acts as drop-in replacement for a subset of =julia=.
+Once installed, =DaemonicCabal.jl= provides =juliaclient=, which serves as a
+drop-in replacement for a subset of =julia=, with a few extra tricks.
 
 #+begin_example
 ~$ juliaclient --help
@@ -21,6 +22,17 @@ Switches (a '*' marks the default value, if applicable):
  --banner={yes|no|auto*}    Enable or disable startup banner
  --color={yes|no|auto*}     Enable or disable color text
  --history-file={yes*|no}   Load or save history
+
+Client-specific switches:
+
+ --session[=<label>]        Reuse worker state in Main module. With a label,
+                            multiple clients can share the same session.
+ --revise[=yes|no*]         Enable or disable Revise.jl integration
+ --restart                  Kill workers for the project and exit
+
+Daemon management (systemd):
+
+ systemctl --user {start | stop | restart | status} julia-daemon
 #+end_example
 
 Currently the client makes use of unix sockets and [[https://unixism.net/loti/what_is_io_uring.html][=io_uring=]], and so only works
@@ -29,37 +41,76 @@ on Linux systems at the moment.
 * Usage
 
 + Install somewhere (potentially in a separate package environment)
-+ Run =using DaemonConductor; DaemonConductor.install()=
++ Run =using DaemonicCabal; DaemonicCabal.install()=
 + Use =juliaclient= as a (mostly) drop-in replacement for =julia=
+
+* Sessions
+
+By default, each =juliaclient= invocation runs in a fresh module. Use =--session=
+to persist state in =Main= across invocations:
+
+#+begin_example
+~$ juliaclient --session -e 'x = 42'
+~$ juliaclient --session -e 'println(x)'  # prints 42
+#+end_example
+
+Without a label, session affinity is based on the parent process (shell), so
+different terminal windows tend to get separate sessions (this is not
+guaranteed).
+
+With a label, multiple clients can explicitly share the same session:
+
+#+begin_example
+# Terminal A
+~$ juliaclient --session=shared -e 'data = [1,2,3]'
+
+# Terminal B (different shell, same label)
+~$ juliaclient --session=shared -e 'push!(data, 4); data'  # [1, 2, 3, 4]
+#+end_example
+
+Labeled sessions bypass the normal =MAX_CLIENTS= limit, allowing multiple
+clients to attach to the same worker simultaneously.
 
 * Configuration
 
 When the daemon starts, it pays attention to the following environmental variables:
-+ =JULIA_DAEMON_SERVER= (default: =/run/user/$UID/julia-daemon.sock=), the socket
-  the client connects to.
-+ =JULIA_DAEMON_WORKER_ARGS= (default: =--startup-file=no=), arguments passed to the
-  worker Julia processes (individual arguments are split on whitespace).
-+ =JULIA_DAEMON_WORKER_MAXCLIENTS= (default: =1=), the maximum number of clients a
-  worker may be attached to at once. Set to =0= to disable.
-+ =JULIA_DAEMON_WORKER_EXECUTABLE= (default: =julia= on =PATH=), the path to the Julia
-  executable used by the workers.
-+ =JULIA_DAEMON_WORKER_TTL= (default: =7200=, 2h), the number of seconds a worker
-  should be kept alive for after the last client disconnects from it. This
-  variable can be updated within the worker itself.
-+ =JULIA_DAEMON_REVISE= (default: =no=), whether revise should be automatically
-  enabled in client sessions. Can also be set with =--revise=.
 
-Similarly, the client pays attention to =JULIA_DAEMON_SERVER= to make sure it
-connects to the right socket.
+| Variable                       | Default                                    | Description                                                     |
+|--------------------------------+--------------------------------------------+-----------------------------------------------------------------|
+| =JULIA_DAEMON_SERVER=            | =/run/user/$UID/julia-daemon/conductor.sock= | Socket path for client connections                              |
+| =JULIA_DAEMON_RUNTIME=           | =/run/user/$UID/julia-daemon=                | Runtime directory for sockets and PID file                      |
+| =JULIA_DAEMON_WORKER_EXECUTABLE= | =julia=                                      | Julia binary for workers                                        |
+| =JULIA_DAEMON_WORKER_ARGS=       | =--startup-file=no=                          | Arguments passed to worker processes (split on whitespace)      |
+| =JULIA_DAEMON_WORKER_PROJECT=    | (none)                                     | Project for the worker itself (not client projects)             |
+| =JULIA_DAEMON_WORKER_MAXCLIENTS= | =1=                                          | Max clients per worker (0 = unlimited)                          |
+| =JULIA_DAEMON_WORKER_TTL=        | =7200=                                       | Worker idle timeout in seconds (2 hours)                        |
+| =JULIA_DAEMON_LABEL_TTL=         | =90=                                         | Session label retention after last client disconnects (seconds) |
+| =JULIA_DAEMON_REVISE=            | =no=                                         | Enable Revise.jl by default (also settable with =--revise=)       |
+
+The client also reads =JULIA_DAEMON_SERVER= and =JULIA_DAEMON_RUNTIME= to locate
+the conductor socket.
+
+* Architecture
+
+#+begin_example
+┌─────────────────┐      ┌──────────────────┐      ┌──────────────────────┐
+│  Client (Zig)   │─────▶│  Conductor (Zig) │─────▶│  Worker Pool (Julia) │
+└────────┬────────┘      └──────────────────┘      └────────┬─────────────┘
+         │                                                  │
+         └────────────────── stdio ─────────────────────────┘
+#+end_example
+
+- *Client*: Lightweight Zig binary users invoke. Connects to conductor to get
+  assigned a worker, then connects directly to the worker for stdio/signals
+  via =io_uring=.
+- *Conductor*: Zig daemon managing the worker pool. Spawns workers per-project,
+  routes client requests, maintains environment fingerprint cache.
+- *Worker*: Julia process handling client sessions. Each worker serves one project
+  and can handle multiple clients.
 
 * Caveats
 
-+ A worker is started per-project, and so running the same thing in multiple
-  projects will incur the worker startup and compile cost multiple times.
-+ Workers are currently kept alive forever, leading to ballooning memory usage.
-  This should be addressed in the future.
-+ The REPL seems a little funky, and wasn't designed to allow for multiple REPLs
-  per Julia process.
-+ Sometimes the socket file disappears, for mysterious reasons.
-+ This is currently the result of a weekend of work, there are likely some minor
-  issues that haven't been shaken out yet.
++ A worker is started per-project, so running scripts in different projects
+  incurs separate startup/compile costs.
++ The REPL works but wasn't designed for multiple concurrent REPLs per process.
++ Linux-only, due to the dependency on =io_uring=

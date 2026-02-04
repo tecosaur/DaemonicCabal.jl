@@ -2,22 +2,36 @@ module DaemonWorker
 
 using Base.Threads
 using REPL
-using Serialization
 using Sockets
-
-using BaseDirs
 
 const WORKER_ID = Ref("")
 
+@static if VERSION >= v"1.11"
+    include("scopedio.jl")
+end
+
+include("protocol.jl")
 include("setup.jl")
+include("run.jl")
 
 function __init__()
     try_load_revise()
     WORKER_ID[] = String(rand('a':'z', 6))
-    # With `REPL.Terminals.raw!`, there are to invocations incompatable
-    # with an `IOContext`: `check_open` and `.handle`. However, `raw!` isn't
-    # able to work normally anyway, so we may as well override it.
-    @eval REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool) = raw
+    include(joinpath(@__DIR__, "overrides.jl"))
+    @static if VERSION >= v"1.11"
+        unsafe_pipe!(WORKER_TERM.stdin, Base.stdin)
+        unsafe_pipe!(WORKER_TERM.stdout, Base.stdout)
+        unsafe_pipe!(WORKER_TERM.stderr, Base.stderr)
+        WORKER_TERM.terminfo = @static if VERSION >= v"1.12"
+            Base.current_terminfo()
+        else
+            Base.current_terminfo
+        end
+        WORKER_TERM.have_color = Base.get_have_color()
+        redirect_stdin(ScopedStdin())
+        redirect_stdout(ScopedStdout())
+        redirect_stderr(ScopedStderr())
+    end
 end
 
 include("precompile.jl")
