@@ -16,28 +16,35 @@ if !("--release" ∈ ARGS)
     exit(ecode)
 end
 
-push!(FLAGS, "-fstrip", "-flto", "-O", "ReleaseSmall")
+push!(FLAGS, "-fstrip", "-O", "ReleaseSmall")
 
 const VERSION = open(TOML.parse, joinpath(@__DIR__, "Project.toml"))["version"]
 const ARTIFACTS = Dict{String, Any}[]
 const WORKDIR = mktempdir()
 
 @info "native"
-run(`$zig build-exe $FLAGS -femit-bin=julia-conductor --name julia-conductor conductor/main.zig`)
-run(`$zig build-exe $FLAGS -femit-bin=juliaclient --name juliaclient client/client.zig`)
+run(`$zig build-exe $FLAGS -flto -femit-bin=julia-conductor --name julia-conductor conductor/main.zig`)
+run(`$zig build-exe $FLAGS -flto -femit-bin=juliaclient --name juliaclient client/client.zig`)
 
-for (os, arch) in [
-    ("linux", "x86_64"),
-    ("linux", "aarch64"),
-    # ("macos", "x86_64"),
-    # ("macos", "arm"),
-    # ("windows", "x86_64"),
-    # ("windows", "aarch64"),
-    ]
+const BUILD_SPECS = Tuple{String, String, Vector{String}}[
+    ("linux", "x86_64", ["-flto"]),
+    ("linux", "aarch64", ["-flto"]),
+    ("macos", "x86_64", []),
+    ("macos", "aarch64", []),
+    ("freebsd", "x86_64", []),
+    ("freebsd", "aarch64", []),
+    ("freebsd", "arm", []),
+    ("openbsd", "x86_64", []),
+    ("openbsd", "aarch64", []),
+    # ("windows", "x86_64", []),
+    # ("windows", "aarch64", []),
+]
+
+for (os, arch, extra_flags) in BUILD_SPECS
     @info "$os-$arch"
     target = "$arch-$os"
-    run(`$zig build-exe $FLAGS -target $target -femit-bin=$WORKDIR/julia-conductor --name julia-conductor conductor/main.zig`)
-    run(`$zig build-exe $FLAGS -target $target -femit-bin=$WORKDIR/juliaclient --name juliaclient client/client.zig`)
+    run(`$zig build-exe $FLAGS $extra_flags -target $target -femit-bin=$WORKDIR/julia-conductor --name julia-conductor conductor/main.zig`)
+    run(`$zig build-exe $FLAGS $extra_flags -target $target -femit-bin=$WORKDIR/juliaclient --name juliaclient client/client.zig`)
     tarball = joinpath(@__DIR__, "$os-$arch.tar.gz")
     run(`tar -czf $tarball -C $WORKDIR .`)
     tar256 = first(eachsplit(readchomp(`sha256sum $tarball`)))

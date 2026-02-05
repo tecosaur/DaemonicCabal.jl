@@ -17,6 +17,8 @@ pub const worker = @import("worker.zig");
 
 pub const eventLoopImpl = if (builtin.os.tag == .linux)
     @import("eloop/linux.zig")
+else if (builtin.os.tag.isBSD())
+    @import("eloop/kqueue.zig")
 else
     @compileError("unsupported OS");
 
