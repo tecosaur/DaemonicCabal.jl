@@ -6,11 +6,13 @@ const zig = joinpath(@__DIR__, "zig", "zig")
 
 const FLAGS = ["-fsingle-threaded", "-fPIE"]
 
+showsuccess(cmd::Cmd) = success(pipeline(cmd; stdout, stderr))
+
 if !("--release" ∈ ARGS)
-    push!(FLAGS, "-fstack-protector", "-O", "Debug")
+    push!(FLAGS, "-O", "Debug")
     ecode = 0
-    ecode |= !success(`$zig build-exe $FLAGS -femit-bin=julia-conductor --name julia-conductor conductor/main.zig`)
-    ecode |= !success(`$zig build-exe $FLAGS -femit-bin=juliaclient --name juliaclient client/client.zig`)
+    ecode |= !showsuccess(`$zig build-exe $FLAGS -femit-bin=julia-conductor --name julia-conductor conductor/main.zig`)
+    ecode |= !showsuccess(`$zig build-exe $FLAGS -femit-bin=juliaclient --name juliaclient client/client.zig`)
     exit(ecode)
 end
 

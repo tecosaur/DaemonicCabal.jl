@@ -2,17 +2,23 @@
 // SPDX-License-Identifier: MPL-2.0
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
-const linux = std.os.linux;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
 const config = @import("config.zig");
 const args = @import("args.zig");
 const project = @import("project.zig");
 const env_cache = @import("env_cache.zig");
-const worker = @import("worker.zig");
+pub const worker = @import("worker.zig");
+
+pub const eventLoopImpl = if (builtin.os.tag == .linux)
+    @import("eloop/linux.zig")
+else
+    @compileError("unsupported OS");
 
 const readExact = protocol.readExact;
 const randomSocketPath = protocol.randomSocketPath;
@@ -57,43 +63,11 @@ const CLIENT_HELP =
 ;
 
 // ============================================================================
-// Signal handling (global state required for signal handlers)
+// Global state for cleanup
 // ============================================================================
 
-var g_socket_path: [:0]const u8 = "";
-var g_pid_path: [:0]const u8 = "";
-var g_signal_pipe: [2]posix.fd_t = .{ -1, -1 };
-
-const SIGNAL_SHUTDOWN: u8 = 'S';
-const SIGNAL_RECREATE: u8 = 'R';
-
-fn handleShutdown(_: posix.SIG) callconv(.c) void {
-    _ = linux.write(@intCast(g_signal_pipe[1]), &[_]u8{SIGNAL_SHUTDOWN}, 1);
-}
-
-fn handleUsr1(_: posix.SIG) callconv(.c) void {
-    _ = linux.write(@intCast(g_signal_pipe[1]), &[_]u8{SIGNAL_RECREATE}, 1);
-}
-
-fn createSignalPipe() !void {
-    g_signal_pipe = Io.Threaded.pipe2(.{ .NONBLOCK = true }) catch return error.PipeCreationFailed;
-}
-
-fn installSignalHandlers() void {
-    const shutdown_sigact = posix.Sigaction{
-        .handler = .{ .handler = @ptrCast(&handleShutdown) },
-        .mask = std.mem.zeroes(posix.sigset_t),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.TERM, &shutdown_sigact, null);
-    posix.sigaction(posix.SIG.INT, &shutdown_sigact, null);
-    const usr1_sigact = posix.Sigaction{
-        .handler = .{ .handler = @ptrCast(&handleUsr1) },
-        .mask = std.mem.zeroes(posix.sigset_t),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.USR1, &usr1_sigact, null);
-}
+pub var g_socket_path: [:0]const u8 = "";
+pub var g_pid_path: [:0]const u8 = "";
 
 // ============================================================================
 // Types
@@ -135,7 +109,7 @@ const WorkerAssignment = struct {
 // Conductor
 // ============================================================================
 
-const Conductor = struct {
+pub const Conductor = struct {
     io: Io,
     allocator: Allocator,
     cfg: config.Config,
@@ -146,13 +120,13 @@ const Conductor = struct {
     reserve: ?*worker.Worker,
     next_worker_id: u32,
     client_counter: u32,
-    ring: *linux.IoUring,
+    event_loop: eventLoopImpl.EventLoop,
 
     // ========================================================================
     // Lifecycle
     // ========================================================================
 
-    pub fn init(io: Io, allocator: Allocator, cfg: config.Config, environ_map: *std.process.Environ.Map, ring: *linux.IoUring) Conductor {
+    pub fn init(io: Io, allocator: Allocator, cfg: config.Config, environ_map: *std.process.Environ.Map) !Conductor {
         return .{
             .io = io,
             .allocator = allocator,
@@ -164,11 +138,12 @@ const Conductor = struct {
             .reserve = null,
             .next_worker_id = 0,
             .client_counter = 0,
-            .ring = ring,
+            .event_loop = try eventLoopImpl.EventLoop.init(64),
         };
     }
 
     pub fn deinit(self: *Conductor) void {
+        self.event_loop.deinit();
         self.cache.deinit();
         self.active_clients.deinit();
         if (self.reserve) |r| {
@@ -185,6 +160,9 @@ const Conductor = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.workers.deinit();
+        if (g_socket_path.len > 0) self.allocator.free(g_socket_path);
+        if (g_pid_path.len > 0) self.allocator.free(g_pid_path);
+        self.cfg.deinit();
     }
 
     pub fn run(self: *Conductor) !void {
@@ -192,10 +170,8 @@ const Conductor = struct {
         const pid_path = try std.fmt.allocPrint(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir});
         g_pid_path = try self.allocator.dupeZ(u8, pid_path);
         self.allocator.free(pid_path);
-        try createSignalPipe();
-        defer posix.close(g_signal_pipe[0]);
-        defer posix.close(g_signal_pipe[1]);
-        installSignalHandlers();
+        try eventLoopImpl.installSignalHandlers();
+        defer eventLoopImpl.cleanupSignalHandlers();
         self.writePidFile();
         defer Io.Dir.deleteFileAbsolute(self.io, g_pid_path) catch {};
         var server = try self.createServer();
@@ -222,143 +198,28 @@ const Conductor = struct {
     // ========================================================================
 
     fn eventLoop(self: *Conductor, server: *Io.net.Server) void {
-        var signal_buf: [16]u8 = undefined;
-        var pong_buf: [7]u8 = undefined;
-        var client_addr: posix.sockaddr = undefined;
-        var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-        var server_fd = server.socket.handle;
-        var ping_timer = linux.kernel_timespec{ .sec = @intCast(self.cfg.ping_interval), .nsec = 0 };
-        var ping_timeout_ts = linux.kernel_timespec{ .sec = @intCast(self.cfg.ping_timeout), .nsec = 0 };
-        var health_check_ts = linux.kernel_timespec{ .sec = 1, .nsec = 0 }; // delay before health check after client disconnect
-        // Queue initial operations
-        _ = self.ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr, &client_addr_len, 0) catch |err| {
-            std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
-            return;
-        };
-        _ = self.ring.read(@intFromEnum(EventLocation.signal), g_signal_pipe[0], .{ .buffer = &signal_buf }, 0) catch |err| {
-            std.debug.print("Fatal: failed to queue signal read: {}\n", .{err});
-            return;
-        };
-        _ = self.ring.timeout(@intFromEnum(EventLocation.ping_timer), &ping_timer, 0, 0) catch |err| {
-            std.debug.print("Fatal: failed to queue ping timer: {}\n", .{err});
-            return;
-        };
-        while (true) {
-            _ = self.ring.submit_and_wait(1) catch |err| {
-                if (err == error.SignalInterrupt) continue;
-                std.debug.print("Fatal: io_uring submit_and_wait failed: {}\n", .{err});
-                return;
-            };
-            var need_rearm_accept = false;
-            var need_rearm_ping_timer = false;
-            while (self.ring.cq_ready() > 0) {
-                const cqe = self.ring.copy_cqe() catch |err| {
-                    std.debug.print("Fatal: io_uring copy_cqe failed: {}\n", .{err});
-                    return;
-                };
-                const user_data = cqe.user_data;
-                // Worker events (user_data >= 0x1000, bit 0: 0=pong, 1=health check timeout)
-                if (user_data >= 0x1000) {
-                    const w: *worker.Worker = @ptrFromInt(user_data & ~@as(u64, 1));
-                    if ((user_data & 1) != 0) {
-                        // Health check timeout: ping worker if idle and not recently pinged
-                        const recently_pinged = (self.currentTime() - w.last_pinged) < 2;
-                        if (w.active_clients == 0 and !w.ping_pending and !recently_pinged) {
-                            self.queuePing(w, &pong_buf, &ping_timeout_ts);
-                        }
-                    } else {
-                        self.handlePongResponse(w, cqe.res, &pong_buf);
-                    }
-                    continue;
-                }
-                switch (@as(EventLocation, @enumFromInt(user_data))) {
-                    .accept => {
-                        if (cqe.res >= 0) {
-                            const client_fd: posix.fd_t = @intCast(cqe.res);
-                            self.handleConnectionFd(client_fd, &health_check_ts) catch |err| {
-                                std.debug.print("Client handling failed: {}\n", .{err});
-                            };
-                            posix.close(client_fd);
-                        } else {
-                            const err_code: u32 = @intCast(-cqe.res);
-                            if (err_code != @intFromEnum(posix.E.BADF)) {
-                                std.debug.print("Accept error: {d}\n", .{cqe.res});
-                            }
-                        }
-                        need_rearm_accept = true;
-                    },
-                    .signal => {
-                        if (cqe.res > 0) {
-                            const len: usize = @intCast(cqe.res);
-                            for (signal_buf[0..len]) |sig| {
-                                switch (sig) {
-                                    SIGNAL_SHUTDOWN => {
-                                        std.debug.print("\nShutdown requested, stopping workers...\n", .{});
-                                        self.gracefulShutdown();
-                                        return;
-                                    },
-                                    SIGNAL_RECREATE => {
-                                        std.debug.print("Recreating socket due to SIGUSR1\n", .{});
-                                        server.deinit(self.io);
-                                        Io.Dir.deleteFileAbsolute(self.io, self.cfg.socket_path) catch {};
-                                        server.* = self.createServer() catch |err| {
-                                            std.debug.print("Failed to recreate socket: {}\n", .{err});
-                                            continue;
-                                        };
-                                        server_fd = server.socket.handle;
-                                        need_rearm_accept = true;
-                                    },
-                                    else => {},
-                                }
-                            }
-                        }
-                        _ = self.ring.read(@intFromEnum(EventLocation.signal), g_signal_pipe[0], .{ .buffer = &signal_buf }, 0) catch |err| {
-                            std.debug.print("Fatal: failed to requeue signal read: {}\n", .{err});
-                            return;
-                        };
-                    },
-                    .ping_timer => {
-                        self.queueWorkerPings(&pong_buf, &ping_timeout_ts);
-                        need_rearm_ping_timer = true;
-                    },
-                    .ignored, _ => {},
-                }
-            }
-            if (need_rearm_accept) {
-                client_addr_len = @sizeOf(posix.sockaddr);
-                _ = self.ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr, &client_addr_len, 0) catch |err| {
-                    std.debug.print("Fatal: failed to requeue accept: {}\n", .{err});
-                    return;
-                };
-            }
-            if (need_rearm_ping_timer) {
-                _ = self.ring.timeout(@intFromEnum(EventLocation.ping_timer), &ping_timer, 0, 0) catch |err| {
-                    std.debug.print("Fatal: failed to requeue ping timer: {}\n", .{err});
-                    return;
-                };
-            }
-        }
+        eventLoopImpl.run(self, server);
     }
 
     // ========================================================================
     // Connection handling
     // ========================================================================
 
-    fn handleConnectionFd(self: *Conductor, socket: posix.socket_t, health_check_ts: *linux.kernel_timespec) !void {
+    pub fn handleConnectionFd(self: *Conductor, socket: posix.socket_t) !void {
         var magic_buf: [4]u8 = undefined;
         try readExact(socket, &magic_buf);
         const magic = std.mem.readInt(u32, &magic_buf, .little);
         if (magic == protocol.client.magic) {
             try self.handleClient(socket);
         } else if (magic == protocol.notification.magic) {
-            self.handleNotification(socket, health_check_ts);
+            self.handleNotification(socket);
         } else {
             std.debug.print("Invalid magic: {x}\n", .{magic});
             return error.InvalidMagic;
         }
     }
 
-    fn handleNotification(self: *Conductor, socket: posix.socket_t, health_check_ts: *linux.kernel_timespec) void {
+    fn handleNotification(self: *Conductor, socket: posix.socket_t) void {
         var type_buf: [1]u8 = undefined;
         readExact(socket, &type_buf) catch |err| {
             std.debug.print("Notification read error (type): {}\n", .{err});
@@ -374,7 +235,7 @@ const Conductor = struct {
             .client_done => _ = self.clientDone(pid),
             .client_exit => {
                 if (self.clientDone(pid)) |w| {
-                    if (!w.ping_pending) _ = self.ring.timeout(@intFromPtr(w) | 1, health_check_ts, 0, 0) catch {};
+                    if (!w.ping_pending) self.event_loop.scheduleHealthCheck(w);
                 }
             },
             .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{pid}),
@@ -467,7 +328,7 @@ const Conductor = struct {
         // The Switch structs in parsed.switches contain slices into these strings,
         // so we must NOT free them here. They are freed via request.deinit().
         const cached = self.cache.lookup(fingerprint) orelse blk: {
-            _ = linux.write(socket, &[_]u8{protocol.client.env_request}, 1);
+            _ = platform.write(socket, &[_]u8{protocol.client.env_request});
             const full_env = try self.readFullEnv(socket);
             break :blk self.cache.insert(fingerprint, full_env);
         };
@@ -605,7 +466,7 @@ const Conductor = struct {
             std.debug.print("Worker {d}: assigning label '{s}'\n", .{ w.id, session_label.? });
             w.session_label = try self.allocator.dupe(u8, session_label.?);
         }
-        w.cancelPendingPing(self.ring);
+        self.event_loop.cancelPendingPing(w);
         return .{ .paths = try w.runClient(self.allocator, client_info), .w = w, .reason = .new_worker };
     }
 
@@ -617,7 +478,7 @@ const Conductor = struct {
     }
 
     fn tryAssignWorker(self: *Conductor, w: *worker.Worker, client_info: *const worker.ClientInfo, reason: AssignReason) ?WorkerAssignment {
-        w.cancelPendingPing(self.ring);
+        self.event_loop.cancelPendingPing(w);
         const paths = w.runClient(self.allocator, client_info) catch |err| {
             _ = self.handleRunClientError(w, err);
             return null;
@@ -739,7 +600,7 @@ const Conductor = struct {
             self.next_worker_id += 1;
             break :blk new;
         };
-        w.cancelPendingPing(self.ring);
+        self.event_loop.cancelPendingPing(w);
         try w.setProject(proj_copy);
         try list.append(self.allocator, w);
         if (self.reserve == null) self.createReserveWorker(null) catch |err| {
@@ -764,7 +625,7 @@ const Conductor = struct {
         return 0;
     }
 
-    fn killUnresponsiveWorker(self: *Conductor, w: *worker.Worker) void {
+    pub fn killUnresponsiveWorker(self: *Conductor, w: *worker.Worker) void {
         std.debug.print("Killing unresponsive worker {d}\n", .{w.id});
         if (self.reserve == w) self.reserve = null;
         self.removeActiveClientsForWorker(w);
@@ -880,70 +741,7 @@ const Conductor = struct {
         return null;
     }
 
-    // ========================================================================
-    // Health checking
-    // ========================================================================
-
-    fn queueWorkerPings(self: *Conductor, pong_buf: *[7]u8, timeout_ts: *linux.kernel_timespec) void {
-        const now = self.currentTime();
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| {
-                self.maybeQueuePing(w, pong_buf, timeout_ts, now);
-            }
-        }
-        if (self.reserve) |r| self.maybeQueuePing(r, pong_buf, timeout_ts, now);
-    }
-
-    fn maybeQueuePing(self: *Conductor, w: *worker.Worker, pong_buf: *[7]u8, timeout_ts: *linux.kernel_timespec, now: i64) void {
-        if (w.ping_pending) return;
-        if (w.active_clients > 0) return;
-        if (now - w.last_pinged < @as(i64, @intCast(self.cfg.ping_interval))) return;
-        self.queuePing(w, pong_buf, timeout_ts);
-    }
-
-    fn queuePing(self: *Conductor, w: *worker.Worker, pong_buf: *[7]u8, timeout_ts: *linux.kernel_timespec) void {
-        w.sendPing();
-        const sqe = self.ring.read(@intFromPtr(w), w.socket, .{ .buffer = pong_buf }, 0) catch {
-            w.ping_pending = false;
-            return;
-        };
-        sqe.flags |= linux.IOSQE_IO_LINK;
-        _ = self.ring.link_timeout(@intFromEnum(EventLocation.ignored), timeout_ts, 0) catch {};
-    }
-
-    fn handlePongResponse(self: *Conductor, w: *worker.Worker, cqe_res: i32, pong_buf: *[7]u8) void {
-        if (cqe_res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
-            if (w.ping_pending) {
-                w.ping_pending = false;
-                std.debug.print("Worker {d}: ping timed out\n", .{w.id});
-                self.killUnresponsiveWorker(w);
-            }
-            return;
-        }
-        w.ping_pending = false;
-        if (cqe_res <= 0) {
-            std.debug.print("Worker {d}: ping failed (res={d})\n", .{ w.id, cqe_res });
-            self.killUnresponsiveWorker(w);
-            return;
-        }
-        const bytes_read: usize = @intCast(cqe_res);
-        if (bytes_read < 7) {
-            protocol.readExact(w.socket, pong_buf[bytes_read..]) catch {
-                std.debug.print("Worker {d}: pong short read\n", .{w.id});
-                self.killUnresponsiveWorker(w);
-                return;
-            };
-        }
-        w.last_pinged = self.currentTime();
-        const worker_count = std.mem.readInt(u16, pong_buf[5..7], .little);
-        if (worker_count != w.active_clients) {
-            std.debug.print("Worker {d}: client count mismatch (worker={d}, conductor={d}), syncing\n", .{ w.id, worker_count, w.active_clients });
-            self.syncWorkerClients(w);
-        }
-    }
-
-    fn syncWorkerClients(self: *Conductor, w: *worker.Worker) void {
+    pub fn syncWorkerClients(self: *Conductor, w: *worker.Worker) void {
         var pids: [32]u32 = undefined;
         var count: u16 = 0;
         var it = self.active_clients.iterator();
@@ -966,7 +764,7 @@ const Conductor = struct {
     // Shutdown
     // ========================================================================
 
-    fn gracefulShutdown(self: *Conductor) void {
+    pub fn gracefulShutdown(self: *Conductor) void {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items) |w| w.softExit();
@@ -1002,22 +800,21 @@ const Conductor = struct {
     }
 
     fn anyWorkerAlive(self: *Conductor) bool {
-        var status: u32 = 0;
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items) |w| {
                 if (w.process.id) |pid| {
-                    const ret = linux.waitpid(pid, &status, linux.W.NOHANG);
-                    if (ret == pid) continue;
-                    if (ret == 0) return true;
+                    const result = platform.waitpidNonBlocking(pid);
+                    if (result.exited) continue;
+                    if (result.pid == 0) return true;
                 }
             }
         }
         if (self.reserve) |r| {
             if (r.process.id) |pid| {
-                const ret = linux.waitpid(pid, &status, linux.W.NOHANG);
-                if (ret == pid) return false;
-                if (ret == 0) return true;
+                const result = platform.waitpidNonBlocking(pid);
+                if (result.exited) return false;
+                if (result.pid == 0) return true;
             }
         }
         return false;
@@ -1027,18 +824,18 @@ const Conductor = struct {
     // Utilities
     // ========================================================================
 
-    fn currentTime(self: *Conductor) i64 {
-        return (Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).toSeconds();
+    pub fn currentTime(self: *Conductor) i64 {
+        return platform.timeSeconds(self.io);
     }
 
-    fn createServer(self: *Conductor) !Io.net.Server {
+    pub fn createServer(self: *Conductor) !Io.net.Server {
         const addr = try Io.net.UnixAddress.init(self.cfg.socket_path);
         return addr.listen(self.io, .{ .kernel_backlog = 128 });
     }
 
     fn writePidFile(self: *Conductor) void {
         var buf: [16]u8 = undefined;
-        const pid_str = std.fmt.bufPrint(&buf, "{d}", .{linux.getpid()}) catch unreachable;
+        const pid_str = std.fmt.bufPrint(&buf, "{d}", .{platform.getpid()}) catch unreachable;
         var file = Io.Dir.createFileAbsolute(self.io, g_pid_path, .{}) catch |err| {
             std.debug.print("Warning: failed to create PID file: {}\n", .{err});
             return;
@@ -1067,8 +864,8 @@ const Conductor = struct {
         defer stdio_conn.close(self.io);
         const signals_conn = try signals_server.accept(self.io);
         defer signals_conn.close(self.io);
-        _ = linux.write(stdio_conn.socket.handle, content.ptr, content.len);
-        _ = linux.write(signals_conn.socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00, 0x00 }, 4);
+        _ = platform.write(stdio_conn.socket.handle, content);
+        _ = platform.write(signals_conn.socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00, 0x00 });
         stdio_conn.shutdown(self.io, .send) catch {};
         signals_conn.shutdown(self.io, .send) catch {};
     }
@@ -1078,7 +875,7 @@ const Conductor = struct {
         var w = protocol.BufWriter{ .buf = &buf };
         w.writeLenPrefixed(u16, stdio);
         w.writeLenPrefixed(u16, signals);
-        _ = linux.write(socket, &buf, w.pos);
+        _ = platform.write(socket, w.written());
     }
 };
 
@@ -1090,9 +887,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
     const cfg = try config.Config.load(allocator, init.environ_map);
-    var ring = try linux.IoUring.init(64, 0);
-    defer ring.deinit();
-    var conductor = Conductor.init(io, allocator, cfg, init.environ_map, &ring);
+    var conductor = try Conductor.init(io, allocator, cfg, init.environ_map);
     defer conductor.deinit();
     std.debug.print("Starting Julia Daemon Conductor. Configuration:\n", .{});
     std.debug.print(" - Worker executable: {s}\n", .{cfg.worker_executable});

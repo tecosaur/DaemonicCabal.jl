@@ -3,9 +3,9 @@
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
 const config = @import("config.zig");
 const args = @import("args.zig");
@@ -57,10 +57,12 @@ pub const Worker = struct {
         try argv.append(cfg.worker_executable);
         // JuliaUp channel selector must come immediately after executable
         if (julia_channel) |ch| try argv.append(ch);
-        if (cfg.worker_project.len > 0) {
-            const project_arg = try std.fmt.allocPrint(allocator, "--project={s}", .{cfg.worker_project});
-            try argv.append(project_arg);
-        }
+        const project_arg: ?[]const u8 = if (cfg.worker_project.len > 0)
+            try std.fmt.allocPrint(allocator, "--project={s}", .{cfg.worker_project})
+        else
+            null;
+        defer if (project_arg) |p| allocator.free(p);
+        if (project_arg) |p| try argv.append(p);
         var it = std.mem.splitScalar(u8, cfg.worker_args, ' ');
         while (it.next()) |arg| {
             if (arg.len > 0) try argv.append(arg);
@@ -75,14 +77,11 @@ pub const Worker = struct {
         const worker_stream = try setup_server.accept(io);
         const socket = worker_stream.socket.handle;
         // Set read timeout to avoid blocking conductor if worker becomes unresponsive
-        const timeout = linux.timeval{ .sec = @intCast(cfg.ping_timeout), .usec = 0 };
-        const timeout_bytes = std.mem.asBytes(&timeout);
-        _ = linux.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, timeout_bytes.ptr, timeout_bytes.len);
+        platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
         var magic_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
-        _ = linux.write(socket, &magic_buf, 4);
-        var ts: linux.timespec = undefined;
-        _ = linux.clock_gettime(.MONOTONIC, &ts);
+        _ = platform.write(socket, &magic_buf);
+        const now = (Io.Clock.now(.awake, io) catch Io.Timestamp{ .nanoseconds = 0 }).toSeconds();
         return .{
             .allocator = allocator,
             .id = id,
@@ -91,9 +90,9 @@ pub const Worker = struct {
             .project = null,
             .julia_channel = julia_channel,
             .session_label = null,
-            .created_at = ts.sec,
-            .last_active = ts.sec,
-            .last_pinged = ts.sec,
+            .created_at = now,
+            .last_active = now,
+            .last_pinged = now,
             .active_clients = 0,
         };
     }
@@ -115,7 +114,7 @@ pub const Worker = struct {
         var buf: [5]u8 = undefined;
         buf[0] = @intFromEnum(msg_type);
         std.mem.writeInt(u32, buf[1..5], payload_len, .little);
-        _ = linux.write(self.socket, &buf, 5);
+        _ = platform.write(self.socket, &buf);
     }
 
     const Header = struct {
@@ -148,36 +147,19 @@ pub const Worker = struct {
         try readExact(self.socket, &payload);
     }
 
-    /// Send ping without waiting for response (for async ping via io_uring)
+    /// Send ping without waiting for response (for async ping via event loop)
     pub fn sendPing(self: *Worker) void {
         self.writeHeader(.ping, 0);
         self.ping_pending = true;
     }
-
-    /// Cancel pending async ping read and drain the pong response.
-    /// Must be called before any synchronous worker communication if ping_pending is true.
-    /// The cancelled read completion will be ignored in the main event loop (checks for ECANCELED).
-    pub fn cancelPendingPing(self: *Worker, ring: *linux.IoUring) void {
-        if (!self.ping_pending) return;
-        // Cancel the pending io_uring read using worker pointer as user_data
-        _ = ring.cancel(@intFromEnum(EventLocation.ignored), @intFromPtr(self), 0) catch {};
-        // Submit cancel request (completions handled later in main loop)
-        _ = ring.submit() catch {};
-        // Drain the pong from the socket (7 bytes: 5 header + 2 client count)
-        var buf: [7]u8 = undefined;
-        readExact(self.socket, &buf) catch {};
-        self.ping_pending = false;
-    }
-
-    const EventLocation = protocol.EventLocation;
 
     /// Takes ownership of project slice (caller must not free on success)
     pub fn setProject(self: *Worker, project: []const u8) !void {
         self.writeHeader(.set_project, @intCast(2 + project.len));
         var len_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_buf, @intCast(project.len), .little);
-        _ = linux.write(self.socket, &len_buf, 2);
-        _ = linux.write(self.socket, project.ptr, project.len);
+        _ = platform.write(self.socket, &len_buf);
+        _ = platform.write(self.socket, project);
         const header = try self.readHeader();
         if (header.msg_type == .err) {
             std.debug.print("Worker {d}: setProject got {s} ({s})\n", .{
@@ -205,11 +187,11 @@ pub const Worker = struct {
         self.writeHeader(.sync_clients, payload_len);
         var len_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_buf, @intCast(pids.len), .little);
-        _ = linux.write(self.socket, &len_buf, 2);
+        _ = platform.write(self.socket, &len_buf);
         for (pids) |pid| {
             var pid_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &pid_buf, pid, .little);
-            _ = linux.write(self.socket, &pid_buf, 4);
+            _ = platform.write(self.socket, &pid_buf);
         }
         // Wait for ack with remaining client count
         const header = try self.readHeader();
@@ -270,7 +252,7 @@ pub const Worker = struct {
         }
         // Send header + payload
         self.writeHeader(.client_run, @intCast(payload_size));
-        _ = linux.write(self.socket, send_buf.ptr, payload_size);
+        _ = platform.write(self.socket, send_buf);
         // Read response
         const header = try self.readHeader();
         if (header.msg_type == .err) {

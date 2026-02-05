@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 const std = @import("std");
-const posix = std.posix;
 const Io = std.Io;
+
+const platform = @import("platform/main.zig");
 
 // Client ↔ Conductor Protocol
 //   1. Client sends: magic + flags + pid + ppid + cwd + env_fingerprint + args
@@ -87,11 +88,12 @@ pub const EventLocation = enum(u64) {
     _,
 };
 
-/// Read exactly buf.len bytes from socket, returning error on EOF
-pub fn readExact(fd: posix.socket_t, buf: []u8) !void {
+/// Read exactly buf.len bytes from socket, returning error on EOF.
+/// Uses platform-specific read implementation.
+pub fn readExact(fd: std.posix.socket_t, buf: []u8) !void {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = try posix.read(fd, buf[total..]);
+        const n = try std.posix.read(fd, buf[total..]);
         if (n == 0) return error.EndOfStream;
         total += n;
     }

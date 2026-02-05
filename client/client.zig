@@ -2,21 +2,21 @@
 // SPDX-License-Identifier: MPL-2.0
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const posix = std.posix;
-const linux = std.os.linux;
 const protocol = @import("protocol.zig");
+const platform = @import("platform/main.zig");
+
+const eloop = if (builtin.os.tag == .linux)
+    @import("eloop/linux.zig")
+else
+    @compileError("unsupported OS");
 
 // Single-threaded Io for cross-platform operations (no thread pool overhead)
 const io: Io = Io.Threaded.global_single_threaded.io();
 
 const BufWriter = protocol.BufWriter;
-
-const Location = enum(u64) {
-    stdin,
-    stdout,
-    signals,
-};
 
 const SocketSet = struct {
     stdio: Io.net.Stream,
@@ -36,7 +36,7 @@ fn signalHandler(
     _: ?*anyopaque,
 ) callconv(.c) void {
     switch (sig) {
-        .INT => _ = linux.write(sockets.stdio.socket.handle, "\x03", 1),
+        .INT => _ = platform.write(sockets.stdio.socket.handle, "\x03"),
         .TERM => {
             notifyExit();
             std.process.exit(128 + @intFromEnum(posix.SIG.TERM));
@@ -64,7 +64,7 @@ fn connectUnix(path: []const u8) !Io.net.Stream {
 
 fn connectToConductor(allocator: std.mem.Allocator, env: EnvInfo) !Io.net.Stream {
     const runtime_dir = env.runtime_dir orelse
-        try std.fmt.allocPrint(allocator, "/run/user/{d}/julia-daemon", .{linux.getuid()});
+        try platform.defaultRuntimeDir(allocator, env.xdg_runtime_dir, env.home);
     const path = env.server_path orelse
         try std.fmt.allocPrint(allocator, "{s}/conductor.sock", .{runtime_dir});
     conductor_path = path;
@@ -99,7 +99,7 @@ fn readPidAndSignal(pid_path: []const u8) bool {
     const pid_str = std.mem.trimEnd(u8, content, &.{ '\n', '\r', ' ' });
     const pid = std.fmt.parseInt(i32, pid_str, 10) catch return false;
     // Send SIGUSR1
-    _ = linux.kill(pid, posix.SIG.USR1);
+    _ = platform.kill(pid, posix.SIG.USR1);
     return true;
 }
 
@@ -111,8 +111,8 @@ fn sendClientInfo(socket: Io.net.Stream, env: EnvInfo, is_tty: bool, args: []con
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty }));
     w.writeSlice(&.{ 0, 0, 0 }); // reserved
     // PID and PPID
-    w.writeInt(u32, @intCast(linux.getpid()));
-    w.writeInt(u32, @intCast(linux.getppid()));
+    w.writeInt(u32, @intCast(platform.getpid()));
+    w.writeInt(u32, @intCast(platform.getppid()));
     // CWD (length-prefixed)
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_len = try std.process.currentPath(io, &cwd_buf);
@@ -124,7 +124,7 @@ fn sendClientInfo(socket: Io.net.Stream, env: EnvInfo, is_tty: bool, args: []con
     for (args) |arg_ptr| {
         w.writeLenPrefixed(u16, std.mem.span(arg_ptr));
     }
-    _ = linux.write(socket.socket.handle, w.written().ptr, w.pos);
+    _ = platform.write(socket.socket.handle, w.written());
 }
 
 const EnvBlock = std.process.Environ.Block;
@@ -134,10 +134,12 @@ const EnvInfo = struct {
     count: u16,
     server_path: ?[]const u8,
     runtime_dir: ?[]const u8,
+    xdg_runtime_dir: ?[]const u8,
+    home: ?[]const u8,
 };
 
 fn scanEnv(block: EnvBlock) EnvInfo {
-    var info = EnvInfo{ .fingerprint = 0, .count = 0, .server_path = null, .runtime_dir = null };
+    var info = EnvInfo{ .fingerprint = 0, .count = 0, .server_path = null, .runtime_dir = null, .xdg_runtime_dir = null, .home = null };
     for (block) |entry_opt| {
         const entry = entry_opt orelse break;
         const kv = std.mem.span(entry);
@@ -152,6 +154,10 @@ fn scanEnv(block: EnvBlock) EnvInfo {
             info.server_path = kv["JULIA_DAEMON_SERVER=".len..];
         } else if (std.mem.startsWith(u8, kv, "JULIA_DAEMON_RUNTIME=")) {
             info.runtime_dir = kv["JULIA_DAEMON_RUNTIME=".len..];
+        } else if (std.mem.startsWith(u8, kv, "XDG_RUNTIME_DIR=")) {
+            info.xdg_runtime_dir = kv["XDG_RUNTIME_DIR=".len..];
+        } else if (std.mem.startsWith(u8, kv, "HOME=")) {
+            info.home = kv["HOME=".len..];
         }
     }
     return info;
@@ -168,7 +174,7 @@ fn sendFullEnv(socket: Io.net.Stream, env: EnvInfo, block: EnvBlock) void {
         w.writeLenPrefixed(u16, kv[0..eq]);
         w.writeLenPrefixed(u16, kv[eq + 1 ..]);
     }
-    _ = linux.write(socket.socket.handle, w.written().ptr, w.pos);
+    _ = platform.write(socket.socket.handle, w.written());
 }
 
 fn connectToWorker(allocator: std.mem.Allocator, conductor: Io.net.Stream, env: EnvInfo, block: EnvBlock) !SocketSet {
@@ -214,13 +220,13 @@ const SignalParser = struct {
     len: usize = 0,
     const header_size = 3; // id (1) + len (2)
 
-    const Result = union(enum) {
+    pub const Result = union(enum) {
         none,
         exit: u8,
         // Future: resize: struct { w: u16, h: u16 },
     };
 
-    fn feed(self: *@This(), input: []const u8, fd: posix.fd_t) Result {
+    pub fn feed(self: *@This(), input: []const u8, fd: posix.fd_t) Result {
         if (self.len + input.len > self.buf.len) {
             std.debug.print("[client] signal buffer overflow\n", .{});
             return .none;
@@ -257,7 +263,7 @@ const SignalParser = struct {
             protocol.signals.exit => .{ .exit = if (data.len == 1) data[0] else unreachable },
             protocol.signals.raw_mode => blk: {
                 if (data.len == 1) setTerminalRaw(data[0] != 0);
-                _ = linux.write(fd, &[_]u8{ id, 0, 0 }, 3); // ack: id + len(0)
+                _ = platform.write(fd, &[_]u8{ id, 0, 0 }); // ack: id + len(0)
                 break :blk .none;
             },
             protocol.signals.query_size => blk: {
@@ -267,7 +273,7 @@ const SignalParser = struct {
                 std.mem.writeInt(u16, resp[1..3], 4, .little); // len = 4
                 std.mem.writeInt(u16, resp[3..5], size.height, .little);
                 std.mem.writeInt(u16, resp[5..7], size.width, .little);
-                _ = linux.write(fd, &resp, 7);
+                _ = platform.write(fd, &resp);
                 break :blk .none;
             },
             else => .none,
@@ -276,9 +282,8 @@ const SignalParser = struct {
 };
 
 fn getTerminalSize() struct { height: u16, width: u16 } {
-    var ws: posix.winsize = undefined;
-    if (linux.ioctl(posix.STDIN_FILENO, linux.T.IOCGWINSZ, @intFromPtr(&ws)) == 0) {
-        return .{ .height = ws.row, .width = ws.col };
+    if (platform.getTerminalSize(posix.STDIN_FILENO)) |size| {
+        return .{ .height = size.rows, .width = size.cols };
     }
     return .{ .height = 24, .width = 80 }; // fallback
 }
@@ -297,69 +302,18 @@ fn notifyExit() void {
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
     buf[4] = @intFromEnum(protocol.notification.Type.client_exit);
-    std.mem.writeInt(u32, buf[5..9], @intCast(linux.getpid()), .little);
-    _ = linux.write(stream.socket.handle, &buf, 9);
+    std.mem.writeInt(u32, buf[5..9], @intCast(platform.getpid()), .little);
+    _ = platform.write(stream.socket.handle, &buf);
 }
 
 var signal_parser = SignalParser{};
 
-fn runIoUring() !void {
+fn runEventLoop() !void {
     const stdio_fd = sockets.stdio.socket.handle;
     const signals_fd = sockets.signals.socket.handle;
-    const buf_size = 1024;
-    var ring = try linux.IoUring.init(4, 0);
-    defer ring.deinit();
-    var stdout_buf: [buf_size]u8 = undefined;
-    var stdin_buf: [buf_size]u8 = undefined;
-    var signals_buf: [buf_size]u8 = undefined;
-    // Queue initial reads
-    _ = try ring.read(@intFromEnum(Location.stdout), stdio_fd, .{ .buffer = &stdout_buf }, 0);
-    _ = try ring.read(@intFromEnum(Location.stdin), posix.STDIN_FILENO, .{ .buffer = &stdin_buf }, 0);
-    _ = try ring.read(@intFromEnum(Location.signals), signals_fd, .{ .buffer = &signals_buf }, 0);
-    // Wait for both: stdout EOF (guarantees output flushed) and exit code (from signals socket).
-    // If signals EOF arrives without exit code, worker crashed - use exit code 1.
-    var exit_code: ?u8 = null;
-    var stdout_eof = false;
-    while (true) {
-        _ = try ring.submit_and_wait(1);
-        while (ring.cq_ready() > 0) {
-            const cqe = try ring.copy_cqe();
-            const len: usize = @intCast(@max(0, cqe.res));
-            switch (cqe.user_data) {
-                @intFromEnum(Location.stdout) => {
-                    // Treat errors (e.g., ECONNRESET) same as EOF
-                    if (cqe.res <= 0) {
-                        stdout_eof = true;
-                        continue;
-                    }
-                    _ = linux.write(posix.STDOUT_FILENO, &stdout_buf, len);
-                    _ = try ring.read(@intFromEnum(Location.stdout), stdio_fd, .{ .buffer = &stdout_buf }, 0);
-                },
-                @intFromEnum(Location.stdin) => {
-                    if (cqe.res <= 0 or exit_code != null) continue; // EOF/error or exiting
-                    _ = linux.write(stdio_fd, &stdin_buf, len);
-                    _ = try ring.read(@intFromEnum(Location.stdin), posix.STDIN_FILENO, .{ .buffer = &stdin_buf }, 0);
-                },
-                @intFromEnum(Location.signals) => {
-                    // Treat errors same as EOF - worker may have crashed or closed connection
-                    if (cqe.res <= 0) {
-                        if (exit_code == null) exit_code = 1;
-                        continue;
-                    }
-                    switch (signal_parser.feed(signals_buf[0..len], signals_fd)) {
-                        .exit => |code| exit_code = code,
-                        .none => _ = try ring.read(@intFromEnum(Location.signals), signals_fd, .{ .buffer = &signals_buf }, 0),
-                    }
-                },
-                else => {},
-            }
-        }
-        // Exit only when we have both exit code AND stdout is drained
-        if (exit_code != null and stdout_eof) {
-            notifyExit();
-            std.process.exit(exit_code.?);
-        }
-    }
+    const exit_code = try eloop.run(stdio_fd, signals_fd, &signal_parser);
+    notifyExit();
+    std.process.exit(exit_code);
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -368,8 +322,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = arena.allocator();
     const env = scanEnv(init.environ.block);
     // Set raw mode for TTY to avoid line buffering
-    var ws: posix.winsize = undefined;
-    const is_tty = linux.ioctl(posix.STDIN_FILENO, linux.T.IOCGWINSZ, @intFromPtr(&ws)) == 0;
+    const is_tty = platform.isatty(posix.STDIN_FILENO);
     if (is_tty) {
         var termios = try posix.tcgetattr(posix.STDIN_FILENO);
         termios.lflag.ECHO = false;
@@ -384,5 +337,5 @@ pub fn main(init: std.process.Init.Minimal) !void {
     sockets = try connectToWorker(alloc, conductor, env, init.environ.block);
     // Forward signals to worker instead of terminating
     registerSignalHandlers();
-    try runIoUring();
+    try runEventLoop();
 }
