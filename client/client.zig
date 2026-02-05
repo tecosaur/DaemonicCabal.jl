@@ -10,6 +10,8 @@ const platform = @import("platform/main.zig");
 
 const eloop = if (builtin.os.tag == .linux)
     @import("eloop/linux.zig")
+else if (builtin.os.tag.isBSD())
+    @import("eloop/kqueue.zig")
 else
     @compileError("unsupported OS");
 

@@ -11,7 +11,7 @@ const os = builtin.os.tag;
 const impl = if (os == .linux)
     @import("linux.zig")
 else
-    @compileError("unsupported OS");
+    @import("posix.zig");
 
 // Re-export platform implementation
 pub const fd_t = impl.fd_t;
