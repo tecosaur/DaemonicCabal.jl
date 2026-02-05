@@ -5,7 +5,6 @@
 // Multiplexes stdin, stdout (from worker), and signals socket.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
 
@@ -31,20 +30,19 @@ pub fn run(
     const kq = c.kqueue();
     if (kq == -1) return error.KqueueCreateFailed;
     defer _ = c.close(kq);
-    // Register reads on all three sources
-    var changes: [3]c.Kevent = .{
-        makeKevent(@intCast(posix.STDIN_FILENO), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDIN),
+    // Register reads on worker stdout and signals (required)
+    var changes: [2]c.Kevent = .{
         makeKevent(@intCast(stdio_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDOUT),
         makeKevent(@intCast(signals_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_SIGNALS),
     };
-    var dummy: [1]c.Kevent = undefined;
-    if (c.kevent(kq, &changes, 3, &dummy, 0, null) < 0) {
-        const err: posix.E = @enumFromInt(c._errno().*);
-        std.debug.print("kevent register failed: {} (fds: stdin={}, stdio={}, signals={})\n", .{
-            err, posix.STDIN_FILENO, stdio_fd, signals_fd,
-        });
+    var no_changes: [0]c.Kevent = undefined;
+    if (keventCall(kq, &changes, &no_changes) < 0) {
         return error.KqueueRegisterFailed;
     }
+    // Register stdin separately: may fail on macOS when stdin is a device
+    // file like /dev/null (kqueue returns EINVAL for non-pollable fds).
+    var stdin_change = [1]c.Kevent{makeKevent(@intCast(posix.STDIN_FILENO), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDIN)};
+    _ = keventCall(kq, &stdin_change, &no_changes);
     // Buffers
     const buf_size = 1024;
     var stdout_buf: [buf_size]u8 = undefined;
@@ -53,12 +51,11 @@ pub fn run(
     // State
     var exit_code: ?u8 = null;
     var stdout_eof = false;
-    var stdin_active = true;
+    var stdin_eof = false;
     // Event buffer
     var events: [8]c.Kevent = undefined;
-    var no_changes: [1]c.Kevent = undefined;
     while (true) {
-        const nevents = c.kevent(kq, &no_changes, 0, &events, events.len, null);
+        const nevents = keventCall(kq, &no_changes, &events);
         if (nevents < 0) {
             const err: posix.E = @enumFromInt(c._errno().*);
             if (err == .INTR) continue;
@@ -69,40 +66,36 @@ pub fn run(
             if ((ev.flags & EV_ERROR) != 0) continue;
             switch (udataInt(ev)) {
                 UDATA_STDOUT => {
-                    // Check for EOF (EV_EOF flag or data == 0)
+                    if (stdout_eof) continue;
+                    // Read available data first
+                    if (ev.data > 0) {
+                        const n = posix.read(stdio_fd, &stdout_buf) catch {
+                            stdout_eof = true;
+                            continue;
+                        };
+                        if (n > 0) _ = platform.write(posix.STDOUT_FILENO, stdout_buf[0..n]);
+                    }
+                    // Check for EOF and unregister to prevent busy loop
                     if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
                         stdout_eof = true;
-                        continue;
+                        var del = [1]c.Kevent{makeKevent(@intCast(stdio_fd), c.EVFILT.READ, c.EV.DELETE, 0, 0, UDATA_STDOUT)};
+                        _ = keventCall(kq, &del, &no_changes);
                     }
-                    // Read available data
-                    const n = posix.read(stdio_fd, &stdout_buf) catch {
-                        stdout_eof = true;
-                        continue;
-                    };
-                    if (n == 0) {
-                        stdout_eof = true;
-                        continue;
-                    }
-                    _ = platform.write(posix.STDOUT_FILENO, stdout_buf[0..n]);
                 },
                 UDATA_STDIN => {
-                    if (!stdin_active or exit_code != null) continue;
+                    if (stdin_eof or exit_code != null) continue;
+                    // For pipes, EV_EOF is set immediately but data may still be available.
+                    // Read any pending data, then unregister to stop busy-looping.
+                    if (ev.data > 0) {
+                        const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch continue;
+                        if (n > 0) _ = platform.write(stdio_fd, stdin_buf[0..n]);
+                    }
                     if ((ev.flags & EV_EOF) != 0) {
-                        stdin_active = false;
-                        deleteEvent(kq, posix.STDIN_FILENO);
-                        continue;
+                        stdin_eof = true;
+                        // Unregister stdin from kqueue to prevent busy loop
+                        var del = [1]c.Kevent{makeKevent(@intCast(posix.STDIN_FILENO), c.EVFILT.READ, c.EV.DELETE, 0, 0, UDATA_STDIN)};
+                        _ = keventCall(kq, &del, &no_changes);
                     }
-                    const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch {
-                        stdin_active = false;
-                        deleteEvent(kq, posix.STDIN_FILENO);
-                        continue;
-                    };
-                    if (n == 0) {
-                        stdin_active = false;
-                        deleteEvent(kq, posix.STDIN_FILENO);
-                        continue;
-                    }
-                    _ = platform.write(stdio_fd, stdin_buf[0..n]);
                 },
                 UDATA_SIGNALS => {
                     if ((ev.flags & EV_EOF) != 0) {
@@ -132,9 +125,6 @@ pub fn run(
     }
 }
 
-const Udata = @TypeOf(@as(c.Kevent, undefined).udata);
-const udata_is_ptr = @typeInfo(Udata) == .pointer;
-
 fn makeKevent(
     ident: usize,
     filter: i16,
@@ -149,15 +139,13 @@ fn makeKevent(
         .flags = flags,
         .fflags = fflags,
         .data = data,
-        .udata = if (udata_is_ptr) @ptrFromInt(udata) else udata,
+        .udata = udata,
     };
 }
 fn udataInt(ev: c.Kevent) usize {
-    return if (udata_is_ptr) @intFromPtr(ev.udata) else ev.udata;
+    return ev.udata;
 }
-/// Remove a read event registration from kqueue
-fn deleteEvent(kq: posix.fd_t, fd: posix.fd_t) void {
-    var change = makeKevent(@intCast(fd), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0);
-    var dummy: [1]c.Kevent = undefined;
-    _ = c.kevent(kq, @ptrCast(&change), 1, &dummy, 0, null);
+/// Wrapper for kevent syscall using slices
+fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent) c_int {
+    return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), null);
 }

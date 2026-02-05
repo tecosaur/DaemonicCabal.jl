@@ -97,26 +97,26 @@ pub const EventLoop = struct {
     /// Uses bit 0 of udata to distinguish from pong timeouts.
     pub fn scheduleHealthCheck(self: *EventLoop, w: *worker.Worker) void {
         const udata_tagged = @intFromPtr(w) | 1;
-        var change = makeKevent(
+        var changes = [1]c.Kevent{makeKevent(
             udata_tagged, // ident: use tagged pointer for uniqueness
             c.EVFILT.TIMER,
             c.EV.ADD | c.EV.ONESHOT,
             0,
             1000, // 1 second delay
             udata_tagged,
-        );
-        _ = keventSubmit(self.kq, @ptrCast(&change), 1);
+        )};
+        _ = keventSubmit(self.kq, &changes);
     }
 
     /// Cancel pending async ping read and drain the pong response.
     pub fn cancelPendingPing(self: *EventLoop, w: *worker.Worker) void {
         if (!w.ping_pending) return;
         // Delete the read registration (may already be gone if it fired)
-        var changes: [2]c.Kevent = .{
+        var changes = [2]c.Kevent{
             makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0),
             makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0),
         };
-        _ = keventSubmit(self.kq, &changes, 2);
+        _ = keventSubmit(self.kq, &changes);
         // Drain pong synchronously
         var buf: [7]u8 = undefined;
         protocol.readExact(w.socket, &buf) catch {};
@@ -150,17 +150,17 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
             UDATA_PING_TIMER,
         ),
     };
-    if (keventSubmit(kq, &init_changes, 3) < 0) {
+    if (keventSubmit(kq, &init_changes) < 0) {
         std.debug.print("Fatal: failed to register initial kevents\n", .{});
         return;
     }
     // Event buffer
     var events: [32]c.Kevent = undefined;
-    // Dummy changelist for calls where we only want to wait for events
-    var no_changes: [1]c.Kevent = undefined;
+    // Empty changelist for calls where we only want to wait for events
+    var no_changes: [0]c.Kevent = undefined;
     // Main loop
     while (true) {
-        const nevents = c.kevent(kq, &no_changes, 0, &events, events.len, null);
+        const nevents = keventCall(kq, &no_changes, &events);
         if (nevents < 0) {
             // Check errno for EINTR (signal interrupted)
             const err: posix.E = @enumFromInt(c._errno().*);
@@ -247,8 +247,8 @@ fn handleSignal(
             SIGNAL_RECREATE => {
                 std.debug.print("Recreating socket due to SIGUSR1\n", .{});
                 // Remove old server fd from kqueue
-                var del_change = makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0);
-                _ = keventSubmit(kq, @ptrCast(&del_change), 1);
+                var del_changes = [1]c.Kevent{makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
+                _ = keventSubmit(kq, &del_changes);
                 server.deinit(conductor.io);
                 Io.Dir.deleteFileAbsolute(conductor.io, conductor.cfg.socket_path) catch {};
                 server.* = conductor.createServer() catch |err| {
@@ -257,8 +257,8 @@ fn handleSignal(
                 };
                 server_fd.* = server.socket.handle;
                 // Register new server fd
-                var add_change = makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT);
-                _ = keventSubmit(kq, @ptrCast(&add_change), 1);
+                var add_changes = [1]c.Kevent{makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT)};
+                _ = keventSubmit(kq, &add_changes);
             },
             else => {},
         }
@@ -309,7 +309,7 @@ fn queuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
             @intFromPtr(w), // udata = worker ptr (bit 0 clear)
         ),
     };
-    if (keventSubmit(kq, &changes, 2) < 0) {
+    if (keventSubmit(kq, &changes) < 0) {
         w.ping_pending = false;
     }
 }
@@ -327,8 +327,8 @@ fn handlePongReady(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker, pon
     if (!w.ping_pending) return;
     w.ping_pending = false; // Clear FIRST, before any fallible operations
     // Cancel timeout timer (may fail if already fired - that's fine)
-    var change = makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0);
-    _ = keventSubmit(kq, @ptrCast(&change), 1);
+    var changes = [1]c.Kevent{makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
+    _ = keventSubmit(kq, &changes);
     // Read pong (socket is ready, but may need multiple reads for full 7 bytes)
     const n = posix.read(w.socket, pong_buf) catch |err| {
         std.debug.print("Worker {d}: pong read error: {}\n", .{ w.id, err });
@@ -357,16 +357,13 @@ fn handlePongTimeout(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) v
     if (!w.ping_pending) return;
     w.ping_pending = false;
     // Cancel read registration (may fail if already fired - that's fine)
-    var change = makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0);
-    _ = keventSubmit(kq, @ptrCast(&change), 1);
+    var changes = [1]c.Kevent{makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
+    _ = keventSubmit(kq, &changes);
     std.debug.print("Worker {d}: ping timed out\n", .{w.id});
     conductor.killUnresponsiveWorker(w);
 }
 
 // Helpers
-
-const Udata = @TypeOf(@as(c.Kevent, undefined).udata);
-const udata_is_ptr = @typeInfo(Udata) == .pointer;
 
 fn makeKevent(
     ident: usize,
@@ -382,18 +379,19 @@ fn makeKevent(
         .flags = flags,
         .fflags = fflags,
         .data = data,
-        .udata = if (udata_is_ptr) @ptrFromInt(udata) else udata,
+        .udata = udata,
     };
 }
 fn udataInt(ev: c.Kevent) usize {
-    return if (udata_is_ptr) @intFromPtr(ev.udata) else ev.udata;
+    return ev.udata;
 }
-
+/// Wrapper for kevent syscall using slices
+fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent) c_int {
+    return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), null);
+}
 /// Submit kevent changes, ignoring the event list. Returns number of changes
 /// processed, or -1 on error.
-fn keventSubmit(kq: posix.fd_t, changelist: [*]const c.Kevent, nchanges: usize) c_int {
-    // Zig's bindings require non-null pointers, so we pass a dummy event buffer
-    // with nevents=0 to avoid receiving any events
-    var dummy: [1]c.Kevent = undefined;
-    return c.kevent(kq, changelist, @intCast(nchanges), &dummy, 0, null);
+fn keventSubmit(kq: posix.fd_t, changelist: []const c.Kevent) c_int {
+    var dummy: [0]c.Kevent = undefined;
+    return keventCall(kq, changelist, &dummy);
 }
