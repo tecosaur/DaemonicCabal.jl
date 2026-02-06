@@ -216,11 +216,11 @@ fn connectToWorker(allocator: std.mem.Allocator, conductor: Io.net.Stream, env: 
 }
 
 // Signal parser with buffering for fragmented reads.
-// Protocol: <id:u8><len:u16><data> (may contain multiple signals)
+// Protocol: <id:u8><len:u8><data> (may contain multiple signals)
 const SignalParser = struct {
     buf: [256]u8 = undefined,
     len: usize = 0,
-    const header_size = 3; // id (1) + len (2)
+    const header_size = 2; // id (1) + len (1)
 
     pub const Result = union(enum) {
         none,
@@ -243,7 +243,7 @@ const SignalParser = struct {
         var pos: usize = 0;
         while (pos + header_size <= self.len) {
             const id = self.buf[pos];
-            const data_len = std.mem.readInt(u16, self.buf[pos + 1 ..][0..2], .little);
+            const data_len: usize = self.buf[pos + 1];
             const total_len = header_size + data_len;
             if (pos + total_len > self.len) break; // incomplete signal
             result = dispatch(id, self.buf[pos + header_size .. pos + total_len], fd);
@@ -265,16 +265,16 @@ const SignalParser = struct {
             protocol.signals.exit => .{ .exit = if (data.len == 1) data[0] else unreachable },
             protocol.signals.raw_mode => blk: {
                 if (data.len == 1) setTerminalRaw(data[0] != 0);
-                _ = platform.write(fd, &[_]u8{ id, 0, 0 }); // ack: id + len(0)
+                _ = platform.write(fd, &[_]u8{ id, 0 }); // ack: id + len:u8=0
                 break :blk .none;
             },
             protocol.signals.query_size => blk: {
                 const size = getTerminalSize();
-                var resp: [7]u8 = undefined;
+                var resp: [6]u8 = undefined;
                 resp[0] = id;
-                std.mem.writeInt(u16, resp[1..3], 4, .little); // len = 4
-                std.mem.writeInt(u16, resp[3..5], size.height, .little);
-                std.mem.writeInt(u16, resp[5..7], size.width, .little);
+                resp[1] = 4; // len:u8 = 4 bytes of data
+                std.mem.writeInt(u16, resp[2..4], size.height, .little);
+                std.mem.writeInt(u16, resp[4..6], size.width, .little);
                 _ = platform.write(fd, &resp);
                 break :blk .none;
             },

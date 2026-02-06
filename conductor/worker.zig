@@ -26,9 +26,10 @@ pub const Worker = struct {
     julia_channel: ?[]const u8,
     session_label: ?[]const u8,
     created_at: i64,
-    last_active: i96,
+    last_active: i64,
     last_pinged: i64,
     ping_pending: bool = false,
+    pong_buf: [5]u8 = undefined,
     active_clients: u32,
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
@@ -113,25 +114,25 @@ pub const Worker = struct {
         posix.close(self.socket);
     }
 
-    fn writeHeader(self: *Worker, msg_type: protocol.worker.MessageType, payload_len: u32) void {
-        var buf: [5]u8 = undefined;
+    fn writeHeader(self: *Worker, msg_type: protocol.worker.MessageType, payload_len: u16) void {
+        var buf: [3]u8 = undefined;
         buf[0] = @intFromEnum(msg_type);
-        std.mem.writeInt(u32, buf[1..5], payload_len, .little);
-        _ = platform.write(self.socket, &buf);
+        std.mem.writeInt(u16, buf[1..3], payload_len, .little);
+        platform.write(self.socket, &buf);
     }
 
     const Header = struct {
         msg_type: protocol.worker.MessageType,
-        payload_len: u32,
-        raw: [5]u8,
+        payload_len: u16,
+        raw: [3]u8,
     };
 
     fn readHeader(self: *Worker) !Header {
-        var buf: [5]u8 = undefined;
+        var buf: [3]u8 = undefined;
         try readExact(self.socket, &buf);
         return .{
             .msg_type = @enumFromInt(buf[0]),
-            .payload_len = std.mem.readInt(u32, buf[1..5], .little),
+            .payload_len = std.mem.readInt(u16, buf[1..3], .little),
             .raw = buf,
         };
     }
@@ -148,6 +149,11 @@ pub const Worker = struct {
         // Drain the 2-byte client count payload
         var payload: [2]u8 = undefined;
         try readExact(self.socket, &payload);
+    }
+
+    pub fn shouldPing(self: *const Worker, now: i64, ping_interval: u64) bool {
+        return !self.ping_pending and self.active_clients == 0
+            and now - self.last_pinged >= @as(i64, @intCast(ping_interval));
     }
 
     /// Send ping without waiting for response (for async ping via event loop)
@@ -186,15 +192,15 @@ pub const Worker = struct {
     /// Send list of active PIDs to worker; worker kills any clients not in list.
     /// Returns the worker's reported remaining client count.
     pub fn syncClients(self: *Worker, pids: []const u32) !u16 {
-        const payload_len: u32 = 2 + @as(u32, @intCast(pids.len)) * 4;
+        const payload_len: u16 = 2 + @as(u16, @intCast(pids.len)) * 4;
         self.writeHeader(.sync_clients, payload_len);
         var len_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_buf, @intCast(pids.len), .little);
-        _ = platform.write(self.socket, &len_buf);
+        platform.write(self.socket, &len_buf);
         for (pids) |pid| {
             var pid_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &pid_buf, pid, .little);
-            _ = platform.write(self.socket, &pid_buf);
+            platform.write(self.socket, &pid_buf);
         }
         // Wait for ack with remaining client count
         const header = try self.readHeader();

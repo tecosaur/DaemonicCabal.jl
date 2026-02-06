@@ -70,6 +70,7 @@ pub const notification = struct {
 };
 
 // Signal Protocol (Worker → Client via signals socket)
+// Format: id:u8 + len:u8 + data
 pub const signals = struct {
     pub const exit: u8 = 0x01;
     pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw
@@ -119,6 +120,40 @@ pub const BufWriter = struct {
 
     pub fn written(self: *const @This()) []const u8 {
         return self.buf[0..self.pos];
+    }
+};
+
+/// Helper for reading binary protocol messages from a socket
+pub const BufReader = struct {
+    fd: std.posix.socket_t,
+
+    pub fn readInt(self: BufReader, comptime T: type) !T {
+        var buf: [@sizeOf(T)]u8 = undefined;
+        try readExact(self.fd, &buf);
+        return std.mem.readInt(T, &buf, .little);
+    }
+
+    pub fn readSlice(self: BufReader, buf: []u8) !void {
+        try readExact(self.fd, buf);
+    }
+
+    /// Read a length-prefixed byte slice, allocating with the given allocator.
+    pub fn readLenPrefixed(self: BufReader, comptime T: type, allocator: std.mem.Allocator) ![]u8 {
+        const len = try self.readInt(T);
+        const buf = try allocator.alloc(u8, len);
+        errdefer allocator.free(buf);
+        try readExact(self.fd, buf);
+        return buf;
+    }
+
+    pub fn skip(self: BufReader, n: usize) !void {
+        var discard: [8]u8 = undefined;
+        var remaining = n;
+        while (remaining > 0) {
+            const to_read = @min(remaining, discard.len);
+            try readExact(self.fd, discard[0..to_read]);
+            remaining -= to_read;
+        }
     }
 };
 

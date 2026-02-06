@@ -73,7 +73,7 @@ const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
 const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
 
 function send_signal(io::IO, id::UInt8, data::Vector{UInt8})
-    write(io, id, UInt16(length(data)), data)
+    write(io, id, UInt8(length(data)), data)
 end
 
 # Copied from `init_active_project()` in `base/initdefs.jl`.

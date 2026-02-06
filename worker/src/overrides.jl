@@ -30,7 +30,7 @@
         term = ACTIVE_TERM[]
         if isopen(term.signals)
             send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
-            read(term.signals, 3)  # ack: id(1) + len(2), len=0
+            read(term.signals, 2)  # ack: id(1) + len(1), len=0
         end
         raw
     end

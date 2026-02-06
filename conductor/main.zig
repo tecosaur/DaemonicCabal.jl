@@ -231,18 +231,13 @@ pub const Conductor = struct {
     }
 
     fn handleNotification(self: *Conductor, socket: posix.socket_t) void {
-        var type_buf: [1]u8 = undefined;
-        readExact(socket, &type_buf) catch |err| {
-            std.debug.print("Notification read error (type): {}\n", .{err});
+        var buf: [5]u8 = undefined;
+        readExact(socket, &buf) catch |err| {
+            std.debug.print("Notification read error: {}\n", .{err});
             return;
         };
-        var pid_buf: [4]u8 = undefined;
-        readExact(socket, &pid_buf) catch |err| {
-            std.debug.print("Notification read error (pid): {}\n", .{err});
-            return;
-        };
-        const pid = std.mem.readInt(u32, &pid_buf, .little);
-        switch (@as(protocol.notification.Type, @enumFromInt(type_buf[0]))) {
+        const pid = std.mem.readInt(u32, buf[1..5], .little);
+        switch (@as(protocol.notification.Type, @enumFromInt(buf[0]))) {
             .client_done => _ = self.clientDone(pid),
             .client_exit => {
                 if (self.clientDone(pid)) |w| {
@@ -316,31 +311,23 @@ pub const Conductor = struct {
     };
 
     fn readClientRequest(self: *Conductor, socket: posix.socket_t) !ClientRequest {
-        var header_buf: [4]u8 = undefined;
-        try readExact(socket, &header_buf);
-        const flags: protocol.client.Flags = @bitCast(header_buf[0]);
-        var pid_buf: [4]u8 = undefined;
-        try readExact(socket, &pid_buf);
-        const pid = std.mem.readInt(u32, &pid_buf, .little);
-        var ppid_buf: [4]u8 = undefined;
-        try readExact(socket, &ppid_buf);
-        const ppid = std.mem.readInt(u32, &ppid_buf, .little);
-        var cwd_len_buf: [2]u8 = undefined;
-        try readExact(socket, &cwd_len_buf);
-        const cwd_len = std.mem.readInt(u16, &cwd_len_buf, .little);
-        const cwd = try self.allocator.alloc(u8, cwd_len);
+        var r = protocol.BufReader{ .fd = socket };
+        // Fixed header: flags(1) + reserved(3) + pid(4) + ppid(4) = 12 bytes
+        var hdr: [12]u8 = undefined;
+        try r.readSlice(&hdr);
+        const flags: protocol.client.Flags = @bitCast(hdr[0]);
+        const pid = std.mem.readInt(u32, hdr[4..8], .little);
+        const ppid = std.mem.readInt(u32, hdr[8..12], .little);
+        const cwd = try r.readLenPrefixed(u16, self.allocator);
         errdefer self.allocator.free(cwd);
-        try readExact(socket, cwd);
-        var fp_buf: [8]u8 = undefined;
-        try readExact(socket, &fp_buf);
-        const fingerprint = std.mem.readInt(u64, &fp_buf, .little);
-        const client_args = try self.readClientArgs(socket);
+        const fingerprint = try r.readInt(u64);
+        const client_args = try self.readClientArgs(&r);
         // NOTE: client_args ownership transfers to parsed.
         // The Switch structs in parsed.switches contain slices into these strings,
         // so we must NOT free them here. They are freed via request.deinit().
         const cached = self.cache.lookup(fingerprint) orelse blk: {
-            _ = platform.write(socket, &[_]u8{protocol.client.env_request});
-            const full_env = try self.readFullEnv(socket);
+            platform.write(socket, &[_]u8{protocol.client.env_request});
+            const full_env = try self.readFullEnv(&r);
             break :blk self.cache.insert(fingerprint, full_env);
         };
         var parsed = try args.parse(self.allocator, client_args);
@@ -359,31 +346,21 @@ pub const Conductor = struct {
         };
     }
 
-    fn readClientArgs(self: *Conductor, socket: posix.socket_t) ![][]const u8 {
-        var arg_count_buf: [2]u8 = undefined;
-        try readExact(socket, &arg_count_buf);
-        const arg_count = std.mem.readInt(u16, &arg_count_buf, .little);
+    fn readClientArgs(self: *Conductor, r: *protocol.BufReader) ![][]const u8 {
+        const arg_count = try r.readInt(u16);
         const client_args = try self.allocator.alloc([]const u8, arg_count);
         errdefer self.allocator.free(client_args);
         var allocated: usize = 0;
         errdefer for (client_args[0..allocated]) |arg| self.allocator.free(arg);
         for (0..arg_count) |i| {
-            var arg_len_buf: [2]u8 = undefined;
-            try readExact(socket, &arg_len_buf);
-            const arg_len = std.mem.readInt(u16, &arg_len_buf, .little);
-            const arg = try self.allocator.alloc(u8, arg_len);
-            errdefer self.allocator.free(arg);
-            try readExact(socket, arg);
-            client_args[i] = arg;
+            client_args[i] = try r.readLenPrefixed(u16, self.allocator);
             allocated += 1;
         }
         return client_args;
     }
 
-    fn readFullEnv(self: *Conductor, socket: posix.socket_t) ![]worker.EnvVar {
-        var count_buf: [2]u8 = undefined;
-        try readExact(socket, &count_buf);
-        const count = std.mem.readInt(u16, &count_buf, .little);
+    fn readFullEnv(self: *Conductor, r: *protocol.BufReader) ![]worker.EnvVar {
+        const count = try r.readInt(u16);
         const env = try self.allocator.alloc(worker.EnvVar, count);
         errdefer self.allocator.free(env);
         var allocated: usize = 0;
@@ -392,18 +369,9 @@ pub const Conductor = struct {
             self.allocator.free(e.value);
         };
         for (0..count) |i| {
-            var key_len_buf: [2]u8 = undefined;
-            try readExact(socket, &key_len_buf);
-            const key_len = std.mem.readInt(u16, &key_len_buf, .little);
-            const key = try self.allocator.alloc(u8, key_len);
+            const key = try r.readLenPrefixed(u16, self.allocator);
             errdefer self.allocator.free(key);
-            try readExact(socket, key);
-            var val_len_buf: [2]u8 = undefined;
-            try readExact(socket, &val_len_buf);
-            const val_len = std.mem.readInt(u16, &val_len_buf, .little);
-            const val = try self.allocator.alloc(u8, val_len);
-            errdefer self.allocator.free(val);
-            try readExact(socket, val);
+            const val = try r.readLenPrefixed(u16, self.allocator);
             env[i] = .{ .key = key, .value = val };
             allocated += 1;
         }
@@ -828,9 +796,18 @@ pub const Conductor = struct {
         return false;
     }
 
-    // ========================================================================
-    // Utilities
-    // ========================================================================
+    // --- Utilities ---
+
+    pub fn processPong(self: *Conductor, w: *worker.Worker, pong_buf: *const [5]u8) void {
+        w.last_pinged = self.currentTime();
+        const worker_count = std.mem.readInt(u16, pong_buf[3..5], .little);
+        if (worker_count != w.active_clients) {
+            std.debug.print("Worker {d}: client count mismatch (worker={d}, conductor={d}), syncing\n", .{
+                w.id, worker_count, w.active_clients,
+            });
+            self.syncWorkerClients(w);
+        }
+    }
 
     pub fn currentTime(self: *Conductor) i64 {
         return platform.timeSeconds(self.io);
@@ -873,7 +850,7 @@ pub const Conductor = struct {
         const signals_conn = try signals_server.accept(self.io);
         defer signals_conn.close(self.io);
         platform.write(stdio_conn.socket.handle, content);
-        platform.write(signals_conn.socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00, 0x00 });
+        platform.write(signals_conn.socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00 });
         stdio_conn.shutdown(self.io, .send) catch {};
         signals_conn.shutdown(self.io, .send) catch {};
     }

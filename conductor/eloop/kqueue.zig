@@ -86,7 +86,7 @@ pub const EventLoop = struct {
         };
         _ = keventSubmit(self.kq, &changes);
         // Drain pong synchronously
-        var buf: [7]u8 = undefined;
+        var buf: [5]u8 = undefined;
         protocol.readExact(w.socket, &buf) catch {};
         w.ping_pending = false;
     }
@@ -101,7 +101,6 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     conductor.event_loop.ping_timeout_ms = @intCast(conductor.cfg.ping_timeout * 1000);
     // Buffers
     var signal_buf: [16]u8 = undefined;
-    var pong_buf: [7]u8 = undefined;
     // Register initial events
     var init_changes: [3]c.Kevent = .{
         // Server accept (level-triggered read)
@@ -167,7 +166,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                         }
                     } else {
                         // EVFILT_READ: pong data ready
-                        handlePongReady(conductor, kq, w, &pong_buf);
+                        handlePongReady(conductor, kq, w);
                     }
                 },
             }
@@ -248,9 +247,7 @@ fn queueWorkerPings(conductor: *Conductor, kq: posix.fd_t) void {
 }
 
 fn maybeQueuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker, now: i64) void {
-    if (w.ping_pending) return;
-    if (w.active_clients > 0) return;
-    if (now - w.last_pinged < @as(i64, @intCast(conductor.cfg.ping_interval))) return;
+    if (!w.shouldPing(now, conductor.cfg.ping_interval)) return;
     queuePing(conductor, kq, w);
 }
 
@@ -290,34 +287,27 @@ fn handleHealthCheck(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) v
     }
 }
 
-fn handlePongReady(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker, pong_buf: *[7]u8) void {
+fn handlePongReady(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
     // Guard against race with timeout (both may fire in same kevent batch)
     if (!w.ping_pending) return;
     w.ping_pending = false; // Clear FIRST, before any fallible operations
     // Cancel timeout timer (may fail if already fired - that's fine)
     var changes = [1]c.Kevent{makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
     _ = keventSubmit(kq, &changes);
-    // Read pong (socket is ready, but may need multiple reads for full 7 bytes)
-    const n = posix.read(w.socket, pong_buf) catch |err| {
+    // Read pong into worker's own buffer (socket is ready, but may need multiple reads for full 7 bytes)
+    const n = posix.read(w.socket, &w.pong_buf) catch |err| {
         std.debug.print("Worker {d}: pong read error: {}\n", .{ w.id, err });
         conductor.killUnresponsiveWorker(w);
         return;
     };
-    if (n < 7) {
-        protocol.readExact(w.socket, pong_buf[n..]) catch {
+    if (n < 5) {
+        protocol.readExact(w.socket, w.pong_buf[n..]) catch {
             std.debug.print("Worker {d}: pong short read\n", .{w.id});
             conductor.killUnresponsiveWorker(w);
             return;
         };
     }
-    w.last_pinged = conductor.currentTime();
-    const worker_count = std.mem.readInt(u16, pong_buf[5..7], .little);
-    if (worker_count != w.active_clients) {
-        std.debug.print("Worker {d}: client count mismatch (worker={d}, conductor={d}), syncing\n", .{
-            w.id, worker_count, w.active_clients,
-        });
-        conductor.syncWorkerClients(w);
-    }
+    conductor.processPong(w, &w.pong_buf);
 }
 
 fn handlePongTimeout(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
