@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -70,17 +71,19 @@ pub const Worker = struct {
         try argv.append("--eval");
         try argv.append(eval_expr);
         // Spawn in separate process group so terminal SIGINT only goes to conductor
-        const child = try std.process.spawn(io, .{
+        const spawn_opts: std.process.SpawnOptions = .{
             .argv = argv.items,
-            .pgid = 0,
-        });
+            // pgid = 0 creates new process group (Unix only)
+            .pgid = if (builtin.os.tag == .windows) null else 0,
+        };
+        const child = try std.process.spawn(io, spawn_opts);
         const worker_stream = try setup_server.accept(io);
         const socket = worker_stream.socket.handle;
         // Set read timeout to avoid blocking conductor if worker becomes unresponsive
         platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
         var magic_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
-        _ = platform.write(socket, &magic_buf);
+        platform.write(socket, &magic_buf);
         const now = (Io.Clock.now(.awake, io) catch Io.Timestamp{ .nanoseconds = 0 }).toSeconds();
         return .{
             .allocator = allocator,
@@ -158,8 +161,8 @@ pub const Worker = struct {
         self.writeHeader(.set_project, @intCast(2 + project.len));
         var len_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_buf, @intCast(project.len), .little);
-        _ = platform.write(self.socket, &len_buf);
-        _ = platform.write(self.socket, project);
+        platform.write(self.socket, &len_buf);
+        platform.write(self.socket, project);
         const header = try self.readHeader();
         if (header.msg_type == .err) {
             std.debug.print("Worker {d}: setProject got {s} ({s})\n", .{
@@ -252,7 +255,7 @@ pub const Worker = struct {
         }
         // Send header + payload
         self.writeHeader(.client_run, @intCast(payload_size));
-        _ = platform.write(self.socket, send_buf);
+        platform.write(self.socket, send_buf);
         // Read response
         const header = try self.readHeader();
         if (header.msg_type == .err) {

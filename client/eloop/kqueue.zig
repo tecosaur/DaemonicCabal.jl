@@ -73,7 +73,7 @@ pub fn run(
                             stdout_eof = true;
                             continue;
                         };
-                        if (n > 0) _ = platform.write(posix.STDOUT_FILENO, stdout_buf[0..n]);
+                        if (n > 0) platform.write(posix.STDOUT_FILENO, stdout_buf[0..n]);
                     }
                     // Check for EOF and unregister to prevent busy loop
                     if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
@@ -88,7 +88,7 @@ pub fn run(
                     // Read any pending data, then unregister to stop busy-looping.
                     if (ev.data > 0) {
                         const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch continue;
-                        if (n > 0) _ = platform.write(stdio_fd, stdin_buf[0..n]);
+                        if (n > 0) platform.write(stdio_fd, stdin_buf[0..n]);
                     }
                     if ((ev.flags & EV_EOF) != 0) {
                         stdin_eof = true;
