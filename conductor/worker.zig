@@ -100,8 +100,7 @@ pub const Worker = struct {
 
     /// Record a PPID for session affinity tracking (circular buffer, 0 = empty)
     pub fn recordPpid(self: *Worker, ppid: u32, max_history: u32) void {
-        const cap = @min(max_history, max_recent_ppids);
-        if (cap == 0) return;
+        const cap = if (max_history == 0) max_recent_ppids else @min(max_history, max_recent_ppids);
         self.recent_ppids[self.recent_ppids_next] = ppid;
         self.recent_ppids_next = (self.recent_ppids_next + 1) % cap;
     }
@@ -317,6 +316,7 @@ pub const Worker = struct {
         // Empty stdio path means worker rejected (at capacity)
         if (stdio_len == 0) return error.WorkerBusy;
         const stdio = try allocator.dupe(u8, payload[rpos..][0..stdio_len]);
+        errdefer allocator.free(stdio);
         rpos += stdio_len;
         const signals_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
         rpos += 2;

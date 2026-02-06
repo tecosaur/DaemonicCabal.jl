@@ -81,7 +81,7 @@ function set_project(project)
     Base.set_active_project(
         project === nothing ? nothing :
         project == "" ? nothing :
-        startswith(project, "@") ? load_path_expand(project) :
+        startswith(project, "@") ? Base.load_path_expand(project) :
         abspath(expanduser(project)))
 end
 

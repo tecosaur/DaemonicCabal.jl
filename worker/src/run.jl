@@ -48,7 +48,7 @@ end
 
 # Finalize module for a specific client (cheap)
 function prepare_module(client::ClientInfo)
-    mod = if haskey(client.switches, "--session")
+    mod = if keyfound(client.switches, "--session")
         Main
     else
         get_module()
@@ -75,7 +75,7 @@ function getval(pairlist, key, default)
     if isnothing(index) default else last(pairlist[index]) end
 end
 
-haskey(pairlist, key) = !isnothing(findfirst(p -> first(p) == key, pairlist))
+keyfound(pairlist, key) = !isnothing(findfirst(p -> first(p) == key, pairlist))
 
 function runclient(client::ClientInfo, stdio::Base.PipeEndpoint, signals::Base.PipeEndpoint)
     hascolor = getval(client.switches, "--color",

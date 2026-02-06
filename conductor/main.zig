@@ -104,7 +104,7 @@ const WorkerList = std.array_list.Aligned(*worker.Worker, null);
 const ActiveClientInfo = struct {
     worker: *worker.Worker,
     client_num: u32,
-    start_time_us: i96,
+    start_time_us: i64,
 };
 
 const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
@@ -188,9 +188,9 @@ const Conductor = struct {
     }
 
     pub fn run(self: *Conductor) !void {
-        g_socket_path = self.allocator.dupeZ(u8, self.cfg.socket_path) catch "";
+        g_socket_path = try self.allocator.dupeZ(u8, self.cfg.socket_path);
         const pid_path = try std.fmt.allocPrint(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir});
-        g_pid_path = self.allocator.dupeZ(u8, pid_path) catch "";
+        g_pid_path = try self.allocator.dupeZ(u8, pid_path);
         self.allocator.free(pid_path);
         try createSignalPipe();
         defer posix.close(g_signal_pipe[0]);
@@ -389,7 +389,7 @@ const Conductor = struct {
     }
 
     fn handleClient(self: *Conductor, socket: posix.socket_t) !void {
-        const request = try self.readClientRequest(socket);
+        var request = try self.readClientRequest(socket);
         defer request.deinit(self.allocator);
         self.client_counter += 1;
         // Handle special commands
@@ -434,10 +434,10 @@ const Conductor = struct {
         project: ?[]const u8,
         raw_args: []const []const u8, // Backing storage for parsed.switches slices
 
-        fn deinit(self: *const ClientRequest, allocator: Allocator) void {
+        fn deinit(self: *ClientRequest, allocator: Allocator) void {
             allocator.free(self.cwd);
             if (self.project) |p| allocator.free(p);
-            @constCast(&self.parsed).deinit();
+            self.parsed.deinit();
             for (self.raw_args) |arg| allocator.free(arg);
             allocator.free(self.raw_args);
         }
@@ -752,6 +752,7 @@ const Conductor = struct {
         if (self.workers.getPtr(proj)) |list| {
             const count = list.items.len;
             for (list.items) |w| {
+                self.removeActiveClientsForWorker(w);
                 w.softExit();
                 w.deinit();
                 self.allocator.destroy(w);
@@ -766,6 +767,7 @@ const Conductor = struct {
     fn killUnresponsiveWorker(self: *Conductor, w: *worker.Worker) void {
         std.debug.print("Killing unresponsive worker {d}\n", .{w.id});
         if (self.reserve == w) self.reserve = null;
+        self.removeActiveClientsForWorker(w);
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items, 0..) |item, i| {
@@ -775,9 +777,30 @@ const Conductor = struct {
                 }
             }
         }
-        if (w.process.id) |pid| posix.kill(pid, posix.SIG.KILL) catch {};
+        if (w.process.id) |id| _ = platform.kill(id, platform.SIG.KILL);
         w.deinit();
         self.allocator.destroy(w);
+    }
+
+    fn removeActiveClientsForWorker(self: *Conductor, w: *worker.Worker) void {
+        // Collect-then-remove loop: repeat until no more matches, since
+        // the fixed buffer may not hold all entries in one pass.
+        var to_remove: [64]u32 = undefined;
+        while (true) {
+            var remove_count: usize = 0;
+            var it = self.active_clients.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.worker == w) {
+                    to_remove[remove_count] = entry.key_ptr.*;
+                    remove_count += 1;
+                    if (remove_count >= to_remove.len) break;
+                }
+            }
+            for (to_remove[0..remove_count]) |pid| {
+                _ = self.active_clients.remove(pid);
+            }
+            if (remove_count < to_remove.len) break;
+        }
     }
 
     fn makeWorkerKey(self: *Conductor, proj: []const u8, julia_channel: ?[]const u8) ![]const u8 {
@@ -833,17 +856,16 @@ const Conductor = struct {
     // ========================================================================
 
     fn registerClient(self: *Conductor, pid: u32, client_num: u32, w: *worker.Worker) !void {
-        const now_ns = (Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds;
-        try self.active_clients.put(pid, .{ .worker = w, .client_num = client_num, .start_time_us = @divTrunc(now_ns, 1000) });
+        const now_us: i64 = @intCast(@divTrunc((Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds, 1000));
+        try self.active_clients.put(pid, .{ .worker = w, .client_num = client_num, .start_time_us = now_us });
     }
 
     fn clientDone(self: *Conductor, pid: u32) ?*worker.Worker {
         if (self.active_clients.fetchRemove(pid)) |entry| {
             const info = entry.value;
             if (info.worker.active_clients > 0) info.worker.active_clients -= 1;
-            const now_ns = (Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds;
-            info.worker.last_active = @divTrunc(now_ns, 1_000_000_000);
-            const now_us = @divTrunc(now_ns, 1000);
+            const now_us: i64 = @intCast(@divTrunc((Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds, 1000));
+            info.worker.last_active = @divTrunc(now_us, 1_000_000);
             const duration_us = now_us - info.start_time_us;
             const duration_s: u64 = @intCast(@divTrunc(duration_us, 1_000_000));
             const duration_ms: u64 = @intCast(@divTrunc(@mod(duration_us, 1_000_000), 1_000));
