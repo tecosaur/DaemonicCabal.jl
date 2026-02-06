@@ -1,82 +1,107 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// POSIX platform implementation for BSD/Darwin using libc (std.c).
+// Shared POSIX platform code used by both linux.zig and bsd.zig.
+// Platform-specific raw syscall wrappers are imported from the active impl.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const c = std.c;
 const posix = std.posix;
+const impl = if (builtin.os.tag == .linux) @import("linux.zig") else @import("bsd.zig");
 
-// Types
-pub const fd_t = posix.fd_t;
-pub const pid_t = c.pid_t;
-pub const uid_t = c.uid_t;
-pub const SIG = posix.SIG;
-
-// Process information
-pub const getuid = c.getuid;
-pub const getpid = c.getpid;
-pub const getppid = c.getppid;
-
-// I/O - write needs wrapper for slice + return type conversion
-pub fn write(fd: fd_t, buf: []const u8) usize {
-    const ret = c.write(fd, buf.ptr, buf.len);
-    return if (ret < 0) 0 else @intCast(ret);
+/// Format into either an allocator (returns owned slice) or a `[]u8` buffer (returns sub-slice).
+pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
+    if (@TypeOf(out) == std.mem.Allocator)
+        return std.fmt.allocPrint(out, fmt, args)
+    else
+        return std.fmt.bufPrint(out, fmt, args) catch error.NameTooLong;
 }
 
-// Process control - kill needs wrapper for return type conversion
-pub fn kill(pid: pid_t, sig: SIG) usize {
-    const ret = c.kill(pid, sig);
-    return if (ret < 0) 1 else 0;
+// I/O — on POSIX, sockets are fds.
+pub fn socketWrite(fd: posix.socket_t, buf: []const u8) void { impl.write(fd, buf); }
+pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
+    return posix.read(fd, buf) catch |err| {
+        @branchHint(.cold);
+        if (err != error.ConnectionResetByPeer)
+            std.debug.print("socketRead error: {}\n", .{err});
+        return 0;
+    };
 }
 
-pub const WaitPidResult = struct { pid: pid_t, exited: bool };
-
-pub fn waitpidNonBlocking(pid: pid_t) WaitPidResult {
-    var status: c_int = 0;
-    const ret = c.waitpid(pid, &status, 1); // WNOHANG = 1
+// Process helpers
+pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
+    return child.id orelse 0;
+}
+pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };
+pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
+    const ret = impl.rawWaitpid(pid);
     return .{ .pid = ret, .exited = ret == pid };
 }
 
-// Socket options
-pub fn setRecvTimeout(socket: fd_t, seconds: u32) void {
-    const timeout = c.timeval{ .sec = @intCast(seconds), .usec = 0 };
-    const timeout_bytes = std.mem.asBytes(&timeout);
-    _ = c.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, timeout_bytes.ptr, @intCast(timeout_bytes.len));
-}
-
 // Terminal
-pub fn getTerminalSize(fd: fd_t) ?struct { rows: u16, cols: u16 } {
+pub fn getTerminalSize(fd: posix.fd_t) ?struct { rows: u16, cols: u16 } {
     var ws: posix.winsize = undefined;
-    if (c.ioctl(fd, @intCast(posix.T.IOCGWINSZ), @intFromPtr(&ws)) == 0) {
+    if (impl.rawIoctl(fd, posix.T.IOCGWINSZ, @intFromPtr(&ws)) == 0)
         return .{ .rows = ws.row, .cols = ws.col };
-    }
     return null;
 }
-
-pub fn isatty(fd: fd_t) bool {
-    return getTerminalSize(fd) != null;
+pub fn isatty(fd: posix.fd_t) bool { return getTerminalSize(fd) != null; }
+pub fn setRecvTimeout(socket: posix.fd_t, seconds: u32) void {
+    posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(
+        &impl.Timeval{ .sec = @intCast(seconds), .usec = 0 },
+    )) catch {};
 }
 
-// Paths
-pub fn defaultRuntimeDir(allocator: std.mem.Allocator, xdg_runtime_dir: ?[]const u8, home: ?[]const u8) ![]const u8 {
-    if (xdg_runtime_dir) |xdg| {
-        return std.fmt.allocPrint(allocator, "{s}/julia-daemon", .{xdg});
-    } else if (builtin.os.tag == .macos) {
-        const home_dir = home orelse try getHomeDir();
-        return std.fmt.allocPrint(allocator, "{s}/Library/Application Support/julia-daemon", .{home_dir});
-    } else {
-        return std.fmt.allocPrint(allocator, "/run/user/{d}/julia-daemon", .{c.getuid()});
+// Terminal raw mode
+var saved_termios: ?posix.termios = null;
+pub fn setRawModeStdin(raw: bool) void { setRawMode(impl.STDIN_HANDLE, raw); }
+pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
+    if (raw) {
+        var termios = posix.tcgetattr(stdin) catch return;
+        if (saved_termios == null) saved_termios = termios;
+        termios.lflag.ECHO = false;
+        termios.lflag.ICANON = false;
+        posix.tcsetattr(stdin, .FLUSH, termios) catch {};
+    } else if (saved_termios) |termios| {
+        posix.tcsetattr(stdin, .FLUSH, termios) catch {};
+        saved_termios = null;
     }
 }
 
-fn getHomeDir() ![]const u8 {
-    var pwd: c.passwd = undefined;
-    var result: ?*c.passwd = null;
-    var buf: [1024]u8 = undefined;
-    if (c.getpwuid_r(c.getuid(), &pwd, &buf, buf.len, &result) != 0 or result == null) {
-        return error.HomeNotSet;
+// Signal handling
+pub const SignalHandler = struct {
+    sockets_ptr: *anyopaque,
+    write_fn: *const fn (*anyopaque, []const u8) void,
+    notify_exit_fn: *const fn () void,
+    pub fn writeStdio(self: SignalHandler, data: []const u8) void {
+        self.write_fn(self.sockets_ptr, data);
     }
-    return std.mem.span(result.?.dir orelse return error.HomeNotSet);
+    pub fn notifyExit(self: SignalHandler) void {
+        self.notify_exit_fn();
+    }
+};
+var g_signal_handler: ?SignalHandler = null;
+fn signalAction(sig: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    const handler = g_signal_handler orelse return;
+    switch (sig) {
+        .INT => handler.writeStdio("\x03"),
+        .TERM => {
+            handler.notifyExit();
+            std.process.exit(128 + @intFromEnum(posix.SIG.TERM));
+        },
+        else => {},
+    }
+}
+pub fn registerSignalHandlers(handler: SignalHandler) void {
+    g_signal_handler = handler;
+    var mask = std.mem.zeroes(posix.sigset_t);
+    posix.sigaddset(&mask, posix.SIG.INT);
+    posix.sigaddset(&mask, posix.SIG.TERM);
+    const sigact = posix.Sigaction{
+        .handler = .{ .sigaction = signalAction },
+        .mask = mask,
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sigact, null);
+    posix.sigaction(posix.SIG.TERM, &sigact, null);
 }

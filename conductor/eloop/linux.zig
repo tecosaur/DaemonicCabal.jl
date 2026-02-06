@@ -15,46 +15,13 @@ const protocol = @import("../protocol.zig");
 const worker = @import("../worker.zig");
 
 const EventLocation = protocol.EventLocation;
+const posix_signals = @import("posix_signals.zig");
 
-// Shutdown signaling (converts Unix signals to event loop events via pipe)
-pub const SIGNAL_SHUTDOWN: u8 = 'S';
-pub const SIGNAL_RECREATE: u8 = 'R';
-
-/// Signal pipe for converting async signals to event loop events
-pub var signal_pipe: [2]posix.fd_t = .{ -1, -1 };
-
-fn handleShutdown(_: posix.SIG) callconv(.c) void {
-    _ = platform.write(signal_pipe[1], &[_]u8{SIGNAL_SHUTDOWN});
-}
-
-fn handleUsr1(_: posix.SIG) callconv(.c) void {
-    _ = platform.write(signal_pipe[1], &[_]u8{SIGNAL_RECREATE});
-}
-
-/// Create signal pipe and install signal handlers. Call before running event loop.
-pub fn installSignalHandlers() !void {
-    signal_pipe = Io.Threaded.pipe2(.{ .NONBLOCK = true }) catch return error.PipeCreationFailed;
-    const shutdown_sigact = posix.Sigaction{
-        .handler = .{ .handler = @ptrCast(&handleShutdown) },
-        .mask = std.mem.zeroes(posix.sigset_t),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.TERM, &shutdown_sigact, null);
-    posix.sigaction(posix.SIG.INT, &shutdown_sigact, null);
-    const usr1_sigact = posix.Sigaction{
-        .handler = .{ .handler = @ptrCast(&handleUsr1) },
-        .mask = std.mem.zeroes(posix.sigset_t),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.USR1, &usr1_sigact, null);
-}
-
-/// Close signal pipe. Call after event loop exits.
-pub fn cleanupSignalHandlers() void {
-    if (signal_pipe[0] != -1) posix.close(signal_pipe[0]);
-    if (signal_pipe[1] != -1) posix.close(signal_pipe[1]);
-    signal_pipe = .{ -1, -1 };
-}
+pub const installSignalHandlers = posix_signals.installSignalHandlers;
+pub const cleanupSignalHandlers = posix_signals.cleanupSignalHandlers;
+const signal_pipe = &posix_signals.signal_pipe;
+const SIGNAL_SHUTDOWN = posix_signals.SIGNAL_SHUTDOWN;
+const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 
 // EventLoop (wraps io_uring + health check state)
 pub const EventLoop = struct {

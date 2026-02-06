@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const Io = std.Io;
-
 const platform = @import("platform/main.zig");
 
 // Client ↔ Conductor Protocol
@@ -89,11 +88,10 @@ pub const EventLocation = enum(u64) {
 };
 
 /// Read exactly buf.len bytes from socket, returning error on EOF.
-/// Uses platform-specific read implementation.
 pub fn readExact(fd: std.posix.socket_t, buf: []u8) !void {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = try std.posix.read(fd, buf[total..]);
+        const n = platform.socketRead(fd, buf[total..]);
         if (n == 0) return error.EndOfStream;
         total += n;
     }

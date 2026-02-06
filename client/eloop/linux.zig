@@ -50,12 +50,12 @@ pub fn run(
                         stdout_eof = true;
                         continue;
                     }
-                    _ = platform.write(posix.STDOUT_FILENO, stdout_buf[0..len]);
+                    platform.write(posix.STDOUT_FILENO, stdout_buf[0..len]);
                     _ = try ring.read(@intFromEnum(Location.stdout), stdio_fd, .{ .buffer = &stdout_buf }, 0);
                 },
                 @intFromEnum(Location.stdin) => {
                     if (cqe.res <= 0 or exit_code != null) continue; // EOF/error or exiting
-                    _ = platform.write(stdio_fd, stdin_buf[0..len]);
+                    platform.write(stdio_fd, stdin_buf[0..len]);
                     _ = try ring.read(@intFromEnum(Location.stdin), posix.STDIN_FILENO, .{ .buffer = &stdin_buf }, 0);
                 },
                 @intFromEnum(Location.signals) => {

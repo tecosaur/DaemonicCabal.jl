@@ -34,6 +34,29 @@ const VERSION = blk: {
     break :blk project_toml[start..end];
 };
 
+const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
+    .linux =>
+        \\Daemon management (systemd):
+        \\
+        \\ systemctl --user {start | stop | restart | status} julia-daemon
+        \\
+    ,
+    .macos =>
+        \\Daemon management (launchd):
+        \\
+        \\ launchctl {start | stop} net.julialang.julia-daemon
+        \\ tail -f ~/Library/Logs/julia-daemon.log
+        \\
+    ,
+    else =>
+        \\Daemon management:
+        \\
+        \\ pgrep -f julia-conductor   (status)
+        \\ pkill -f julia-conductor   (stop)
+        \\
+    ,
+};
+
 const CLIENT_HELP =
     \\
     \\    juliaclient [switches] -- [programfile] [args...]
@@ -58,11 +81,7 @@ const CLIENT_HELP =
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
     \\ --restart                  Kill workers for the project and exit
     \\
-    \\Daemon management (systemd):
-    \\
-    \\ systemctl --user {start | stop | restart | status} julia-daemon
-    \\
-;
+++ DAEMON_MANAGEMENT_HELP;
 
 // ============================================================================
 // Global state for cleanup
@@ -180,7 +199,7 @@ pub const Conductor = struct {
         defer server.deinit(self.io);
         defer Io.Dir.deleteFileAbsolute(self.io, self.cfg.socket_path) catch {};
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
-        self.eventLoop(&server);
+        eventLoopImpl.run(self, &server);
     }
 
     fn cleanupRuntimeDir(self: *Conductor) void {
@@ -195,17 +214,7 @@ pub const Conductor = struct {
         }
     }
 
-    // ========================================================================
-    // Event loop
-    // ========================================================================
-
-    fn eventLoop(self: *Conductor, server: *Io.net.Server) void {
-        eventLoopImpl.run(self, server);
-    }
-
-    // ========================================================================
-    // Connection handling
-    // ========================================================================
+    // --- Connection handling ---
 
     pub fn handleConnectionFd(self: *Conductor, socket: posix.socket_t) !void {
         var magic_buf: [4]u8 = undefined;
@@ -558,7 +567,7 @@ pub const Conductor = struct {
         self.next_worker_id += 1;
         self.reserve = w;
         try w.ping();
-        std.debug.print("Reserve worker {d} created (pid {d})\n", .{ w.id, w.process.id orelse 0 });
+        std.debug.print("Reserve worker {d} created (pid {d})\n", .{ w.id, platform.getChildPid(w.process) });
     }
 
     fn addWorkerToPool(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8) !*worker.Worker {
@@ -594,7 +603,7 @@ pub const Conductor = struct {
             );
             std.debug.print("Spawning worker {d} (pid {d}) for project {s}{s}{s}\n", .{
                 self.next_worker_id,
-                new.process.id orelse 0,
+                platform.getChildPid(new.process),
                 proj,
                 if (julia_channel != null) " " else "",
                 julia_channel orelse "",
@@ -683,22 +692,19 @@ pub const Conductor = struct {
     }
 
     fn findWorkerIdByPid(self: *Conductor, pid: u32) ?u32 {
-        const target_pid: i32 = @intCast(pid);
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items) |w| {
-                if (w.process.id == target_pid) return w.id;
+                if (platform.getChildPid(w.process) == pid) return w.id;
             }
         }
         if (self.reserve) |r| {
-            if (r.process.id == target_pid) return r.id;
+            if (platform.getChildPid(r.process) == pid) return r.id;
         }
         return null;
     }
 
-    // ========================================================================
-    // Session labels
-    // ========================================================================
+    // --- Session labels ---
 
     fn isLabelExpired(self: *Conductor, w: *worker.Worker, now: i64) bool {
         if (w.session_label == null or w.active_clients > 0) return false;
@@ -774,10 +780,10 @@ pub const Conductor = struct {
         if (self.reserve) |r| r.softExit();
         if (self.waitForWorkers(1000)) return;
         std.debug.print("Timeout waiting for soft exit, sending SIGTERM\n", .{});
-        self.signalAllWorkers(posix.SIG.TERM);
+        self.signalAllWorkers(platform.SIG.TERM);
         if (self.waitForWorkers(1000)) return;
         std.debug.print("Timeout waiting for SIGTERM, sending SIGKILL\n", .{});
-        self.signalAllWorkers(posix.SIG.KILL);
+        self.signalAllWorkers(platform.SIG.KILL);
     }
 
     fn waitForWorkers(self: *Conductor, timeout_ms: u32) bool {
@@ -789,15 +795,15 @@ pub const Conductor = struct {
         return false;
     }
 
-    fn signalAllWorkers(self: *Conductor, sig: posix.SIG) void {
+    fn signalAllWorkers(self: *Conductor, sig: platform.SIG) void {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items) |w| {
-                if (w.process.id) |pid| posix.kill(pid, sig) catch {};
+                if (w.process.id) |id| _ = platform.kill(id, sig);
             }
         }
         if (self.reserve) |r| {
-            if (r.process.id) |pid| posix.kill(pid, sig) catch {};
+            if (r.process.id) |id| _ = platform.kill(id, sig);
         }
     }
 
@@ -866,8 +872,8 @@ pub const Conductor = struct {
         defer stdio_conn.close(self.io);
         const signals_conn = try signals_server.accept(self.io);
         defer signals_conn.close(self.io);
-        _ = platform.write(stdio_conn.socket.handle, content);
-        _ = platform.write(signals_conn.socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00, 0x00 });
+        platform.write(stdio_conn.socket.handle, content);
+        platform.write(signals_conn.socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00, 0x00 });
         stdio_conn.shutdown(self.io, .send) catch {};
         signals_conn.shutdown(self.io, .send) catch {};
     }
@@ -877,13 +883,11 @@ pub const Conductor = struct {
         var w = protocol.BufWriter{ .buf = &buf };
         w.writeLenPrefixed(u16, stdio);
         w.writeLenPrefixed(u16, signals);
-        _ = platform.write(socket, w.written());
+        platform.write(socket, w.written());
     }
 };
 
-// ============================================================================
-// Entry point
-// ============================================================================
+// --- Entry point ---
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
