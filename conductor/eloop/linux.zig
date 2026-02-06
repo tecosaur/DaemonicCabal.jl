@@ -49,7 +49,7 @@ pub const EventLoop = struct {
         if (!w.ping_pending) return;
         _ = self.ring.cancel(@intFromEnum(EventLocation.ignored), @intFromPtr(w), 0) catch {};
         _ = self.ring.submit() catch {};
-        var buf: [7]u8 = undefined;
+        var buf: [5]u8 = undefined;
         protocol.readExact(w.socket, &buf) catch {};
         w.ping_pending = false;
     }
@@ -59,7 +59,6 @@ pub const EventLoop = struct {
 pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     const ring = &conductor.event_loop.ring;
     var signal_buf: [16]u8 = undefined;
-    var pong_buf: [7]u8 = undefined;
     var client_addr: posix.sockaddr = undefined;
     var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
     var server_fd = server.socket.handle;
@@ -98,10 +97,10 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                 if ((user_data & 1) != 0) {
                     const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
                     if (w.active_clients == 0 and !w.ping_pending and !recently_pinged) {
-                        queuePing(ring, w, &pong_buf, &ping_timeout_ts);
+                        queuePing(ring, w, &ping_timeout_ts);
                     }
                 } else {
-                    handlePongResponse(conductor, w, cqe.res, &pong_buf);
+                    handlePongResponse(conductor, w, cqe.res);
                 }
                 continue;
             }
@@ -152,7 +151,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     };
                 },
                 .ping_timer => {
-                    queueWorkerPings(conductor, ring, &pong_buf, &ping_timeout_ts);
+                    queueWorkerPings(conductor, ring, &ping_timeout_ts);
                     need_rearm_ping_timer = true;
                 },
                 .ignored, _ => {},
@@ -175,27 +174,25 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
 }
 
 // Health checking
-fn queueWorkerPings(conductor: *Conductor, ring: *linux.IoUring, pong_buf: *[7]u8, timeout_ts: *linux.kernel_timespec) void {
+fn queueWorkerPings(conductor: *Conductor, ring: *linux.IoUring, timeout_ts: *linux.kernel_timespec) void {
     const now = conductor.currentTime();
     var it = conductor.workers.iterator();
     while (it.next()) |entry| {
         for (entry.value_ptr.items) |w| {
-            maybeQueuePing(conductor, ring, w, pong_buf, timeout_ts, now);
+            maybeQueuePing(conductor, ring, w, timeout_ts, now);
         }
     }
-    if (conductor.reserve) |r| maybeQueuePing(conductor, ring, r, pong_buf, timeout_ts, now);
+    if (conductor.reserve) |r| maybeQueuePing(conductor, ring, r, timeout_ts, now);
 }
 
-fn maybeQueuePing(conductor: *Conductor, ring: *linux.IoUring, w: *worker.Worker, pong_buf: *[7]u8, timeout_ts: *linux.kernel_timespec, now: i64) void {
-    if (w.ping_pending) return;
-    if (w.active_clients > 0) return;
-    if (now - w.last_pinged < @as(i64, @intCast(conductor.cfg.ping_interval))) return;
-    queuePing(ring, w, pong_buf, timeout_ts);
+fn maybeQueuePing(conductor: *Conductor, ring: *linux.IoUring, w: *worker.Worker, timeout_ts: *linux.kernel_timespec, now: i64) void {
+    if (!w.shouldPing(now, conductor.cfg.ping_interval)) return;
+    queuePing(ring, w, timeout_ts);
 }
 
-fn queuePing(ring: *linux.IoUring, w: *worker.Worker, pong_buf: *[7]u8, timeout_ts: *linux.kernel_timespec) void {
+fn queuePing(ring: *linux.IoUring, w: *worker.Worker, timeout_ts: *linux.kernel_timespec) void {
     w.sendPing();
-    const sqe = ring.read(@intFromPtr(w), w.socket, .{ .buffer = pong_buf }, 0) catch {
+    const sqe = ring.read(@intFromPtr(w), w.socket, .{ .buffer = &w.pong_buf }, 0) catch {
         w.ping_pending = false;
         return;
     };
@@ -203,7 +200,7 @@ fn queuePing(ring: *linux.IoUring, w: *worker.Worker, pong_buf: *[7]u8, timeout_
     _ = ring.link_timeout(@intFromEnum(EventLocation.ignored), timeout_ts, 0) catch {};
 }
 
-fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, cqe_res: i32, pong_buf: *[7]u8) void {
+fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, cqe_res: i32) void {
     if (cqe_res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
         if (w.ping_pending) {
             w.ping_pending = false;
@@ -219,17 +216,12 @@ fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, cqe_res: i32, po
         return;
     }
     const bytes_read: usize = @intCast(cqe_res);
-    if (bytes_read < 7) {
-        protocol.readExact(w.socket, pong_buf[bytes_read..]) catch {
+    if (bytes_read < 5) {
+        protocol.readExact(w.socket, w.pong_buf[bytes_read..]) catch {
             std.debug.print("Worker {d}: pong short read\n", .{w.id});
             conductor.killUnresponsiveWorker(w);
             return;
         };
     }
-    w.last_pinged = conductor.currentTime();
-    const worker_count = std.mem.readInt(u16, pong_buf[5..7], .little);
-    if (worker_count != w.active_clients) {
-        std.debug.print("Worker {d}: client count mismatch (worker={d}, conductor={d}), syncing\n", .{ w.id, worker_count, w.active_clients });
-        conductor.syncWorkerClients(w);
-    }
+    conductor.processPong(w, &w.pong_buf);
 }

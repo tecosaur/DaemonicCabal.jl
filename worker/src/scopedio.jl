@@ -40,7 +40,9 @@ function unsafe_pipe!(pipe::Base.PipeEndpoint, pipe2::Base.PipeEndpoint)
     pipe.buffer = pipe2.buffer
     pipe.cond = pipe2.cond
     pipe.readerror = pipe2.readerror
+    pipe.sendbuf = pipe2.sendbuf
     pipe.lock = pipe2.lock
+    pipe.throttle = pipe2.throttle
     Base.associate_julia_struct(pipe.handle, pipe)
     pipe
 end
@@ -86,9 +88,9 @@ function Base.displaysize(::Union{ScopedStdout, ScopedStderr})
     term = ACTIVE_TERM[]
     isopen(term.signals) || return (24, 80)
     send_signal(term.signals, SIGNAL_QUERY_SIZE, UInt8[])
-    # Response: id(1) + len(2) + height(2) + width(2)
-    resp = read(term.signals, 7)
-    height = reinterpret(UInt16, resp[4:5])[1]
-    width = reinterpret(UInt16, resp[6:7])[1]
+    # Response: id(1) + len(1) + height(2) + width(2)
+    resp = read(term.signals, 6)
+    height = reinterpret(UInt16, resp[3:4])[1]
+    width = reinterpret(UInt16, resp[5:6])[1]
     (Int(height), Int(width))
 end

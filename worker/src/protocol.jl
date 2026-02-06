@@ -40,7 +40,7 @@ const ERR_CODE = (
 
 struct MessageHeader
     msg_type::UInt8
-    payload_len::UInt32
+    payload_len::UInt16
 end
 
 # Verify protocol magic at connection start
@@ -49,17 +49,17 @@ function verify_magic(conn::IO)
     magic == PROTOCOL_MAGIC || error("Invalid protocol magic: $(repr(magic))")
 end
 
-# Read a message header (type + length, 5 bytes)
+# Read a message header (type + length, 3 bytes)
 function read_header(conn::IO)
     msg_type = read(conn, UInt8)
-    payload_len = read(conn, UInt32)
+    payload_len = read(conn, UInt16)
     MessageHeader(msg_type, payload_len)
 end
 
-# Write a message header (type + length, 5 bytes)
+# Write a message header (type + length, 3 bytes)
 function write_header(conn::IO, msg_type::UInt8, payload_len::Integer)
     write(conn, msg_type)
-    write(conn, UInt32(payload_len))
+    write(conn, UInt16(payload_len))
 end
 
 # Read a length-prefixed string (u16 length)
