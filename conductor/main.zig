@@ -33,6 +33,7 @@ const VERSION = blk: {
     const end = if (std.mem.indexOfPos(u8, project_toml, start, "\"")) |i| i else unreachable;
     break :blk project_toml[start..end];
 };
+const VERSION_STRING = "juliaclient " ++ VERSION ++ "\n";
 
 const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
     .linux =>
@@ -83,16 +84,12 @@ const CLIENT_HELP =
     \\
 ++ DAEMON_MANAGEMENT_HELP;
 
-// ============================================================================
-// Global state for cleanup
-// ============================================================================
+// --- Global state for cleanup ---
 
 pub var g_socket_path: [:0]const u8 = "";
 pub var g_pid_path: [:0]const u8 = "";
 
-// ============================================================================
-// Types
-// ============================================================================
+// --- Types ---
 
 const WorkerList = std.array_list.Aligned(*worker.Worker, null);
 
@@ -109,15 +106,6 @@ const AssignReason = enum {
     ppid_affinity,
     recent_worker,
     new_worker,
-
-    pub fn description(self: AssignReason) []const u8 {
-        return switch (self) {
-            .session_label => "session label match",
-            .ppid_affinity => "PPID affinity",
-            .recent_worker => "recent worker",
-            .new_worker => "new worker",
-        };
-    }
 };
 
 const WorkerAssignment = struct {
@@ -126,9 +114,7 @@ const WorkerAssignment = struct {
     reason: AssignReason,
 };
 
-// ============================================================================
-// Conductor
-// ============================================================================
+// --- Conductor ---
 
 pub const Conductor = struct {
     io: Io,
@@ -143,9 +129,7 @@ pub const Conductor = struct {
     client_counter: u32,
     event_loop: eventLoopImpl.EventLoop,
 
-    // ========================================================================
-    // Lifecycle
-    // ========================================================================
+    // --- Lifecycle ---
 
     pub fn init(io: Io, allocator: Allocator, cfg: config.Config, environ_map: *std.process.Environ.Map) !Conductor {
         return .{
@@ -199,6 +183,9 @@ pub const Conductor = struct {
         defer server.deinit(self.io);
         defer Io.Dir.deleteFileAbsolute(self.io, self.cfg.socket_path) catch {};
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
+        self.createReserveWorker(null) catch |err| {
+            std.debug.print("Failed to create reserve worker: {}\n", .{err});
+        };
         eventLoopImpl.run(self, &server);
     }
 
@@ -265,9 +252,7 @@ pub const Conductor = struct {
             return;
         }
         if (request.parsed.hasSwitch("--version") or request.parsed.hasSwitch("-v")) {
-            const version_str = try std.fmt.allocPrint(self.allocator, "juliaclient {s}\n", .{VERSION});
-            defer self.allocator.free(version_str);
-            try self.serveString(socket, version_str);
+            try self.serveString(socket, VERSION_STRING);
             return;
         }
         const project_path = request.project orelse "";
@@ -404,7 +389,7 @@ pub const Conductor = struct {
         };
         const now = self.currentTime();
         const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, now);
-        std.debug.print("Assigned client {d} to worker {d}: {s}\n", .{ self.client_counter, assignment.w.id, assignment.reason.description() });
+        std.debug.print("Assigned client {d} to worker {d}: {s}\n", .{ self.client_counter, assignment.w.id, @tagName(assignment.reason) });
         defer self.allocator.free(assignment.paths.stdio);
         defer self.allocator.free(assignment.paths.signals);
         assignment.w.last_pinged = now;
@@ -413,9 +398,7 @@ pub const Conductor = struct {
         self.sendSocketPaths(socket, assignment.paths.stdio, assignment.paths.signals);
     }
 
-    // ========================================================================
-    // Worker selection
-    // ========================================================================
+    // --- Worker selection ---
 
     fn selectWorker(
         self: *Conductor,
@@ -518,9 +501,7 @@ pub const Conductor = struct {
         }
     }
 
-    // ========================================================================
-    // Worker pool management
-    // ========================================================================
+    // --- Worker pool management ---
 
     pub fn createReserveWorker(self: *Conductor, julia_channel: ?[]const u8) !void {
         const w = try self.allocator.create(worker.Worker);
@@ -688,9 +669,7 @@ pub const Conductor = struct {
         }
     }
 
-    // ========================================================================
-    // Client tracking
-    // ========================================================================
+    // --- Client tracking ---
 
     fn registerClient(self: *Conductor, pid: u32, client_num: u32, w: *worker.Worker) !void {
         const now_us: i64 = @intCast(@divTrunc((Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds, 1000));
@@ -736,9 +715,7 @@ pub const Conductor = struct {
         std.debug.print("Worker {d}: sync complete, {d} active clients\n", .{ w.id, remaining });
     }
 
-    // ========================================================================
-    // Shutdown
-    // ========================================================================
+    // --- Shutdown ---
 
     pub fn gracefulShutdown(self: *Conductor) void {
         var it = self.workers.iterator();
@@ -882,8 +859,5 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     };
     conductor.cleanupRuntimeDir();
-    conductor.createReserveWorker(null) catch |err| {
-        std.debug.print("Failed to create reserve worker: {}\n", .{err});
-    };
     try conductor.run();
 }

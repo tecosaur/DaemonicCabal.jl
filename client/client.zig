@@ -18,118 +18,47 @@ else
 // Single-threaded Io for cross-platform operations (no thread pool overhead)
 const io: Io = Io.Threaded.global_single_threaded.io();
 
-const BufWriter = protocol.BufWriter;
+// Runtime socket paths are short (runtime_dir + hex name + suffix), 256 bytes is ample.
+const max_socket_path = 256;
+
+// --- Types ---
+
+/// Buffered socket writer — flushes automatically when the buffer fills.
+const SocketWriter = struct {
+    buf: [8192]u8 = undefined,
+    pos: usize = 0,
+    handle: posix.socket_t,
+    fn flush(self: *SocketWriter) void {
+        if (self.pos > 0) {
+            platform.socketWrite(self.handle, self.buf[0..self.pos]);
+            self.pos = 0;
+        }
+    }
+    fn writeInt(self: *SocketWriter, comptime T: type, val: T) void {
+        if (self.pos + @sizeOf(T) > self.buf.len) self.flush();
+        std.mem.writeInt(T, self.buf[self.pos..][0..@sizeOf(T)], val, .little);
+        self.pos += @sizeOf(T);
+    }
+    fn writeSlice(self: *SocketWriter, data: []const u8) void {
+        var remaining = data;
+        while (remaining.len > 0) {
+            if (self.pos == self.buf.len) self.flush();
+            const n = @min(remaining.len, self.buf.len - self.pos);
+            @memcpy(self.buf[self.pos..][0..n], remaining[0..n]);
+            self.pos += n;
+            remaining = remaining[n..];
+        }
+    }
+    fn writeLenPrefixed(self: *SocketWriter, comptime T: type, data: []const u8) void {
+        self.writeInt(T, @intCast(data.len));
+        self.writeSlice(data);
+    }
+};
 
 const SocketSet = struct {
     stdio: Io.net.Stream,
     signals: Io.net.Stream,
 };
-
-// Global socket set (needed for signal handler which can't capture state)
-var sockets: SocketSet = undefined;
-
-// Conductor socket path for exit notification
-var conductor_path: []const u8 = undefined;
-
-// Forward process signals to the worker
-fn signalHandler(
-    sig: posix.SIG,
-    _: *const posix.siginfo_t,
-    _: ?*anyopaque,
-) callconv(.c) void {
-    switch (sig) {
-        .INT => _ = platform.write(sockets.stdio.socket.handle, "\x03"),
-        .TERM => {
-            notifyExit();
-            std.process.exit(128 + @intFromEnum(posix.SIG.TERM));
-        },
-        else => {},
-    }
-}
-
-fn registerSignalHandlers() void {
-    var mask = std.mem.zeroes(posix.sigset_t);
-    posix.sigaddset(&mask, posix.SIG.INT);
-    posix.sigaddset(&mask, posix.SIG.TERM);
-    const sigact = posix.Sigaction{
-        .handler = .{ .sigaction = signalHandler },
-        .mask = mask,
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.INT, &sigact, null);
-    posix.sigaction(posix.SIG.TERM, &sigact, null);
-}
-
-fn connectUnix(path: []const u8) !Io.net.Stream {
-    return (try Io.net.UnixAddress.init(path)).connect(io);
-}
-
-fn connectToConductor(allocator: std.mem.Allocator, env: EnvInfo) !Io.net.Stream {
-    const runtime_dir = env.runtime_dir orelse
-        try platform.defaultRuntimeDir(allocator, env.xdg_runtime_dir, env.home);
-    const path = env.server_path orelse
-        try std.fmt.allocPrint(allocator, "{s}/conductor.sock", .{runtime_dir});
-    conductor_path = path;
-    // First attempt
-    if (connectUnix(path)) |stream| return stream else |_| {}
-    // Connection failed - try to signal conductor to recreate socket
-    const pid_path = try std.fmt.allocPrint(allocator, "{s}/conductor.pid", .{runtime_dir});
-    if (readPidAndSignal(pid_path)) {
-        // Wait up to 2 seconds for socket to be recreated, checking every 100ms
-        var attempts: u32 = 0;
-        while (attempts < 20) : (attempts += 1) {
-            Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
-            if (connectUnix(path)) |stream| return stream else |_| {}
-        }
-    }
-    // Give up
-    std.debug.print(
-        \\Failed to connect to {s}
-        \\
-        \\Try restarting the daemon:
-        \\
-        \\  systemctl --user restart julia-daemon
-        \\
-    , .{path});
-    std.process.exit(127);
-}
-
-fn readPidAndSignal(pid_path: []const u8) bool {
-    // Read PID from file
-    var buf: [16]u8 = undefined;
-    const content = Io.Dir.readFile(.cwd(), io, pid_path, &buf) catch return false;
-    const pid_str = std.mem.trimEnd(u8, content, &.{ '\n', '\r', ' ' });
-    const pid = std.fmt.parseInt(i32, pid_str, 10) catch return false;
-    // Send SIGUSR1
-    _ = platform.kill(pid, posix.SIG.USR1);
-    return true;
-}
-
-fn sendClientInfo(socket: Io.net.Stream, env: EnvInfo, is_tty: bool, args: []const [*:0]const u8) !void {
-    var buf: [8192]u8 = undefined;
-    var w = BufWriter{ .buf = &buf };
-    // Header: magic (4) + flags (1) + reserved (3)
-    w.writeInt(u32, protocol.client.magic);
-    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty }));
-    w.writeSlice(&.{ 0, 0, 0 }); // reserved
-    // PID and PPID
-    w.writeInt(u32, @intCast(platform.getpid()));
-    w.writeInt(u32, @intCast(platform.getppid()));
-    // CWD (length-prefixed)
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_len = try std.process.currentPath(io, &cwd_buf);
-    w.writeLenPrefixed(u16, cwd_buf[0..cwd_len]);
-    // Environment fingerprint
-    w.writeInt(u64, env.fingerprint);
-    // Args (count + length-prefixed strings)
-    w.writeInt(u16, @intCast(args.len));
-    for (args) |arg_ptr| {
-        w.writeLenPrefixed(u16, std.mem.span(arg_ptr));
-    }
-    _ = platform.write(socket.socket.handle, w.written());
-}
-
-const EnvBlock = std.process.Environ.Block;
 
 const EnvInfo = struct {
     fingerprint: u64,
@@ -140,80 +69,7 @@ const EnvInfo = struct {
     home: ?[]const u8,
 };
 
-fn scanEnv(block: EnvBlock) EnvInfo {
-    var info = EnvInfo{ .fingerprint = 0, .count = 0, .server_path = null, .runtime_dir = null, .xdg_runtime_dir = null, .home = null };
-    for (block) |entry_opt| {
-        const entry = entry_opt orelse break;
-        const kv = std.mem.span(entry);
-        if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // benchmarking noise
-        info.count += 1;
-        // XOR hash for order-independent fingerprint
-        var h = std.hash.Wyhash.init(kv.len);
-        h.update(kv);
-        info.fingerprint ^= h.final();
-        // Extract config paths if present
-        if (std.mem.startsWith(u8, kv, "JULIA_DAEMON_SERVER=")) {
-            info.server_path = kv["JULIA_DAEMON_SERVER=".len..];
-        } else if (std.mem.startsWith(u8, kv, "JULIA_DAEMON_RUNTIME=")) {
-            info.runtime_dir = kv["JULIA_DAEMON_RUNTIME=".len..];
-        } else if (std.mem.startsWith(u8, kv, "XDG_RUNTIME_DIR=")) {
-            info.xdg_runtime_dir = kv["XDG_RUNTIME_DIR=".len..];
-        } else if (std.mem.startsWith(u8, kv, "HOME=")) {
-            info.home = kv["HOME=".len..];
-        }
-    }
-    return info;
-}
-
-fn sendFullEnv(socket: Io.net.Stream, env: EnvInfo, block: EnvBlock) void {
-    var buf: [64 * 1024]u8 = undefined;
-    var w = BufWriter{ .buf = &buf };
-    w.writeInt(u16, env.count);
-    for (block) |entry_opt| {
-        const kv = std.mem.span(entry_opt orelse break);
-        if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue;
-        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
-        w.writeLenPrefixed(u16, kv[0..eq]);
-        w.writeLenPrefixed(u16, kv[eq + 1 ..]);
-    }
-    _ = platform.write(socket.socket.handle, w.written());
-}
-
-fn connectToWorker(allocator: std.mem.Allocator, conductor: Io.net.Stream, env: EnvInfo, block: EnvBlock) !SocketSet {
-    var buf: [512]u8 = undefined;
-    var sr = conductor.reader(io, &buf);
-    const reader = &sr.interface;
-    // First byte is either '?' (env request) or low byte of stdio path length
-    const first_byte = try reader.takeByte();
-    if (first_byte == protocol.client.env_request) {
-        sendFullEnv(conductor, env, block);
-    }
-    // Read length-prefixed socket paths (reconstruct length if we already read first byte)
-    const stdio_len = if (first_byte == protocol.client.env_request)
-        try reader.takeInt(u16, .little)
-    else
-        @as(u16, first_byte) | (@as(u16, try reader.takeByte()) << 8);
-    const stdio_path = try allocator.alloc(u8, stdio_len);
-    defer allocator.free(stdio_path);
-    try reader.readSliceAll(stdio_path);
-    const signals_len = try reader.takeInt(u16, .little);
-    const signals_path = try allocator.alloc(u8, signals_len);
-    defer allocator.free(signals_path);
-    try reader.readSliceAll(signals_path);
-    conductor.close(io);
-    // Connect to worker sockets and clean up socket files
-    const stdio = connectUnix(stdio_path) catch |e| {
-        std.debug.print("Failed to connect to worker stdio socket: {s}: {}\n", .{stdio_path, e});
-        std.process.exit(127);
-    };
-    Io.Dir.deleteFileAbsolute(io, stdio_path) catch {};
-    const signals = connectUnix(signals_path) catch |e| {
-        std.debug.print("Failed to connect to worker signals socket: {}\n", .{e});
-        std.process.exit(127);
-    };
-    Io.Dir.deleteFileAbsolute(io, signals_path) catch {};
-    return .{ .stdio = stdio, .signals = signals };
-}
+const EnvBlock = std.process.Environ.Block;
 
 // Signal parser with buffering for fragmented reads.
 // Protocol: <id:u8><len:u8><data> (may contain multiple signals)
@@ -225,12 +81,12 @@ const SignalParser = struct {
     pub const Result = union(enum) {
         none,
         exit: u8,
-        // Future: resize: struct { w: u16, h: u16 },
     };
 
-    pub fn feed(self: *@This(), input: []const u8, fd: posix.fd_t) Result {
+    pub fn feed(self: *@This(), input: []const u8, fd: posix.socket_t) Result {
         if (self.len + input.len > self.buf.len) {
             std.debug.print("[client] signal buffer overflow\n", .{});
+            self.len = 0;
             return .none;
         }
         @memcpy(self.buf[self.len..][0..input.len], input);
@@ -238,7 +94,7 @@ const SignalParser = struct {
         return self.process(fd);
     }
 
-    fn process(self: *@This(), fd: posix.fd_t) Result {
+    fn process(self: *@This(), fd: posix.socket_t) Result {
         var result: Result = .none;
         var pos: usize = 0;
         while (pos + header_size <= self.len) {
@@ -260,12 +116,12 @@ const SignalParser = struct {
         return result;
     }
 
-    fn dispatch(id: u8, data: []const u8, fd: posix.fd_t) Result {
+    fn dispatch(id: u8, data: []const u8, fd: posix.socket_t) Result {
         return switch (id) {
-            protocol.signals.exit => .{ .exit = if (data.len == 1) data[0] else unreachable },
+            protocol.signals.exit => .{ .exit = if (data.len >= 1) data[0] else 1 },
             protocol.signals.raw_mode => blk: {
-                if (data.len == 1) setTerminalRaw(data[0] != 0);
-                _ = platform.write(fd, &[_]u8{ id, 0 }); // ack: id + len:u8=0
+                if (data.len == 1) platform.setRawMode(data[0] != 0);
+                platform.socketWrite(fd, &[_]u8{ id, 0 }); // ack: id + len:u8=0
                 break :blk .none;
             },
             protocol.signals.query_size => blk: {
@@ -275,7 +131,7 @@ const SignalParser = struct {
                 resp[1] = 4; // len:u8 = 4 bytes of data
                 std.mem.writeInt(u16, resp[2..4], size.height, .little);
                 std.mem.writeInt(u16, resp[4..6], size.width, .little);
-                _ = platform.write(fd, &resp);
+                platform.socketWrite(fd, &resp);
                 break :blk .none;
             },
             else => .none,
@@ -283,18 +139,216 @@ const SignalParser = struct {
     }
 };
 
-fn getTerminalSize() struct { height: u16, width: u16 } {
-    if (platform.getTerminalSize(posix.STDIN_FILENO)) |size| {
-        return .{ .height = size.rows, .width = size.cols };
-    }
-    return .{ .height = 24, .width = 80 }; // fallback
+// --- Globals ---
+
+// Global socket set (needed for signal handler which can't capture state)
+var sockets: SocketSet = undefined;
+// Conductor socket path for exit notification (global buffer so it outlives connectToConductor)
+var conductor_path_buf: [max_socket_path]u8 = undefined;
+var conductor_path: []const u8 = &.{};
+var signal_parser = SignalParser{};
+
+// --- Signal handler wiring ---
+
+fn signalWriteStdio(ptr: *anyopaque, data: []const u8) void {
+    const sock_set: *SocketSet = @ptrCast(@alignCast(ptr));
+    platform.socketWrite(sock_set.stdio.socket.handle, data);
 }
 
-fn setTerminalRaw(raw: bool) void {
-    var termios = posix.tcgetattr(posix.STDIN_FILENO) catch return;
-    termios.lflag.ECHO = !raw;
-    termios.lflag.ICANON = !raw;
-    posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, termios) catch {};
+fn signalNotifyExit() void {
+    notifyExit();
+    platform.setRawMode(false);
+}
+
+fn registerSignalHandlers() void {
+    platform.registerSignalHandlers(.{
+        .sockets_ptr = @ptrCast(&sockets),
+        .write_fn = &signalWriteStdio,
+        .notify_exit_fn = &signalNotifyExit,
+    });
+}
+
+// --- Main pipeline ---
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    const env = scanEnv(init.environ.block);
+    // Set raw mode for TTY to avoid line buffering
+    const is_tty = platform.isatty(platform.getStdinHandle());
+    if (is_tty) platform.setRawMode(true);
+    defer platform.setRawMode(false);
+    // Connect to conductor and send client info
+    const conductor = try connectToConductor(env);
+    defer notifyExit();
+    var w = SocketWriter{ .handle = conductor.socket.handle };
+    try sendClientInfo(&w, env, is_tty, init.args);
+    // Get worker socket paths (conductor may request full env on cache miss)
+    sockets = try connectToWorker(conductor, &w, env, init.environ.block);
+    // Forward signals to worker instead of terminating
+    registerSignalHandlers();
+    try runEventLoop();
+}
+
+fn scanEnv(block: EnvBlock) EnvInfo {
+    var info = EnvInfo{ .fingerprint = 0, .count = 0, .server_path = null, .runtime_dir = null, .xdg_runtime_dir = null, .home = null };
+    const env_vars = .{
+        .{ "JULIA_DAEMON_SERVER=", "server_path" },
+        .{ "JULIA_DAEMON_RUNTIME=", "runtime_dir" },
+        .{ "XDG_RUNTIME_DIR=", "xdg_runtime_dir" },
+        .{ "HOME=", "home" },
+    };
+    for (block) |entry_opt| {
+        const entry = entry_opt orelse break;
+        const kv = std.mem.span(entry);
+        if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // benchmarking noise
+        info.count += 1;
+        // XOR hash for order-independent fingerprint
+        var h = std.hash.Wyhash.init(kv.len);
+        h.update(kv);
+        info.fingerprint ^= h.final();
+        // Extract config paths if present
+        inline for (env_vars) |ev| {
+            if (std.mem.startsWith(u8, kv, ev[0])) {
+                @field(info, ev[1]) = kv[ev[0].len..];
+            }
+        }
+    }
+    return info;
+}
+
+fn connectToConductor(env: EnvInfo) !Io.net.Stream {
+    var runtime_dir_buf: [max_socket_path]u8 = undefined;
+    const runtime_dir = env.runtime_dir orelse
+        try platform.defaultRuntimeDir(&runtime_dir_buf, env.xdg_runtime_dir, env.home);
+    conductor_path = env.server_path orelse
+        std.fmt.bufPrint(&conductor_path_buf, "{s}/conductor.sock", .{runtime_dir}) catch return error.NameTooLong;
+    const path = conductor_path;
+    // First attempt
+    if (connectUnix(path)) |stream| return stream else |_| {}
+    // Connection failed - try to signal conductor to recreate socket
+    var pid_buf: [max_socket_path]u8 = undefined;
+    const pid_path = std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong;
+    if (readPidAndSignal(pid_path)) {
+        // Wait up to 2 seconds for socket to be recreated, checking every 100ms
+        var attempts: u32 = 0;
+        while (attempts < 20) : (attempts += 1) {
+            Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
+            if (connectUnix(path)) |stream| return stream else |_| {}
+        }
+    }
+    // Give up
+    std.debug.print(
+        \\Failed to connect to {s}
+        \\
+        \\Try restarting the daemon:
+        \\
+        \\  {s}
+        \\
+    , .{ path, switch (builtin.os.tag) {
+        .linux => "systemctl --user restart julia-daemon",
+        .macos => "launchctl kickstart -k gui/$(id -u)/net.julialang.julia-daemon",
+        else => "pkill -f julia-conductor && julia-conductor &",
+    } });
+    std.process.exit(127);
+}
+
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args) !void {
+    // Header: magic + flags + reserved + pid + ppid
+    w.writeInt(u32, protocol.client.magic);
+    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty }));
+    w.writeSlice(&.{ 0, 0, 0 });
+    w.writeInt(u32, @intCast(platform.getpid()));
+    w.writeInt(u32, @intCast(platform.getppid()));
+    // CWD (read directly into the writer's buffer after a 2-byte length prefix)
+    if (w.pos + 2 >= w.buf.len) w.flush();
+    const len_pos = w.pos;
+    w.pos += 2; // reserve space for length prefix
+    const cwd_len = try std.process.currentPath(io, w.buf[w.pos..]);
+    std.mem.writeInt(u16, w.buf[len_pos..][0..2], @intCast(cwd_len), .little);
+    w.pos += cwd_len;
+    // Environment fingerprint
+    w.writeInt(u64, env.fingerprint);
+    // Args (count known upfront from the args vector)
+    w.writeInt(u16, @intCast(raw_args.vector.len));
+    for (raw_args.vector) |arg_ptr| {
+        w.writeLenPrefixed(u16, std.mem.span(arg_ptr));
+    }
+    w.flush();
+}
+
+fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, block: EnvBlock) !SocketSet {
+    var buf: [512]u8 = undefined;
+    var sr = conductor.reader(io, &buf);
+    const reader = &sr.interface;
+    // First byte is either '?' (env request) or low byte of stdio path length
+    const first_byte = try reader.takeByte();
+    if (first_byte == protocol.client.env_request) {
+        sendFullEnv(w, env, block);
+    }
+    // Read length-prefixed socket paths (reconstruct length if we already read first byte)
+    const stdio_len: usize = if (first_byte == protocol.client.env_request)
+        try reader.takeInt(u16, .little)
+    else
+        @as(u16, first_byte) | (@as(u16, try reader.takeByte()) << 8);
+    var stdio_buf: [max_socket_path]u8 = undefined;
+    if (stdio_len > stdio_buf.len) return error.NameTooLong;
+    const stdio_path = stdio_buf[0..stdio_len];
+    try reader.readSliceAll(stdio_path);
+    const signals_len: usize = try reader.takeInt(u16, .little);
+    var signals_buf: [max_socket_path]u8 = undefined;
+    if (signals_len > signals_buf.len) return error.NameTooLong;
+    const signals_path = signals_buf[0..signals_len];
+    try reader.readSliceAll(signals_path);
+    conductor.close(io);
+    // Connect to worker sockets and clean up socket files
+    const stdio = connectAndCleanup(stdio_path, "stdio");
+    const signals = connectAndCleanup(signals_path, "signals");
+    return .{ .stdio = stdio, .signals = signals };
+}
+
+fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
+    w.writeInt(u16, env.count);
+    for (block) |entry_opt| {
+        const kv = std.mem.span(entry_opt orelse break);
+        if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue;
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        w.writeLenPrefixed(u16, kv[0..eq]);
+        w.writeLenPrefixed(u16, kv[eq + 1 ..]);
+    }
+    w.flush();
+}
+
+fn runEventLoop() !void {
+    const stdio_fd = sockets.stdio.socket.handle;
+    const signals_fd = sockets.signals.socket.handle;
+    const exit_code = try eloop.run(stdio_fd, signals_fd, &signal_parser);
+    notifyExit();
+    std.process.exit(exit_code);
+}
+
+// --- Helpers ---
+
+fn connectUnix(path: []const u8) !Io.net.Stream {
+    return (try Io.net.UnixAddress.init(path)).connect(io);
+}
+
+fn connectAndCleanup(path: []const u8, comptime label: []const u8) Io.net.Stream {
+    const stream = connectUnix(path) catch |e| {
+        std.debug.print("Failed to connect to worker " ++ label ++ " socket: {s}: {}\n", .{ path, e });
+        std.process.exit(127);
+    };
+    Io.Dir.deleteFileAbsolute(io, path) catch {};
+    return stream;
+}
+
+fn readPidAndSignal(pid_path: []const u8) bool {
+    // Read PID from file
+    var buf: [16]u8 = undefined;
+    const content = Io.Dir.readFile(.cwd(), io, pid_path, &buf) catch return false;
+    const pid_str = std.mem.trimEnd(u8, content, &.{ '\n', '\r', ' ' });
+    const pid = std.fmt.parseInt(i32, pid_str, 10) catch return false;
+    // Send SIGUSR1
+    _ = platform.kill(pid, platform.SIG.USR1);
+    return true;
 }
 
 fn notifyExit() void {
@@ -305,39 +359,13 @@ fn notifyExit() void {
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
     buf[4] = @intFromEnum(protocol.notification.Type.client_exit);
     std.mem.writeInt(u32, buf[5..9], @intCast(platform.getpid()), .little);
-    _ = platform.write(stream.socket.handle, &buf);
+    platform.socketWrite(stream.socket.handle, &buf);
 }
 
-var signal_parser = SignalParser{};
-
-fn runEventLoop() !void {
-    const stdio_fd = sockets.stdio.socket.handle;
-    const signals_fd = sockets.signals.socket.handle;
-    const exit_code = try eloop.run(stdio_fd, signals_fd, &signal_parser);
-    notifyExit();
-    std.process.exit(exit_code);
-}
-
-pub fn main(init: std.process.Init.Minimal) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const env = scanEnv(init.environ.block);
-    // Set raw mode for TTY to avoid line buffering
-    const is_tty = platform.isatty(posix.STDIN_FILENO);
-    if (is_tty) {
-        var termios = try posix.tcgetattr(posix.STDIN_FILENO);
-        termios.lflag.ECHO = false;
-        termios.lflag.ICANON = false;
-        try posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, termios);
+fn getTerminalSize() struct { height: u16, width: u16 } {
+    if (platform.getTerminalSize(platform.getStdinHandle())) |size| {
+        return .{ .height = size.rows, .width = size.cols };
     }
-    // Connect to conductor and send client info
-    const conductor = try connectToConductor(alloc, env);
-    defer notifyExit();
-    try sendClientInfo(conductor, env, is_tty, init.args.vector);
-    // Get worker socket paths (conductor may request full env on cache miss)
-    sockets = try connectToWorker(alloc, conductor, env, init.environ.block);
-    // Forward signals to worker instead of terminating
-    registerSignalHandlers();
-    try runEventLoop();
+    return .{ .height = 24, .width = 80 }; // fallback
 }
+
