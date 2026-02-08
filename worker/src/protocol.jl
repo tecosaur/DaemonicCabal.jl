@@ -86,11 +86,13 @@ end
 is_tcp_address(addr::AbstractString) =
     !startswith(addr, '/') && !startswith(addr, '.') && !contains(addr, '/') && contains(addr, ':')
 
-# Connect to an address (Unix path or host:port)
+# Connect to an address (Unix path or host:port), setting TCP_NODELAY for TCP sockets
 function connect_to(address::AbstractString)
     if is_tcp_address(address)
         host, port = rsplit(address, ':', limit=2)
-        Sockets.connect(Sockets.IPv4(String(host)), parse(Int, port))
+        sock = Sockets.connect(Sockets.IPv4(String(host)), parse(Int, port))
+        Sockets.nagle(sock, false)
+        sock
     else
         Sockets.connect(address)
     end

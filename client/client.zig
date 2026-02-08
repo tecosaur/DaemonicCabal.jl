@@ -136,6 +136,11 @@ const SignalParser = struct {
                 platform.socketWrite(fd, &resp);
                 break :blk .none;
             },
+            protocol.signals.nodelay => blk: {
+                protocol.setTcpNodelay(sockets.stdin.socket.handle);
+                protocol.setTcpNodelay(fd); // signals socket
+                break :blk .none;
+            },
             else => .none,
         };
     }
@@ -183,6 +188,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer platform.setRawMode(false);
     // Connect to conductor and send client info
     const conductor = try connectToConductor(env);
+    if (transport_mode == .tcp) protocol.setTcpNodelay(conductor.socket.handle);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor.socket.handle };
     try sendClientInfo(&w, env, is_tty, init.args, addr_arg.skip);
@@ -335,12 +341,14 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     try reader.readSliceAll(signals_path);
     conductor.close(io);
     // Connect to worker sockets (and clean up socket files in unix mode)
-    return .{
+    const result = SocketSet{
         .stdin = connectToWorkerSocket(stdin_path, "stdin"),
         .stdout = connectToWorkerSocket(stdout_path, "stdout"),
         .stderr = connectToWorkerSocket(stderr_path, "stderr"),
         .signals = connectToWorkerSocket(signals_path, "signals"),
     };
+    if (transport_mode == .tcp) protocol.setTcpNodelay(result.signals.socket.handle);
+    return result;
 }
 
 fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {

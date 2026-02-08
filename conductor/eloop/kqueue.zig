@@ -187,6 +187,7 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
         return;
     }
     defer _ = c.close(client_fd);
+    if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
     conductor.handleConnectionFd(client_fd) catch |err| {
         std.debug.print("Client handling failed: {}\n", .{err});
     };
