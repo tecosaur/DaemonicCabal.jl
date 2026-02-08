@@ -79,6 +79,7 @@ pub const Worker = struct {
         const child = try std.process.spawn(io, spawn_opts);
         const worker_stream = try setup.server.accept(io);
         const socket = worker_stream.socket.handle;
+        if (cfg.transport == .tcp) protocol.setTcpNodelay(socket);
         // Set read timeout to avoid blocking conductor if worker becomes unresponsive
         platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
         var magic_buf: [4]u8 = undefined;

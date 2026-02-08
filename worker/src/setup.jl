@@ -71,6 +71,7 @@ end
 const SIGNAL_EXIT = 0x01
 const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
 const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
+const SIGNAL_NODELAY = 0x04    # disable Nagle on stdin+signals (low-latency connection)
 
 function send_signal(io::IO, id::UInt8, data::Vector{UInt8})
     write(io, id, UInt8(length(data)), data)
@@ -193,10 +194,20 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
                         end
                         send_sockets(conn, stdin_path, stdout_path, stderr_path, signals_path, active_count)
                         # Accept connections and spawn client handler
+                        is_tcp = stdin_srv isa Sockets.TCPServer
+                        t0 = if is_tcp time_ns() else 0 end
                         client_stdin = accept(stdin_srv)
                         client_stdout = accept(stdout_srv)
                         client_stderr = accept(stderr_srv)
                         signals = accept(signals_srv)
+                        if is_tcp
+                            Sockets.nagle(signals, false)
+                            if time_ns() - t0 < 40_000_000
+                                Sockets.nagle(client_stdout, false)
+                                Sockets.nagle(client_stderr, false)
+                                send_signal(signals, SIGNAL_NODELAY, UInt8[])
+                            end
+                        end
                         close(stdin_srv); close(stdout_srv); close(stderr_srv); close(signals_srv)
                         task = Threads.@spawn try
                             runclient(client, client_stdin, client_stdout, client_stderr, signals)

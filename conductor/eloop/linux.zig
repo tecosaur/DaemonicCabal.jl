@@ -108,6 +108,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                 .accept => {
                     if (cqe.res >= 0) {
                         const client_fd: posix.fd_t = @intCast(cqe.res);
+                        if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
                         conductor.handleConnectionFd(client_fd) catch |err| {
                             std.debug.print("Client handling failed: {}\n", .{err});
                         };

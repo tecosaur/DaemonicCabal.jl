@@ -75,6 +75,7 @@ pub const signals = struct {
     pub const exit: u8 = 0x01;
     pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw
     pub const query_size: u8 = 0x03; // response: height(u16) + width(u16)
+    pub const nodelay: u8 = 0x04;    // disable Nagle on stdin+signals (low-latency connection)
 };
 
 // Event user_data encoding for io_uring:
@@ -210,6 +211,11 @@ pub const Address = struct {
     mode: TransportMode,
     addr: []const u8,
 };
+
+/// Disable Nagle's algorithm on a TCP socket.
+pub fn setTcpNodelay(fd: std.posix.socket_t) void {
+    std.posix.setsockopt(fd, 6, 1, std.mem.asBytes(&@as(c_int, 1))) catch {};
+}
 
 /// Detect transport mode from address string, stripping any `tcp://` scheme prefix.
 /// `tcp://host[:port]` or bare `host[:port]` → tcp; paths (containing `/` or starting with `.`) → unix.
