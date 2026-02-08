@@ -390,12 +390,14 @@ pub const Conductor = struct {
         const now = self.currentTime();
         const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, now);
         std.debug.print("Assigned client {d} to worker {d}: {s}\n", .{ self.client_counter, assignment.w.id, @tagName(assignment.reason) });
-        defer self.allocator.free(assignment.paths.stdio);
+        defer self.allocator.free(assignment.paths.stdin);
+        defer self.allocator.free(assignment.paths.stdout);
+        defer self.allocator.free(assignment.paths.stderr);
         defer self.allocator.free(assignment.paths.signals);
         assignment.w.last_pinged = now;
         assignment.w.recordPpid(request.ppid, self.cfg.worker_maxclients);
         try self.registerClient(request.pid, self.client_counter, assignment.w);
-        self.sendSocketPaths(socket, assignment.paths.stdio, assignment.paths.signals);
+        self.sendSocketPaths(socket, assignment.paths);
     }
 
     // --- Worker selection ---
@@ -809,34 +811,57 @@ pub const Conductor = struct {
     }
 
     fn serveString(self: *Conductor, client_socket: posix.socket_t, content: []const u8) !void {
-        var stdio_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var stdin_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var stdout_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var stderr_buf: [std.fs.max_path_bytes]u8 = undefined;
         var signals_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const stdio_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "stdio.sock", &stdio_buf);
+        const stdin_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "stdin.sock", &stdin_buf);
+        const stdout_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "stdout.sock", &stdout_buf);
+        const stderr_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "stderr.sock", &stderr_buf);
         const signals_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "signals.sock", &signals_buf);
-        const stdio_addr = try Io.net.UnixAddress.init(stdio_path);
-        var stdio_server = try stdio_addr.listen(self.io, .{});
-        defer stdio_server.deinit(self.io);
-        defer Io.Dir.deleteFileAbsolute(self.io, stdio_path) catch {};
+        const stdin_addr = try Io.net.UnixAddress.init(stdin_path);
+        var stdin_server = try stdin_addr.listen(self.io, .{});
+        defer stdin_server.deinit(self.io);
+        defer Io.Dir.deleteFileAbsolute(self.io, stdin_path) catch {};
+        const stdout_addr = try Io.net.UnixAddress.init(stdout_path);
+        var stdout_server = try stdout_addr.listen(self.io, .{});
+        defer stdout_server.deinit(self.io);
+        defer Io.Dir.deleteFileAbsolute(self.io, stdout_path) catch {};
+        const stderr_addr = try Io.net.UnixAddress.init(stderr_path);
+        var stderr_server = try stderr_addr.listen(self.io, .{});
+        defer stderr_server.deinit(self.io);
+        defer Io.Dir.deleteFileAbsolute(self.io, stderr_path) catch {};
         const signals_addr = try Io.net.UnixAddress.init(signals_path);
         var signals_server = try signals_addr.listen(self.io, .{});
         defer signals_server.deinit(self.io);
         defer Io.Dir.deleteFileAbsolute(self.io, signals_path) catch {};
-        self.sendSocketPaths(client_socket, stdio_path, signals_path);
-        const stdio_conn = try stdio_server.accept(self.io);
-        defer stdio_conn.close(self.io);
+        self.sendSocketPaths(client_socket, .{
+            .stdin = stdin_path, .stdout = stdout_path,
+            .stderr = stderr_path, .signals = signals_path,
+        });
+        const stdin_conn = try stdin_server.accept(self.io);
+        defer stdin_conn.close(self.io);
+        const stdout_conn = try stdout_server.accept(self.io);
+        defer stdout_conn.close(self.io);
+        const stderr_conn = try stderr_server.accept(self.io);
+        defer stderr_conn.close(self.io);
         const signals_conn = try signals_server.accept(self.io);
         defer signals_conn.close(self.io);
-        platform.write(stdio_conn.socket.handle, content);
+        platform.write(stdout_conn.socket.handle, content);
+        // Shut down output streams then send exit signal
+        stdout_conn.shutdown(self.io, .send) catch {};
+        stderr_conn.shutdown(self.io, .send) catch {};
         platform.write(signals_conn.socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00 });
-        stdio_conn.shutdown(self.io, .send) catch {};
         signals_conn.shutdown(self.io, .send) catch {};
     }
 
-    fn sendSocketPaths(_: *Conductor, socket: posix.socket_t, stdio: []const u8, signals: []const u8) void {
-        var buf: [512]u8 = undefined;
+    fn sendSocketPaths(_: *Conductor, socket: posix.socket_t, paths: worker.Worker.SocketPaths) void {
+        var buf: [1024]u8 = undefined;
         var w = protocol.BufWriter{ .buf = &buf };
-        w.writeLenPrefixed(u16, stdio);
-        w.writeLenPrefixed(u16, signals);
+        w.writeLenPrefixed(u16, paths.stdin);
+        w.writeLenPrefixed(u16, paths.stdout);
+        w.writeLenPrefixed(u16, paths.stderr);
+        w.writeLenPrefixed(u16, paths.signals);
         platform.write(socket, w.written());
     }
 };
