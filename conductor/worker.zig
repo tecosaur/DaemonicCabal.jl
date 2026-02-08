@@ -217,7 +217,9 @@ pub const Worker = struct {
     }
 
     pub const SocketPaths = struct {
-        stdio: []const u8,
+        stdin: []const u8,
+        stdout: []const u8,
+        stderr: []const u8,
         signals: []const u8,
     };
 
@@ -298,21 +300,31 @@ pub const Worker = struct {
         const payload = try allocator.alloc(u8, header.payload_len);
         defer allocator.free(payload);
         try readExact(self.socket, payload);
-        // Parse: active_clients (u32) + stdio path + signals path
+        // Parse: active_clients (u32) + stdin path + stdout path + stderr path + signals path
         var rpos: usize = 0;
         self.active_clients = std.mem.readInt(u32, payload[rpos..][0..4], .little);
         rpos += 4;
-        const stdio_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
+        const stdin_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
         rpos += 2;
-        // Empty stdio path means worker rejected (at capacity)
-        if (stdio_len == 0) return error.WorkerBusy;
-        const stdio = try allocator.dupe(u8, payload[rpos..][0..stdio_len]);
-        errdefer allocator.free(stdio);
-        rpos += stdio_len;
+        // Empty stdin path means worker rejected (at capacity)
+        if (stdin_len == 0) return error.WorkerBusy;
+        const stdin_path = try allocator.dupe(u8, payload[rpos..][0..stdin_len]);
+        errdefer allocator.free(stdin_path);
+        rpos += stdin_len;
+        const stdout_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
+        rpos += 2;
+        const stdout_path = try allocator.dupe(u8, payload[rpos..][0..stdout_len]);
+        errdefer allocator.free(stdout_path);
+        rpos += stdout_len;
+        const stderr_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
+        rpos += 2;
+        const stderr_path = try allocator.dupe(u8, payload[rpos..][0..stderr_len]);
+        errdefer allocator.free(stderr_path);
+        rpos += stderr_len;
         const signals_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
         rpos += 2;
-        const signals = try allocator.dupe(u8, payload[rpos..][0..signals_len]);
-        return .{ .stdio = stdio, .signals = signals };
+        const signals_path = try allocator.dupe(u8, payload[rpos..][0..signals_len]);
+        return .{ .stdin = stdin_path, .stdout = stdout_path, .stderr = stderr_path, .signals = signals_path };
     }
 };
 

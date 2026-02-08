@@ -12,7 +12,7 @@ const STATE = (
     soft_exit = Ref(false),
     conductor_conn = Ref{Union{IO, Nothing}}(nothing),
     conductor_socket = Ref(""),
-    standby_sockets = Ref{Union{Nothing, NTuple{2, Pair{Sockets.PipeServer, String}}}}(nothing),
+    standby_sockets = Ref{Union{Nothing, NTuple{4, Pair{Sockets.PipeServer, String}}}}(nothing),
     standby_module = Ref{Union{Nothing, Module}}(nothing))
 
 # Configuration (set during runworker from environment)
@@ -92,21 +92,24 @@ function create_socket()::Pair{Sockets.PipeServer, String}
     Sockets.listen(path) => path
 end
 
-# Get sockets for a new client, using standby if available
-function get_client_sockets()::NTuple{2, Pair{Sockets.PipeServer, String}}
+# Get sockets for a new client (stdin, stdout, stderr, signals), using standby if available
+function get_client_sockets()::NTuple{4, Pair{Sockets.PipeServer, String}}
     sockets = @lock STATE.lock begin
         s = STATE.standby_sockets[]
         STATE.standby_sockets[] = nothing
         s
     end
-    isnothing(sockets) ? (create_socket(), create_socket()) : sockets
+    if isnothing(sockets)
+        (create_socket(), create_socket(), create_socket(), create_socket())
+    else
+        sockets
+    end
 end
-
 # Ensure standby sockets exist (called after client disconnect or on startup)
 function ensure_standby_sockets()
     @lock STATE.lock begin
         if isnothing(STATE.standby_sockets[])
-            STATE.standby_sockets[] = (create_socket(), create_socket())
+            STATE.standby_sockets[] = (create_socket(), create_socket(), create_socket(), create_socket())
         end
     end
 end
@@ -149,26 +152,27 @@ function runworker(socketpath::String, worker_number::Int=-1)
                 active_count = @lock STATE.lock length(STATE.clients)
                 if !client.force && MAX_CLIENTS > 0 && active_count >= MAX_CLIENTS
                     # Reject: send empty paths with current count
-                    send_sockets(conn, "", "", active_count)
+                    send_sockets(conn, "", "", "", "", active_count)
                 else
                     try
-                        (stdio_server, stdio_path), (signals_server, signals_path) = get_client_sockets()
+                        (stdin_srv, stdin_path), (stdout_srv, stdout_path),
+                            (stderr_srv, stderr_path), (signals_srv, signals_path) = get_client_sockets()
                         # Register client and get count (before sending response)
                         active_count = @lock STATE.lock begin
                             push!(STATE.clients, (time(), client))
                             length(STATE.clients)
                         end
-                        send_sockets(conn, stdio_path, signals_path, active_count)
+                        send_sockets(conn, stdin_path, stdout_path, stderr_path, signals_path, active_count)
                         # Accept connections and spawn client handler
-                        stdio = accept(stdio_server)
-                        signals = accept(signals_server)
-                        # Clean up server sockets (paths remain for client to connect)
-                        close(stdio_server)
-                        close(signals_server)
+                        client_stdin = accept(stdin_srv)
+                        client_stdout = accept(stdout_srv)
+                        client_stderr = accept(stderr_srv)
+                        signals = accept(signals_srv)
+                        close(stdin_srv); close(stdout_srv); close(stderr_srv); close(signals_srv)
                         task = Threads.@spawn try
-                            runclient(client, stdio, signals)
+                            runclient(client, client_stdin, client_stdout, client_stderr, signals)
                         catch
-                            isopen(stdio) && rethrow()
+                            isopen(client_stdout) && rethrow()
                         end
                         @lock STATE.lock STATE.client_tasks[client.pid] = task
                     catch err

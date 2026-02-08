@@ -93,11 +93,16 @@ function send_notification(socket_path::AbstractString, type::UInt8, payload...)
 end
 
 # Send SOCKETS response with socket paths and active client count
-function send_sockets(conn::IO, stdio_path::AbstractString, signals_path::AbstractString, active_clients::Integer)
-    payload_len = 4 + 2 + ncodeunits(stdio_path) + 2 + ncodeunits(signals_path)
+function send_sockets(conn::IO, stdin_path::AbstractString, stdout_path::AbstractString,
+                      stderr_path::AbstractString, signals_path::AbstractString,
+                      active_clients::Integer)
+    payload_len = 4 + 2 + ncodeunits(stdin_path) + 2 + ncodeunits(stdout_path) +
+                      2 + ncodeunits(stderr_path) + 2 + ncodeunits(signals_path)
     write_header(conn, MSG_TYPE.sockets, payload_len)
     write(conn, UInt32(active_clients))
-    write_string(conn, stdio_path)
+    write_string(conn, stdin_path)
+    write_string(conn, stdout_path)
+    write_string(conn, stderr_path)
     write_string(conn, signals_path)
     flush(conn)
 end

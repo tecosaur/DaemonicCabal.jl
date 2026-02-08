@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //
 // BSD/macOS kqueue-based event loop for the client.
-// Multiplexes stdin, stdout (from worker), and signals socket.
+// Multiplexes local stdin, worker stdout, worker stderr, and signals socket.
 
 const std = @import("std");
 const c = std.c;
@@ -18,21 +18,25 @@ const EV_ERROR: u16 = if (@hasDecl(c.EV, "ERROR")) c.EV.ERROR else 0x4000;
 // Event identifiers stored in udata
 const UDATA_STDIN: usize = 0;
 const UDATA_STDOUT: usize = 1;
-const UDATA_SIGNALS: usize = 2;
+const UDATA_STDERR: usize = 2;
+const UDATA_SIGNALS: usize = 3;
 
 /// Run the client I/O loop using kqueue.
 /// Returns exit code when complete.
 pub fn run(
-    stdio_fd: posix.fd_t,
+    stdin_fd: posix.fd_t,
+    stdout_fd: posix.fd_t,
+    stderr_fd: posix.fd_t,
     signals_fd: posix.fd_t,
     signal_parser: anytype,
 ) !u8 {
     const kq = c.kqueue();
     if (kq == -1) return error.KqueueCreateFailed;
     defer _ = c.close(kq);
-    // Register reads on worker stdout and signals (required)
-    var changes: [2]c.Kevent = .{
-        makeKevent(@intCast(stdio_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDOUT),
+    // Register reads on worker stdout, stderr, and signals (required)
+    var changes: [3]c.Kevent = .{
+        makeKevent(@intCast(stdout_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDOUT),
+        makeKevent(@intCast(stderr_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDERR),
         makeKevent(@intCast(signals_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_SIGNALS),
     };
     var dummy: [1]c.Kevent = undefined;
@@ -47,11 +51,13 @@ pub fn run(
     // Buffers
     const buf_size = 1024;
     var stdout_buf: [buf_size]u8 = undefined;
+    var stderr_buf: [buf_size]u8 = undefined;
     var stdin_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
     // State
     var exit_code: ?u8 = null;
     var stdout_eof = false;
+    var stderr_eof = false;
     // Event buffer
     var events: [8]c.Kevent = undefined;
     var no_changes: [0]c.Kevent = undefined;
@@ -69,7 +75,7 @@ pub fn run(
                 UDATA_STDOUT => {
                     // Read available data first (kqueue can set EV_EOF with data still pending)
                     if (ev.data > 0) {
-                        const n = posix.read(stdio_fd, &stdout_buf) catch {
+                        const n = posix.read(stdout_fd, &stdout_buf) catch {
                             stdout_eof = true;
                             continue;
                         };
@@ -79,12 +85,28 @@ pub fn run(
                         stdout_eof = true;
                     }
                 },
+                UDATA_STDERR => {
+                    if (ev.data > 0) {
+                        const n = posix.read(stderr_fd, &stderr_buf) catch {
+                            stderr_eof = true;
+                            continue;
+                        };
+                        if (n > 0) platform.write(posix.STDERR_FILENO, stderr_buf[0..n]);
+                    }
+                    if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
+                        stderr_eof = true;
+                    }
+                },
                 UDATA_STDIN => {
                     if (exit_code != null) continue;
                     // Read pending data first (kqueue can set EV_EOF with data still pending)
                     if (ev.data > 0) {
                         const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch 0;
-                        if (n > 0) platform.write(stdio_fd, stdin_buf[0..n]);
+                        if (n > 0) platform.write(stdin_fd, stdin_buf[0..n]);
+                    }
+                    // Close stdin socket on local stdin EOF so worker sees EOF
+                    if ((ev.flags & EV_EOF) != 0) {
+                        posix.close(stdin_fd);
                     }
                 },
                 UDATA_SIGNALS => {
@@ -108,8 +130,8 @@ pub fn run(
                 else => {},
             }
         }
-        // Exit only when we have both exit code AND stdout is drained
-        if (exit_code != null and stdout_eof) {
+        // Exit only when we have exit code AND both output streams are drained
+        if (exit_code != null and stdout_eof and stderr_eof) {
             return exit_code.?;
         }
     }

@@ -75,19 +75,22 @@ function getval(pairlist, key, default)
     if isnothing(index) default else last(pairlist[index]) end
 end
 
-function runclient(client::ClientInfo, stdio::Base.PipeEndpoint, signals::Base.PipeEndpoint)
+function runclient(client::ClientInfo, client_stdin::Base.PipeEndpoint,
+                   client_stdout::Base.PipeEndpoint, client_stderr::Base.PipeEndpoint,
+                   signals::Base.PipeEndpoint)
     hascolor = getval(client.switches, "--color",
                       ifelse(startswith(getval(client.env, "TERM", ""),
                                         "xterm"),
                              "yes", "")) == "yes"
-    stdiox = IOContext(stdio, :color => hascolor)
+    stdoutx = IOContext(client_stdout, :color => hascolor)
+    stderrx = IOContext(client_stderr, :color => hascolor)
     mod = prepare_module(client)
     exit_code = 0
     try
         withenv(client.env...) do
             @static if VERSION < v"1.11"
-                redirect_stdio(stdin=stdiox, stdout=stdiox, stderr=stdiox) do
-                    runclient(mod, client; stdout=stdiox)
+                redirect_stdio(stdin=client_stdin, stdout=stdoutx, stderr=stderrx) do
+                    runclient(mod, client; stdout=stdoutx)
                 end
             else
                 term = get(ENV, "TERM", @static Sys.iswindows() ? "" : "dumb")
@@ -104,35 +107,40 @@ function runclient(client::ClientInfo, stdio::Base.PipeEndpoint, signals::Base.P
                     hascolor
                 end
                 client_vterm = VirtualTerm(
-                    stdio, stdio, stdio, signals,
+                    client_stdin, client_stdout, client_stderr, signals,
                     term, get(TERMINFOS, term, nothing),
                     color, nothing)
                 with(ACTIVE_TERM => client_vterm) do
-                    runclient(mod, client; stdout=stdiox)
+                    runclient(mod, client; stdout=stdoutx)
                 end
             end
         end
     catch err
         if err isa DaemonClientExit
             exit_code = err.code
-        elseif isopen(stdio)
+        elseif isopen(client_stdout)
             # TODO trim the stacktrace
             Base.invokelatest(
                 Base.display_error,
-                stdiox,
+                stderrx,
                 Base.scrub_repl_backtrace(
                     current_exceptions()))
             exit_code = 1
         end
     finally
-        # Close stdio first to ensure all output is flushed before sending exit signal.
-        # Client waits for stdio EOF to guarantee output is drained.
-        if isopen(stdio)
-            try flush(stdio) catch end
-            try close(stdio) catch end
-            send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
+        # Close output streams first to ensure all output is flushed before sending
+        # exit signal. Client waits for stdout+stderr EOF to guarantee output is drained.
+        for stream in (client_stdout, client_stderr)
+            if isopen(stream)
+                try flush(stream) catch end
+                try close(stream) catch end
+            end
         end
-        try close(signals) catch end
+        if isopen(signals)
+            send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
+            try close(signals) catch end
+        end
+        try close(client_stdin) catch end
         @lock STATE.lock begin
             client_index = findfirst(e -> last(e) === client, STATE.clients)
             if !isnothing(client_index)

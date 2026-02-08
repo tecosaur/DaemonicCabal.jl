@@ -34,6 +34,10 @@ pub fn getStdoutHandle() std.posix.fd_t {
     if (os == .windows) return impl.getStdoutHandle();
     return impl.STDOUT_HANDLE;
 }
+pub fn getStderrHandle() std.posix.fd_t {
+    if (os == .windows) return impl.getStderrHandle();
+    return impl.STDERR_HANDLE;
+}
 
 // Shared POSIX / Windows-specific
 const shared = if (os != .windows) @import("posix.zig") else impl;

@@ -38,8 +38,10 @@
     @eval function Base.display_error(io::IO, stack::Base.ExceptionStack)
         if !isempty(stack) && first(stack).exception isa DaemonClientExit
             exit = first(stack).exception
-            close(ACTIVE_TERM[].stdout)
-            send_signal(ACTIVE_TERM[].signals, SIGNAL_EXIT, UInt8[exit.code % UInt8])
+            term = ACTIVE_TERM[]
+            try close(term.stdout) catch end
+            try close(term.stderr) catch end
+            send_signal(term.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8])
             display(exit)
         else
             printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
