@@ -38,28 +38,14 @@ elseif Sys.isapple()
 elseif Sys.isbsd()
     include("installers/bsd.jl")
 else
-    @doc """
-    install()
-Setup the daemon and client on this machine.
-!!! warning
-    This is currently unimplemented for $(Sys.KERNEL)!
-"""
-    function install()
-        @error "This functionality is currently only implemented for Linux, macOS, and BSD.\n" *
-            "If you're up for it, consider making a PR to add support for $(Sys.KERNEL) 🙂"
+    function install_service(::Dict{String,String})
+        @error "Service installation is not implemented for $(Sys.KERNEL).\n" *
+            "If you're up for it, consider making a PR to add support 🙂"
     end
-
-    @doc """
-    uninstall()
-Undo `install()`.
-!!! warning
-    This is currently unimplemented for $(Sys.KERNEL)!
-"""
-    function uninstall()
-        @error "This functionality is currently only implemented for Linux, macOS, and BSD.\n" *
-            "If you're up for it, consider making a PR to add support for $(Sys.KERNEL) 🙂"
+    function uninstall_service()
+        @error "Service removal is not implemented for $(Sys.KERNEL).\n" *
+            "If you're up for it, consider making a PR to add support 🙂"
     end
-
     __init__() = @warn "DaemonicCabal is not supported on $(Sys.KERNEL) systems (yet)"
 end
 
