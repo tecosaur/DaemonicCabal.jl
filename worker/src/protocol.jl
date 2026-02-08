@@ -81,10 +81,25 @@ function send_pong(conn::IO, active_clients::Integer)
     flush(conn)
 end
 
+# --- Dual transport (Unix sockets / TCP) ---
+
+is_tcp_address(addr::AbstractString) =
+    !startswith(addr, '/') && !startswith(addr, '.') && !contains(addr, '/') && contains(addr, ':')
+
+# Connect to an address (Unix path or host:port)
+function connect_to(address::AbstractString)
+    if is_tcp_address(address)
+        host, port = rsplit(address, ':', limit=2)
+        Sockets.connect(Sockets.IPv4(String(host)), parse(Int, port))
+    else
+        Sockets.connect(address)
+    end
+end
+
 # Send notification to conductor via main socket
-function send_notification(socket_path::AbstractString, type::UInt8, payload...)
+function send_notification(address::AbstractString, type::UInt8, payload...)
     try
-        conn = Sockets.connect(socket_path)
+        conn = connect_to(address)
         write(conn, NOTIFICATION_MAGIC, type, payload...)
         close(conn)
     catch
@@ -135,6 +150,7 @@ struct ClientInfo
     switches::Vector{Tuple{String, String}}
     programfile::Union{Nothing, String}
     args::Vector{String}
+    port_set::Int  # PortPool index, or 0xFFFF when unmanaged
 end
 
 # Read CLIENT_RUN payload
@@ -173,6 +189,7 @@ function read_client_run(conn::IO, payload_len::Integer)
     for i in 1:arg_count
         args[i] = read_string(conn)
     end
-    ClientInfo(tty, force, pid, cwd, env, switches, programfile, args)
+    port_set = Int(read(conn, UInt16))
+    ClientInfo(tty, force, pid, cwd, env, switches, programfile, args, port_set)
 end
 

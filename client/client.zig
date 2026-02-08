@@ -56,7 +56,9 @@ const SocketWriter = struct {
 };
 
 const SocketSet = struct {
-    stdio: Io.net.Stream,
+    stdin: Io.net.Stream,
+    stdout: Io.net.Stream,
+    stderr: Io.net.Stream,
     signals: Io.net.Stream,
 };
 
@@ -143,16 +145,17 @@ const SignalParser = struct {
 
 // Global socket set (needed for signal handler which can't capture state)
 var sockets: SocketSet = undefined;
-// Conductor socket path for exit notification (global buffer so it outlives connectToConductor)
+// Conductor address for exit notification (global buffer so it outlives connectToConductor)
 var conductor_path_buf: [max_socket_path]u8 = undefined;
 var conductor_path: []const u8 = &.{};
+var transport_mode: protocol.TransportMode = .unix;
 var signal_parser = SignalParser{};
 
 // --- Signal handler wiring ---
 
-fn signalWriteStdio(ptr: *anyopaque, data: []const u8) void {
+fn signalWriteStdin(ptr: *anyopaque, data: []const u8) void {
     const sock_set: *SocketSet = @ptrCast(@alignCast(ptr));
-    platform.socketWrite(sock_set.stdio.socket.handle, data);
+    platform.socketWrite(sock_set.stdin.socket.handle, data);
 }
 
 fn signalNotifyExit() void {
@@ -163,7 +166,7 @@ fn signalNotifyExit() void {
 fn registerSignalHandlers() void {
     platform.registerSignalHandlers(.{
         .sockets_ptr = @ptrCast(&sockets),
-        .write_fn = &signalWriteStdio,
+        .write_fn = &signalWriteStdin,
         .notify_exit_fn = &signalNotifyExit,
     });
 }
@@ -171,7 +174,9 @@ fn registerSignalHandlers() void {
 // --- Main pipeline ---
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    const env = scanEnv(init.environ.block);
+    var env = scanEnv(init.environ.block);
+    const addr_arg = extractAddressArg(init.args.vector);
+    if (addr_arg.value) |addr| env.server_path = addr;
     // Set raw mode for TTY to avoid line buffering
     const is_tty = platform.isatty(platform.getStdinHandle());
     if (is_tty) platform.setRawMode(true);
@@ -180,7 +185,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const conductor = try connectToConductor(env);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor.socket.handle };
-    try sendClientInfo(&w, env, is_tty, init.args);
+    try sendClientInfo(&w, env, is_tty, init.args, addr_arg.skip);
     // Get worker socket paths (conductor may request full env on cache miss)
     sockets = try connectToWorker(conductor, &w, env, init.environ.block);
     // Forward signals to worker instead of terminating
@@ -219,20 +224,34 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
     const runtime_dir = env.runtime_dir orelse
         try platform.defaultRuntimeDir(&runtime_dir_buf, env.xdg_runtime_dir, env.home);
-    conductor_path = env.server_path orelse
+    const raw_path = env.server_path orelse
         std.fmt.bufPrint(&conductor_path_buf, "{s}/conductor.sock", .{runtime_dir}) catch return error.NameTooLong;
-    const path = conductor_path;
+    const parsed = protocol.parseAddress(raw_path) catch {
+        std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and unix paths are supported.\n", .{raw_path});
+        std.process.exit(1);
+    };
+    transport_mode = parsed.mode;
+    conductor_path = parsed.addr;
+    const addr = conductor_path;
     // First attempt
-    if (connectUnix(path)) |stream| return stream else |_| {}
-    // Connection failed - try to signal conductor to recreate socket
-    var pid_buf: [max_socket_path]u8 = undefined;
-    const pid_path = std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong;
-    if (readPidAndSignal(pid_path)) {
-        // Wait up to 2 seconds for socket to be recreated, checking every 100ms
+    if (protocol.connectAddress(io, transport_mode, addr)) |stream| return stream else |_| {}
+    // In TCP mode, no PID file / SIGUSR1 recovery — just retry briefly
+    if (transport_mode == .tcp) {
         var attempts: u32 = 0;
         while (attempts < 20) : (attempts += 1) {
             Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
-            if (connectUnix(path)) |stream| return stream else |_| {}
+            if (protocol.connectAddress(io, transport_mode, addr)) |stream| return stream else |_| {}
+        }
+    } else {
+        // Unix mode: try to signal conductor to recreate socket
+        var pid_buf: [max_socket_path]u8 = undefined;
+        const pid_path = std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong;
+        if (readPidAndSignal(pid_path)) {
+            var attempts: u32 = 0;
+            while (attempts < 20) : (attempts += 1) {
+                Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
+                if (connectUnix(addr)) |stream| return stream else |_| {}
+            }
         }
     }
     // Give up
@@ -243,7 +262,9 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
         \\
         \\  {s}
         \\
-    , .{ path, switch (builtin.os.tag) {
+        \\Or specify a different address with -a <addr>
+        \\
+    , .{ addr, switch (builtin.os.tag) {
         .linux => "systemctl --user restart julia-daemon",
         .macos => "launchctl kickstart -k gui/$(id -u)/net.julialang.julia-daemon",
         else => "pkill -f julia-conductor && julia-conductor &",
@@ -251,7 +272,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     std.process.exit(127);
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args) !void {
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args, skip: [2]usize) !void {
     // Header: magic + flags + reserved + pid + ppid
     w.writeInt(u32, protocol.client.magic);
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty }));
@@ -267,42 +288,59 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.pr
     w.pos += cwd_len;
     // Environment fingerprint
     w.writeInt(u64, env.fingerprint);
-    // Args (count known upfront from the args vector)
-    w.writeInt(u16, @intCast(raw_args.vector.len));
-    for (raw_args.vector) |arg_ptr| {
+    // Args (skip address flag indices — client-only, not forwarded)
+    const skip_count = @as(u16, if (skip[0] != sentinel) 1 else 0) +
+        @as(u16, if (skip[1] != sentinel) 1 else 0);
+    w.writeInt(u16, @intCast(raw_args.vector.len - skip_count));
+    for (raw_args.vector, 0..) |arg_ptr, i| {
+        if (i == skip[0] or i == skip[1]) continue;
         w.writeLenPrefixed(u16, std.mem.span(arg_ptr));
     }
     w.flush();
 }
 
 fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, block: EnvBlock) !SocketSet {
-    var buf: [512]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var sr = conductor.reader(io, &buf);
     const reader = &sr.interface;
-    // First byte is either '?' (env request) or low byte of stdio path length
+    // First byte is either '?' (env request) or low byte of stdin path length
     const first_byte = try reader.takeByte();
     if (first_byte == protocol.client.env_request) {
         sendFullEnv(w, env, block);
     }
-    // Read length-prefixed socket paths (reconstruct length if we already read first byte)
-    const stdio_len: usize = if (first_byte == protocol.client.env_request)
+    // Read 4 length-prefixed socket paths: stdin, stdout, stderr, signals
+    // (reconstruct first path length if we already consumed the first byte)
+    const stdin_len: usize = if (first_byte == protocol.client.env_request)
         try reader.takeInt(u16, .little)
     else
         @as(u16, first_byte) | (@as(u16, try reader.takeByte()) << 8);
-    var stdio_buf: [max_socket_path]u8 = undefined;
-    if (stdio_len > stdio_buf.len) return error.NameTooLong;
-    const stdio_path = stdio_buf[0..stdio_len];
-    try reader.readSliceAll(stdio_path);
+    var stdin_buf: [max_socket_path]u8 = undefined;
+    if (stdin_len > stdin_buf.len) return error.NameTooLong;
+    const stdin_path = stdin_buf[0..stdin_len];
+    try reader.readSliceAll(stdin_path);
+    const stdout_len: usize = try reader.takeInt(u16, .little);
+    var stdout_buf: [max_socket_path]u8 = undefined;
+    if (stdout_len > stdout_buf.len) return error.NameTooLong;
+    const stdout_path = stdout_buf[0..stdout_len];
+    try reader.readSliceAll(stdout_path);
+    const stderr_len: usize = try reader.takeInt(u16, .little);
+    var stderr_buf: [max_socket_path]u8 = undefined;
+    if (stderr_len > stderr_buf.len) return error.NameTooLong;
+    const stderr_path = stderr_buf[0..stderr_len];
+    try reader.readSliceAll(stderr_path);
     const signals_len: usize = try reader.takeInt(u16, .little);
     var signals_buf: [max_socket_path]u8 = undefined;
     if (signals_len > signals_buf.len) return error.NameTooLong;
     const signals_path = signals_buf[0..signals_len];
     try reader.readSliceAll(signals_path);
     conductor.close(io);
-    // Connect to worker sockets and clean up socket files
-    const stdio = connectAndCleanup(stdio_path, "stdio");
-    const signals = connectAndCleanup(signals_path, "signals");
-    return .{ .stdio = stdio, .signals = signals };
+    // Connect to worker sockets (and clean up socket files in unix mode)
+    return .{
+        .stdin = connectToWorkerSocket(stdin_path, "stdin"),
+        .stdout = connectToWorkerSocket(stdout_path, "stdout"),
+        .stderr = connectToWorkerSocket(stderr_path, "stderr"),
+        .signals = connectToWorkerSocket(signals_path, "signals"),
+    };
 }
 
 fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
@@ -318,9 +356,13 @@ fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
 }
 
 fn runEventLoop() !void {
-    const stdio_fd = sockets.stdio.socket.handle;
-    const signals_fd = sockets.signals.socket.handle;
-    const exit_code = try eloop.run(stdio_fd, signals_fd, &signal_parser);
+    const exit_code = try eloop.run(
+        sockets.stdin.socket.handle,
+        sockets.stdout.socket.handle,
+        sockets.stderr.socket.handle,
+        sockets.signals.socket.handle,
+        &signal_parser,
+    );
     notifyExit();
     std.process.exit(exit_code);
 }
@@ -331,13 +373,31 @@ fn connectUnix(path: []const u8) !Io.net.Stream {
     return (try Io.net.UnixAddress.init(path)).connect(io);
 }
 
-fn connectAndCleanup(path: []const u8, comptime label: []const u8) Io.net.Stream {
-    const stream = connectUnix(path) catch |e| {
-        std.debug.print("Failed to connect to worker " ++ label ++ " socket: {s}: {}\n", .{ path, e });
+fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Stream {
+    // In TCP mode the conductor sends just `:port` — prepend the conductor host
+    var addr_buf: [max_socket_path]u8 = undefined;
+    const addr = if (raw.len > 0 and raw[0] == ':') blk: {
+        const host = conductorHost();
+        if (host.len + raw.len > addr_buf.len) {
+            std.debug.print("Worker " ++ label ++ " address too long\n", .{});
+            std.process.exit(127);
+        }
+        @memcpy(addr_buf[0..host.len], host);
+        @memcpy(addr_buf[host.len..][0..raw.len], raw);
+        break :blk addr_buf[0 .. host.len + raw.len];
+    } else raw;
+    const mode = (protocol.parseAddress(addr) catch unreachable).mode;
+    const stream = protocol.connectAddress(io, mode, addr) catch |e| {
+        std.debug.print("Failed to connect to worker " ++ label ++ " socket: {s}: {}\n", .{ addr, e });
         std.process.exit(127);
     };
-    Io.Dir.deleteFileAbsolute(io, path) catch {};
+    if (mode == .unix) Io.Dir.deleteFileAbsolute(io, raw) catch {};
     return stream;
+}
+
+fn conductorHost() []const u8 {
+    const colon = std.mem.lastIndexOfScalar(u8, conductor_path, ':') orelse return conductor_path;
+    return conductor_path[0..colon];
 }
 
 fn readPidAndSignal(pid_path: []const u8) bool {
@@ -352,8 +412,7 @@ fn readPidAndSignal(pid_path: []const u8) bool {
 }
 
 fn notifyExit() void {
-    const addr = Io.net.UnixAddress.init(conductor_path) catch return;
-    const stream = addr.connect(io) catch return;
+    const stream = protocol.connectAddress(io, transport_mode, conductor_path) catch return;
     defer stream.close(io);
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
@@ -369,3 +428,30 @@ fn getTerminalSize() struct { height: u16, width: u16 } {
     return .{ .height = 24, .width = 80 }; // fallback
 }
 
+const sentinel = std.math.maxInt(usize);
+
+const AddressArg = struct {
+    value: ?[]const u8,
+    skip: [2]usize, // indices to omit when forwarding; sentinel = unused
+};
+
+fn extractAddressArg(vector: []const ?[*:0]const u8) AddressArg {
+    const none = AddressArg{ .value = null, .skip = .{ sentinel, sentinel } };
+    for (vector, 0..) |entry, i| {
+        if (i == 0) continue;
+        const arg = std.mem.span(entry orelse continue);
+        if (std.mem.eql(u8, arg, "--")) return none;
+        // --address=<value> or -a<value>
+        if (std.mem.startsWith(u8, arg, "--address="))
+            return .{ .value = arg["--address=".len..], .skip = .{ i, sentinel } };
+        if (arg.len > 2 and arg[0] == '-' and arg[1] == 'a')
+            return .{ .value = arg[2..], .skip = .{ i, sentinel } };
+        // --address <value> or -a <value>
+        if (std.mem.eql(u8, arg, "--address") or std.mem.eql(u8, arg, "-a")) {
+            const next = if (i + 1 < vector.len) vector[i + 1] else null;
+            if (next) |v| return .{ .value = std.mem.span(v), .skip = .{ i, i + 1 } };
+            return none;
+        }
+    }
+    return none;
+}

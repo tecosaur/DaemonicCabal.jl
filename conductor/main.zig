@@ -24,6 +24,7 @@ else
 
 const readExact = protocol.readExact;
 const randomSocketPath = protocol.randomSocketPath;
+const createListener = protocol.createListener;
 const EventLocation = protocol.EventLocation;
 
 const VERSION = blk: {
@@ -77,6 +78,7 @@ const CLIENT_HELP =
     \\
     \\Client-specific switches:
     \\
+    \\ -a, --address <addr>       Connect to conductor at <addr> instead of default
     \\ --session[=<label>]        Reuse worker state in Main module. With a label,
     \\                            multiple clients can share the same session.
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
@@ -97,6 +99,7 @@ const ActiveClientInfo = struct {
     worker: *worker.Worker,
     client_num: u32,
     start_time_us: i64,
+    port_set: u16, // PortPool index, or PortPool.none when unmanaged
 };
 
 const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
@@ -124,6 +127,7 @@ pub const Conductor = struct {
     cache: env_cache.EnvCache,
     workers: std.StringHashMap(WorkerList),
     active_clients: ActiveClientMap,
+    port_pool: ?protocol.PortPool,
     reserve: ?*worker.Worker,
     next_worker_id: u32,
     client_counter: u32,
@@ -140,6 +144,7 @@ pub const Conductor = struct {
             .cache = env_cache.EnvCache.init(allocator),
             .workers = std.StringHashMap(WorkerList).init(allocator),
             .active_clients = ActiveClientMap.init(allocator),
+            .port_pool = if (cfg.port_range) |r| protocol.PortPool.init(r.base, r.count) else null,
             .reserve = null,
             .next_worker_id = 0,
             .client_counter = 0,
@@ -172,16 +177,22 @@ pub const Conductor = struct {
 
     pub fn run(self: *Conductor) !void {
         g_socket_path = try self.allocator.dupeZ(u8, self.cfg.socket_path);
-        const pid_path = try std.fmt.allocPrint(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir});
-        g_pid_path = try self.allocator.dupeZ(u8, pid_path);
-        self.allocator.free(pid_path);
         try eventLoopImpl.installSignalHandlers();
         defer eventLoopImpl.cleanupSignalHandlers();
-        self.writePidFile();
-        defer Io.Dir.deleteFileAbsolute(self.io, g_pid_path) catch {};
+        if (self.cfg.transport == .unix) {
+            const pid_path = try std.fmt.allocPrint(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir});
+            g_pid_path = try self.allocator.dupeZ(u8, pid_path);
+            self.allocator.free(pid_path);
+            self.writePidFile();
+        }
+        defer if (self.cfg.transport == .unix) {
+            Io.Dir.deleteFileAbsolute(self.io, g_pid_path) catch {};
+        };
         var server = try self.createServer();
         defer server.deinit(self.io);
-        defer Io.Dir.deleteFileAbsolute(self.io, self.cfg.socket_path) catch {};
+        defer if (self.cfg.transport == .unix) {
+            Io.Dir.deleteFileAbsolute(self.io, self.cfg.socket_path) catch {};
+        };
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
         self.createReserveWorker(null) catch |err| {
             std.debug.print("Failed to create reserve worker: {}\n", .{err});
@@ -376,6 +387,13 @@ pub const Conductor = struct {
             if (session_label) |l| (if (l.len > 0) l else ".") else "",
             request.project orelse "(default)",
         });
+        const port_set = if (self.port_pool) |*pool| blk: {
+            break :blk pool.allocate() orelse {
+                std.debug.print("Client {d}: port pool exhausted\n", .{self.client_counter});
+                return error.PortPoolExhausted;
+            };
+        } else protocol.PortPool.none;
+        errdefer self.releasePortSet(port_set);
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
             .force = is_labeled_session,
@@ -386,6 +404,7 @@ pub const Conductor = struct {
             .switches = request.parsed.switches.items,
             .programfile = request.parsed.program_file,
             .args = request.parsed.program_args,
+            .port_set = port_set,
         };
         const now = self.currentTime();
         const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, now);
@@ -396,7 +415,7 @@ pub const Conductor = struct {
         defer self.allocator.free(assignment.paths.signals);
         assignment.w.last_pinged = now;
         assignment.w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        try self.registerClient(request.pid, self.client_counter, assignment.w);
+        try self.registerClient(request.pid, self.client_counter, assignment.w, port_set);
         self.sendSocketPaths(socket, assignment.paths);
     }
 
@@ -614,6 +633,7 @@ pub const Conductor = struct {
             var it = self.active_clients.iterator();
             while (it.next()) |entry| {
                 if (entry.value_ptr.worker == w) {
+                    self.releasePortSet(entry.value_ptr.port_set);
                     to_remove[remove_count] = entry.key_ptr.*;
                     remove_count += 1;
                     if (remove_count >= to_remove.len) break;
@@ -671,16 +691,25 @@ pub const Conductor = struct {
         }
     }
 
+    // --- Port pool ---
+
+    fn releasePortSet(self: *Conductor, port_set: u16) void {
+        if (port_set != protocol.PortPool.none) {
+            if (self.port_pool) |*pool| pool.release(port_set);
+        }
+    }
+
     // --- Client tracking ---
 
-    fn registerClient(self: *Conductor, pid: u32, client_num: u32, w: *worker.Worker) !void {
+    fn registerClient(self: *Conductor, pid: u32, client_num: u32, w: *worker.Worker, port_set: u16) !void {
         const now_us: i64 = @intCast(@divTrunc((Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds, 1000));
-        try self.active_clients.put(pid, .{ .worker = w, .client_num = client_num, .start_time_us = now_us });
+        try self.active_clients.put(pid, .{ .worker = w, .client_num = client_num, .start_time_us = now_us, .port_set = port_set });
     }
 
     fn clientDone(self: *Conductor, pid: u32) ?*worker.Worker {
         if (self.active_clients.fetchRemove(pid)) |entry| {
             const info = entry.value;
+            self.releasePortSet(info.port_set);
             if (info.worker.active_clients > 0) info.worker.active_clients -= 1;
             const now_us: i64 = @intCast(@divTrunc((Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds, 1000));
             info.worker.last_active = @divTrunc(now_us, 1_000_000);
@@ -793,8 +822,7 @@ pub const Conductor = struct {
     }
 
     pub fn createServer(self: *Conductor) !Io.net.Server {
-        const addr = try Io.net.UnixAddress.init(self.cfg.socket_path);
-        return addr.listen(self.io, .{ .kernel_backlog = 128 });
+        return protocol.listenAddress(self.io, self.cfg.transport, self.cfg.socket_path);
     }
 
     fn writePidFile(self: *Conductor) void {
@@ -811,57 +839,64 @@ pub const Conductor = struct {
     }
 
     fn serveString(self: *Conductor, client_socket: posix.socket_t, content: []const u8) !void {
-        var stdin_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var stdout_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var stderr_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var signals_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const stdin_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "stdin.sock", &stdin_buf);
-        const stdout_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "stdout.sock", &stdout_buf);
-        const stderr_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "stderr.sock", &stderr_buf);
-        const signals_path = try randomSocketPath(self.io, self.cfg.runtime_dir, "signals.sock", &signals_buf);
-        const stdin_addr = try Io.net.UnixAddress.init(stdin_path);
-        var stdin_server = try stdin_addr.listen(self.io, .{});
-        defer stdin_server.deinit(self.io);
-        defer Io.Dir.deleteFileAbsolute(self.io, stdin_path) catch {};
-        const stdout_addr = try Io.net.UnixAddress.init(stdout_path);
-        var stdout_server = try stdout_addr.listen(self.io, .{});
-        defer stdout_server.deinit(self.io);
-        defer Io.Dir.deleteFileAbsolute(self.io, stdout_path) catch {};
-        const stderr_addr = try Io.net.UnixAddress.init(stderr_path);
-        var stderr_server = try stderr_addr.listen(self.io, .{});
-        defer stderr_server.deinit(self.io);
-        defer Io.Dir.deleteFileAbsolute(self.io, stderr_path) catch {};
-        const signals_addr = try Io.net.UnixAddress.init(signals_path);
-        var signals_server = try signals_addr.listen(self.io, .{});
-        defer signals_server.deinit(self.io);
-        defer Io.Dir.deleteFileAbsolute(self.io, signals_path) catch {};
+        const mode = self.cfg.transport;
+        const bind = self.cfg.bind_address;
+        const rdir = self.cfg.runtime_dir;
+        var port_set_idx: u16 = protocol.PortPool.none;
+        var ports: ?[4]u16 = null;
+        if (self.port_pool) |*pool| {
+            if (pool.allocate()) |idx| {
+                port_set_idx = idx;
+                ports = pool.portsForIndex(idx);
+            }
+        }
+        defer self.releasePortSet(port_set_idx);
+        const suffixes = [_][]const u8{ "stdin.sock", "stdout.sock", "stderr.sock", "signals.sock" };
+        var bufs: [4][std.fs.max_path_bytes]u8 = undefined;
+        var listeners: [4]protocol.Listener = undefined;
+        var created: usize = 0;
+        defer for (listeners[0..created]) |*l| {
+            if (mode == .unix) Io.Dir.deleteFileAbsolute(self.io, l.addr) catch {};
+            l.server.deinit(self.io);
+        };
+        for (0..4) |i| {
+            listeners[i] = if (ports) |p|
+                try protocol.listenTcp(self.io, bind, p[i], &bufs[i])
+            else
+                try createListener(self.io, mode, rdir, suffixes[i], bind, &bufs[i]);
+            created += 1;
+        }
         self.sendSocketPaths(client_socket, .{
-            .stdin = stdin_path, .stdout = stdout_path,
-            .stderr = stderr_path, .signals = signals_path,
+            .stdin = listeners[0].addr, .stdout = listeners[1].addr,
+            .stderr = listeners[2].addr, .signals = listeners[3].addr,
         });
-        const stdin_conn = try stdin_server.accept(self.io);
-        defer stdin_conn.close(self.io);
-        const stdout_conn = try stdout_server.accept(self.io);
-        defer stdout_conn.close(self.io);
-        const stderr_conn = try stderr_server.accept(self.io);
-        defer stderr_conn.close(self.io);
-        const signals_conn = try signals_server.accept(self.io);
-        defer signals_conn.close(self.io);
-        platform.write(stdout_conn.socket.handle, content);
-        // Shut down output streams then send exit signal
-        stdout_conn.shutdown(self.io, .send) catch {};
-        stderr_conn.shutdown(self.io, .send) catch {};
-        platform.write(signals_conn.socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00 });
-        signals_conn.shutdown(self.io, .send) catch {};
+        var conns: [4]Io.net.Stream = undefined;
+        var accepted: usize = 0;
+        defer for (conns[0..accepted]) |c| c.close(self.io);
+        for (0..4) |i| {
+            conns[i] = try listeners[i].server.accept(self.io);
+            accepted += 1;
+        }
+        platform.write(conns[1].socket.handle, content);
+        conns[1].shutdown(self.io, .send) catch {};
+        conns[2].shutdown(self.io, .send) catch {};
+        platform.write(conns[3].socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00 });
+        conns[3].shutdown(self.io, .send) catch {};
     }
 
-    fn sendSocketPaths(_: *Conductor, socket: posix.socket_t, paths: worker.Worker.SocketPaths) void {
+    fn sendSocketPaths(self: *Conductor, socket: posix.socket_t, paths: worker.Worker.SocketPaths) void {
         var buf: [1024]u8 = undefined;
         var w = protocol.BufWriter{ .buf = &buf };
-        w.writeLenPrefixed(u16, paths.stdin);
-        w.writeLenPrefixed(u16, paths.stdout);
-        w.writeLenPrefixed(u16, paths.stderr);
-        w.writeLenPrefixed(u16, paths.signals);
+        // In TCP mode, send just the port — the client uses the conductor host
+        const all = [_][]const u8{ paths.stdin, paths.stdout, paths.stderr, paths.signals };
+        for (all) |path| {
+            if (self.cfg.transport == .tcp) {
+                const colon = std.mem.lastIndexOfScalar(u8, path, ':') orelse path.len;
+                w.writeLenPrefixed(u16, path[colon..]);
+            } else {
+                w.writeLenPrefixed(u16, path);
+            }
+        }
         platform.write(socket, w.written());
     }
 };
@@ -879,10 +914,17 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(" - Worker args: {s}\n", .{cfg.worker_args});
     std.debug.print(" - Max clients per worker: {d}\n", .{cfg.worker_maxclients});
     std.debug.print(" - Worker TTL: {d} seconds\n", .{cfg.worker_ttl});
-    Io.Dir.createDirAbsolute(io, cfg.runtime_dir, .default_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    conductor.cleanupRuntimeDir();
+    std.debug.print(" - Transport: {s}\n", .{@tagName(cfg.transport)});
+    std.debug.print(" - Address: {s}\n", .{cfg.socket_path});
+    if (cfg.port_range) |r| {
+        std.debug.print(" - Port range: {d}-{d} ({d} port sets, {d} ports used)\n", .{ r.base, r.base + r.count * 4 - 1, r.count, @as(u32, r.count) * 4 });
+    }
+    if (cfg.transport == .unix) {
+        Io.Dir.createDirAbsolute(io, cfg.runtime_dir, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        conductor.cleanupRuntimeDir();
+    }
     try conductor.run();
 }

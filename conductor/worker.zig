@@ -14,6 +14,7 @@ const args = @import("args.zig");
 const BufWriter = protocol.BufWriter;
 const readExact = protocol.readExact;
 const randomSocketPath = protocol.randomSocketPath;
+const createListener = protocol.createListener;
 
 const max_recent_ppids = 32;
 
@@ -43,15 +44,13 @@ pub const Worker = struct {
         julia_channel: ?[]const u8,
     ) !Worker {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const setup_path = try randomSocketPath(io, runtime_dir, "wsetup.sock", &path_buf);
-        const setup_addr = try Io.net.UnixAddress.init(setup_path);
-        var setup_server = try setup_addr.listen(io, .{});
-        defer setup_server.deinit(io);
-        defer Io.Dir.deleteFileAbsolute(io, setup_path) catch {};
+        var setup = try createListener(io, cfg.transport, runtime_dir, "wsetup.sock", cfg.bind_address, &path_buf);
+        defer setup.server.deinit(io);
+        defer if (cfg.transport == .unix) { Io.Dir.deleteFileAbsolute(io, setup.addr) catch {}; };
         const eval_expr = try std.fmt.allocPrint(
             allocator,
-            "using DaemonWorker; DaemonWorker.runworker(\"{s}\", {d})",
-            .{ setup_path, id },
+            "using DaemonWorker; DaemonWorker.runworker(\"{s}\", {d}, \"{s}\")",
+            .{ setup.addr, id, cfg.socket_path },
         );
         defer allocator.free(eval_expr);
         var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
@@ -78,7 +77,7 @@ pub const Worker = struct {
             .pgid = if (builtin.os.tag == .windows) null else 0,
         };
         const child = try std.process.spawn(io, spawn_opts);
-        const worker_stream = try setup_server.accept(io);
+        const worker_stream = try setup.server.accept(io);
         const socket = worker_stream.socket.handle;
         // Set read timeout to avoid blocking conductor if worker becomes unresponsive
         platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
@@ -230,7 +229,7 @@ pub const Worker = struct {
     ) !SocketPaths {
         // Calculate payload size
         const pf_len: usize = if (client_info.programfile) |pf| pf.len + 2 else 0;
-        var payload_size: usize = 1 + 4 + 2 + client_info.cwd.len + 2 + 2 + 1 + pf_len + 2;
+        var payload_size: usize = 1 + 4 + 2 + client_info.cwd.len + 2 + 2 + 1 + pf_len + 2 + 2;
         for (client_info.env) |e| payload_size += 4 + e.key.len + e.value.len;
         for (client_info.switches) |sw| payload_size += 4 + sw.name.len + sw.value.len;
         for (client_info.args) |arg| payload_size += 2 + arg.len;
@@ -261,6 +260,7 @@ pub const Worker = struct {
         for (client_info.args) |arg| {
             w.writeLenPrefixed(u16, arg);
         }
+        w.writeInt(u16, client_info.port_set);
         // Send header + payload
         self.writeHeader(.client_run, @intCast(payload_size));
         platform.write(self.socket, send_buf);
@@ -338,6 +338,7 @@ pub const ClientInfo = struct {
     switches: []const args.Switch,
     programfile: ?[]const u8,
     args: []const []const u8,
+    port_set: u16, // PortPool index, or PortPool.none when unmanaged
 };
 
 pub const EnvVar = struct {

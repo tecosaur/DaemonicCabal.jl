@@ -46,6 +46,37 @@ function uninstall_client_symlink()
     rm(binpath)
 end
 
+"""
+    daemon_env(; worker_maxclients, worker_ttl, worker_args, mode, conductor_host, conductor_port, ports, env) -> Dict{String,String}
+
+Build the complete environment variable dict for the conductor process.
+"""
+function daemon_env(; worker_maxclients::Integer, worker_ttl::Integer,
+                    worker_args::AbstractString, mode::Symbol,
+                    conductor_host::AbstractString, conductor_port::Integer,
+                    ports::UnitRange{Int}, env)
+    mode in (:sockets, :tcp) || throw(ArgumentError("mode must be :sockets or :tcp, got :$mode"))
+    d = Dict{String,String}(
+        "JULIA_DAEMON_SERVER" => mainsocket(),
+        "JULIA_DAEMON_WORKER_EXECUTABLE" => worker_executable(),
+        "JULIA_DAEMON_WORKER_PROJECT" => installed_worker_project(),
+        "JULIA_DAEMON_WORKER_MAXCLIENTS" => string(worker_maxclients),
+        "JULIA_DAEMON_WORKER_ARGS" => worker_args,
+        "JULIA_DAEMON_WORKER_TTL" => string(worker_ttl))
+    if mode === :tcp
+        d["JULIA_DAEMON_SERVER"] = "$conductor_host:$conductor_port"
+        if !isempty(ports)
+            1024 <= first(ports) || throw(ArgumentError("port range must start at 1024 or above"))
+            last(ports) <= 65535 || throw(ArgumentError("port range must end at 65535 or below"))
+            d["JULIA_DAEMON_PORTS"] = "$(first(ports))-$(last(ports))"
+        end
+    end
+    for (k, v) in env
+        d[string(k)] = string(v)
+    end
+    return d
+end
+
 function make_tree_readonly(path::AbstractString)
     for (root, dirs, files) in walkdir(path)
         for f in files
