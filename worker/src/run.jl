@@ -75,9 +75,9 @@ function getval(pairlist, key, default)
     if isnothing(index) default else last(pairlist[index]) end
 end
 
-function runclient(client::ClientInfo, client_stdin::Base.PipeEndpoint,
-                   client_stdout::Base.PipeEndpoint, client_stderr::Base.PipeEndpoint,
-                   signals::Base.PipeEndpoint)
+function runclient(client::ClientInfo, client_stdin::Union{Base.PipeEndpoint, Sockets.TCPSocket},
+                   client_stdout::Union{Base.PipeEndpoint, Sockets.TCPSocket}, client_stderr::Union{Base.PipeEndpoint, Sockets.TCPSocket},
+                   signals::Union{Base.PipeEndpoint, Sockets.TCPSocket})
     hascolor = getval(client.switches, "--color",
                       ifelse(startswith(getval(client.env, "TERM", ""),
                                         "xterm"),

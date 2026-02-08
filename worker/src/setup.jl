@@ -12,13 +12,14 @@ const STATE = (
     soft_exit = Ref(false),
     conductor_conn = Ref{Union{IO, Nothing}}(nothing),
     conductor_socket = Ref(""),
-    standby_sockets = Ref{Union{Nothing, NTuple{4, Pair{Sockets.PipeServer, String}}}}(nothing),
+    standby_sockets = Ref{Union{Nothing, NTuple{4, Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}}}}(nothing),
     standby_module = Ref{Union{Nothing, Module}}(nothing))
 
 # Configuration (set during runworker from environment)
 RUNTIME_DIR::String = ""
 MAX_CLIENTS::Int = 1
 WORKER_TTL::Int = 0
+PORT_BASE::Int = 0  # Base port for managed port range (from JULIA_DAEMON_PORTS)
 
 # Exiting
 
@@ -86,14 +87,33 @@ end
 
 # Worker management
 
-function create_socket()::Pair{Sockets.PipeServer, String}
-    sockfile = string("worker-", WORKER_ID[], '-', String(rand('a':'z', 8)), ".sock")
-    path = joinpath(RUNTIME_DIR, sockfile)
-    Sockets.listen(path) => path
+function create_socket(port::Integer=0)::Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}
+    if is_tcp_address(STATE.conductor_socket[])
+        bind_addr = get(ENV, "JULIA_DAEMON_BIND", "0.0.0.0")
+        server = Sockets.listen(Sockets.IPv4(bind_addr), port)
+        host, actual_port = Sockets.getsockname(server)
+        server => "$(host):$(actual_port)"
+    else
+        sockfile = string("worker-", WORKER_ID[], '-', String(rand('a':'z', 8)), ".sock")
+        path = joinpath(RUNTIME_DIR, sockfile)
+        Sockets.listen(path) => path
+    end
 end
 
+function ports_for_index(port_set::Int)::NTuple{4, Int}
+    start = PORT_BASE + port_set * 4
+    (start, start + 1, start + 2, start + 3)
+end
+
+const PORT_SET_NONE = 0xFFFF
+
 # Get sockets for a new client (stdin, stdout, stderr, signals), using standby if available
-function get_client_sockets()::NTuple{4, Pair{Sockets.PipeServer, String}}
+function get_client_sockets(port_set::Int)::NTuple{4, Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}}
+    # With a managed port range, we must use the assigned ports (no standby)
+    if port_set != PORT_SET_NONE
+        p1, p2, p3, p4 = ports_for_index(port_set)
+        return (create_socket(p1), create_socket(p2), create_socket(p3), create_socket(p4))
+    end
     sockets = @lock STATE.lock begin
         s = STATE.standby_sockets[]
         STATE.standby_sockets[] = nothing
@@ -105,8 +125,11 @@ function get_client_sockets()::NTuple{4, Pair{Sockets.PipeServer, String}}
         sockets
     end
 end
-# Ensure standby sockets exist (called after client disconnect or on startup)
+# Ensure standby sockets exist (called after client disconnect or on startup).
+# Standby is disabled when a managed port range is active, since the port set
+# index is not known until the conductor sends a client_run message.
 function ensure_standby_sockets()
+    PORT_BASE > 0 && return
     @lock STATE.lock begin
         if isnothing(STATE.standby_sockets[])
             STATE.standby_sockets[] = (create_socket(), create_socket(), create_socket(), create_socket())
@@ -114,18 +137,24 @@ function ensure_standby_sockets()
     end
 end
 
-function runworker(socketpath::String, worker_number::Int=-1)
+function runworker(socketpath::String, worker_number::Int=-1, conductor_address::String="")
     # Disable Julia's default SIGINT handling which throws uncatchable InterruptException
     # This allows us to exit cleanly when the conductor shuts down
     Base.exit_on_sigint(false)
-    conn = Sockets.connect(socketpath)
+    conn = connect_to(socketpath)
     STATE.conductor_conn[] = conn
-    # Configuration from environment
     STATE.worker_number[] = worker_number
-    global RUNTIME_DIR = dirname(socketpath)
+    STATE.conductor_socket[] = if !isempty(conductor_address)
+        conductor_address
+    else
+        joinpath(dirname(socketpath), "conductor.sock")
+    end
+    global RUNTIME_DIR = is_tcp_address(STATE.conductor_socket[]) ? "" : dirname(socketpath)
     global MAX_CLIENTS = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS", "1"))
     global WORKER_TTL = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_TTL", "0"))
-    STATE.conductor_socket[] = joinpath(RUNTIME_DIR, "conductor.sock")
+    global PORT_BASE = if haskey(ENV, "JULIA_DAEMON_PORTS")
+        parse(Int, split(ENV["JULIA_DAEMON_PORTS"], '-')[1])
+    else 0 end
     ensure_standby_sockets()
     ensure_standby_module()
     try
@@ -156,7 +185,7 @@ function runworker(socketpath::String, worker_number::Int=-1)
                 else
                     try
                         (stdin_srv, stdin_path), (stdout_srv, stdout_path),
-                            (stderr_srv, stderr_path), (signals_srv, signals_path) = get_client_sockets()
+                            (stderr_srv, stderr_path), (signals_srv, signals_path) = get_client_sockets(client.port_set)
                         # Register client and get count (before sending response)
                         active_count = @lock STATE.lock begin
                             push!(STATE.clients, (time(), client))

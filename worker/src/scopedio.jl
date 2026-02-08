@@ -4,10 +4,10 @@
 using Base.ScopedValues
 
 mutable struct VirtualTerm
-    const stdin::Base.PipeEndpoint
-    const stdout::Base.PipeEndpoint
-    const stderr::Base.PipeEndpoint
-    const signals::Base.PipeEndpoint
+    const stdin::Union{Base.PipeEndpoint, Sockets.TCPSocket}
+    const stdout::Union{Base.PipeEndpoint, Sockets.TCPSocket}
+    const stderr::Union{Base.PipeEndpoint, Sockets.TCPSocket}
+    const signals::Union{Base.PipeEndpoint, Sockets.TCPSocket}
     const term::String
     terminfo::Union{Nothing, Base.TermInfo}
     have_color::Union{Nothing, Bool}

@@ -16,6 +16,10 @@ const DEFAULTS = (
     worker_maxclients = 1,
     worker_args = "--startup-file=no",
     worker_ttl = 2*60*60, # 2h
+    mode = :sockets,
+    conductor_host = "127.0.0.1",
+    conductor_port = 9345,
+    ports = 35520:37568,
 )
 
 mainsocket() = get(ENV, "JULIA_DAEMON_SERVER",

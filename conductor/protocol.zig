@@ -164,3 +164,124 @@ pub fn randomSocketPath(io: Io, runtime_dir: []const u8, suffix: []const u8, buf
     const hex = std.fmt.bytesToHex(rand_buf, .lower);
     return std.fmt.bufPrint(buf, "{s}/{s}-{s}", .{ runtime_dir, &hex, suffix }) catch error.PathTooLong;
 }
+
+// --- Port pool for managed TCP port ranges ---
+
+/// Manages a pool of port sets (4 consecutive ports each) for TCP mode.
+/// Port set `i` maps to ports `base + i*4` through `base + i*4 + 3`
+/// (stdin, stdout, stderr, signals).
+pub const PortPool = struct {
+    base: u16,
+    count: u16,
+    free: std.StaticBitSet(max_port_sets),
+
+    pub const max_port_sets = 2048;
+    pub const none: u16 = 0xFFFF; // sentinel: no managed port set
+
+    pub fn init(base: u16, count: u16) PortPool {
+        std.debug.assert(count <= max_port_sets);
+        var free = std.StaticBitSet(max_port_sets).initEmpty();
+        for (0..count) |i| free.set(i);
+        return .{ .base = base, .count = count, .free = free };
+    }
+
+    pub fn allocate(self: *PortPool) ?u16 {
+        const bit = self.free.findFirstSet() orelse return null;
+        self.free.unset(bit);
+        return @intCast(bit);
+    }
+
+    pub fn release(self: *PortPool, index: u16) void {
+        std.debug.assert(index < self.count);
+        self.free.set(index);
+    }
+
+    pub fn portsForIndex(self: *const PortPool, index: u16) [4]u16 {
+        const start = self.base + index * 4;
+        return .{ start, start + 1, start + 2, start + 3 };
+    }
+};
+
+// --- Dual transport (Unix sockets / TCP) ---
+
+pub const TransportMode = enum { unix, tcp };
+
+pub const Address = struct {
+    mode: TransportMode,
+    addr: []const u8,
+};
+
+/// Detect transport mode from address string, stripping any `tcp://` scheme prefix.
+/// `tcp://host[:port]` or bare `host[:port]` → tcp; paths (containing `/` or starting with `.`) → unix.
+pub fn parseAddress(raw: []const u8) error{UnsupportedScheme}!Address {
+    if (std.mem.indexOf(u8, raw, "://")) |sep| {
+        if (std.mem.eql(u8, raw[0..sep], "tcp"))
+            return .{ .mode = .tcp, .addr = raw[sep + 3 ..] };
+        return error.UnsupportedScheme;
+    }
+    if (raw.len > 0 and raw[0] != '/' and raw[0] != '.' and
+        std.mem.indexOfScalar(u8, raw, '/') == null)
+        return .{ .mode = .tcp, .addr = raw };
+    return .{ .mode = .unix, .addr = raw };
+}
+
+pub const default_tcp_port: u16 = 9345;
+
+fn parseHostPort(addr: []const u8) !Io.net.IpAddress {
+    const colon = std.mem.lastIndexOfScalar(u8, addr, ':');
+    const host = if (colon) |c| addr[0..c] else addr;
+    const port: u16 = if (colon) |c|
+        std.fmt.parseInt(u16, addr[c + 1 ..], 10) catch return error.InvalidAddress
+    else
+        default_tcp_port;
+    return Io.net.IpAddress.parse(host, port) catch return error.InvalidAddress;
+}
+
+pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net.Stream {
+    return switch (mode) {
+        .unix => (try Io.net.UnixAddress.init(addr)).connect(io_ctx),
+        .tcp => Io.net.IpAddress.connect(try parseHostPort(addr), io_ctx, .{ .mode = .stream }),
+    };
+}
+
+pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net.Server {
+    return switch (mode) {
+        .unix => (try Io.net.UnixAddress.init(addr)).listen(io_ctx, .{ .kernel_backlog = 128 }),
+        .tcp => Io.net.IpAddress.listen(try parseHostPort(addr), io_ctx, .{ .kernel_backlog = 128, .reuse_address = true }),
+    };
+}
+
+pub const Listener = struct { server: Io.net.Server, addr: []const u8 };
+
+pub fn createListener(
+    io_ctx: Io,
+    mode: TransportMode,
+    runtime_dir: []const u8,
+    suffix: []const u8,
+    bind_addr: []const u8,
+    buf: []u8,
+) !Listener {
+    switch (mode) {
+        .unix => {
+            const path = try randomSocketPath(io_ctx, runtime_dir, suffix, buf);
+            const unix_addr = try Io.net.UnixAddress.init(path);
+            return .{ .server = try unix_addr.listen(io_ctx, .{}), .addr = path };
+        },
+        .tcp => return listenTcp(io_ctx, bind_addr, 0, buf),
+    }
+}
+
+/// Port 0 = ephemeral (OS-assigned).
+pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16, buf: []u8) !Listener {
+    const ip = Io.net.IpAddress.parse(bind_addr, port) catch return error.InvalidAddress;
+    var server = try Io.net.IpAddress.listen(ip, io_ctx, .{ .reuse_address = true });
+    const actual_port = switch (server.socket.address) {
+        .ip4 => |a| a.port,
+        .ip6 => |a| a.port,
+    };
+    const addr_str = std.fmt.bufPrint(buf, "{s}:{d}", .{ bind_addr, actual_port }) catch {
+        server.deinit(io_ctx);
+        return error.NameTooLong;
+    };
+    return .{ .server = server, .addr = addr_str };
+}
