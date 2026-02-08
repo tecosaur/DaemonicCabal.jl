@@ -81,19 +81,6 @@ function send_pong(conn::IO, active_clients::Integer)
     flush(conn)
 end
 
-# Send PROJECT_OK response
-function send_project_ok(conn::IO)
-    write_header(conn, MSG_TYPE.project_ok, 0)
-    flush(conn)
-end
-
-# Send ACK response with client count
-function send_ack(conn::IO, client_count::Integer)
-    write_header(conn, MSG_TYPE.ack, 2)
-    write(conn, UInt16(client_count))
-    flush(conn)
-end
-
 # Send notification to conductor via main socket
 function send_notification(socket_path::AbstractString, type::UInt8, payload...)
     try
@@ -104,12 +91,6 @@ function send_notification(socket_path::AbstractString, type::UInt8, payload...)
         # Conductor may have shut down, ignore
     end
 end
-
-send_client_done(socket_path::AbstractString, pid::Integer) =
-    send_notification(socket_path, NOTIF_TYPE.client_done, UInt32(pid))
-
-send_worker_exit(socket_path::AbstractString) =
-    send_notification(socket_path, NOTIF_TYPE.worker_exit, UInt32(getpid()))
 
 # Send SOCKETS response with socket paths and active client count
 function send_sockets(conn::IO, stdio_path::AbstractString, signals_path::AbstractString, active_clients::Integer)
@@ -137,11 +118,6 @@ function send_error(conn::IO, code::UInt16, message::AbstractString)
     write(conn, code)
     write_string(conn, message)
     flush(conn)
-end
-
-# Read SET_PROJECT payload
-function read_set_project(conn::IO, payload_len::Integer)
-    read_string(conn)
 end
 
 # Client info from CLIENT_RUN message
