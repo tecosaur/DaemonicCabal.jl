@@ -35,14 +35,15 @@ pub fn run(
         makeKevent(@intCast(stdio_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDOUT),
         makeKevent(@intCast(signals_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_SIGNALS),
     };
-    var no_changes: [0]c.Kevent = undefined;
-    if (keventCall(kq, &changes, &no_changes) < 0) {
+    var dummy: [1]c.Kevent = undefined;
+    if (keventCall(kq, &changes, &dummy) < 0) {
         return error.KqueueRegisterFailed;
     }
     // Register stdin separately: may fail on macOS when stdin is a device
     // file like /dev/null (kqueue returns EINVAL for non-pollable fds).
+    // If registration fails, stdin events simply won't be delivered.
     var stdin_change = [1]c.Kevent{makeKevent(@intCast(posix.STDIN_FILENO), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDIN)};
-    _ = keventCall(kq, &stdin_change, &no_changes);
+    _ = keventCall(kq, &stdin_change, &dummy);
     // Buffers
     const buf_size = 1024;
     var stdout_buf: [buf_size]u8 = undefined;
@@ -51,9 +52,9 @@ pub fn run(
     // State
     var exit_code: ?u8 = null;
     var stdout_eof = false;
-    var stdin_eof = false;
     // Event buffer
     var events: [8]c.Kevent = undefined;
+    var no_changes: [0]c.Kevent = undefined;
     while (true) {
         const nevents = keventCall(kq, &no_changes, &events);
         if (nevents < 0) {
@@ -66,8 +67,7 @@ pub fn run(
             if ((ev.flags & EV_ERROR) != 0) continue;
             switch (udataInt(ev)) {
                 UDATA_STDOUT => {
-                    if (stdout_eof) continue;
-                    // Read available data first
+                    // Read available data first (kqueue can set EV_EOF with data still pending)
                     if (ev.data > 0) {
                         const n = posix.read(stdio_fd, &stdout_buf) catch {
                             stdout_eof = true;
@@ -75,26 +75,16 @@ pub fn run(
                         };
                         if (n > 0) platform.write(posix.STDOUT_FILENO, stdout_buf[0..n]);
                     }
-                    // Check for EOF and unregister to prevent busy loop
                     if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
                         stdout_eof = true;
-                        var del = [1]c.Kevent{makeKevent(@intCast(stdio_fd), c.EVFILT.READ, c.EV.DELETE, 0, 0, UDATA_STDOUT)};
-                        _ = keventCall(kq, &del, &no_changes);
                     }
                 },
                 UDATA_STDIN => {
-                    if (stdin_eof or exit_code != null) continue;
-                    // For pipes, EV_EOF is set immediately but data may still be available.
-                    // Read any pending data, then unregister to stop busy-looping.
+                    if (exit_code != null) continue;
+                    // Read pending data first (kqueue can set EV_EOF with data still pending)
                     if (ev.data > 0) {
-                        const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch continue;
+                        const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch 0;
                         if (n > 0) platform.write(stdio_fd, stdin_buf[0..n]);
-                    }
-                    if ((ev.flags & EV_EOF) != 0) {
-                        stdin_eof = true;
-                        // Unregister stdin from kqueue to prevent busy loop
-                        var del = [1]c.Kevent{makeKevent(@intCast(posix.STDIN_FILENO), c.EVFILT.READ, c.EV.DELETE, 0, 0, UDATA_STDIN)};
-                        _ = keventCall(kq, &del, &no_changes);
                     }
                 },
                 UDATA_SIGNALS => {
