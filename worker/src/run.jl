@@ -48,7 +48,7 @@ end
 
 # Finalize module for a specific client (cheap)
 function prepare_module(client::ClientInfo)
-    mod = if keyfound(client.switches, "--session")
+    mod = if any(p -> first(p) == "--session", client.switches)
         Main
     else
         get_module()
@@ -74,8 +74,6 @@ function getval(pairlist, key, default)
     index = findfirst(p -> first(p) == key, pairlist)
     if isnothing(index) default else last(pairlist[index]) end
 end
-
-keyfound(pairlist, key) = !isnothing(findfirst(p -> first(p) == key, pairlist))
 
 function runclient(client::ClientInfo, stdio::Base.PipeEndpoint, signals::Base.PipeEndpoint)
     hascolor = getval(client.switches, "--color",
@@ -147,17 +145,19 @@ function runclient(client::ClientInfo, stdio::Base.PipeEndpoint, signals::Base.P
             end
         end
         # Notify conductor that client is done
-        send_client_done(STATE.conductor_socket[], client.pid)
+        send_notification(STATE.conductor_socket[], NOTIF_TYPE.client_done, UInt32(client.pid))
         ensure_standby_sockets()
         ensure_standby_module()
         queue_ttl_check()
     end
 end
 
+# Basically a bootleg version of `exec_options` from `base/client.jl`.
 function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout)
-    runrepl = "-i" ∈ client.switches ||
-        (isnothing(client.programfile) && "--eval" ∉ first.(client.switches) &&
-        "--print" ∉ first.(client.switches))
+    set_switches = [s for (s, _) in client.switches]
+    runrepl = "-i" ∈ set_switches ||
+        (isnothing(client.programfile) && "--eval" ∉ set_switches &&
+        "--print" ∉ set_switches)
     for (switch, value) in client.switches
         if switch == "--eval"
             Core.eval(mod, Base.parse_input_line(value))
@@ -189,9 +189,9 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout)
         end
     end
     if runrepl
-        interactiveinput = runrepl && client.tty
+        interactiveinput = client.tty
         hascolor = get(stdout, :color, false)
-        quiet = "-q" in first.(client.switches) || "--quiet" in first.(client.switches)
+        quiet = "-q" ∈ set_switches || "--quiet" ∈ set_switches
         banner = Symbol(getval(client.switches, "--banner", ifelse(interactiveinput, "yes", "no")))
         histfile = getval(client.switches, "--history-file", "yes") != "no"
         replcall = if VERSION < v"1.11"

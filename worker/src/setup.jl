@@ -47,7 +47,7 @@ end
 
 function perform_ttl_check(::Timer)
     if WORKER_TTL > 0 && time() - (@lock STATE.lock STATE.lastclient[]) >= WORKER_TTL
-        send_worker_exit(STATE.conductor_socket[])
+        send_notification(STATE.conductor_socket[], NOTIF_TYPE.worker_exit, UInt32(getpid()))
         real_exit(0)
     end
 end
@@ -66,8 +66,7 @@ function kill_stuck_clients(active_pids::Set{Int})
     end
 end
 
-# Basically a bootleg version of `exec_options`.
-# Note: client is already registered in STATE.clients before this is called
+# Signal protocol (Worker → Client via signals socket)
 const SIGNAL_EXIT = 0x01
 const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
 const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
@@ -134,11 +133,12 @@ function runworker(socketpath::String, worker_number::Int=-1)
                 active = @lock STATE.lock length(STATE.clients)
                 send_pong(conn, active)
             elseif header.msg_type == MSG_TYPE.set_project
-                project = read_set_project(conn, header.payload_len)
+                project = read_string(conn)
                 try
                     set_project(project)
                     STATE.project[] = project
-                    send_project_ok(conn)
+                    write_header(conn, MSG_TYPE.project_ok, 0)
+                    flush(conn)
                 catch err
                     send_error(conn, ERR_CODE.project_not_found,
                                "Failed to set project: $(sprint(showerror, err))")
@@ -200,7 +200,9 @@ function runworker(socketpath::String, worker_number::Int=-1)
                 end
                 kill_stuck_clients(active_pids)
                 remaining = @lock STATE.lock length(STATE.clients)
-                send_ack(conn, remaining)
+                write_header(conn, MSG_TYPE.ack, 2)
+                write(conn, UInt16(remaining))
+                flush(conn)
             else
                 # Skip unknown message payload
                 read(conn, header.payload_len)
