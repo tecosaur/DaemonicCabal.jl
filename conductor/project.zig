@@ -5,7 +5,7 @@ const std = @import("std");
 const Io = std.Io;
 const args = @import("args.zig");
 
-/// Find project path from parsed args, environment, or by walking up from cwd.
+/// Find project path from parsed args or environment.
 /// Returns allocated string that caller must free, or null for default (@v#.#).
 pub fn resolve(
     allocator: std.mem.Allocator,
@@ -35,8 +35,8 @@ pub fn resolve(
         }
         return try allocator.dupe(u8, project);
     }
-    // 3. Walk up from cwd looking for Project.toml
-    return findProjectToml(allocator, io, cwd);
+    // No --project or JULIA_PROJECT: use default environment (@v#.#)
+    return null;
 }
 
 fn findProjectToml(allocator: std.mem.Allocator, io: Io, start_dir: []const u8) !?[]const u8 {
