@@ -178,9 +178,9 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
 
 fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
     // Accept is level-triggered, so we don't need to re-arm
-    var client_addr: c.sockaddr = undefined;
-    var client_addr_len: c.socklen_t = @sizeOf(c.sockaddr);
-    const client_fd = c.accept(server_fd, &client_addr, &client_addr_len);
+    var client_addr: posix.sockaddr = undefined;
+    var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    const client_fd = c.accept(server_fd, @ptrCast(&client_addr), &client_addr_len);
     if (client_fd < 0) {
         const err: posix.E = @enumFromInt(c._errno().*);
         std.debug.print("Accept error: {}\n", .{err});
@@ -188,7 +188,8 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
     }
     defer _ = c.close(client_fd);
     if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
-    conductor.handleConnectionFd(client_fd) catch |err| {
+    const peer = main.PeerInfo{ .addr = client_addr, .len = client_addr_len };
+    conductor.handleConnectionFd(client_fd, &peer) catch |err| {
         std.debug.print("Client handling failed: {}\n", .{err});
     };
 }

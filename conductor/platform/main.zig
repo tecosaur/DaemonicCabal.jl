@@ -25,6 +25,9 @@ pub const getppid = impl.getppid;
 pub const write = impl.write;
 pub const kill = impl.kill;
 pub const defaultRuntimeDir = impl.defaultRuntimeDir;
+pub const isLoopback = if (os != .windows) impl.isLoopback else struct {
+    fn f(_: anytype, _: anytype) bool { return true; } // Windows: treat all as local for now
+}.f;
 // Standard handles — POSIX constants vs Win32 GetStdHandle
 pub fn getStdinHandle() std.posix.fd_t {
     if (os == .windows) return impl.getStdinHandle();
