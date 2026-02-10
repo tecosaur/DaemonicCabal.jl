@@ -21,6 +21,12 @@ pub const Config = struct {
     ping_interval: u64, // seconds
     ping_timeout: u64, // seconds
     port_range: ?PortRange, // from JULIA_DAEMON_PORTS=low-high
+    host_home: []const u8, // host user's home dir (for sandbox depot access)
+    sandbox_remote_clients: bool, // sandbox remote (non-loopback) TCP clients (default: true)
+    sandbox_empty_environment: bool, // mask ~/.julia/environments with empty dir in sandbox (default: true)
+    sandbox_max_memory: ?[]const u8, // e.g. "4G", "512M" — per-sandbox cgroup memory limit
+    sandbox_max_cpu: ?u32, // cgroup cpu.max percentage, e.g. 200 = 2 cores
+    sandbox_session_bypass: bool, // allow remote --session=<name> to join local workers
 
     pub const PortRange = struct { base: u16, count: u16 };
 
@@ -68,6 +74,12 @@ pub const Config = struct {
             .ping_interval = parseUint(u64, env.get("JULIA_DAEMON_PING_INTERVAL"), 30),
             .ping_timeout = parseUint(u64, env.get("JULIA_DAEMON_PING_TIMEOUT"), 5),
             .port_range = if (transport == .tcp) parsePortRange(env.get("JULIA_DAEMON_PORTS")) else null,
+            .host_home = env.get("HOME") orelse "",
+            .sandbox_remote_clients = !std.mem.eql(u8, env.get("JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS") orelse "1", "0"),
+            .sandbox_empty_environment = !std.mem.eql(u8, env.get("JULIA_DAEMON_SANDBOX_EMPTY_ENVIRONMENT") orelse "1", "0"),
+            .sandbox_max_memory = env.get("JULIA_DAEMON_SANDBOX_MAX_MEMORY"),
+            .sandbox_max_cpu = parseOptionalUint(u32, env.get("JULIA_DAEMON_SANDBOX_MAX_CPU")),
+            .sandbox_session_bypass = std.mem.eql(u8, env.get("JULIA_DAEMON_SANDBOX_SESSION_BYPASS") orelse "0", "1"),
         };
     }
 
@@ -80,6 +92,11 @@ pub const Config = struct {
 fn parseUint(comptime T: type, s: ?[]const u8, default: T) T {
     const str = s orelse return default;
     return std.fmt.parseInt(T, str, 10) catch default;
+}
+
+fn parseOptionalUint(comptime T: type, s: ?[]const u8) ?T {
+    const str = s orelse return null;
+    return std.fmt.parseInt(T, str, 10) catch null;
 }
 
 fn parsePortRange(s: ?[]const u8) ?Config.PortRange {

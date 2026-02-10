@@ -92,8 +92,11 @@ function create_socket(port::Integer=0)::Pair{Union{Sockets.PipeServer, Sockets.
     if is_tcp_address(STATE.conductor_socket[])
         bind_addr = get(ENV, "JULIA_DAEMON_BIND", "0.0.0.0")
         server = Sockets.listen(Sockets.IPv4(bind_addr), port)
-        host, actual_port = Sockets.getsockname(server)
-        server => "$(host):$(actual_port)"
+        _, actual_port = Sockets.getsockname(server)
+        # Report just :port — the client prepends the conductor's host,
+        # which is correct for both local and remote connections.
+        # Reporting the bind address (e.g. 0.0.0.0) would fail for remote clients.
+        server => ":$(actual_port)"
     else
         sockfile = string("worker-", WORKER_ID[], '-', String(rand('a':'z', 8)), ".sock")
         path = joinpath(RUNTIME_DIR, sockfile)
@@ -195,7 +198,7 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
                         send_sockets(conn, stdin_path, stdout_path, stderr_path, signals_path, active_count)
                         # Accept connections and spawn client handler
                         is_tcp = stdin_srv isa Sockets.TCPServer
-                        t0 = if is_tcp time_ns() else 0 end
+                        t0 = time_ns()
                         client_stdin = accept(stdin_srv)
                         client_stdout = accept(stdout_srv)
                         client_stderr = accept(stderr_srv)

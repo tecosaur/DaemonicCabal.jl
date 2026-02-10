@@ -10,6 +10,7 @@ const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
 const config = @import("config.zig");
 const args = @import("args.zig");
+const sandbox = if (builtin.os.tag == .linux) @import("sandbox.zig") else struct {};
 
 const BufWriter = protocol.BufWriter;
 const readExact = protocol.readExact;
@@ -43,43 +44,103 @@ pub const Worker = struct {
         runtime_dir: []const u8,
         julia_channel: ?[]const u8,
     ) !Worker {
+        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, false, null);
+    }
+
+    pub fn spawnSandboxed(
+        allocator: Allocator,
+        io: Io,
+        cfg: *const config.Config,
+        id: u32,
+        runtime_dir: []const u8,
+        julia_channel: ?[]const u8,
+        environ_map: *const std.process.Environ.Map,
+    ) !Worker {
+        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, true, environ_map);
+    }
+
+    fn spawnImpl(
+        allocator: Allocator,
+        io: Io,
+        cfg: *const config.Config,
+        id: u32,
+        runtime_dir: []const u8,
+        julia_channel: ?[]const u8,
+        sandboxed: bool,
+        environ_map: ?*const std.process.Environ.Map,
+    ) !Worker {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var setup = try createListener(io, cfg.transport, runtime_dir, "wsetup.sock", cfg.bind_address, &path_buf);
+        // Conductor and worker are always on the same machine, so use a
+        // Unix socket regardless of the client-facing transport mode.
+        var setup = try createListener(io, .unix, runtime_dir, "wsetup.sock", "", &path_buf);
         defer setup.server.deinit(io);
-        defer if (cfg.transport == .unix) { Io.Dir.deleteFileAbsolute(io, setup.addr) catch {}; };
+        defer Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
         const eval_expr = try std.fmt.allocPrint(
             allocator,
             "using DaemonWorker; DaemonWorker.runworker(\"{s}\", {d}, \"{s}\")",
             .{ setup.addr, id, cfg.socket_path },
         );
         defer allocator.free(eval_expr);
-        var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
-        defer argv.deinit();
-        try argv.append(cfg.worker_executable);
-        // JuliaUp channel selector must come immediately after executable
-        if (julia_channel) |ch| try argv.append(ch);
-        const project_arg: ?[]const u8 = if (cfg.worker_project.len > 0)
-            try std.fmt.allocPrint(allocator, "--project={s}", .{cfg.worker_project})
-        else
-            null;
-        defer if (project_arg) |p| allocator.free(p);
-        if (project_arg) |p| try argv.append(p);
-        var it = std.mem.splitScalar(u8, cfg.worker_args, ' ');
-        while (it.next()) |arg| {
-            if (arg.len > 0) try argv.append(arg);
+        // Sandboxed spawn: fork+namespace+bind-mounts+exec (Linux only)
+        var child: std.process.Child = undefined;
+        if (sandboxed and builtin.os.tag == .linux) {
+            // execve(2) requires an absolute path — resolve bare command via PATH.
+            // std.process.spawn does this internally, but sandbox uses raw execve.
+            const exe_path = if (std.mem.indexOfScalar(u8, cfg.worker_executable, '/') != null)
+                cfg.worker_executable
+            else if (environ_map.?.get("PATH")) |p|
+                resolveInPath(io, cfg.worker_executable, p) orelse cfg.worker_executable
+            else
+                cfg.worker_executable;
+            const extra_binds = [_][]const u8{cfg.worker_project};
+            const sandbox_cfg = sandbox.SandboxConfig{
+                .julia_executable = exe_path,
+                .julia_channel = julia_channel,
+                .worker_project = cfg.worker_project,
+                .worker_args = cfg.worker_args,
+                .eval_expr = eval_expr,
+                .host_environ = environ_map.?,
+                .setup_socket_path = setup.addr,
+                .worker_id = id,
+                .host_home = cfg.host_home,
+                .extra_ro_binds = &extra_binds,
+                .empty_environment = cfg.sandbox_empty_environment,
+                .max_memory = cfg.sandbox_max_memory,
+                .max_cpu = cfg.sandbox_max_cpu,
+            };
+            std.debug.print("Spawning sandboxed worker\n", .{});
+            const sandbox_pid = try sandbox.spawnSandboxed(allocator, &sandbox_cfg);
+            // The host-visible PID is the intermediate process (child 1)
+            // which waits on the Julia process inside the PID namespace —
+            // killing it terminates the whole sandbox.
+            child = .{ .id = sandbox_pid, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
+        } else {
+            // Normal spawn via std.process
+            var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
+            defer argv.deinit();
+            try argv.append(cfg.worker_executable);
+            if (julia_channel) |ch| try argv.append(ch);
+            const project_arg: ?[]const u8 = if (cfg.worker_project.len > 0)
+                try std.fmt.allocPrint(allocator, "--project={s}", .{cfg.worker_project})
+            else
+                null;
+            defer if (project_arg) |p| allocator.free(p);
+            if (project_arg) |p| try argv.append(p);
+            {
+                // Split on spaces; individual args containing spaces are not supported.
+                var it = std.mem.tokenizeScalar(u8, cfg.worker_args, ' ');
+                while (it.next()) |arg| try argv.append(arg);
+            }
+            try argv.append("--eval");
+            try argv.append(eval_expr);
+            // Spawn in separate process group so terminal SIGINT only goes to conductor
+            child = try std.process.spawn(io, .{
+                .argv = argv.items,
+                .pgid = if (builtin.os.tag == .windows) null else 0,
+            });
         }
-        try argv.append("--eval");
-        try argv.append(eval_expr);
-        // Spawn in separate process group so terminal SIGINT only goes to conductor
-        const spawn_opts: std.process.SpawnOptions = .{
-            .argv = argv.items,
-            // pgid = 0 creates new process group (Unix only)
-            .pgid = if (builtin.os.tag == .windows) null else 0,
-        };
-        const child = try std.process.spawn(io, spawn_opts);
         const worker_stream = try setup.server.accept(io);
         const socket = worker_stream.socket.handle;
-        if (cfg.transport == .tcp) protocol.setTcpNodelay(socket);
         // Set read timeout to avoid blocking conductor if worker becomes unresponsive
         platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
         var magic_buf: [4]u8 = undefined;
@@ -263,10 +324,13 @@ pub const Worker = struct {
         }
         w.writeInt(u16, client_info.port_set);
         // Send header + payload
+        std.debug.print("Worker {d}: sending client_run ({d} bytes)\n", .{ self.id, payload_size });
         self.writeHeader(.client_run, @intCast(payload_size));
         platform.write(self.socket, send_buf);
         // Read response
+        std.debug.print("Worker {d}: waiting for response...\n", .{self.id});
         const header = try self.readHeader();
+        std.debug.print("Worker {d}: got response: {s} ({d} bytes payload)\n", .{ self.id, @tagName(header.msg_type), header.payload_len });
         if (header.msg_type == .err) {
             std.debug.print("Worker {d}: runClient got {s} ({s})\n", .{
                 self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
@@ -325,6 +389,9 @@ pub const Worker = struct {
         const signals_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
         rpos += 2;
         const signals_path = try allocator.dupe(u8, payload[rpos..][0..signals_len]);
+        std.debug.print("Worker {d}: sockets: in={s} out={s} err={s} sig={s}\n", .{
+            self.id, stdin_path, stdout_path, stderr_path, signals_path,
+        });
         return .{ .stdin = stdin_path, .stdout = stdout_path, .stderr = stderr_path, .signals = signals_path };
     }
 };
@@ -346,3 +413,16 @@ pub const EnvVar = struct {
     key: []const u8,
     value: []const u8,
 };
+
+/// Search PATH for a bare command name, returning the first existing candidate.
+var resolve_buf: [std.fs.max_path_bytes]u8 = undefined;
+fn resolveInPath(io: Io, name: []const u8, path_env: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = std.fmt.bufPrint(&resolve_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
+        return candidate;
+    }
+    return null;
+}

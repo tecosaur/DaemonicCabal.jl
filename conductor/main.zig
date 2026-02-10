@@ -15,6 +15,18 @@ const project = @import("project.zig");
 const env_cache = @import("env_cache.zig");
 pub const worker = @import("worker.zig");
 
+/// Peer address info passed from the event loop's accept to connection handling.
+pub const PeerInfo = struct {
+    addr: posix.sockaddr = std.mem.zeroes(posix.sockaddr),
+    len: posix.socklen_t = 0,
+    /// True if the peer is a non-loopback TCP connection (remote client).
+    pub fn isRemote(self: *const PeerInfo, transport: protocol.TransportMode) bool {
+        if (transport != .tcp) return false;
+        if (self.len == 0) return false;
+        return !platform.isLoopback(&self.addr, self.len);
+    }
+};
+
 pub const eventLoopImpl = if (builtin.os.tag == .linux)
     @import("eloop/linux.zig")
 else if (builtin.os.tag.isBSD())
@@ -214,12 +226,12 @@ pub const Conductor = struct {
 
     // --- Connection handling ---
 
-    pub fn handleConnectionFd(self: *Conductor, socket: posix.socket_t) !void {
+    pub fn handleConnectionFd(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) !void {
         var magic_buf: [4]u8 = undefined;
         try readExact(socket, &magic_buf);
         const magic = std.mem.readInt(u32, &magic_buf, .little);
         if (magic == protocol.client.magic) {
-            try self.handleClient(socket);
+            try self.handleClient(socket, peer);
         } else if (magic == protocol.notification.magic) {
             self.handleNotification(socket);
         } else {
@@ -253,8 +265,9 @@ pub const Conductor = struct {
         }
     }
 
-    fn handleClient(self: *Conductor, socket: posix.socket_t) !void {
-        var request = try self.readClientRequest(socket);
+    fn handleClient(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) !void {
+        const is_remote = peer.isRemote(self.cfg.transport);
+        var request = try self.readClientRequest(socket, is_remote);
         defer request.deinit(self.allocator);
         self.client_counter += 1;
         // Handle special commands
@@ -266,6 +279,12 @@ pub const Conductor = struct {
             try self.serveString(socket, VERSION_STRING);
             return;
         }
+        // Remote client routing: sandbox unless disabled
+        if (is_remote and self.cfg.sandbox_remote_clients) {
+            try self.handleRemoteClient(socket, &request);
+            return;
+        }
+        // Local client: normal path
         const project_path = request.project orelse "";
         const julia_channel = request.parsed.julia_channel;
         const worker_key = try self.makeWorkerKey(project_path, julia_channel);
@@ -284,7 +303,39 @@ pub const Conductor = struct {
             return;
         }
         // Normal client: assign to worker
-        try self.assignClientToWorker(socket, &request, worker_key);
+        try self.assignClientToWorker(socket, &request, worker_key, false);
+    }
+
+    fn handleRemoteClient(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest) !void {
+        // Sandboxed workers are only available on Linux
+        if (comptime builtin.os.tag != .linux) {
+            std.debug.print("Client {d}: remote client rejected (sandboxing unavailable on this platform)\n", .{self.client_counter});
+            try self.serveString(socket,
+                "Sandboxed workers are only available on Linux. " ++
+                "Remote TCP clients from non-loopback addresses are rejected.\n",
+            );
+            return;
+        }
+        std.debug.print("Client {d}: remote connection, using sandbox\n", .{self.client_counter});
+        const session_label = request.parsed.getSwitch("--session");
+        const is_labeled_session = session_label != null and session_label.?.len > 0;
+        // Session bypass: allow remote --session=<name> to join existing local workers
+        if (is_labeled_session and self.cfg.sandbox_session_bypass) {
+            if (self.findWorkerByLabelGlobal(session_label.?)) |w| {
+                std.debug.print("Client {d}: session bypass — joining local worker {d} (label '{s}')\n", .{
+                    self.client_counter, w.id, session_label.?,
+                });
+                try self.assignClientToExistingWorker(socket, request, w);
+                return;
+            }
+        }
+        // Sandboxed worker: use __sandbox__ project key
+        const sandbox_key = if (request.parsed.julia_channel) |ch|
+            try self.makeWorkerKey("__sandbox__", ch)
+        else
+            try self.allocator.dupe(u8, "__sandbox__");
+        defer self.allocator.free(sandbox_key);
+        try self.assignClientToWorker(socket, request, sandbox_key, true);
     }
 
     const ClientRequest = struct {
@@ -306,7 +357,7 @@ pub const Conductor = struct {
         }
     };
 
-    fn readClientRequest(self: *Conductor, socket: posix.socket_t) !ClientRequest {
+    fn readClientRequest(self: *Conductor, socket: posix.socket_t, is_remote: bool) !ClientRequest {
         var r = protocol.BufReader{ .fd = socket };
         // Fixed header: flags(1) + reserved(3) + pid(4) + ppid(4) = 12 bytes
         var hdr: [12]u8 = undefined;
@@ -321,15 +372,23 @@ pub const Conductor = struct {
         // NOTE: client_args ownership transfers to parsed.
         // The Switch structs in parsed.switches contain slices into these strings,
         // so we must NOT free them here. They are freed via request.deinit().
-        const cached = self.cache.lookup(fingerprint) orelse blk: {
+        // Remote clients: always request full env (fingerprint cache is per-machine)
+        const cached = if (is_remote) blk: {
             platform.write(socket, &[_]u8{protocol.client.env_request});
             const full_env = try self.readFullEnv(&r);
             break :blk self.cache.insert(fingerprint, full_env);
-        };
+        } else (self.cache.lookup(fingerprint) orelse blk: {
+            platform.write(socket, &[_]u8{protocol.client.env_request});
+            const full_env = try self.readFullEnv(&r);
+            break :blk self.cache.insert(fingerprint, full_env);
+        });
         var parsed = try args.parse(self.allocator, client_args);
         errdefer parsed.deinit();
-        const home_dir = self.environ_map.get("HOME") orelse "";
-        const proj = try project.resolve(self.allocator, self.io, &parsed, cached.julia_project, home_dir, cwd);
+        // Remote clients: skip project resolution (filesystem doesn't match)
+        const proj = if (is_remote) null else blk: {
+            const home_dir = self.environ_map.get("HOME") orelse "";
+            break :blk try project.resolve(self.allocator, self.io, &parsed, cached.julia_project, home_dir, cwd);
+        };
         return .{
             .flags = flags,
             .pid = pid,
@@ -374,11 +433,11 @@ pub const Conductor = struct {
         return env;
     }
 
-    fn assignClientToWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8) !void {
+    fn assignClientToWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandboxed: bool) !void {
         const list = try self.getWorkerList(worker_key);
         const session_label = request.parsed.getSwitch("--session");
         const is_labeled_session = session_label != null and session_label.?.len > 0;
-        std.debug.print("Client {d}; pid: {d}{s}{s}{s}{s}, project: {s}\n", .{
+        std.debug.print("Client {d}; pid: {d}{s}{s}{s}{s}, project: {s}{s}\n", .{
             self.client_counter,
             request.pid,
             if (request.parsed.julia_channel != null) ", julia: " else "",
@@ -386,6 +445,7 @@ pub const Conductor = struct {
             if (session_label != null) ", session: " else "",
             if (session_label) |l| (if (l.len > 0) l else ".") else "",
             request.project orelse "(default)",
+            if (sandboxed) " [sandboxed]" else "",
         });
         const port_set = if (self.port_pool) |*pool| blk: {
             break :blk pool.allocate() orelse {
@@ -394,20 +454,24 @@ pub const Conductor = struct {
             };
         } else protocol.PortPool.none;
         errdefer self.releasePortSet(port_set);
+        // Sandboxed workers: override identity env vars so the worker's
+        // withenv(client.env...) doesn't leak the remote client's HOME etc.
+        const sandbox_env = if (sandboxed) try self.buildSandboxClientEnv(request.env) else null;
+        defer if (sandbox_env) |e| self.allocator.free(e);
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
             .force = is_labeled_session,
             .pid = request.pid,
             .ppid = request.ppid,
-            .cwd = request.cwd,
-            .env = request.env,
+            .cwd = if (sandboxed) "/home/sandbox" else request.cwd,
+            .env = sandbox_env orelse request.env,
             .switches = request.parsed.switches.items,
             .programfile = request.parsed.program_file,
             .args = request.parsed.program_args,
             .port_set = port_set,
         };
         const now = self.currentTime();
-        const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, now);
+        const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, now, sandboxed);
         std.debug.print("Assigned client {d} to worker {d}: {s}\n", .{ self.client_counter, assignment.w.id, @tagName(assignment.reason) });
         defer self.allocator.free(assignment.paths.stdin);
         defer self.allocator.free(assignment.paths.stdout);
@@ -416,7 +480,47 @@ pub const Conductor = struct {
         assignment.w.last_pinged = now;
         assignment.w.recordPpid(request.ppid, self.cfg.worker_maxclients);
         try self.registerClient(request.pid, self.client_counter, assignment.w, port_set);
+        std.debug.print("Client {d}: sending socket paths to client\n", .{self.client_counter});
         self.sendSocketPaths(socket, assignment.paths);
+        std.debug.print("Client {d}: done\n", .{self.client_counter});
+    }
+
+    /// Assign a remote client to an existing (already-selected) worker.
+    /// Used for session bypass where the worker was found via global label search.
+    fn assignClientToExistingWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, w: *worker.Worker) !void {
+        const port_set = if (self.port_pool) |*pool| blk: {
+            break :blk pool.allocate() orelse {
+                std.debug.print("Client {d}: port pool exhausted\n", .{self.client_counter});
+                return error.PortPoolExhausted;
+            };
+        } else protocol.PortPool.none;
+        errdefer self.releasePortSet(port_set);
+        const session_label = request.parsed.getSwitch("--session");
+        const is_labeled_session = session_label != null and session_label.?.len > 0;
+        // Remote client's cwd doesn't exist on the host — use host home
+        const client_info = worker.ClientInfo{
+            .tty = request.flags.tty,
+            .force = is_labeled_session,
+            .pid = request.pid,
+            .ppid = request.ppid,
+            .cwd = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/",
+            .env = request.env,
+            .switches = request.parsed.switches.items,
+            .programfile = request.parsed.program_file,
+            .args = request.parsed.program_args,
+            .port_set = port_set,
+        };
+        self.event_loop.cancelPendingPing(w);
+        const paths = try w.runClient(self.allocator, &client_info);
+        defer self.allocator.free(paths.stdin);
+        defer self.allocator.free(paths.stdout);
+        defer self.allocator.free(paths.stderr);
+        defer self.allocator.free(paths.signals);
+        const now = self.currentTime();
+        w.last_pinged = now;
+        w.recordPpid(request.ppid, self.cfg.worker_maxclients);
+        try self.registerClient(request.pid, self.client_counter, w, port_set);
+        self.sendSocketPaths(socket, paths);
     }
 
     // --- Worker selection ---
@@ -430,6 +534,7 @@ pub const Conductor = struct {
         project_path: []const u8,
         julia_channel: ?[]const u8,
         now: i64,
+        sandboxed: bool,
     ) !WorkerAssignment {
         // 1. Labeled session: find worker with matching label
         if (is_labeled_session) {
@@ -437,20 +542,29 @@ pub const Conductor = struct {
                 if (self.tryAssignWorker(w, client_info, .session_label)) |a| return a;
             }
         }
-        // 2. PPID-affinity
-        if (self.findWorkerByPpid(list, client_info.ppid, now)) |w| {
-            if (self.tryAssignWorker(w, client_info, .ppid_affinity)) |a| return a;
+        // Sandboxed workers skip PPID affinity and existing-worker reuse
+        if (!sandboxed) {
+            // 2. PPID-affinity
+            if (self.findWorkerByPpid(list, client_info.ppid, now)) |w| {
+                if (self.tryAssignWorker(w, client_info, .ppid_affinity)) |a| return a;
+            }
+            // 3. Second-most-recent available worker
+            if (self.tryExistingWorkers(list, client_info, now)) |a| return a;
         }
-        // 3. Second-most-recent available worker
-        if (self.tryExistingWorkers(list, client_info, now)) |a| return a;
         // 4. Spawn new worker
-        const w = try self.addWorkerToPool(list, project_path, julia_channel);
+        const w = if (sandboxed)
+            try self.addSandboxedWorkerToPool(list, julia_channel)
+        else
+            try self.addWorkerToPool(list, project_path, julia_channel);
         if (is_labeled_session and w.session_label == null) {
             std.debug.print("Worker {d}: assigning label '{s}'\n", .{ w.id, session_label.? });
             w.session_label = try self.allocator.dupe(u8, session_label.?);
         }
         self.event_loop.cancelPendingPing(w);
-        return .{ .paths = try w.runClient(self.allocator, client_info), .w = w, .reason = .new_worker };
+        std.debug.print("Worker {d}: sending client to worker...\n", .{w.id});
+        const paths = try w.runClient(self.allocator, client_info);
+        std.debug.print("Worker {d}: got socket paths, sending to client\n", .{w.id});
+        return .{ .paths = paths, .w = w, .reason = .new_worker };
     }
 
     fn isWorkerAvailable(self: *Conductor, w: *worker.Worker, now: i64) bool {
@@ -590,6 +704,39 @@ pub const Conductor = struct {
         return w;
     }
 
+    /// Search ALL worker lists for a worker with matching session label.
+    /// Used for session bypass (remote client joining local worker by label).
+    fn findWorkerByLabelGlobal(self: *Conductor, label: []const u8) ?*worker.Worker {
+        var it = self.workers.iterator();
+        while (it.next()) |entry| {
+            if (findWorkerByLabel(entry.value_ptr, label)) |w| return w;
+        }
+        return null;
+    }
+
+    fn addSandboxedWorkerToPool(self: *Conductor, list: *WorkerList, julia_channel: ?[]const u8) !*worker.Worker {
+        const w = try self.allocator.create(worker.Worker);
+        errdefer self.allocator.destroy(w);
+        w.* = try worker.Worker.spawnSandboxed(
+            self.allocator,
+            self.io,
+            &self.cfg,
+            self.next_worker_id,
+            self.cfg.runtime_dir,
+            julia_channel,
+            self.environ_map,
+        );
+        std.debug.print("Spawning sandboxed worker {d} (pid {d})\n", .{
+            self.next_worker_id,
+            platform.getChildPid(w.process),
+        });
+        self.next_worker_id += 1;
+        self.event_loop.cancelPendingPing(w);
+        // Sandboxed workers use default project (no setProject call)
+        try list.append(self.allocator, w);
+        return w;
+    }
+
     fn killWorkersForProject(self: *Conductor, proj: []const u8) usize {
         if (self.workers.getPtr(proj)) |list| {
             const count = list.items.len;
@@ -689,6 +836,32 @@ pub const Conductor = struct {
             self.allocator.free(label);
             w.session_label = null;
         }
+    }
+
+    // --- Sandbox env filtering ---
+
+    const sandbox_identity_keys = [_][]const u8{ "HOME", "USER", "LOGNAME" };
+    const sandbox_identity_vars = [_]worker.EnvVar{
+        .{ .key = "HOME", .value = "/home/sandbox" },
+        .{ .key = "USER", .value = "sandbox" },
+        .{ .key = "LOGNAME", .value = "sandbox" },
+    };
+
+    /// Build a client env slice with identity vars overridden for sandbox.
+    /// Caller must free the returned slice (but not the individual EnvVars,
+    /// which point into the original env or static strings).
+    fn buildSandboxClientEnv(self: *Conductor, env: []const worker.EnvVar) ![]const worker.EnvVar {
+        // Upper bound: original env + identity overrides
+        const result = try self.allocator.alloc(worker.EnvVar, env.len + sandbox_identity_vars.len);
+        var n: usize = 0;
+        for (env) |e| {
+            var is_identity = false;
+            for (sandbox_identity_keys) |k|
+                if (std.mem.eql(u8, e.key, k)) { is_identity = true; };
+            if (!is_identity) { result[n] = e; n += 1; }
+        }
+        for (sandbox_identity_vars) |e| { result[n] = e; n += 1; }
+        return result[0..n];
     }
 
     // --- Port pool ---
@@ -919,6 +1092,14 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.port_range) |r| {
         std.debug.print(" - Port range: {d}-{d} ({d} port sets, {d} ports used)\n", .{ r.base, r.base + r.count * 4 - 1, r.count, @as(u32, r.count) * 4 });
     }
+    if (cfg.sandbox_max_memory) |m|
+        std.debug.print(" - Sandbox memory limit: {s}\n", .{m});
+    if (cfg.sandbox_max_cpu) |c|
+        std.debug.print(" - Sandbox CPU limit: {d}%\n", .{c});
+    if (!cfg.sandbox_remote_clients)
+        std.debug.print(" - Sandbox remote clients: disabled\n", .{});
+    if (cfg.sandbox_session_bypass)
+        std.debug.print(" - Sandbox session bypass: enabled\n", .{});
     if (cfg.transport == .unix) {
         Io.Dir.createDirAbsolute(io, cfg.runtime_dir, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
