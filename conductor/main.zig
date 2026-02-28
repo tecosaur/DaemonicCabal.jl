@@ -96,6 +96,7 @@ const CLIENT_HELP =
     \\ --sync                     Attach to shared REPL (requires --session=<label>)
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
     \\ --restart                  Kill workers for the project and exit
+    \\ --sandbox                  Run in an isolated sandbox (Linux only)
     \\
 ++ DAEMON_MANAGEMENT_HELP;
 
@@ -169,16 +170,10 @@ pub const Conductor = struct {
         self.event_loop.deinit();
         self.cache.deinit();
         self.active_clients.deinit();
-        if (self.reserve) |r| {
-            r.deinit();
-            self.allocator.destroy(r);
-        }
+        if (self.reserve) |r| self.cleanupWorker(r);
         var it = self.workers.iterator();
         while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| {
-                w.deinit();
-                self.allocator.destroy(w);
-            }
+            for (entry.value_ptr.items) |w| self.cleanupWorker(w);
             entry.value_ptr.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
@@ -186,6 +181,20 @@ pub const Conductor = struct {
         if (g_socket_path.len > 0) self.allocator.free(g_socket_path);
         if (g_pid_path.len > 0) self.allocator.free(g_pid_path);
         self.cfg.deinit();
+    }
+
+    fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
+        if (w.sandboxed) self.removeSandboxDir(w.id);
+        w.deinit();
+        self.allocator.destroy(w);
+    }
+
+    fn removeSandboxDir(self: *Conductor, worker_id: u32) void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "sandbox-{d}", .{worker_id}) catch return;
+        var dir = Io.Dir.openDirAbsolute(self.io, self.cfg.runtime_dir, .{}) catch return;
+        defer dir.close(self.io);
+        dir.deleteTree(self.io, name) catch {};
     }
 
     pub fn run(self: *Conductor) !void {
@@ -221,7 +230,10 @@ pub const Conductor = struct {
         defer dir.close(self.io);
         var iter = dir.iterate();
         while (iter.next(self.io) catch null) |entry| {
-            dir.deleteFile(self.io, entry.name) catch {};
+            if (entry.kind == .directory)
+                dir.deleteTree(self.io, entry.name) catch {}
+            else
+                dir.deleteFile(self.io, entry.name) catch {};
         }
     }
 
@@ -285,6 +297,15 @@ pub const Conductor = struct {
             try self.handleRemoteClient(socket, &request);
             return;
         }
+        // Local --sandbox or remote --sandbox with auto-sandbox disabled
+        if (request.parsed.hasSwitch("--sandbox")) {
+            if (is_remote) {
+                try self.handleRemoteClient(socket, &request);
+            } else {
+                try self.handleLocalSandboxClient(socket, &request);
+            }
+            return;
+        }
         // Local client: normal path
         const project_path = request.project orelse "";
         const julia_channel = request.parsed.julia_channel;
@@ -313,7 +334,7 @@ pub const Conductor = struct {
             return;
         }
         // Normal client: assign to worker
-        try self.assignClientToWorker(socket, &request, worker_key, false);
+        try self.assignClientToWorker(socket, &request, worker_key, .none);
     }
 
     fn handleRemoteClient(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest) !void {
@@ -345,7 +366,34 @@ pub const Conductor = struct {
         else
             try self.allocator.dupe(u8, "__sandbox__");
         defer self.allocator.free(sandbox_key);
-        try self.assignClientToWorker(socket, request, sandbox_key, true);
+        try self.assignClientToWorker(socket, request, sandbox_key, .remote);
+    }
+
+    fn handleLocalSandboxClient(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest) !void {
+        if (comptime builtin.os.tag != .linux) {
+            std.debug.print("Client {d}: --sandbox rejected (Linux only)\n", .{self.client_counter});
+            try self.serveString(socket, "--sandbox requires Linux (user namespaces).\n");
+            return;
+        }
+        const cwd = trimTrailingSlashes(request.cwd);
+        const proj = trimTrailingSlashes(request.project orelse "");
+        // When cwd is inside a non-global project, mount the project rw
+        // (subsumes cwd). Otherwise mount just cwd rw.
+        const is_named_env = proj.len > 0 and proj[0] == '@';
+        const has_local_project = proj.len > 0 and !is_named_env;
+        const rw_mount: []const u8 = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd;
+        const rw_binds = [_][]const u8{rw_mount};
+        // Worker key encodes rw mount + project so workers only share when
+        // their mount configuration matches
+        const worker_key = if (request.parsed.julia_channel) |ch|
+            try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}", .{ rw_mount, proj, ch })
+        else
+            try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}", .{ rw_mount, proj });
+        defer self.allocator.free(worker_key);
+        std.debug.print("Client {d}: local sandbox, rw={s}, project={s}\n", .{
+            self.client_counter, rw_mount, if (proj.len > 0) proj else "(default)",
+        });
+        try self.assignClientToWorker(socket, request, worker_key, .{ .local = &rw_binds });
     }
 
     const ClientRequest = struct {
@@ -443,7 +491,13 @@ pub const Conductor = struct {
         return env;
     }
 
-    fn assignClientToWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandboxed: bool) !void {
+    const SandboxKind = union(enum) {
+        none,
+        remote,
+        local: []const []const u8, // rw bind mounts
+    };
+
+    fn assignClientToWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandbox: SandboxKind) !void {
         const list = try self.getWorkerList(worker_key);
         const session_label = request.parsed.getSwitch("--session");
         const is_labeled_session = session_label != null and session_label.?.len > 0;
@@ -455,7 +509,7 @@ pub const Conductor = struct {
             if (session_label != null) ", session: " else "",
             if (session_label) |l| (if (l.len > 0) l else ".") else "",
             request.project orelse "(default)",
-            if (sandboxed) " [sandboxed]" else "",
+            if (sandbox != .none) " [sandboxed]" else "",
         });
         const port_set = if (self.port_pool) |*pool| blk: {
             break :blk pool.allocate() orelse {
@@ -464,16 +518,16 @@ pub const Conductor = struct {
             };
         } else protocol.PortPool.none;
         errdefer self.releasePortSet(port_set);
-        // Sandboxed workers: override identity env vars so the worker's
-        // withenv(client.env...) doesn't leak the remote client's HOME etc.
-        const sandbox_env = if (sandboxed) try self.buildSandboxClientEnv(request.env) else null;
+        // Remote sandboxed workers: override identity env vars so the
+        // worker's withenv(client.env...) doesn't leak the remote HOME etc.
+        const sandbox_env = if (sandbox == .remote) try self.buildSandboxClientEnv(request.env) else null;
         defer if (sandbox_env) |e| self.allocator.free(e);
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
             .force = is_labeled_session,
             .pid = request.pid,
             .ppid = request.ppid,
-            .cwd = if (sandboxed) "/home/sandbox" else request.cwd,
+            .cwd = if (sandbox == .remote) "/home/sandbox" else request.cwd,
             .env = sandbox_env orelse request.env,
             .switches = request.parsed.switches.items,
             .programfile = request.parsed.program_file,
@@ -481,7 +535,7 @@ pub const Conductor = struct {
             .port_set = port_set,
         };
         const now = self.currentTime();
-        const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, now, sandboxed);
+        const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, now, sandbox);
         std.debug.print("Assigned client {d} to worker {d}: {s}\n", .{ self.client_counter, assignment.w.id, @tagName(assignment.reason) });
         defer self.allocator.free(assignment.paths.stdin);
         defer self.allocator.free(assignment.paths.stdout);
@@ -544,7 +598,7 @@ pub const Conductor = struct {
         project_path: []const u8,
         julia_channel: ?[]const u8,
         now: i64,
-        sandboxed: bool,
+        sandbox: SandboxKind,
     ) !WorkerAssignment {
         // 1. Labeled session: find worker with matching label
         if (is_labeled_session) {
@@ -552,8 +606,8 @@ pub const Conductor = struct {
                 if (self.tryAssignWorker(w, client_info, .session_label)) |a| return a;
             }
         }
-        // Sandboxed workers skip PPID affinity and existing-worker reuse
-        if (!sandboxed) {
+        // Remote sandboxed workers skip PPID affinity and existing-worker reuse
+        if (sandbox != .remote) {
             // 2. PPID-affinity
             if (self.findWorkerByPpid(list, client_info.ppid, now)) |w| {
                 if (self.tryAssignWorker(w, client_info, .ppid_affinity)) |a| return a;
@@ -562,10 +616,11 @@ pub const Conductor = struct {
             if (self.tryExistingWorkers(list, client_info, now)) |a| return a;
         }
         // 4. Spawn new worker
-        const w = if (sandboxed)
-            try self.addSandboxedWorkerToPool(list, julia_channel)
-        else
-            try self.addWorkerToPool(list, project_path, julia_channel);
+        const w = switch (sandbox) {
+            .none => try self.addWorkerToPool(list, project_path, julia_channel),
+            .remote => try self.addSandboxedWorkerToPool(list, project_path, julia_channel, &.{}),
+            .local => |rw_binds| try self.addSandboxedWorkerToPool(list, project_path, julia_channel, rw_binds),
+        };
         if (is_labeled_session and w.session_label == null) {
             std.debug.print("Worker {d}: assigning label '{s}'\n", .{ w.id, session_label.? });
             w.session_label = try self.allocator.dupe(u8, session_label.?);
@@ -724,9 +779,22 @@ pub const Conductor = struct {
         return null;
     }
 
-    fn addSandboxedWorkerToPool(self: *Conductor, list: *WorkerList, julia_channel: ?[]const u8) !*worker.Worker {
+    fn addSandboxedWorkerToPool(
+        self: *Conductor,
+        list: *WorkerList,
+        project_path: []const u8,
+        julia_channel: ?[]const u8,
+        rw_binds: []const []const u8,
+    ) !*worker.Worker {
+        const proj_copy = if (project_path.len > 0) try self.allocator.dupe(u8, project_path) else null;
+        errdefer if (proj_copy) |p| self.allocator.free(p);
         const w = try self.allocator.create(worker.Worker);
         errdefer self.allocator.destroy(w);
+        // When the project dir isn't already covered by an rw bind, mount it ro
+        const proj_ro = if (project_path.len > 0 and !pathCoveredBy(project_path, rw_binds))
+            &[_][]const u8{project_path}
+        else
+            &[_][]const u8{};
         w.* = try worker.Worker.spawnSandboxed(
             self.allocator,
             self.io,
@@ -735,16 +803,39 @@ pub const Conductor = struct {
             self.cfg.runtime_dir,
             julia_channel,
             self.environ_map,
+            proj_ro,
+            rw_binds,
         );
-        std.debug.print("Spawning sandboxed worker {d} (pid {d})\n", .{
+        std.debug.print("Spawning sandboxed worker {d} (pid {d}){s}{s}\n", .{
             self.next_worker_id,
             platform.getChildPid(w.process),
+            if (project_path.len > 0) " for project " else "",
+            if (project_path.len > 0) project_path else "",
         });
         self.next_worker_id += 1;
         self.event_loop.cancelPendingPing(w);
-        // Sandboxed workers use default project (no setProject call)
+        if (proj_copy) |p| try w.setProject(p);
         try list.append(self.allocator, w);
         return w;
+    }
+
+    fn trimTrailingSlashes(path: []const u8) []const u8 {
+        var end = path.len;
+        while (end > 1 and path[end - 1] == '/') end -= 1;
+        return path[0..end];
+    }
+
+    /// Test whether `path` is equal to or a subdirectory of any entry in `dirs`.
+    fn pathCoveredBy(path: []const u8, dirs: []const []const u8) bool {
+        const p = trimTrailingSlashes(path);
+        for (dirs) |raw_d| {
+            const d = trimTrailingSlashes(raw_d);
+            if (std.mem.eql(u8, d, p)) return true;
+            if (p.len > d.len and
+                std.mem.startsWith(u8, p, d) and
+                p[d.len] == '/') return true;
+        }
+        return false;
     }
 
     fn killWorkersForProject(self: *Conductor, proj: []const u8) usize {
@@ -753,8 +844,7 @@ pub const Conductor = struct {
             for (list.items) |w| {
                 self.removeActiveClientsForWorker(w);
                 w.softExit();
-                w.deinit();
-                self.allocator.destroy(w);
+                self.cleanupWorker(w);
             }
             list.deinit(self.allocator);
             _ = self.workers.remove(proj);
@@ -777,8 +867,7 @@ pub const Conductor = struct {
             }
         }
         if (w.process.id) |id| _ = platform.kill(id, platform.SIG.KILL);
-        w.deinit();
-        self.allocator.destroy(w);
+        self.cleanupWorker(w);
     }
 
     fn removeActiveClientsForWorker(self: *Conductor, w: *worker.Worker) void {

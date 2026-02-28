@@ -47,11 +47,12 @@ pub const SandboxConfig = struct {
     worker_args: []const u8,
     eval_expr: []const u8,
     host_environ: *const std.process.Environ.Map,
-    setup_socket_path: []const u8, // host path to wsetup-*.sock (bind-mounted individually)
+    setup_socket_path: []const u8, // host path to wsetup-*.sock (parent dir bind-mounted rw)
     worker_id: u32, // conductor-assigned worker ID (unique, used for cgroup naming)
     // Isolation
     host_home: []const u8,
     extra_ro_binds: []const []const u8 = &.{},
+    extra_rw_binds: []const []const u8 = &.{},
     empty_environment: bool = true,
     max_memory: ?[]const u8,
     max_cpu: ?u32,
@@ -160,8 +161,9 @@ fn setupNamespaces(orig_uid: linux.uid_t, orig_gid: linux.gid_t) SandboxError!vo
 //   1. mountStaging    — tmpfs staging area, overlay dirs, first pivot_root
 //   2. mountSystemDirs — /dev, /proc, /tmp, system ro-binds
 //   3. mountHome       — /home tmpfs, juliaup config, depot overlay, sandbox symlink
-//   4. extra ro-binds  — caller-specified paths (e.g. worker project)
-//   5. final pivot     — pivot_root into /newroot, detach staging
+//   4. extra binds     — caller-specified ro and rw paths (e.g. worker project, client cwd)
+//   5. socket dir      — per-worker runtime subdirectory (rw, for stdio sockets)
+//   6. final pivot     — pivot_root into /newroot, detach staging
 
 fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
     const home = config.host_home;
@@ -178,17 +180,29 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
         mkdirp(dst);
         robindOptional(src, dst);
     }
-    // Setup socket: bind-mount only the specific socket file the worker
-    // needs to connect back to the conductor. This avoids exposing the
-    // entire runtime dir (which contains conductor.sock, pid files, etc.).
+    // Extra read-write bind mounts (e.g. client cwd/project for --sandbox)
+    for (config.extra_rw_binds) |path| {
+        if (path.len == 0) continue;
+        var src_buf: [512]u8 = undefined;
+        var dst_buf: [512]u8 = undefined;
+        const src = fmtPath(&src_buf, "/oldroot{s}", .{path}) orelse continue;
+        const dst = fmtPath(&dst_buf, "/newroot{s}", .{path}) orelse continue;
+        mkdirp(dst);
+        try mountBind(src, dst);
+    }
+    // Per-worker socket directory: bind-mount rw so the worker can
+    // create stdio sockets visible to the host. Only the per-worker
+    // subdirectory (e.g. sandbox-1/) is exposed, not the main runtime dir.
     if (config.setup_socket_path.len > 0) {
-        var sock_src: [512]u8 = undefined;
-        var sock_dst: [512]u8 = undefined;
-        if (fmtPath(&sock_src, "/oldroot{s}", .{config.setup_socket_path})) |src| {
-            if (fmtPath(&sock_dst, "/newroot{s}", .{config.setup_socket_path})) |dst| {
-                mkdirp(dst);
-                touchFile(dst) catch {};
-                mountBind(src, dst) catch {};
+        if (std.mem.lastIndexOfScalar(u8, config.setup_socket_path, '/')) |sep| {
+            const runtime_dir = config.setup_socket_path[0..sep];
+            var src_buf: [512]u8 = undefined;
+            var dst_buf: [512]u8 = undefined;
+            if (fmtPath(&src_buf, "/oldroot{s}", .{runtime_dir})) |src| {
+                if (fmtPath(&dst_buf, "/newroot{s}", .{runtime_dir})) |dst| {
+                    mkdirp(dst);
+                    mountBind(src, dst) catch {};
+                }
             }
         }
     }

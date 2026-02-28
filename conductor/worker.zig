@@ -33,6 +33,7 @@ pub const Worker = struct {
     ping_pending: bool = false,
     pong_buf: [5]u8 = undefined,
     active_clients: u32,
+    sandboxed: bool = false,
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
 
@@ -44,7 +45,7 @@ pub const Worker = struct {
         runtime_dir: []const u8,
         julia_channel: ?[]const u8,
     ) !Worker {
-        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, false, null);
+        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, false, null, &.{}, &.{});
     }
 
     pub fn spawnSandboxed(
@@ -55,8 +56,10 @@ pub const Worker = struct {
         runtime_dir: []const u8,
         julia_channel: ?[]const u8,
         environ_map: *const std.process.Environ.Map,
+        extra_ro_binds: []const []const u8,
+        extra_rw_binds: []const []const u8,
     ) !Worker {
-        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, true, environ_map);
+        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, true, environ_map, extra_ro_binds, extra_rw_binds);
     }
 
     fn spawnImpl(
@@ -68,11 +71,25 @@ pub const Worker = struct {
         julia_channel: ?[]const u8,
         sandboxed: bool,
         environ_map: ?*const std.process.Environ.Map,
+        extra_ro_binds: []const []const u8,
+        extra_rw_binds: []const []const u8,
     ) !Worker {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        // Sandboxed workers use a per-worker subdirectory so the sandbox
+        // can bind-mount it rw without exposing the rest of the runtime dir.
+        // The worker derives its RUNTIME_DIR from dirname(setup_socket_path),
+        // so placing the setup socket here makes the worker create its
+        // stdio sockets in the same isolated subdirectory.
+        var subdir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const effective_runtime_dir = if (sandboxed and builtin.os.tag == .linux) blk: {
+            const subdir = std.fmt.bufPrint(&subdir_buf, "{s}/sandbox-{d}", .{ runtime_dir, id }) catch
+                return error.PathTooLong;
+            Io.Dir.createDirAbsolute(io, subdir, .default_dir) catch {};
+            break :blk subdir;
+        } else runtime_dir;
         // Conductor and worker are always on the same machine, so use a
         // Unix socket regardless of the client-facing transport mode.
-        var setup = try createListener(io, .unix, runtime_dir, "wsetup.sock", "", &path_buf);
+        var setup = try createListener(io, .unix, effective_runtime_dir, "wsetup.sock", "", &path_buf);
         defer setup.server.deinit(io);
         defer Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
         const eval_expr = try std.fmt.allocPrint(
@@ -92,7 +109,19 @@ pub const Worker = struct {
                 resolveInPath(io, cfg.worker_executable, p) orelse cfg.worker_executable
             else
                 cfg.worker_executable;
-            const extra_binds = [_][]const u8{cfg.worker_project};
+            // Merge caller-provided ro binds with the worker project dir
+            var ro_binds: [8][]const u8 = undefined;
+            var n_ro: usize = 0;
+            ro_binds[n_ro] = cfg.worker_project;
+            n_ro += 1;
+            if (extra_ro_binds.len > ro_binds.len - n_ro) {
+                std.debug.print("Worker: too many ro binds ({d}), max {d}\n", .{ extra_ro_binds.len + 1, ro_binds.len });
+                return error.TooManyBinds;
+            }
+            for (extra_ro_binds) |b| {
+                ro_binds[n_ro] = b;
+                n_ro += 1;
+            }
             const sandbox_cfg = sandbox.SandboxConfig{
                 .julia_executable = exe_path,
                 .julia_channel = julia_channel,
@@ -103,7 +132,8 @@ pub const Worker = struct {
                 .setup_socket_path = setup.addr,
                 .worker_id = id,
                 .host_home = cfg.host_home,
-                .extra_ro_binds = &extra_binds,
+                .extra_ro_binds = ro_binds[0..n_ro],
+                .extra_rw_binds = extra_rw_binds,
                 .empty_environment = cfg.sandbox_empty_environment,
                 .max_memory = cfg.sandbox_max_memory,
                 .max_cpu = cfg.sandbox_max_cpu,
@@ -159,6 +189,7 @@ pub const Worker = struct {
             .last_active = now,
             .last_pinged = now,
             .active_clients = 0,
+            .sandboxed = sandboxed,
         };
     }
 
