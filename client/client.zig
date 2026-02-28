@@ -78,6 +78,8 @@ const EnvBlock = std.process.Environ.Block;
 const SignalParser = struct {
     buf: [256]u8 = undefined,
     len: usize = 0,
+    sync_mode: bool = false,
+    worker_wants_raw: bool = false,
     const header_size = 2; // id (1) + len (1)
 
     pub const Result = union(enum) {
@@ -104,7 +106,7 @@ const SignalParser = struct {
             const data_len: usize = self.buf[pos + 1];
             const total_len = header_size + data_len;
             if (pos + total_len > self.len) break; // incomplete signal
-            result = dispatch(id, self.buf[pos + header_size .. pos + total_len], fd);
+            result = self.dispatch(id, self.buf[pos + header_size .. pos + total_len], fd);
             pos += total_len;
         }
         // Compact buffer
@@ -118,11 +120,18 @@ const SignalParser = struct {
         return result;
     }
 
-    fn dispatch(id: u8, data: []const u8, fd: posix.socket_t) Result {
+    fn dispatch(self: *@This(), id: u8, data: []const u8, fd: posix.socket_t) Result {
         return switch (id) {
             protocol.signals.exit => .{ .exit = if (data.len >= 1) data[0] else 1 },
             protocol.signals.raw_mode => blk: {
-                if (data.len == 1) platform.setRawMode(data[0] != 0);
+                if (data.len == 1) {
+                    if (self.sync_mode) {
+                        // In sync mode, track worker's desired state but stay in raw mode
+                        self.worker_wants_raw = data[0] != 0;
+                    } else {
+                        platform.setRawMode(data[0] != 0);
+                    }
+                }
                 platform.socketWrite(fd, &[_]u8{ id, 0 }); // ack: id + len:u8=0
                 break :blk .none;
             },
@@ -182,6 +191,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var env = scanEnv(init.environ.block);
     const addr_arg = extractAddressArg(init.args.vector);
     if (addr_arg.value) |addr| env.server_path = addr;
+    const sync_arg = extractSyncArg(init.args.vector);
     // Set raw mode for TTY to avoid line buffering
     const is_tty = platform.isatty(platform.getStdinHandle());
     if (is_tty) platform.setRawMode(true);
@@ -191,12 +201,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (transport_mode == .tcp) protocol.setTcpNodelay(conductor.socket.handle);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor.socket.handle };
-    try sendClientInfo(&w, env, is_tty, init.args, addr_arg.skip);
+    try sendClientInfo(&w, env, is_tty, init.args, addr_arg.skip, sync_arg.skip);
     // Get worker socket paths (conductor may request full env on cache miss)
     sockets = try connectToWorker(conductor, &w, env, init.environ.block);
     // Forward signals to worker instead of terminating
     registerSignalHandlers();
-    try runEventLoop();
+    signal_parser.sync_mode = sync_arg.sync;
+    try runEventLoop(sync_arg.sync);
 }
 
 fn scanEnv(block: EnvBlock) EnvInfo {
@@ -278,7 +289,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     std.process.exit(127);
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args, skip: [2]usize) !void {
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args, addr_skip: [2]usize, sync_skip: usize) !void {
     // Header: magic + flags + reserved + pid + ppid
     w.writeInt(u32, protocol.client.magic);
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty }));
@@ -294,12 +305,16 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.pr
     w.pos += cwd_len;
     // Environment fingerprint
     w.writeInt(u64, env.fingerprint);
-    // Args (skip address flag indices — client-only, not forwarded)
-    const skip_count = @as(u16, if (skip[0] != sentinel) 1 else 0) +
-        @as(u16, if (skip[1] != sentinel) 1 else 0);
+    // Args (skip address flag and --sync indices — client-only, not forwarded to worker as-is)
+    // NOTE: --sync IS forwarded (it's in the switch list), but it is extracted from argv
+    // separately by extractSyncArg for the client to act on locally. The conductor receives
+    // it because it's not skipped from the args sent on the wire.
+    const skip_count = @as(u16, if (addr_skip[0] != sentinel) 1 else 0) +
+        @as(u16, if (addr_skip[1] != sentinel) 1 else 0);
     w.writeInt(u16, @intCast(raw_args.vector.len - skip_count));
     for (raw_args.vector, 0..) |arg_ptr, i| {
-        if (i == skip[0] or i == skip[1]) continue;
+        if (i == addr_skip[0] or i == addr_skip[1]) continue;
+        _ = sync_skip; // --sync stays in the forwarded args
         w.writeLenPrefixed(u16, std.mem.span(arg_ptr));
     }
     w.flush();
@@ -363,13 +378,14 @@ fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
     w.flush();
 }
 
-fn runEventLoop() !void {
+fn runEventLoop(sync_mode: bool) !void {
     const exit_code = try eloop.run(
         sockets.stdin.socket.handle,
         sockets.stdout.socket.handle,
         sockets.stderr.socket.handle,
         sockets.signals.socket.handle,
         &signal_parser,
+        sync_mode,
     );
     notifyExit();
     std.process.exit(exit_code);
@@ -396,7 +412,7 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Str
     } else raw;
     const mode = (protocol.parseAddress(addr) catch unreachable).mode;
     const stream = protocol.connectAddress(io, mode, addr) catch |e| {
-        std.debug.print("Failed to connect to worker " ++ label ++ " socket: {s}: {}\n", .{ addr, e });
+        std.debug.print("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ addr, e });
         std.process.exit(127);
     };
     if (mode == .unix) Io.Dir.deleteFileAbsolute(io, raw) catch {};
@@ -437,6 +453,22 @@ fn getTerminalSize() struct { height: u16, width: u16 } {
 }
 
 const sentinel = std.math.maxInt(usize);
+
+const SyncArg = struct {
+    sync: bool,
+    skip: usize, // index to omit when forwarding; sentinel = unused
+};
+
+fn extractSyncArg(vector: []const ?[*:0]const u8) SyncArg {
+    for (vector, 0..) |entry, i| {
+        if (i == 0) continue;
+        const arg = std.mem.span(entry orelse continue);
+        if (std.mem.eql(u8, arg, "--")) return .{ .sync = false, .skip = sentinel };
+        if (std.mem.eql(u8, arg, "--sync"))
+            return .{ .sync = true, .skip = sentinel }; // keep in forwarded args
+    }
+    return .{ .sync = false, .skip = sentinel };
+}
 
 const AddressArg = struct {
     value: ?[]const u8,

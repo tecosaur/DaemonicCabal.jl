@@ -3,12 +3,15 @@
 
 using Base.ScopedValues
 
+const OutputIO = Union{Base.PipeEndpoint, Sockets.TCPSocket, BroadcastWriter{StreamIO}}
+
 mutable struct VirtualTerm
-    const stdin::Union{Base.PipeEndpoint, Sockets.TCPSocket}
-    const stdout::Union{Base.PipeEndpoint, Sockets.TCPSocket}
-    const stderr::Union{Base.PipeEndpoint, Sockets.TCPSocket}
-    const signals::Union{Base.PipeEndpoint, Sockets.TCPSocket}
+    const stdin::StreamIO
+    const stdout::OutputIO
+    const stderr::OutputIO
+    const signals::StreamIO
     const term::String
+    const sync_session::Union{Nothing, SyncSession}
     terminfo::Union{Nothing, Base.TermInfo}
     have_color::Union{Nothing, Bool}
     have_truecolor::Union{Nothing, Bool}
@@ -53,9 +56,7 @@ const WORKER_TERM = VirtualTerm(
     Base.PipeEndpoint(),
     Base.PipeEndpoint(),
     "Unknown",
-    nothing,
-    nothing,
-    nothing
+    nothing, nothing, nothing, nothing
 )
 
 const ACTIVE_TERM = ScopedValue{VirtualTerm}(WORKER_TERM)
@@ -84,13 +85,33 @@ function Base.get(::Union{ScopedStdout, ScopedStderr}, key::Symbol, default)
     end
 end
 
-function Base.displaysize(::Union{ScopedStdout, ScopedStderr})
-    term = ACTIVE_TERM[]
-    isopen(term.signals) || return (24, 80)
-    send_signal(term.signals, SIGNAL_QUERY_SIZE, UInt8[])
+function query_displaysize(signals::StreamIO)
+    send_signal(signals, SIGNAL_QUERY_SIZE, UInt8[])
     # Response: id(1) + len(1) + height(2) + width(2)
-    resp = read(term.signals, 6)
+    resp = read(signals, 6)
     height = reinterpret(UInt16, resp[3:4])[1]
     width = reinterpret(UInt16, resp[5:6])[1]
     (Int(height), Int(width))
+end
+# In sync mode, query all clients and return component-wise minimum (like tmux).
+function Base.displaysize(::Union{ScopedStdout, ScopedStderr})
+    term = ACTIVE_TERM[]
+    session = term.sync_session
+    if !isnothing(session)
+        min_h, min_w = typemax(Int), typemax(Int)
+        for sig in session.signals
+            isopen(sig) || continue
+            h, w = try query_displaysize(sig) catch; continue end
+            min_h = min(min_h, h)
+            min_w = min(min_w, w)
+        end
+        if min_h == typemax(Int)
+            (24, 80)
+        else
+            (min_h, min_w)
+        end
+    else
+        isopen(term.signals) || return (24, 80)
+        query_displaysize(term.signals)
+    end
 end

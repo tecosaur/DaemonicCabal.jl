@@ -93,6 +93,7 @@ const CLIENT_HELP =
     \\ -a, --address <addr>       Connect to conductor at <addr> instead of default
     \\ --session[=<label>]        Reuse worker state in Main module. With a label,
     \\                            multiple clients can share the same session.
+    \\ --sync                     Attach to shared REPL (requires --session=<label>)
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
     \\ --restart                  Kill workers for the project and exit
     \\
@@ -289,6 +290,15 @@ pub const Conductor = struct {
         const julia_channel = request.parsed.julia_channel;
         const worker_key = try self.makeWorkerKey(project_path, julia_channel);
         defer self.allocator.free(worker_key);
+        if (request.parsed.hasSwitch("--sync")) {
+            const session = request.parsed.getSwitch("--session");
+            if (session == null or session.?.len == 0) {
+                std.debug.print("Client {d}: --sync without --session label, rejecting\n", .{self.client_counter});
+                try self.serveString(socket, "--sync requires --session=<label>\n");
+                return;
+            }
+            std.debug.print("Client {d}: sync mode, session='{s}'\n", .{ self.client_counter, session.? });
+        }
         if (request.parsed.hasSwitch("--restart")) {
             const nkilled = self.killWorkersForProject(worker_key);
             std.debug.print("Restart: killed {d} worker(s) for {s}{s}{s}\n", .{

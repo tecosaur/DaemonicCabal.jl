@@ -13,7 +13,8 @@ const STATE = (
     conductor_conn = Ref{Union{IO, Nothing}}(nothing),
     conductor_socket = Ref(""),
     standby_sockets = Ref{Union{Nothing, NTuple{4, Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}}}}(nothing),
-    standby_module = Ref{Union{Nothing, Module}}(nothing))
+    standby_module = Ref{Union{Nothing, Module}}(nothing),
+    sync_sessions = Dict{String, SyncSession}())
 
 # Configuration (set during runworker from environment)
 RUNTIME_DIR::String = ""
@@ -141,6 +142,217 @@ function ensure_standby_sockets()
     end
 end
 
+# Detect --sync + --session=<label> from client switches.
+# Returns the session label if sync mode is active, nothing otherwise.
+function sync_session_label(client::ClientInfo)
+    any(p -> first(p) == "--sync", client.switches) || return nothing
+    idx = findfirst(p -> first(p) == "--session", client.switches)
+    isnothing(idx) && return nothing
+    label = last(client.switches[idx])
+    if !isempty(label) label end
+end
+
+# Handle disconnect of an interactive sync client. Closes the client's own
+# streams, removes them from the session vectors, sends exit signal, and
+# unregisters. When the last interactive client leaves, closes the merged pipe
+# write end (causing REPL EOF) and removes the session.
+function sync_client_disconnect!(client::ClientInfo, client_stdin::StreamIO,
+                                 client_stdout::StreamIO, client_stderr::StreamIO,
+                                 signals::StreamIO, session::SyncSession, label::String)
+    @lock STATE.lock begin
+        filter!(s -> s !== client_stdout, session.outs)
+        filter!(s -> s !== client_stderr, session.errs)
+        filter!(s -> s !== signals, session.signals)
+        session.interactive_count -= 1
+    end
+    # Newline so the client's terminal exits cleanly (terminal is in raw mode)
+    try write(client_stdout, "\r\n") catch end
+    try close(client_stdout) catch end
+    try close(client_stderr) catch end
+    try
+        send_signal(signals, SIGNAL_EXIT, UInt8[0])
+        close(signals)
+    catch end
+    try close(client_stdin) catch end
+    # If last interactive client, tear down the session
+    last_client = @lock STATE.lock session.interactive_count <= 0
+    if last_client
+        try close(session.writesink) catch end
+        @lock STATE.lock delete!(STATE.sync_sessions, label)
+    end
+    unregister_client!(client)
+end
+
+# Echo -e/-E expressions to REPL observers via the session's stdout vectors.
+function sync_echo_expressions(session::SyncSession, client::ClientInfo)
+    for (switch, value) in client.switches
+        suffix = if switch == "--eval" ";\n"
+        elseif switch == "--print" "\n"
+        else continue end
+        for w in session.outs
+            try write(w, "\r\e[2K\e[1;32mjulia>\e[m ", value, suffix) catch end
+        end
+    end
+end
+
+# Copy client_stdin → merged_write until EOF or error.
+# When `intercept_eof` is set (sync interactive clients), Ctrl-D (0x04) is not
+# forwarded — it detaches this client instead of killing the shared REPL.
+function stdin_copy_loop(client_stdin::StreamIO, merged_write::Base.PipeEndpoint;
+                         intercept_eof::Bool=false)
+    buf = Vector{UInt8}(undef, 64 * 1024)
+    try
+        while true
+            Base.wait_readnb(client_stdin, 1)
+            avail = bytesavailable(client_stdin)
+            if avail == 0
+                eof(client_stdin) && return
+                continue
+            end
+            n = min(avail, length(buf))
+            GC.@preserve buf unsafe_read(client_stdin, pointer(buf), n)
+            if intercept_eof && n == 1 && buf[1] == 0x04
+                return
+            end
+            write(merged_write, @view buf[1:n])
+        end
+    catch e
+        e isa Base.IOError || e isa EOFError || rethrow()
+    end
+end
+
+function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
+                            client_stdout::StreamIO, client_stderr::StreamIO,
+                            signals::StreamIO, label::String)
+    is_interactive = client.tty &&
+        isnothing(client.programfile) &&
+        !any(p -> first(p) ∈ ("--eval", "--print"), client.switches)
+    session = get(STATE.sync_sessions, label, nothing)
+    if is_interactive
+        new_session = isnothing(session)
+        if new_session
+            # First interactive client: create session with merged stdin pipe
+            pipe = Pipe()
+            Base.link_pipe!(pipe; reader_supports_async=true, writer_supports_async=true)
+            outs = StreamIO[client_stdout]
+            errs = StreamIO[client_stderr]
+            sigs = StreamIO[signals]
+            session = SyncSession(pipe.out, pipe.in, outs, errs, sigs, 1)
+            STATE.sync_sessions[label] = session
+        else
+            # Additional interactive client: attach to existing session
+            @lock STATE.lock begin
+                push!(session.outs, client_stdout)
+                push!(session.errs, client_stderr)
+                push!(session.signals, signals)
+                filter!(isopen, session.outs)
+                filter!(isopen, session.errs)
+                filter!(isopen, session.signals)
+                session.interactive_count += 1
+            end
+            # Tell the client that the REPL is in raw mode so it forwards
+            # keystrokes immediately instead of activating cooked emulation.
+            send_signal(signals, SIGNAL_RAW_MODE, UInt8[true])
+            read(signals, 2)
+            # Nudge the REPL to redraw its prompt
+            try write(session.writesink, " \x7f") catch end
+        end
+        task = Threads.@spawn begin
+            stdin_copy_loop(client_stdin, session.writesink; intercept_eof=true)
+            sync_client_disconnect!(client, client_stdin, client_stdout,
+                                    client_stderr, signals, session, label)
+        end
+        @lock STATE.lock STATE.client_tasks[client.pid] = task
+        if new_session
+            out = BroadcastWriter(session.outs)
+            err = BroadcastWriter(session.errs)
+            # Session-owned: exits when mergedin reaches EOF (last client disconnected)
+            Threads.@spawn try
+                runclient(client, session.mergedin, out, err, signals;
+                          owned_streams=(), sync_session=session)
+            catch end
+        end
+    else
+        # Non-interactive: broadcast output to session observers
+        out, err = if !isnothing(session)
+            (BroadcastWriter(StreamIO[client_stdout; session.outs]),
+             BroadcastWriter(StreamIO[client_stderr; session.errs]))
+        else
+            (client_stdout, client_stderr)
+        end
+        task = Threads.@spawn begin
+            if !isnothing(session)
+                sync_echo_expressions(session, client)
+            end
+            try
+                runclient(client, client_stdin, out, err, signals;
+                          owned_streams=(client_stdout, client_stderr))
+            catch
+                isopen(client_stdout) && rethrow()
+            end
+            # Nudge REPL to redraw prompt
+            if !isnothing(session)
+                for w in session.outs try write(w, "\n") catch end end
+                try write(session.writesink, " \x7f") catch end
+            end
+        end
+        @lock STATE.lock STATE.client_tasks[client.pid] = task
+    end
+end
+
+function unregister_client!(client::ClientInfo)
+    @lock STATE.lock begin
+        idx = findfirst(e -> last(e) === client, STATE.clients)
+        !isnothing(idx) && deleteat!(STATE.clients, idx)
+        delete!(STATE.client_tasks, client.pid)
+        STATE.lastclient[] = time()
+        if STATE.soft_exit[] && isempty(STATE.clients)
+            real_exit(0)
+        end
+    end
+    send_notification(STATE.conductor_socket[], NOTIF_TYPE.client_done,
+                      UInt32(client.pid))
+    ensure_standby_sockets()
+    ensure_standby_module()
+    queue_ttl_check()
+end
+
+function spawn_client!(conn::IO, client::ClientInfo)
+    (stdin_srv, stdin_path), (stdout_srv, stdout_path),
+        (stderr_srv, stderr_path), (signals_srv, signals_path) = get_client_sockets(client.port_set)
+    active_count = @lock STATE.lock begin
+        push!(STATE.clients, (time(), client))
+        length(STATE.clients)
+    end
+    send_sockets(conn, stdin_path, stdout_path, stderr_path, signals_path, active_count)
+    is_tcp = stdin_srv isa Sockets.TCPServer
+    t0 = time_ns()
+    client_stdin = accept(stdin_srv)
+    client_stdout = accept(stdout_srv)
+    client_stderr = accept(stderr_srv)
+    signals = accept(signals_srv)
+    if is_tcp
+        Sockets.nagle(signals, false)
+        if time_ns() - t0 < 40_000_000
+            Sockets.nagle(client_stdout, false)
+            Sockets.nagle(client_stderr, false)
+            send_signal(signals, SIGNAL_NODELAY, UInt8[])
+        end
+    end
+    close(stdin_srv); close(stdout_srv); close(stderr_srv); close(signals_srv)
+    label = sync_session_label(client)
+    if isnothing(label)
+        task = Threads.@spawn try
+            runclient(client, client_stdin, client_stdout, client_stderr, signals)
+        catch
+            isopen(client_stdout) && rethrow()
+        end
+        @lock STATE.lock STATE.client_tasks[client.pid] = task
+    else
+        spawn_sync_client!(client, client_stdin, client_stdout, client_stderr, signals, label)
+    end
+end
+
 function runworker(socketpath::String, worker_number::Int=-1, conductor_address::String="")
     # Disable Julia's default SIGINT handling which throws uncatchable InterruptException
     # This allows us to exit cleanly when the conductor shuts down
@@ -188,36 +400,7 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
                     send_sockets(conn, "", "", "", "", active_count)
                 else
                     try
-                        (stdin_srv, stdin_path), (stdout_srv, stdout_path),
-                            (stderr_srv, stderr_path), (signals_srv, signals_path) = get_client_sockets(client.port_set)
-                        # Register client and get count (before sending response)
-                        active_count = @lock STATE.lock begin
-                            push!(STATE.clients, (time(), client))
-                            length(STATE.clients)
-                        end
-                        send_sockets(conn, stdin_path, stdout_path, stderr_path, signals_path, active_count)
-                        # Accept connections and spawn client handler
-                        is_tcp = stdin_srv isa Sockets.TCPServer
-                        t0 = time_ns()
-                        client_stdin = accept(stdin_srv)
-                        client_stdout = accept(stdout_srv)
-                        client_stderr = accept(stderr_srv)
-                        signals = accept(signals_srv)
-                        if is_tcp
-                            Sockets.nagle(signals, false)
-                            if time_ns() - t0 < 40_000_000
-                                Sockets.nagle(client_stdout, false)
-                                Sockets.nagle(client_stderr, false)
-                                send_signal(signals, SIGNAL_NODELAY, UInt8[])
-                            end
-                        end
-                        close(stdin_srv); close(stdout_srv); close(stderr_srv); close(signals_srv)
-                        task = Threads.@spawn try
-                            runclient(client, client_stdin, client_stdout, client_stderr, signals)
-                        catch
-                            isopen(client_stdout) && rethrow()
-                        end
-                        @lock STATE.lock STATE.client_tasks[client.pid] = task
+                        spawn_client!(conn, client)
                     catch err
                         send_error(conn, ERR_CODE.internal_error,
                                    "Failed to start client: $(sprint(showerror, err))")

@@ -10,6 +10,7 @@ const posix = std.posix;
 
 const platform = @import("../platform/main.zig");
 const protocol = @import("../protocol.zig");
+const cooked = @import("../cooked.zig");
 
 // EV flags - some BSD variants have gaps in Zig's bindings
 const EV_EOF: u16 = if (@hasDecl(c.EV, "EOF")) c.EV.EOF else 0x8000;
@@ -29,6 +30,7 @@ pub fn run(
     stderr_fd: posix.fd_t,
     signals_fd: posix.fd_t,
     signal_parser: anytype,
+    sync_mode: bool,
 ) !u8 {
     const kq = c.kqueue();
     if (kq == -1) return error.KqueueCreateFailed;
@@ -54,6 +56,7 @@ pub fn run(
     var stderr_buf: [buf_size]u8 = undefined;
     var stdin_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
+    var cooked_state = cooked.CookedState{};
     // State
     var exit_code: ?u8 = null;
     var stdout_eof = false;
@@ -103,7 +106,15 @@ pub fn run(
                     // Read pending data first (kqueue can set EV_EOF with data still pending)
                     if (ev.data > 0) {
                         const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch 0;
-                        if (n > 0) platform.write(stdin_fd, stdin_buf[0..n]);
+                        if (n > 0) {
+                            if (sync_mode and !signal_parser.worker_wants_raw) {
+                                for (stdin_buf[0..n]) |byte| {
+                                    cooked_state.process(byte, stdin_fd);
+                                }
+                            } else {
+                                platform.write(stdin_fd, stdin_buf[0..n]);
+                            }
+                        }
                     }
                     // Close stdin socket on local stdin EOF so worker sees EOF
                     if ((ev.flags & EV_EOF) != 0) {

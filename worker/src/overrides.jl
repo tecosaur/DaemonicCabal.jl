@@ -28,7 +28,16 @@
 
     @eval function REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool)
         term = ACTIVE_TERM[]
-        if isopen(term.signals)
+        session = term.sync_session
+        if !isnothing(session)
+            for sig in session.signals
+                isopen(sig) || continue
+                try
+                    send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
+                    read(sig, 2)  # ack
+                catch end
+            end
+        elseif isopen(term.signals)
             send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
             read(term.signals, 2)  # ack: id(1) + len(1), len=0
         end
@@ -41,7 +50,14 @@
             term = ACTIVE_TERM[]
             try close(term.stdout) catch end
             try close(term.stderr) catch end
-            send_signal(term.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8])
+            session = term.sync_session
+            if !isnothing(session)
+                for sig in session.signals
+                    try send_signal(sig, SIGNAL_EXIT, UInt8[exit.code % UInt8]) catch end
+                end
+            else
+                send_signal(term.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8])
+            end
             display(exit)
         else
             printstyled(io, "ERROR: ", bold=true, color=Base.error_color())

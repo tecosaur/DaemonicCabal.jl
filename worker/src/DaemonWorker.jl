@@ -8,6 +8,18 @@ using REPL
 using Sockets
 
 const WORKER_ID = Ref("")
+const StreamIO = Union{Base.PipeEndpoint, Sockets.TCPSocket}
+
+mutable struct SyncSession
+    const mergedin::Base.PipeEndpoint
+    const writesink::Base.PipeEndpoint
+    const outs::Vector{StreamIO}
+    const errs::Vector{StreamIO}
+    const signals::Vector{StreamIO}
+    interactive_count::Int
+end
+
+include("broadcastio.jl")
 
 @static if VERSION >= v"1.11"
     include("scopedio.jl")

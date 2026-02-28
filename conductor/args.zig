@@ -18,6 +18,7 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "-h", {} },
     .{ "--help", {} },
     .{ "--restart", {} },
+    .{ "--sync", {} },
     .{ "-q", {} },
     .{ "--quiet", {} },
 });

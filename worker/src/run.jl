@@ -75,9 +75,11 @@ function getval(pairlist, key, default)
     if isnothing(index) default else last(pairlist[index]) end
 end
 
-function runclient(client::ClientInfo, client_stdin::Union{Base.PipeEndpoint, Sockets.TCPSocket},
-                   client_stdout::Union{Base.PipeEndpoint, Sockets.TCPSocket}, client_stderr::Union{Base.PipeEndpoint, Sockets.TCPSocket},
-                   signals::Union{Base.PipeEndpoint, Sockets.TCPSocket})
+function runclient(client::ClientInfo, client_stdin::StreamIO,
+                   client_stdout::IO, client_stderr::IO,
+                   signals::StreamIO;
+                   owned_streams::Tuple=(client_stdout, client_stderr),
+                   sync_session::Union{Nothing, SyncSession}=nothing)
     hascolor = getval(client.switches, "--color",
                       ifelse(startswith(getval(client.env, "TERM", ""),
                                         "xterm"),
@@ -108,8 +110,8 @@ function runclient(client::ClientInfo, client_stdin::Union{Base.PipeEndpoint, So
                 end
                 client_vterm = VirtualTerm(
                     client_stdin, client_stdout, client_stderr, signals,
-                    term, get(TERMINFOS, term, nothing),
-                    color, nothing)
+                    term, sync_session,
+                    get(TERMINFOS, term, nothing), color, nothing)
                 with(ACTIVE_TERM => client_vterm) do
                     runclient(mod, client; stdout=stdoutx)
                 end
@@ -130,33 +132,20 @@ function runclient(client::ClientInfo, client_stdin::Union{Base.PipeEndpoint, So
     finally
         # Close output streams first to ensure all output is flushed before sending
         # exit signal. Client waits for stdout+stderr EOF to guarantee output is drained.
-        for stream in (client_stdout, client_stderr)
-            if isopen(stream)
-                try flush(stream) catch end
-                try close(stream) catch end
-            end
-        end
-        if isopen(signals)
-            send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
-            try close(signals) catch end
+        try flush(client_stdout) catch end
+        try flush(client_stderr) catch end
+        for stream in owned_streams
+            try close(stream) catch end
         end
         try close(client_stdin) catch end
-        @lock STATE.lock begin
-            client_index = findfirst(e -> last(e) === client, STATE.clients)
-            if !isnothing(client_index)
-                deleteat!(STATE.clients, client_index)
+        # Sync REPL task passes owned_streams=() — cleanup is per-client via stdin_copy_loop
+        if !isempty(owned_streams)
+            if isopen(signals)
+                send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
+                try close(signals) catch end
             end
-            delete!(STATE.client_tasks, client.pid)
-            STATE.lastclient[] = time()
-            if STATE.soft_exit[] && isempty(STATE.clients)
-                real_exit(0)
-            end
+            unregister_client!(client)
         end
-        # Notify conductor that client is done
-        send_notification(STATE.conductor_socket[], NOTIF_TYPE.client_done, UInt32(client.pid))
-        ensure_standby_sockets()
-        ensure_standby_module()
-        queue_ttl_check()
     end
 end
 

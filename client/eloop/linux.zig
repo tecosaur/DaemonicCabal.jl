@@ -10,6 +10,7 @@ const posix = std.posix;
 
 const platform = @import("../platform/main.zig");
 const protocol = @import("../protocol.zig");
+const cooked = @import("../cooked.zig");
 
 const Location = enum(u64) {
     local_stdin,
@@ -26,6 +27,7 @@ pub fn run(
     stderr_fd: posix.fd_t,
     signals_fd: posix.fd_t,
     signal_parser: anytype,
+    sync_mode: bool,
 ) !u8 {
     const buf_size = 1024;
     var ring = try linux.IoUring.init(8, 0);
@@ -34,6 +36,7 @@ pub fn run(
     var worker_stdout_buf: [buf_size]u8 = undefined;
     var worker_stderr_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
+    var cooked_state = cooked.CookedState{};
     // Queue initial reads
     _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, 0);
     _ = try ring.read(@intFromEnum(Location.worker_stdout), stdout_fd, .{ .buffer = &worker_stdout_buf }, 0);
@@ -72,7 +75,14 @@ pub fn run(
                         continue;
                     }
                     if (exit_code != null) continue;
-                    platform.write(stdin_fd, local_stdin_buf[0..len]);
+                    // In sync mode with worker requesting cooked: emulate line editing
+                    if (sync_mode and !signal_parser.worker_wants_raw) {
+                        for (local_stdin_buf[0..len]) |byte| {
+                            cooked_state.process(byte, stdin_fd);
+                        }
+                    } else {
+                        platform.write(stdin_fd, local_stdin_buf[0..len]);
+                    }
                     _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, 0);
                 },
                 @intFromEnum(Location.signals) => {

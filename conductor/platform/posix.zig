@@ -104,4 +104,11 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     };
     posix.sigaction(posix.SIG.INT, &sigact, null);
     posix.sigaction(posix.SIG.TERM, &sigact, null);
+    // Ignore SIGPIPE so writes to broken sockets return EPIPE instead of killing the process
+    const pipe_act = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &pipe_act, null);
 }
