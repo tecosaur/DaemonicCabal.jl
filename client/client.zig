@@ -269,6 +269,13 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
                 Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
                 if (connectUnix(addr)) |stream| return stream else |_| {}
             }
+            // Unix socket still missing but conductor is alive — try default TCP port
+            const tcp_addr = std.fmt.bufPrint(&conductor_path_buf, "localhost:{d}", .{protocol.default_tcp_port}) catch unreachable;
+            if (protocol.connectAddress(io, .tcp, tcp_addr)) |stream| {
+                transport_mode = .tcp;
+                conductor_path = tcp_addr;
+                return stream;
+            } else |_| {}
         }
     }
     // Give up

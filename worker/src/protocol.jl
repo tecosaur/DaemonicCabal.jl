@@ -129,7 +129,7 @@ function send_state(conn::IO, active_clients::Integer, last_client_ts::Integer, 
     write_header(conn, MSG_TYPE.state, 13)
     write(conn, UInt32(active_clients))
     write(conn, UInt64(last_client_ts))
-    write(conn, UInt8(soft_exit ? 1 : 0))
+    write(conn, UInt8(ifelse(soft_exit, 1, 0)))
     flush(conn)
 end
 
@@ -156,7 +156,7 @@ struct ClientInfo
 end
 
 # Read CLIENT_RUN payload
-function read_client_run(conn::IO, payload_len::Integer)
+function read_client_run(conn::IO)
     flags = read(conn, UInt8)
     tty = (flags & 0x01) != 0
     force = (flags & 0x02) != 0  # Bypass capacity check

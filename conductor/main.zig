@@ -98,6 +98,7 @@ const CLIENT_HELP =
     \\ --restart                  Kill workers for the project and exit
     \\ --sandbox                  Run in an isolated sandbox (Linux only)
     \\
+    \\
 ++ DAEMON_MANAGEMENT_HELP;
 
 // --- Global state for cleanup ---
@@ -292,25 +293,77 @@ pub const Conductor = struct {
             try self.serveString(socket, VERSION_STRING);
             return;
         }
-        // Remote client routing: sandbox unless disabled
-        if (is_remote and self.cfg.sandbox_remote_clients) {
-            try self.handleRemoteClient(socket, &request);
-            return;
-        }
-        // Local --sandbox or remote --sandbox with auto-sandbox disabled
-        if (request.parsed.hasSwitch("--sandbox")) {
-            if (is_remote) {
-                try self.handleRemoteClient(socket, &request);
-            } else {
-                try self.handleLocalSandboxClient(socket, &request);
+        // Determine sandbox mode
+        const SandboxMode = enum { none, remote, local };
+        const sandbox_mode: SandboxMode = if (is_remote and (self.cfg.sandbox_remote_clients or request.parsed.hasSwitch("--sandbox")))
+            .remote
+        else if (request.parsed.hasSwitch("--sandbox"))
+            .local
+        else
+            .none;
+        // Platform check: sandboxing requires Linux
+        if (sandbox_mode != .none) {
+            if (comptime builtin.os.tag != .linux) {
+                const msg = if (sandbox_mode == .remote)
+                    "Sandboxed workers are only available on Linux. " ++
+                        "Remote TCP clients from non-loopback addresses are rejected.\n"
+                else
+                    "--sandbox requires Linux (user namespaces).\n";
+                std.debug.print("Client {d}: sandbox rejected (Linux only)\n", .{self.client_counter});
+                try self.serveString(socket, msg);
+                return;
             }
-            return;
+            std.debug.print("Client {d}: {s} sandbox\n", .{
+                self.client_counter, if (sandbox_mode == .remote) "remote" else "local",
+            });
         }
-        // Local client: normal path
+        // Session bypass: allow remote --session=<name> to join existing local workers
+        if (sandbox_mode == .remote) {
+            const session_label = request.parsed.getSwitch("--session");
+            if (session_label != null and session_label.?.len > 0 and self.cfg.sandbox_session_bypass) {
+                if (self.findWorkerByLabelGlobal(session_label.?)) |w| {
+                    std.debug.print("Client {d}: session bypass — joining local worker {d} (label '{s}')\n", .{
+                        self.client_counter, w.id, session_label.?,
+                    });
+                    try self.assignClientToExistingWorker(socket, &request, w);
+                    return;
+                }
+            }
+        }
+        // Compute worker key and sandbox bind mounts
         const project_path = request.project orelse "";
         const julia_channel = request.parsed.julia_channel;
-        const worker_key = try self.makeWorkerKey(project_path, julia_channel);
+        var rw_binds: [1][]const u8 = undefined;
+        const worker_key = switch (sandbox_mode) {
+            .none => try self.makeWorkerKey(project_path, julia_channel),
+            .remote => if (julia_channel) |ch|
+                try self.makeWorkerKey("__sandbox__", ch)
+            else
+                try self.allocator.dupe(u8, "__sandbox__"),
+            .local => blk: {
+                const cwd = trimTrailingSlashes(request.cwd);
+                const proj = trimTrailingSlashes(project_path);
+                // When cwd is inside a non-global project, mount the project rw
+                // (subsumes cwd). Otherwise mount just cwd rw.
+                const is_named_env = proj.len > 0 and proj[0] == '@';
+                const has_local_project = proj.len > 0 and !is_named_env;
+                const rw_mount: []const u8 = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd;
+                rw_binds = .{rw_mount};
+                // Worker key encodes rw mount + project so workers only share
+                // when their mount configuration matches
+                break :blk if (julia_channel) |ch|
+                    try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}", .{ rw_mount, proj, ch })
+                else
+                    try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}", .{ rw_mount, proj });
+            },
+        };
         defer self.allocator.free(worker_key);
+        const sandbox: SandboxKind = switch (sandbox_mode) {
+            .none => .none,
+            .remote => .remote,
+            .local => .{ .local = &rw_binds },
+        };
+        // Validate --sync requires --session=<label>
         if (request.parsed.hasSwitch("--sync")) {
             const session = request.parsed.getSwitch("--session");
             if (session == null or session.?.len == 0) {
@@ -320,6 +373,7 @@ pub const Conductor = struct {
             }
             std.debug.print("Client {d}: sync mode, session='{s}'\n", .{ self.client_counter, session.? });
         }
+        // Handle --restart: kill matching workers and report
         if (request.parsed.hasSwitch("--restart")) {
             const nkilled = self.killWorkersForProject(worker_key);
             std.debug.print("Restart: killed {d} worker(s) for {s}{s}{s}\n", .{
@@ -333,67 +387,8 @@ pub const Conductor = struct {
             try self.serveString(socket, msg);
             return;
         }
-        // Normal client: assign to worker
-        try self.assignClientToWorker(socket, &request, worker_key, .none);
-    }
-
-    fn handleRemoteClient(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest) !void {
-        // Sandboxed workers are only available on Linux
-        if (comptime builtin.os.tag != .linux) {
-            std.debug.print("Client {d}: remote client rejected (sandboxing unavailable on this platform)\n", .{self.client_counter});
-            try self.serveString(socket,
-                "Sandboxed workers are only available on Linux. " ++
-                "Remote TCP clients from non-loopback addresses are rejected.\n",
-            );
-            return;
-        }
-        std.debug.print("Client {d}: remote connection, using sandbox\n", .{self.client_counter});
-        const session_label = request.parsed.getSwitch("--session");
-        const is_labeled_session = session_label != null and session_label.?.len > 0;
-        // Session bypass: allow remote --session=<name> to join existing local workers
-        if (is_labeled_session and self.cfg.sandbox_session_bypass) {
-            if (self.findWorkerByLabelGlobal(session_label.?)) |w| {
-                std.debug.print("Client {d}: session bypass — joining local worker {d} (label '{s}')\n", .{
-                    self.client_counter, w.id, session_label.?,
-                });
-                try self.assignClientToExistingWorker(socket, request, w);
-                return;
-            }
-        }
-        // Sandboxed worker: use __sandbox__ project key
-        const sandbox_key = if (request.parsed.julia_channel) |ch|
-            try self.makeWorkerKey("__sandbox__", ch)
-        else
-            try self.allocator.dupe(u8, "__sandbox__");
-        defer self.allocator.free(sandbox_key);
-        try self.assignClientToWorker(socket, request, sandbox_key, .remote);
-    }
-
-    fn handleLocalSandboxClient(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest) !void {
-        if (comptime builtin.os.tag != .linux) {
-            std.debug.print("Client {d}: --sandbox rejected (Linux only)\n", .{self.client_counter});
-            try self.serveString(socket, "--sandbox requires Linux (user namespaces).\n");
-            return;
-        }
-        const cwd = trimTrailingSlashes(request.cwd);
-        const proj = trimTrailingSlashes(request.project orelse "");
-        // When cwd is inside a non-global project, mount the project rw
-        // (subsumes cwd). Otherwise mount just cwd rw.
-        const is_named_env = proj.len > 0 and proj[0] == '@';
-        const has_local_project = proj.len > 0 and !is_named_env;
-        const rw_mount: []const u8 = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd;
-        const rw_binds = [_][]const u8{rw_mount};
-        // Worker key encodes rw mount + project so workers only share when
-        // their mount configuration matches
-        const worker_key = if (request.parsed.julia_channel) |ch|
-            try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}", .{ rw_mount, proj, ch })
-        else
-            try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}", .{ rw_mount, proj });
-        defer self.allocator.free(worker_key);
-        std.debug.print("Client {d}: local sandbox, rw={s}, project={s}\n", .{
-            self.client_counter, rw_mount, if (proj.len > 0) proj else "(default)",
-        });
-        try self.assignClientToWorker(socket, request, worker_key, .{ .local = &rw_binds });
+        // Assign client to worker
+        try self.assignClientToWorker(socket, &request, worker_key, sandbox);
     }
 
     const ClientRequest = struct {

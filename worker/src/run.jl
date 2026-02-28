@@ -24,6 +24,7 @@ function create_module()::Module
     end
     maininclude.head = :toplevel
     Core.eval(mod, maininclude)
+    Core.eval(mod, :(using InteractiveUtils))
     mod
 end
 
@@ -34,7 +35,7 @@ function get_module()::Module
         STATE.standby_module[] = nothing
         m
     end
-    isnothing(mod) ? create_module() : mod
+    if isnothing(mod) create_module() else mod end
 end
 
 # Ensure standby module exists (called after client disconnect or on startup)
@@ -79,10 +80,10 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                    client_stdout::IO, client_stderr::IO,
                    signals::StreamIO;
                    owned_streams::Tuple=(client_stdout, client_stderr),
-                   sync_session::Union{Nothing, SyncSession}=nothing)
+                   sync_session::Union{Nothing, SyncSession}=nothing,
+                   repl_ref::Base.RefValue{REPL.LineEditREPL}=Ref{REPL.LineEditREPL}())
     hascolor = getval(client.switches, "--color",
-                      ifelse(startswith(getval(client.env, "TERM", ""),
-                                        "xterm"),
+                      ifelse(startswith(getval(client.env, "TERM", ""), "xterm"),
                              "yes", "")) == "yes"
     stdoutx = IOContext(client_stdout, :color => hascolor)
     stderrx = IOContext(client_stderr, :color => hascolor)
@@ -95,7 +96,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     runclient(mod, client; stdout=stdoutx)
                 end
             else
-                term = get(ENV, "TERM", @static Sys.iswindows() ? "" : "dumb")
+                term = get(ENV, "TERM", @static if Sys.iswindows() "" else "dumb" end)
                 color = @static if VERSION < v"1.12"
                     let color_switch = getval(client.switches, "--color", nothing)
                         if isnothing(color_switch)
@@ -112,7 +113,9 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     client_stdin, client_stdout, client_stderr, signals,
                     term, sync_session,
                     get(TERMINFOS, term, nothing), color, nothing)
-                with(ACTIVE_TERM => client_vterm) do
+                with(ACTIVE_TERM => client_vterm,
+                     CLIENT_MODULE => mod,
+                     CLIENT_REPL => repl_ref) do
                     runclient(mod, client; stdout=stdoutx)
                 end
             end
@@ -174,15 +177,11 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout)
                 Base.include(mod, client.programfile)
             end
         catch
-            Core.eval(mod, quote
-                          Base.invokelatest(
-                              Base.display_error,
-                              Base.scrub_repl_backtrace(
-                                  current_exceptions()))
-                          if !$(runrepl)
-                              exit(1)
-                          end
-                      end)
+            Base.invokelatest(
+                Base.display_error,
+                Base.scrub_repl_backtrace(
+                    current_exceptions()))
+            runrepl || throw(DaemonClientExit(1))
         end
     end
     if runrepl
@@ -191,16 +190,13 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout)
         quiet = "-q" ∈ set_switches || "--quiet" ∈ set_switches
         banner = Symbol(getval(client.switches, "--banner", ifelse(interactiveinput, "yes", "no")))
         histfile = getval(client.switches, "--history-file", "yes") != "no"
-        replcall = if VERSION < v"1.11"
-            :(Base.run_main_repl($interactiveinput, $quiet, $(banner != :no), $histfile, $hascolor))
+        @static if VERSION < v"1.11"
+            setglobal!(Base, :have_color, hascolor)
+            Base.run_main_repl(interactiveinput, quiet, banner != :no, histfile, hascolor)
         elseif VERSION < v"1.12"
-            :(Base.run_main_repl($interactiveinput, $quiet, $(QuoteNode(banner)), $histfile, $hascolor))
+            Base.run_main_repl(interactiveinput, quiet, banner, histfile, hascolor)
         else
-            :(Base.run_main_repl($interactiveinput, $quiet, $(QuoteNode(banner)), $histfile))
+            Base.run_main_repl(interactiveinput, quiet, banner, histfile)
         end
-        Core.eval(mod, quote
-                      setglobal!(Base, :have_color, $hascolor)
-                      $replcall
-                  end)
     end
 end

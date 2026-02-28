@@ -79,12 +79,13 @@ function send_signal(io::IO, id::UInt8, data::Vector{UInt8})
 end
 
 # Copied from `init_active_project()` in `base/initdefs.jl`.
-function set_project(project)
-    Base.set_active_project(
-        project === nothing ? nothing :
-        project == "" ? nothing :
-        startswith(project, "@") ? Base.load_path_expand(project) :
-        abspath(expanduser(project)))
+function set_project(project::String)
+    resolved = if startswith(project, "@")
+        Base.load_path_expand(project)
+    elseif !isempty(project)
+        abspath(expanduser(project))
+    end
+    Base.set_active_project(resolved)
 end
 
 # Worker management
@@ -153,15 +154,15 @@ function sync_session_label(client::ClientInfo)
 end
 
 # Handle disconnect of an interactive sync client. Closes the client's own
-# streams, removes them from the session vectors, sends exit signal, and
-# unregisters. When the last interactive client leaves, closes the merged pipe
-# write end (causing REPL EOF) and removes the session.
+# streams, removes them from the session broadcast writers, sends exit signal,
+# and unregisters. When the last interactive client leaves, closes the merged
+# pipe write end (causing REPL EOF) and removes the session.
 function sync_client_disconnect!(client::ClientInfo, client_stdin::StreamIO,
                                  client_stdout::StreamIO, client_stderr::StreamIO,
                                  signals::StreamIO, session::SyncSession, label::String)
     @lock STATE.lock begin
-        filter!(s -> s !== client_stdout, session.outs)
-        filter!(s -> s !== client_stderr, session.errs)
+        filter!(s -> s !== client_stdout, session.out.writers)
+        filter!(s -> s !== client_stderr, session.err.writers)
         filter!(s -> s !== signals, session.signals)
         session.interactive_count -= 1
     end
@@ -189,9 +190,7 @@ function sync_echo_expressions(session::SyncSession, client::ClientInfo)
         suffix = if switch == "--eval" ";\n"
         elseif switch == "--print" "\n"
         else continue end
-        for w in session.outs
-            try write(w, "\r\e[2K\e[1;32mjulia>\e[m ", value, suffix) catch end
-        end
+        write(session.out, "\r\e[2K\e[1;32mjulia>\e[m ", value, suffix)
     end
 end
 
@@ -227,73 +226,113 @@ function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
     is_interactive = client.tty &&
         isnothing(client.programfile) &&
         !any(p -> first(p) ∈ ("--eval", "--print"), client.switches)
-    session = get(STATE.sync_sessions, label, nothing)
+    existing = get(STATE.sync_sessions, label, nothing)
     if is_interactive
-        new_session = isnothing(session)
-        if new_session
+        # Resolve session to a concrete SyncSession (avoids Union boxing in closures)
+        new_session = isnothing(existing)
+        session = if new_session
             # First interactive client: create session with merged stdin pipe
             pipe = Pipe()
             Base.link_pipe!(pipe; reader_supports_async=true, writer_supports_async=true)
-            outs = StreamIO[client_stdout]
-            errs = StreamIO[client_stderr]
-            sigs = StreamIO[signals]
-            session = SyncSession(pipe.out, pipe.in, outs, errs, sigs, 1)
-            STATE.sync_sessions[label] = session
+            s = SyncSession(pipe.out, pipe.in,
+                            BroadcastWriter(StreamIO[client_stdout]),
+                            BroadcastWriter(StreamIO[client_stderr]),
+                            StreamIO[signals], 1, Ref{REPL.LineEditREPL}())
+            STATE.sync_sessions[label] = s
+            s
         else
             # Additional interactive client: attach to existing session
             @lock STATE.lock begin
-                push!(session.outs, client_stdout)
-                push!(session.errs, client_stderr)
-                push!(session.signals, signals)
-                filter!(isopen, session.outs)
-                filter!(isopen, session.errs)
-                filter!(isopen, session.signals)
-                session.interactive_count += 1
+                push!(existing.out.writers, client_stdout)
+                push!(existing.err.writers, client_stderr)
+                push!(existing.signals, signals)
+                filter!(isopen, existing.out.writers)
+                filter!(isopen, existing.err.writers)
+                filter!(isopen, existing.signals)
+                existing.interactive_count += 1
             end
             # Tell the client that the REPL is in raw mode so it forwards
             # keystrokes immediately instead of activating cooked emulation.
             send_signal(signals, SIGNAL_RAW_MODE, UInt8[true])
             read(signals, 2)
-            # Nudge the REPL to redraw its prompt
-            try write(session.writesink, " \x7f") catch end
+            # Position the new client's cursor so the REPL refresh
+            # (which moves up curs_row-1 rows) lands correctly on a
+            # fresh terminal, then trigger a redraw.
+            if isassigned(existing.repl) && existing.repl[].mistate !== nothing
+                let mi = existing.repl[].mistate::REPL.LineEdit.MIState
+                    ps = mi.mode_state[mi.current_mode]::REPL.LineEdit.PromptState
+                    write(client_stdout, "\n" ^ (ps.ias.curs_row - 1))
+                    put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
+                end
+            else
+                try write(existing.writesink, " \x7f") catch end
+            end
+            existing
+        end::SyncSession
+        let session = session
+            task = Threads.@spawn begin
+                stdin_copy_loop(client_stdin, session.writesink; intercept_eof=true)
+                sync_client_disconnect!(client, client_stdin, client_stdout,
+                                        client_stderr, signals, session, label)
+            end
+            @lock STATE.lock STATE.client_tasks[client.pid] = task
+            if new_session
+                # Session-owned: exits when mergedin reaches EOF (last client disconnected)
+                Threads.@spawn try
+                    runclient(client, session.mergedin, session.out, session.err, signals;
+                              owned_streams=(), sync_session=session,
+                              repl_ref=session.repl)
+                catch end
+            end
         end
-        task = Threads.@spawn begin
-            stdin_copy_loop(client_stdin, session.writesink; intercept_eof=true)
-            sync_client_disconnect!(client, client_stdin, client_stdout,
-                                    client_stderr, signals, session, label)
-        end
-        @lock STATE.lock STATE.client_tasks[client.pid] = task
-        if new_session
-            out = BroadcastWriter(session.outs)
-            err = BroadcastWriter(session.errs)
-            # Session-owned: exits when mergedin reaches EOF (last client disconnected)
-            Threads.@spawn try
-                runclient(client, session.mergedin, out, err, signals;
-                          owned_streams=(), sync_session=session)
-            catch end
+    elseif !isnothing(existing)
+        # Non-interactive with active session: clear the in-progress REPL
+        # input on observers, run the eval, then restore the prompt.
+        let existing = existing::SyncSession
+            out = BroadcastWriter(StreamIO[client_stdout; existing.out.writers])
+            err = BroadcastWriter(StreamIO[client_stderr; existing.err.writers])
+            has_repl = isassigned(existing.repl) && existing.repl[].mistate !== nothing
+            task = Threads.@spawn begin
+                # Clear the in-progress REPL input before eval output
+                if has_repl
+                    let mi = existing.repl[].mistate::REPL.LineEdit.MIState
+                        ps = mi.mode_state[mi.current_mode]::REPL.LineEdit.PromptState
+                        clear = if ps.ias.curs_row > 1
+                            "\e[$(ps.ias.curs_row - 1)A\e[J"
+                        else
+                            "\e[J"
+                        end
+                        write(existing.out, clear)
+                        ps.ias = REPL.LineEdit.InputAreaState(0, 0)
+                    end
+                end
+                sync_echo_expressions(existing, client)
+                try
+                    runclient(client, client_stdin, out, err, signals;
+                              owned_streams=(client_stdout, client_stderr))
+                catch
+                    isopen(client_stdout) && rethrow()
+                end
+                # Restore the REPL prompt below the eval output
+                write(existing.out, "\n")
+                if has_repl
+                    let mi = existing.repl[].mistate::REPL.LineEdit.MIState
+                        put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
+                    end
+                else
+                    try write(existing.writesink, " \x7f") catch end
+                end
+            end
+            @lock STATE.lock STATE.client_tasks[client.pid] = task
         end
     else
-        # Non-interactive: broadcast output to session observers
-        out, err = if !isnothing(session)
-            (BroadcastWriter(StreamIO[client_stdout; session.outs]),
-             BroadcastWriter(StreamIO[client_stderr; session.errs]))
-        else
-            (client_stdout, client_stderr)
-        end
+        # Non-interactive, no session: direct passthrough
         task = Threads.@spawn begin
-            if !isnothing(session)
-                sync_echo_expressions(session, client)
-            end
             try
-                runclient(client, client_stdin, out, err, signals;
+                runclient(client, client_stdin, client_stdout, client_stderr, signals;
                           owned_streams=(client_stdout, client_stderr))
             catch
                 isopen(client_stdout) && rethrow()
-            end
-            # Nudge REPL to redraw prompt
-            if !isnothing(session)
-                for w in session.outs try write(w, "\n") catch end end
-                try write(session.writesink, " \x7f") catch end
             end
         end
         @lock STATE.lock STATE.client_tasks[client.pid] = task
@@ -365,7 +404,7 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
     else
         joinpath(dirname(socketpath), "conductor.sock")
     end
-    global RUNTIME_DIR = is_tcp_address(STATE.conductor_socket[]) ? "" : dirname(socketpath)
+    global RUNTIME_DIR = if is_tcp_address(STATE.conductor_socket[]) "" else dirname(socketpath) end
     global MAX_CLIENTS = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS", "1"))
     global WORKER_TTL = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_TTL", "0"))
     global PORT_BASE = if haskey(ENV, "JULIA_DAEMON_PORTS")
@@ -392,7 +431,7 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
                                "Failed to set project: $(sprint(showerror, err))")
                 end
             elseif header.msg_type == MSG_TYPE.client_run
-                client = read_client_run(conn, header.payload_len)
+                client = read_client_run(conn)
                 # Check capacity first (force flag bypasses limit for labeled sessions)
                 active_count = @lock STATE.lock length(STATE.clients)
                 if !client.force && MAX_CLIENTS > 0 && active_count >= MAX_CLIENTS

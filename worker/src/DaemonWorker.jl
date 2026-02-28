@@ -4,22 +4,24 @@
 module DaemonWorker
 
 using Base.Threads
+using InteractiveUtils
 using REPL
 using Sockets
 
 const WORKER_ID = Ref("")
 const StreamIO = Union{Base.PipeEndpoint, Sockets.TCPSocket}
 
+include("broadcastio.jl")
+
 mutable struct SyncSession
     const mergedin::Base.PipeEndpoint
     const writesink::Base.PipeEndpoint
-    const outs::Vector{StreamIO}
-    const errs::Vector{StreamIO}
+    const out::BroadcastWriter{StreamIO}
+    const err::BroadcastWriter{StreamIO}
     const signals::Vector{StreamIO}
     interactive_count::Int
+    const repl::Base.RefValue{REPL.LineEditREPL}
 end
-
-include("broadcastio.jl")
 
 @static if VERSION >= v"1.11"
     include("scopedio.jl")

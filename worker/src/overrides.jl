@@ -72,4 +72,41 @@ else
     @eval REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool) = raw
 end
 
+# Override active_module to use the per-client scoped module for REPL
+# evaluation, and install an atreplinit hook that records the REPL
+# object into the client's scoped ref.
+@static if VERSION >= v"1.11"
+    @eval function Base.active_module((; mistate)::REPL.LineEditREPL)
+        if mistate !== nothing && mistate.active_module !== Main
+            mistate.active_module
+        else
+            CLIENT_MODULE[]
+        end
+    end
+    # Override contextual_prompt so the module prefix is suppressed when
+    # the active module is the client's own Main (the standard version
+    # checks `mod == Main` by identity, which fails for our per-client module).
+    @eval function REPL.contextual_prompt(repl::REPL.LineEditREPL, prompt::Union{String,Function})
+        function ()
+            mod = Base.active_module(repl)
+            prefix = (mod === Main || mod === CLIENT_MODULE[]) ? "" : string('(', mod, ") ")
+            prefix * (prompt isa String ? prompt : prompt())
+        end
+    end
+    # Override print_fullname so the client's per-session Main module
+    # prints as just "Main" rather than "Main.Main", and submodules
+    # defined within it print relative to it (e.g. "Main.Foo").
+    @eval function Base.print_fullname(io::IO, m::Module)
+        mp = parentmodule(m)
+        if m === Main || m === Base || m === Core || mp === m || m === CLIENT_MODULE[]
+            Base.show_sym(io, nameof(m))
+        else
+            Base.print_fullname(io, mp)
+            print(io, '.')
+            Base.show_sym(io, nameof(m))
+        end
+    end
+    pushfirst!(Base.repl_hooks, repl -> CLIENT_REPL[][] = repl)
+end
+
 @eval Base.exit(n) = throw(DaemonClientExit(n))
