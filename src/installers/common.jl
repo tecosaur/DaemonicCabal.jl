@@ -49,7 +49,12 @@ end
 
 function install_files()
     dest = install_dir()
-    isdir(dest) && rm(dest; recursive=true, force=true)
+    if isdir(dest)
+        for (root, _, _) in walkdir(dest; topdown=true)
+            chmod(root, 0o755)
+        end
+        rm(dest; recursive=true, force=true)
+    end
     @info "Installing to $dest"
     mkpath(dest)
     cp(SOURCE_WORKER_PROJECT, installed_worker_project())

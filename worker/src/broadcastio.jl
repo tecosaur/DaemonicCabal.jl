@@ -14,7 +14,7 @@ Base.bytesavailable(::BroadcastWriter) = 0
 # Dead clients are cleaned up separately during disconnect processing.
 #
 # Extract parameter names from typed expressions like :(x::T) → :x
-_param_name(e::Expr) = e.head === :(::) ? e.args[1] : e
+_param_name(e::Expr) = if e.head === :(::) e.args[1] else e end
 _param_name(s::Symbol) = s
 
 for (f, params) in [
