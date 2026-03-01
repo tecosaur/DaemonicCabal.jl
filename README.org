@@ -27,16 +27,17 @@ Client-specific switches:
 
  --session[=<label>]        Reuse worker state in Main module. With a label,
                             multiple clients can share the same session.
+ --sync                     Attach to shared REPL (requires --session=<label>)
  --revise[=yes|no*]         Enable or disable Revise.jl integration
  --restart                  Kill workers for the project and exit
+ --sandbox                  Run in an isolated sandbox (Linux only)
 
 Daemon management (systemd):
 
  systemctl --user {start | stop | restart | status} julia-daemon
 #+end_example
 
-Currently the client makes use of unix sockets and [[https://unixism.net/loti/what_is_io_uring.html][=io_uring=]], and so only works
-on Linux systems at the moment.
+Supported platforms: Linux, macOS, BSD.
 
 * Usage
 
@@ -46,8 +47,8 @@ on Linux systems at the moment.
 
 * Sessions
 
-By default, each =juliaclient= invocation runs in a fresh module. Use =--session=
-to persist state in =Main= across invocations:
+By default, each =juliaclient= invocation runs in a fresh module. Use
+=--session= to persist state in =Main= across invocations:
 
 #+begin_example
 ~$ juliaclient --session -e 'x = 42'
@@ -68,27 +69,98 @@ With a label, multiple clients can explicitly share the same session:
 ~$ juliaclient --session=shared -e 'push!(data, 4); data'  # [1, 2, 3, 4]
 #+end_example
 
-Labeled sessions bypass the normal =MAX_CLIENTS= limit, allowing multiple
-clients to attach to the same worker simultaneously.
+Labeled sessions bypass the per-worker client limit.
+
+** Collaborative sessions (=--sync=)
+
+Adding =--sync= upgrades a labeled session to a shared terminal --- multiple
+terminals attach to the same live REPL.
+
+#+begin_example
+# Terminal A: start a shared REPL
+~$ juliaclient --sync --session=work
+
+# Terminal B: attach to the same REPL
+~$ juliaclient --sync --session=work
+
+# Terminal C: inject code (output appears in both REPLs)
+~$ juliaclient --sync --session=work -e 'x = 42'
+#+end_example
+
+Interactive clients share a merged stdin and broadcast stdout/stderr.
+Non-interactive clients (=-e=, =-E=, programfile) run in the shared =Main= with
+output broadcast to all attached terminals. Ctrl-D detaches without killing the
+session; the REPL exits when the last interactive client disconnects.
+
+* Sandboxing
+
+Sandboxed workers run inside Linux user namespaces (no root required) with a
+minimal root filesystem, providing isolation without containers.
+
+** Local sandboxing (=--sandbox=)
+
+Pass =--sandbox= to run in an isolated environment with write access only to the
+working directory:
+
+#+begin_example
+~$ cd ~/myproject
+~$ juliaclient --sandbox -e 'println(pwd()); touch("ok")'  # works
+~$ juliaclient --sandbox -e 'rm("/etc/passwd")'             # permission denied
+#+end_example
+
+The sandbox gives read-write access to:
+- The *project directory* when the working directory is inside it (the project
+  mount subsumes the working directory)
+- Just the *working directory* otherwise (the project is mounted read-only)
+
+Named environments (=@v1.11= etc.) are not mounted read-write.
+
+** Remote sandboxing
+
+When listening on TCP (=JULIA_DAEMON_SERVER=tcp://...=), non-loopback connections
+are automatically sandboxed. Each remote client gets a fresh, isolated worker
+with a read-only view of the host depot and no access to the host home directory.
+Optional cgroup limits can restrict memory and CPU per sandbox.
+
+Local (loopback) TCP clients are not sandboxed unless =--sandbox= is passed.
+Remote clients on non-Linux platforms are rejected.
 
 * Configuration
 
-When the daemon starts, it pays attention to the following environmental variables:
+Environment variables read at daemon startup:
 
-| Variable                       | Default                                    | Description                                                     |
-|--------------------------------+--------------------------------------------+-----------------------------------------------------------------|
-| =JULIA_DAEMON_SERVER=            | =/run/user/$UID/julia-daemon/conductor.sock= | Socket path for client connections                              |
-| =JULIA_DAEMON_RUNTIME=           | =/run/user/$UID/julia-daemon=                | Runtime directory for sockets and PID file                      |
-| =JULIA_DAEMON_WORKER_EXECUTABLE= | =julia=                                      | Julia binary for workers                                        |
-| =JULIA_DAEMON_WORKER_ARGS=       | =--startup-file=no=                          | Arguments passed to worker processes (split on whitespace)      |
-| =JULIA_DAEMON_WORKER_PROJECT=    | (none)                                     | Project for the worker itself (not client projects)             |
-| =JULIA_DAEMON_WORKER_MAXCLIENTS= | =1=                                          | Max clients per worker (0 = unlimited)                          |
-| =JULIA_DAEMON_WORKER_TTL=        | =7200=                                       | Worker idle timeout in seconds (2 hours)                        |
-| =JULIA_DAEMON_LABEL_TTL=         | =90=                                         | Session label retention after last client disconnects (seconds) |
-| =JULIA_DAEMON_REVISE=            | =no=                                         | Enable Revise.jl by default (also settable with =--revise=)       |
+| Variable                       | Default                      | Description                                                     |
+|--------------------------------+------------------------------+-----------------------------------------------------------------|
+| =JULIA_DAEMON_RUNTIME=           | /(platform-specific)/          | Runtime directory for sockets and PID file                      |
+| =JULIA_DAEMON_SERVER=            | =<runtime_dir>/conductor.sock= | Socket path or =tcp://host:port= for TCP mode                  |
+| =JULIA_DAEMON_BIND=              | /(from server addr)/           | TCP bind address override (e.g. =0.0.0.0=)                     |
+| =JULIA_DAEMON_PORTS=             | /unset/                        | Worker port range in TCP mode (e.g. =10000-10100=)              |
+| =JULIA_DAEMON_WORKER_EXECUTABLE= | =julia=                        | Julia binary for workers                                        |
+| =JULIA_DAEMON_WORKER_ARGS=       | =--startup-file=no=            | Arguments passed to worker processes (split on whitespace)      |
+| =JULIA_DAEMON_WORKER_PROJECT=    | /(required)/                   | Project for the worker itself (not client projects)             |
+| =JULIA_DAEMON_WORKER_MAXCLIENTS= | =1=                            | Max clients per worker (0 = unlimited)                          |
+| =JULIA_DAEMON_WORKER_TTL=        | =7200=                         | Worker idle timeout in seconds (2 hours)                        |
+| =JULIA_DAEMON_LABEL_TTL=         | =90=                           | Session label retention after last client disconnects (seconds) |
+| =JULIA_DAEMON_PING_INTERVAL=     | =30=                           | Health check interval (seconds)                                 |
+| =JULIA_DAEMON_PING_TIMEOUT=      | =5=                            | Ping timeout before killing unresponsive worker (seconds)       |
+| =JULIA_DAEMON_REVISE=            | =no=                           | Enable Revise.jl by default (also settable with =--revise=)     |
 
-The client also reads =JULIA_DAEMON_SERVER= and =JULIA_DAEMON_RUNTIME= to locate
-the conductor socket.
+Sandbox configuration (Linux only, applies to both =--sandbox= and remote clients):
+
+| Variable                                    | Default | Description                                                         |
+|---------------------------------------------+---------+---------------------------------------------------------------------|
+| =JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS=       | =1=     | Sandbox remote (non-loopback) TCP clients (=0= to disable)         |
+| =JULIA_DAEMON_SANDBOX_EMPTY_ENVIRONMENT=    | =1=     | Mask =~/.julia/environments= in sandbox (=0= to expose host envs) |
+| =JULIA_DAEMON_SANDBOX_MAX_MEMORY=           | /unset/ | Per-sandbox cgroup memory limit (e.g. =4G=, =512M=)               |
+| =JULIA_DAEMON_SANDBOX_MAX_CPU=              | /unset/ | Per-sandbox cgroup CPU limit as percentage (e.g. =200= = 2 cores)  |
+| =JULIA_DAEMON_SANDBOX_SESSION_BYPASS=       | =0=     | Allow remote =--session=<label>= to join local unsandboxed workers |
+
+Runtime directory defaults: Linux =/run/user/$UID/julia-daemon=, macOS
+=~/Library/Application Support/julia-daemon=, BSD =/tmp/julia-daemon-$UID=,
+Windows =%LOCALAPPDATA%\julia-daemon=.
+
+The client reads =JULIA_DAEMON_SERVER= and =JULIA_DAEMON_RUNTIME= to locate the
+conductor socket.
 
 * Architecture
 
@@ -100,17 +172,14 @@ the conductor socket.
          └────────────────── stdio ─────────────────────────┘
 #+end_example
 
-- *Client*: Lightweight Zig binary users invoke. Connects to conductor to get
-  assigned a worker, then connects directly to the worker for stdio/signals
-  via =io_uring=.
-- *Conductor*: Zig daemon managing the worker pool. Spawns workers per-project,
-  routes client requests, maintains environment fingerprint cache.
-- *Worker*: Julia process handling client sessions. Each worker serves one project
-  and can handle multiple clients.
+- *Client*: Zig binary users invoke. Connects to the conductor, then proxies
+  stdio/signals directly with the assigned worker.
+- *Conductor*: Zig daemon managing the worker pool. Spawns workers per-project
+  and routes client requests.
+- *Worker*: Julia process serving client sessions for a single project.
+
+Platform-specific I/O: =io_uring= on Linux, =kqueue= on macOS/BSD.
 
 * Caveats
 
-+ A worker is started per-project, so running scripts in different projects
-  incurs separate startup/compile costs.
-+ The REPL works but wasn't designed for multiple concurrent REPLs per process.
-+ Linux-only, due to the dependency on =io_uring=
++ Workers are per-project, so different projects incur separate startup costs.
