@@ -34,6 +34,7 @@ pub const Worker = struct {
     pong_buf: [5]u8 = undefined,
     active_clients: u32,
     sandboxed: bool = false,
+    interactive: bool = false,
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
 
@@ -44,8 +45,9 @@ pub const Worker = struct {
         id: u32,
         runtime_dir: []const u8,
         julia_channel: ?[]const u8,
+        interactive: bool,
     ) !Worker {
-        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, false, null, &.{}, &.{});
+        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, interactive, false, null, &.{}, &.{});
     }
 
     pub fn spawnSandboxed(
@@ -59,7 +61,7 @@ pub const Worker = struct {
         extra_ro_binds: []const []const u8,
         extra_rw_binds: []const []const u8,
     ) !Worker {
-        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, true, environ_map, extra_ro_binds, extra_rw_binds);
+        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, false, true, environ_map, extra_ro_binds, extra_rw_binds);
     }
 
     fn spawnImpl(
@@ -69,6 +71,7 @@ pub const Worker = struct {
         id: u32,
         runtime_dir: []const u8,
         julia_channel: ?[]const u8,
+        interactive: bool,
         sandboxed: bool,
         environ_map: ?*const std.process.Environ.Map,
         extra_ro_binds: []const []const u8,
@@ -161,6 +164,7 @@ pub const Worker = struct {
                 var it = std.mem.tokenizeScalar(u8, cfg.worker_args, ' ');
                 while (it.next()) |arg| try argv.append(arg);
             }
+            if (interactive) try argv.append("-i");
             try argv.append("--eval");
             try argv.append(eval_expr);
             // Spawn in separate process group so terminal SIGINT only goes to conductor
@@ -190,6 +194,7 @@ pub const Worker = struct {
             .last_pinged = now,
             .active_clients = 0,
             .sandboxed = sandboxed,
+            .interactive = interactive,
         };
     }
 

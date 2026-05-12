@@ -595,6 +595,9 @@ pub const Conductor = struct {
         now: i64,
         sandbox: SandboxKind,
     ) !WorkerAssignment {
+        const want_interactive = for (client_info.switches) |sw| {
+            if (std.mem.eql(u8, sw.name, "-i")) break true;
+        } else false;
         // 1. Labeled session: find worker with matching label
         if (is_labeled_session) {
             if (findWorkerByLabel(list, session_label.?)) |w| {
@@ -603,16 +606,16 @@ pub const Conductor = struct {
         }
         // Remote sandboxed workers skip PPID affinity and existing-worker reuse
         if (sandbox != .remote) {
-            // 2. PPID-affinity
-            if (self.findWorkerByPpid(list, client_info.ppid, now)) |w| {
+            // 2. PPID-affinity (interactive flag must match)
+            if (self.findWorkerByPpid(list, client_info.ppid, want_interactive, now)) |w| {
                 if (self.tryAssignWorker(w, client_info, .ppid_affinity)) |a| return a;
             }
-            // 3. Second-most-recent available worker
-            if (self.tryExistingWorkers(list, client_info, now)) |a| return a;
+            // 3. Second-most-recent available worker (interactive flag must match)
+            if (self.tryExistingWorkers(list, client_info, want_interactive, now)) |a| return a;
         }
         // 4. Spawn new worker
         const w = switch (sandbox) {
-            .none => try self.addWorkerToPool(list, project_path, julia_channel),
+            .none => try self.addWorkerToPool(list, project_path, julia_channel, want_interactive),
             .remote => try self.addSandboxedWorkerToPool(list, project_path, julia_channel, &.{}),
             .local => |rw_binds| try self.addSandboxedWorkerToPool(list, project_path, julia_channel, rw_binds),
         };
@@ -627,10 +630,11 @@ pub const Conductor = struct {
         return .{ .paths = paths, .w = w, .reason = .new_worker };
     }
 
-    fn isWorkerAvailable(self: *Conductor, w: *worker.Worker, now: i64) bool {
+    fn isWorkerAvailable(self: *Conductor, w: *worker.Worker, interactive: bool, now: i64) bool {
         const max = self.cfg.worker_maxclients;
         if (max != 0 and w.active_clients >= max) return false;
         if (w.session_label != null and !self.isLabelExpired(w, now)) return false;
+        if (w.interactive != interactive) return false;
         return true;
     }
 
@@ -643,9 +647,9 @@ pub const Conductor = struct {
         return .{ .paths = paths, .w = w, .reason = reason };
     }
 
-    fn findWorkerByPpid(self: *Conductor, list: *WorkerList, ppid: u32, now: i64) ?*worker.Worker {
+    fn findWorkerByPpid(self: *Conductor, list: *WorkerList, ppid: u32, interactive: bool, now: i64) ?*worker.Worker {
         for (list.items) |w| {
-            if (!self.isWorkerAvailable(w, now)) continue;
+            if (!self.isWorkerAvailable(w, interactive, now)) continue;
             if (std.mem.indexOfScalar(u32, &w.recent_ppids, ppid) != null) {
                 if (self.isLabelExpired(w, now)) self.clearLabel(w);
                 return w;
@@ -663,11 +667,11 @@ pub const Conductor = struct {
         return null;
     }
 
-    fn tryExistingWorkers(self: *Conductor, list: *WorkerList, client_info: *const worker.ClientInfo, now: i64) ?WorkerAssignment {
+    fn tryExistingWorkers(self: *Conductor, list: *WorkerList, client_info: *const worker.ClientInfo, interactive: bool, now: i64) ?WorkerAssignment {
         var best: ?*worker.Worker = null;
         var second: ?*worker.Worker = null;
         for (list.items) |w| {
-            if (!self.isWorkerAvailable(w, now)) continue;
+            if (!self.isWorkerAvailable(w, interactive, now)) continue;
             if (best == null or w.last_active > best.?.last_active) {
                 second = best;
                 best = w;
@@ -707,6 +711,7 @@ pub const Conductor = struct {
             self.next_worker_id,
             self.cfg.runtime_dir,
             julia_channel,
+            false, // reserve workers are never interactive
         );
         self.next_worker_id += 1;
         self.reserve = w;
@@ -714,16 +719,17 @@ pub const Conductor = struct {
         std.debug.print("Reserve worker {d} created (pid {d})\n", .{ w.id, platform.getChildPid(w.process) });
     }
 
-    fn addWorkerToPool(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8) !*worker.Worker {
+    fn addWorkerToPool(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, interactive: bool) !*worker.Worker {
         const proj_copy = try self.allocator.dupe(u8, proj);
         errdefer self.allocator.free(proj_copy);
-        const can_use_reserve = if (self.reserve) |r| blk: {
+        // Reserve worker is never interactive; only use it for non-interactive clients
+        const can_use_reserve = if (!interactive) (if (self.reserve) |r| blk: {
             const reserve_ch = r.julia_channel;
             if (julia_channel == null and reserve_ch == null) break :blk true;
             if (julia_channel != null and reserve_ch != null)
                 break :blk std.mem.eql(u8, julia_channel.?, reserve_ch.?);
             break :blk false;
-        } else false;
+        } else false) else false;
         const w = if (can_use_reserve) blk: {
             const reserve = self.reserve.?;
             self.reserve = null;
@@ -744,8 +750,10 @@ pub const Conductor = struct {
                 self.next_worker_id,
                 self.cfg.runtime_dir,
                 julia_channel,
+                interactive,
             );
-            std.debug.print("Spawning worker {d} (pid {d}) for project {s}{s}{s}\n", .{
+            std.debug.print("Spawning {s}worker {d} (pid {d}) for project {s}{s}{s}\n", .{
+                if (interactive) "interactive " else "",
                 self.next_worker_id,
                 platform.getChildPid(new.process),
                 proj,
