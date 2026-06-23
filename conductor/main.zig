@@ -163,7 +163,7 @@ pub const Conductor = struct {
             .active_clients = ActiveClientMap.init(allocator),
             .port_pool = if (cfg.port_range) |r| protocol.PortPool.init(r.base, r.count) else null,
             .reserve = null,
-            .next_worker_id = 0,
+            .next_worker_id = 1,
             .client_counter = 0,
             .event_loop = try eventLoopImpl.EventLoop.init(64),
         };
