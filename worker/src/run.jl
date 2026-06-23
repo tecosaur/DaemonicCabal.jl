@@ -76,15 +76,29 @@ function getval(pairlist, key, default)
     if isnothing(index) default else last(pairlist[index]) end
 end
 
+function clienthascolor(client::ClientInfo)
+    cs = getval(client.switches, "--color", nothing)
+    if cs !== nothing
+        cs ∈ ("yes", "true", "1", "")
+    elseif client.tty
+        term = getval(client.env, "TERM", "")
+        @static if VERSION >= v"1.11"
+            haskey(Base.load_terminfo(term), :setaf)
+        else
+            startswith(term, "xterm")
+        end
+    else
+        false
+    end
+end
+
 function runclient(client::ClientInfo, client_stdin::StreamIO,
                    client_stdout::IO, client_stderr::IO,
                    signals::StreamIO;
                    owned_streams::Tuple=(client_stdout, client_stderr),
                    sync_session::Union{Nothing, SyncSession}=nothing,
                    repl_ref::Base.RefValue{REPL.LineEditREPL}=Ref{REPL.LineEditREPL}())
-    hascolor = getval(client.switches, "--color",
-                      ifelse(startswith(getval(client.env, "TERM", ""), "xterm"),
-                             "yes", "")) == "yes"
+    hascolor = clienthascolor(client)
     stdoutx = IOContext(client_stdout, :color => hascolor)
     stderrx = IOContext(client_stderr, :color => hascolor)
     mod = prepare_module(client)
@@ -191,7 +205,7 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout)
     end
     if runrepl
         interactiveinput = client.tty
-        hascolor = get(stdout, :color, false)
+        hascolor = get(stdout, :color, clienthascolor(client))
         quiet = "-q" ∈ set_switches || "--quiet" ∈ set_switches
         banner = Symbol(getval(client.switches, "--banner", ifelse(interactiveinput, "yes", "no")))
         histfile = getval(client.switches, "--history-file", "yes") != "no"
