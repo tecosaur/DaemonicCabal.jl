@@ -48,6 +48,14 @@ pub fn rawWaitpid(pid: posix.pid_t) posix.pid_t {
     var status: c_int = 0;
     return c.waitpid(pid, &status, 1); // WNOHANG = 1
 }
+// Per-process memory/CPU stats not yet implemented on BSD/macOS (no /proc).
+// A sysctl(KERN_PROC) implementation could provide these without libc later.
+pub fn getProcessStats(_: posix.pid_t) ?shared.ProcessStats {
+    return null;
+}
+pub fn getParentName(_: posix.pid_t, _: []u8) ?[]const u8 {
+    return null;
+}
 pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {
     const ret = c.ioctl(fd, @intCast(request), arg);
     return if (ret < 0) 1 else 0;

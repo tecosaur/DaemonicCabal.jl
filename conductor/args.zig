@@ -28,6 +28,7 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
 // Switches that take an optional value (only via --switch=value syntax)
 const optional_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },
+    .{ "--status", {} },
 });
 
 pub const Switch = struct {

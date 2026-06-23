@@ -81,6 +81,67 @@ pub fn isLoopback(addr: *const posix.sockaddr, addr_len: posix.socklen_t) bool {
     return false;
 }
 
+// Read a /proc file into `buf`, returning the bytes read (null if unopenable).
+fn readProc(comptime fmt: []const u8, pid: posix.pid_t, buf: []u8) ?[]const u8 {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, fmt, .{pid}) catch return null;
+    const fd_rc = linux.openat(linux.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    const fd_signed: isize = @bitCast(fd_rc);
+    if (fd_signed < 0) return null;
+    const fd: posix.fd_t = @intCast(fd_signed);
+    defer _ = linux.close(fd);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n: isize = @bitCast(linux.read(fd, buf[total..].ptr, buf[total..].len));
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    return buf[0..total];
+}
+
+// The command name of `pid`'s parent process, copied into `out`. Resolves the
+// parent pid from /proc/<pid>/stat (field 4), then reads /proc/<ppid>/comm.
+// Returns null if either step fails (e.g. a remote client with no local /proc).
+pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
+    var buf: [256]u8 = undefined;
+    const content = readProc("/proc/{d}/stat", pid, &buf) orelse return null;
+    const close_paren = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
+    var fields = std.mem.tokenizeScalar(u8, content[close_paren + 1 ..], ' ');
+    _ = fields.next() orelse return null; // field 3: state
+    const ppid_tok = fields.next() orelse return null; // field 4: ppid
+    const ppid = std.fmt.parseInt(posix.pid_t, ppid_tok, 10) catch return null;
+    if (ppid <= 0) return null;
+    const comm = readProc("/proc/{d}/comm", ppid, out) orelse return null;
+    return std.mem.trimEnd(u8, comm, "\n");
+}
+
+// Process stats — read resident memory and CPU time from /proc/<pid>/stat.
+// Returns null if the process is gone or /proc is unreadable. Fields are parsed
+// from after the final ')' so a comm string containing spaces/parens is skipped.
+pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
+    var buf: [4096]u8 = undefined;
+    const content = readProc("/proc/{d}/stat", pid, &buf) orelse return null;
+    const close_paren = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
+    var fields = std.mem.tokenizeScalar(u8, content[close_paren + 1 ..], ' ');
+    var vals: [22]u64 = undefined; // state(field 3) .. rss(field 24)
+    var count: usize = 0;
+    while (count < vals.len) : (count += 1) {
+        const tok = fields.next() orelse break;
+        vals[count] = std.fmt.parseInt(u64, tok, 10) catch 0;
+    }
+    if (count <= 21) return null;
+    const utime = vals[11]; // field 14
+    const stime = vals[12]; // field 15
+    const rss_pages = vals[21]; // field 24
+    // USER_HZ (_SC_CLK_TCK) is 100 on every mainstream Linux config; reading it
+    // exactly needs libc, which the conductor deliberately doesn't link.
+    const ticks_per_sec: f64 = 100;
+    return .{
+        .rss_bytes = rss_pages * std.heap.pageSize(),
+        .cpu_seconds = @as(f64, @floatFromInt(utime + stime)) / ticks_per_sec,
+    };
+}
+
 // Paths — Linux-specific default runtime directory
 pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, _: ?[]const u8) ![]const u8 {
     if (xdg_runtime_dir) |xdg|

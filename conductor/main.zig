@@ -13,6 +13,7 @@ const config = @import("config.zig");
 const args = @import("args.zig");
 const project = @import("project.zig");
 const env_cache = @import("env_cache.zig");
+const status = @import("status.zig");
 pub const worker = @import("worker.zig");
 
 /// Peer address info passed from the event loop's accept to connection handling.
@@ -97,6 +98,7 @@ const CLIENT_HELP =
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
     \\ --restart                  Kill workers for the project and exit
     \\ --sandbox                  Run in an isolated sandbox (Linux only)
+    \\ --status[=json]            Show the state of the workers, optionally in json
     \\
     \\
 ++ DAEMON_MANAGEMENT_HELP;
@@ -108,16 +110,16 @@ pub var g_pid_path: [:0]const u8 = "";
 
 // --- Types ---
 
-const WorkerList = std.array_list.Aligned(*worker.Worker, null);
+pub const WorkerList = std.array_list.Aligned(*worker.Worker, null);
 
-const ActiveClientInfo = struct {
+pub const ActiveClientInfo = struct {
     worker: *worker.Worker,
     client_num: u32,
     start_time_us: i64,
     port_set: u16, // PortPool index, or PortPool.none when unmanaged
 };
 
-const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
+pub const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
 
 const AssignReason = enum {
     session_label,
@@ -306,6 +308,16 @@ pub const Conductor = struct {
         }
         if (request.parsed.hasSwitch("--version") or request.parsed.hasSwitch("-v")) {
             try self.serveString(socket, VERSION_STRING);
+            return;
+        }
+        if (request.parsed.hasSwitch("--status")) {
+            const report = status.render(self, request.parsed.getSwitch("--status"), request.flags.tty) catch |err| {
+                std.debug.print("Status: render failed: {}\n", .{err});
+                try self.serveString(socket, "Failed to generate status report.\n");
+                return;
+            };
+            defer self.allocator.free(report);
+            try self.serveString(socket, report);
             return;
         }
         // Determine sandbox mode

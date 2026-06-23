@@ -39,6 +39,13 @@ pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
     return .{ .pid = ret, .exited = ret == pid };
 }
 
+/// Resident memory and cumulative CPU time of a process, for status reporting.
+/// `cpu_seconds` is total CPU consumed since the process started (user+system),
+/// not an instantaneous rate.
+pub const ProcessStats = struct { rss_bytes: u64, cpu_seconds: f64 };
+pub const getProcessStats = impl.getProcessStats;
+pub const getParentName = impl.getParentName;
+
 // Terminal
 pub fn getTerminalSize(fd: posix.fd_t) ?struct { rows: u16, cols: u16 } {
     var ws: posix.winsize = undefined;
