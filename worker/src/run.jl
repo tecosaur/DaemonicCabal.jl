@@ -47,6 +47,40 @@ function ensure_standby_module()
     end
 end
 
+# Pre-warm the REPL frontend with a throwaway session: its Base/REPL-overriding methods
+# can't be precompiled, but the JIT'd code is process-global so real sessions reuse it.
+function warm_repl_path()
+    @static if VERSION < v"1.11"
+        return nothing
+    else
+        get(ENV, "JULIA_DAEMON_PREWARM", "1") ∈ ("no", "false", "0") && return nothing
+        try
+            cin  = Pipe(); Base.link_pipe!(cin;  reader_supports_async=true, writer_supports_async=true)
+            cout = Pipe(); Base.link_pipe!(cout; reader_supports_async=true, writer_supports_async=true)
+            cerr = Pipe(); Base.link_pipe!(cerr; reader_supports_async=true, writer_supports_async=true)
+            # Closed signals so raw!/displaysize short-circuit (no client round-trip).
+            sig = Pipe(); Base.link_pipe!(sig); close(sig.in); close(sig.out)
+            dout = errormonitor(@async try read(cout.out) catch end)
+            derr = errormonitor(@async try read(cerr.out) catch end)
+            feeder = errormonitor(@async try write(cin.in, "1+1\n"); close(cin.in) catch end)
+            histfile = tempname()
+            client = ClientInfo(true, false, 0, pwd(),
+                                ["TERM" => "xterm-256color", "JULIA_HISTORY" => histfile,
+                                 "JULIA_DAEMON_REVISE" => "no"],
+                                Tuple{String, String}[],
+                                nothing, String[], 0xFFFF)
+            runclient(client, cin.out, cout.in, cerr.in, sig.out; owned_streams=())
+            close(cout.in); close(cerr.in)
+            wait(dout); wait(derr); wait(feeder)
+            rm(histfile; force=true)
+        catch e
+            @debug "REPL pre-warm failed" exception=(e, catch_backtrace())
+        end
+        ensure_standby_module()
+        return nothing
+    end
+end
+
 # Finalize module for a specific client (cheap)
 function prepare_module(client::ClientInfo)
     mod = if any(p -> first(p) == "--session", client.switches)

@@ -440,6 +440,7 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
     else 0 end
     ensure_standby_sockets()
     ensure_standby_module()
+    errormonitor(Threads.@spawn warm_repl_path())
     try
         verify_magic(conn)
         while isopen(conn)
