@@ -119,6 +119,11 @@ pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
     return std.mem.trimEnd(u8, comm, "\n");
 }
 
+// False: getProcessStats returns RSS (cheap, from /proc/<pid>/stat), but true USS
+// requires an smaps walk (processReclaimable), so eviction refines candidates with
+// a second pass. See runEvictionEpisode and bsd.zig's mem_is_reclaimable.
+pub const mem_is_reclaimable = false;
+
 // Process stats — read resident memory and CPU time from /proc/<pid>/stat.
 // Returns null if the process is gone or /proc is unreadable. Fields are parsed
 // from after the final ')' so a comm string containing spaces/parens is skipped.

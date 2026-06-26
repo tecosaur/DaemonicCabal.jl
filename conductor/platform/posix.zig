@@ -39,16 +39,23 @@ pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
     return .{ .pid = ret, .exited = ret == pid };
 }
 
-/// Resident memory and cumulative CPU time of a process, for status reporting.
-/// `cpu_seconds` is total CPU consumed since the process started (user+system),
-/// not an instantaneous rate.
+/// Per-process memory and cumulative CPU time, for status reporting and eviction
+/// sizing. `rss_bytes` is resident set size on Linux, but phys_footprint on macOS
+/// (the reclaimable private memory — see `mem_is_reclaimable`). `cpu_seconds` is
+/// total CPU consumed since the process started (user+system), not a rate.
 pub const ProcessStats = struct { rss_bytes: u64, cpu_seconds: f64 };
 pub const getProcessStats = impl.getProcessStats;
 pub const getParentName = impl.getParentName;
 
+/// True when `getProcessStats().rss_bytes` already reports the reclaimable
+/// (USS-equivalent) figure, so eviction needs no separate `processReclaimable`
+/// pass. macOS (phys_footprint); false on Linux (RSS, USS needs an smaps walk).
+pub const mem_is_reclaimable = impl.mem_is_reclaimable;
+
 /// Reclaimable (private) memory of a process in bytes — what killing it returns
 /// to the OS (USS). Null where the OS exposes no private-page accounting, in
 /// which case the caller falls back to RSS. Read on demand, never smoothed.
+/// Only consulted where `mem_is_reclaimable` is false (Linux).
 pub const processReclaimable = impl.processReclaimable;
 
 /// Host memory-pressure sources, resolved per-OS. `readPsiSomeAvg10` is the
@@ -126,9 +133,11 @@ fn signalAction(sig: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callc
             else
                 handler.notifyInterrupt();
         },
-        .TERM => {
+        // SIGHUP (terminal closed) and SIGTERM both mean "leave now": tell the
+        // conductor so it frees the worker, restore the terminal, then exit.
+        .TERM, .HUP => {
             handler.notifyExit();
-            std.process.exit(128 + @intFromEnum(posix.SIG.TERM));
+            std.process.exit(128 +% @as(u8, @intCast(@intFromEnum(sig))));
         },
         else => {},
     }
@@ -138,6 +147,7 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     var mask = std.mem.zeroes(posix.sigset_t);
     posix.sigaddset(&mask, posix.SIG.INT);
     posix.sigaddset(&mask, posix.SIG.TERM);
+    posix.sigaddset(&mask, posix.SIG.HUP);
     const sigact = posix.Sigaction{
         .handler = .{ .sigaction = signalAction },
         .mask = mask,
@@ -145,6 +155,7 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     };
     posix.sigaction(posix.SIG.INT, &sigact, null);
     posix.sigaction(posix.SIG.TERM, &sigact, null);
+    posix.sigaction(posix.SIG.HUP, &sigact, null);
     // Ignore SIGPIPE so writes to broken sockets return EPIPE instead of killing the process
     const pipe_act = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },

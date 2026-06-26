@@ -89,6 +89,34 @@ pub const Occupancy = struct {
     }
 };
 
+/// Smoothed CPU utilisation (busy cores) from cumulative-CPU readings, as an EWMA
+/// over real elapsed time, so sampling can be irregular and opportunistic.
+pub const CpuMeter = struct {
+    util: f64 = 0,
+    last_cpu_s: f64 = 0,
+    last_ns: i64 = 0,
+    primed: bool = false,
+
+    // Fold a cumulative-CPU reading at ns timestamp `now_ns` into util as busy
+    // cores. `half_life_s` blends the rate into the EWMA (live view); null sets
+    // util to the raw rate (one-shot, two reads a beat apart bracket the window).
+    // ns timestamps give finer dt than the conductor's seconds clock.
+    pub fn update(self: *CpuMeter, now_ns: i64, cpu_s: f64, half_life_s: ?f64) void {
+        const dt = @as(f64, @floatFromInt(now_ns - self.last_ns)) / 1_000_000_000.0;
+        if (self.primed and dt > 0) {
+            const delta = cpu_s - self.last_cpu_s;
+            const rate = (if (delta > 0) delta else 0) / dt;
+            self.util = if (half_life_s) |h| blk: {
+                const d = std.math.exp2(-dt / h);
+                break :blk rate * (1 - d) + self.util * d;
+            } else rate;
+        }
+        self.last_cpu_s = cpu_s;
+        self.last_ns = now_ns;
+        self.primed = true;
+    }
+};
+
 pub const Worker = struct {
     allocator: Allocator,
     id: u32,
@@ -105,6 +133,8 @@ pub const Worker = struct {
     pong_buf: [5]u8 = undefined,
     active_clients: u32,
     occupancy: Occupancy = .{},
+    cpu: CpuMeter = .{},
+    rss: u64 = 0, // bytes, cached by Conductor.refreshStats for the status render
     sandboxed: bool = false,
     interactive: bool = false,
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
@@ -333,9 +363,12 @@ pub const Worker = struct {
         try readExact(self.socket, &payload);
     }
 
+    // Idle: liveness ping. Busy: slower count-reconcile ping (miss tolerated).
+    const busy_ping_factor = 4;
     pub fn shouldPing(self: *const Worker, now: i64, ping_interval: u64) bool {
-        return !self.ping_pending and self.active_clients == 0
-            and now - self.last_pinged >= @as(i64, @intCast(ping_interval));
+        if (self.ping_pending) return false;
+        const interval: u64 = if (self.active_clients == 0) ping_interval else ping_interval * busy_ping_factor;
+        return now - self.last_pinged >= @as(i64, @intCast(interval));
     }
 
     /// Send ping without waiting for response (for async ping via event loop)
@@ -371,15 +404,13 @@ pub const Worker = struct {
         self.writeHeader(.soft_exit, 0);
     }
 
-    /// Ask the worker to interrupt a specific client's task via InterruptException.
-    /// Fire-and-forget: no ack is read, so this returns immediately and does not
-    /// block subsequent interrupt attempts. The worker will process the message
-    /// asynchronously on its main (interactive) thread.
-    pub fn sendInterrupt(self: *Worker, pid: u32) void {
-        self.writeHeader(.interrupt_client, 4);
-        var pid_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &pid_buf, pid, .little);
-        platform.write(self.socket, &pid_buf);
+    /// Tell the worker to tear down an expired session's REPL. Fire-and-forget.
+    pub fn dropSession(self: *Worker, label: []const u8) void {
+        self.writeHeader(.drop_session, @intCast(2 + label.len));
+        var len_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_buf, @intCast(label.len), .little);
+        platform.write(self.socket, &len_buf);
+        platform.write(self.socket, label);
     }
 
     /// Send list of active PIDs to worker; worker kills any clients not in list.

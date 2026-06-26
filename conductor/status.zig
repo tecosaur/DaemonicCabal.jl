@@ -345,11 +345,14 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const 
         try w.writeAll(path);
     }
     if (workers.len > 1) {
-        try s.open(w, ansi.dim);
-        try w.writeAll("  ");
-        try writeBytes(w, groupRss(workers));
-        try w.writeAll(" pooled");
-        try s.close(w);
+        const pooled = groupRss(workers);
+        if (pooled > 0) {
+            try s.open(w, ansi.dim);
+            try w.writeAll("  ");
+            try writeBytes(w, pooled);
+            try w.writeAll(" pooled");
+            try s.close(w);
+        }
     }
     try w.writeByte('\n');
     for (workers, 0..) |wk, i| {
@@ -364,7 +367,7 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const 
 // columns (uptime, RSS, CPU) line up regardless of label/version/mode length.
 const id_column_width = 26;
 
-fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, key: ?[]const u8, now: i64, nested: bool, is_last: bool) !void {
+fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: ?[]const u8, now: i64, nested: bool, is_last: bool) !void {
     const health = workerHealth(c, wk, now);
     const dim_line = health == .inactive;
     const pad = if (nested) indent ++ indent else indent;
@@ -417,28 +420,25 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker,
     try w.writeAll(" up ");
     if (!dim_line) try s.close(w);
     try writeDurationPadded(w, now - wk.created_at, 5);
-    const stats = platform.getProcessStats(platform.getChildPid(wk.process));
-    // RSS and CPU%: on an active worker with a probed palette, each renders in
-    // its gradient (RSS green→red vs the pool's hottest worker, CPU% blue→
-    // magenta vs 100%). Inactive workers stay in the line's uniform dim span;
-    // without a palette both fall back to plain/dim text as before.
-    try w.writeAll("  ");
-    if (stats) |st| {
+    // RSS and CPU%: on an active worker with a probed palette, each renders in its
+    // gradient (RSS green→red vs the pool's hottest worker, CPU% blue→magenta vs
+    // 100%). Inactive workers stay in the line's uniform dim span; without a palette
+    // both fall back to plain/dim text. rss/util are cached by refreshStats; rss==0
+    // means unmeasured (dead pid), so both columns are suppressed.
+    if (wk.rss > 0) {
+        try w.writeAll("  ");
         const t = if (ctx.rss_ceiling > 0)
-            @as(f64, @floatFromInt(st.rss_bytes)) / @as(f64, @floatFromInt(ctx.rss_ceiling))
+            @as(f64, @floatFromInt(wk.rss)) / @as(f64, @floatFromInt(ctx.rss_ceiling))
         else
             0;
         const styled = try openStat(w, s, ctx, dim_line, .rss, t);
-        try writeBytes(w, st.rss_bytes);
+        try writeBytes(w, wk.rss);
         try closeStat(w, s, dim_line, styled);
-    } else try w.writeAll("n/a");
-    if (stats) |st| {
-        const uptime: f64 = @floatFromInt(@max(1, now - wk.created_at));
-        const pct = st.cpu_seconds / uptime * 100;
+        const pct = wk.cpu.util * 100;
         try w.writeAll("  ");
-        const styled = try openStat(w, s, ctx, dim_line, .cpu, pct / 100);
+        const cpu_styled = try openStat(w, s, ctx, dim_line, .cpu, @min(1.0, wk.cpu.util));
         try w.print("{d:.0}%", .{pct});
-        try closeStat(w, s, dim_line, styled);
+        try closeStat(w, s, dim_line, cpu_styled);
     }
     // Activity (fg→cyan) sits right after CPU% on every worker — so the column
     // aligns across active and idle lines — shown only under pressure eviction.
@@ -587,12 +587,12 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style, now: i64) !void {
         for (entry.value_ptr.items) |wk| {
             active_workers += 1;
             total_clients += wk.active_clients;
-            if (platform.getProcessStats(platform.getChildPid(wk.process))) |st| total_rss += st.rss_bytes;
+            total_rss += wk.rss;
         }
     }
     if (c.reserve) |r| {
         has_reserve = true;
-        if (platform.getProcessStats(platform.getChildPid(r.process))) |st| total_rss += st.rss_bytes;
+        total_rss += r.rss;
     }
     try w.writeByte('\n');
     try s.open(w, ansi.dim);
@@ -600,8 +600,11 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style, now: i64) !void {
     try w.writeAll(indent);
     try w.print("{d} workers", .{active_workers});
     if (has_reserve) try w.writeAll(" · 1 reserve");
-    try w.print(" · {d} clients · ", .{total_clients});
-    try writeBytes(w, total_rss);
+    try w.print(" · {d} clients", .{total_clients});
+    if (total_rss > 0) {
+        try w.writeAll(" · ");
+        try writeBytes(w, total_rss);
+    }
     try w.writeByte('\n');
     try w.writeAll(indent);
     try w.print("worker args  {s}\n", .{c.cfg.worker_args});
@@ -631,9 +634,7 @@ fn countSandboxed(c: *Conductor) usize {
 
 fn groupRss(workers: []const *Worker) u64 {
     var total: u64 = 0;
-    for (workers) |wk| {
-        if (platform.getProcessStats(platform.getChildPid(wk.process))) |st| total += st.rss_bytes;
-    }
+    for (workers) |wk| total += wk.rss;
     return total;
 }
 
@@ -652,12 +653,12 @@ fn rssCeiling(c: *Conductor) u64 {
     while (it.next()) |entry| {
         for (entry.value_ptr.items) |wk| {
             n += 1;
-            if (platform.getProcessStats(platform.getChildPid(wk.process))) |st| max_rss = @max(max_rss, st.rss_bytes);
+            max_rss = @max(max_rss, wk.rss);
         }
     }
     if (c.reserve) |r| {
         n += 1;
-        if (platform.getProcessStats(platform.getChildPid(r.process))) |st| max_rss = @max(max_rss, st.rss_bytes);
+        max_rss = @max(max_rss, r.rss);
     }
     const fair_share: u64 = if (platform.readMemInfo()) |m| m.total / (n + 8) else 0;
     return @max(max_rss, fair_share);

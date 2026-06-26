@@ -119,7 +119,7 @@ for (f, params) in [
 end
 
 function broadcast_to_writers(op::F, io::BroadcastWriter, args...) where {F}
-    local ret
+    ret = nothing
     for w in io.writers
         try
             ret = op(w, args...)
@@ -133,9 +133,11 @@ end
 function Base.write(io::BroadcastWriter, byte::UInt8)
     capture!(io.history, (byte,))
     broadcast_to_writers(write, io, byte)
+    1
 end
 
 function Base.unsafe_write(io::BroadcastWriter, p::Ptr{UInt8}, nb::UInt)
     capture!(io.history, unsafe_wrap(Array, p, Int(nb)))
     broadcast_to_writers(Base.unsafe_write, io, p, nb)
+    Int(nb)
 end

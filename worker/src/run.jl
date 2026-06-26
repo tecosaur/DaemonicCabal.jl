@@ -134,7 +134,9 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                    signals::StreamIO;
                    owned_streams::Tuple=(client_stdout, client_stderr),
                    sync_session::Union{Nothing, SyncSession}=nothing,
-                   repl_ref::Base.RefValue{REPL.LineEditREPL}=Ref{REPL.LineEditREPL}())
+                   repl_ref::Base.RefValue{REPL.LineEditREPL}=Ref{REPL.LineEditREPL}(),
+                   broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing,
+                   replay::Union{Nothing, Tuple{StreamIO, SyncSession}}=nothing)
     hascolor = clienthascolor(client)
     stdoutx = IOContext(client_stdout, :color => hascolor)
     stderrx = IOContext(client_stderr, :color => hascolor)
@@ -146,7 +148,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                 CLIENT_SIGNALS[] = signals
                 try
                     redirect_stdio(stdin=client_stdin, stdout=stdoutx, stderr=stderrx) do
-                        runclient(mod, client; stdout=stdoutx)
+                        runclient(mod, client; stdout=stdoutx, broadcast)
                     end
                 finally
                     CLIENT_SIGNALS[] = nothing
@@ -171,8 +173,9 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     get(TERMINFOS, term, nothing), color, nothing)
                 with(ACTIVE_TERM => client_vterm,
                      CLIENT_MODULE => mod,
-                     CLIENT_REPL => repl_ref) do
-                    runclient(mod, client; stdout=stdoutx)
+                     CLIENT_REPL => repl_ref,
+                     REPLAY_TARGET => replay) do
+                    runclient(mod, client; stdout=stdoutx, broadcast)
                 end
             end
         end
@@ -189,27 +192,41 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
             exit_code = 1
         end
     finally
-        # Close output streams first to ensure all output is flushed before sending
-        # exit signal. Client waits for stdout+stderr EOF to guarantee output is drained.
-        try flush(client_stdout) catch end
-        try flush(client_stderr) catch end
-        for stream in owned_streams
-            try close(stream) catch end
-        end
-        try close(client_stdin) catch end
-        # Sync REPL task passes owned_streams=() — cleanup is per-client via stdin_copy_loop
-        if !isempty(owned_streams)
-            if isopen(signals)
-                send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
-                try close(signals) catch end
-            end
-            unregister_client!(client)
+        # disable_sigint: a force-thrown SIGINT (from interrupting a tight loop)
+        # landing mid uv_write in teardown would siglongjmp out of libuv and
+        # corrupt the task fiber, so the stream I/O must be async-interrupt-atomic.
+        Base.disable_sigint() do
+            teardown_client(client, client_stdin, client_stdout, client_stderr,
+                            signals, owned_streams, exit_code)
         end
     end
 end
 
-# Basically a bootleg version of `exec_options` from `base/client.jl`.
-function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout)
+# Flush and close a finished client's streams, signal its exit, and unregister.
+# Outputs are flushed first so the client drains them before the EOF/exit signal.
+# owned_streams is empty for a sync REPL task (per-client cleanup happens in its
+# stdin_copy_loop instead), so the exit signal / unregister are skipped there.
+function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO,
+                         client_stderr::IO, signals::IO, owned_streams::Tuple, exit_code::Int)
+    try flush(client_stdout) catch end
+    try flush(client_stderr) catch end
+    for io in owned_streams
+        try close(io) catch end
+    end
+    try close(client_stdin) catch end
+    isempty(owned_streams) && return
+    if isopen(signals)
+        send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
+        try close(signals) catch end
+    end
+    unregister_client!(client)
+end
+
+# Basically a bootleg version of `exec_options` from `base/client.jl`. In a sync
+# session, `broadcast` is the session's shared writer: --print shows the result
+# plainly to this client's stdout and also renders it REPL-style to the broadcast.
+function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
+                   broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing)
     set_switches = [s for (s, _) in client.switches]
     runrepl = "-i" ∈ set_switches ||
         (isnothing(client.programfile) && "--eval" ∉ set_switches &&
@@ -220,7 +237,8 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout)
         elseif switch == "--print"
             res = Core.eval(mod, Base.parse_input_line(value))
             Base.invokelatest(show, stdout, res)
-            println()
+            println(stdout)
+            isnothing(broadcast) || display_result(broadcast, res)
         elseif switch == "--load"
             Base.include(mod, value)
         end
@@ -244,7 +262,13 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout)
         interactiveinput = client.tty
         hascolor = get(stdout, :color, clienthascolor(client))
         quiet = "-q" ∈ set_switches || "--quiet" ∈ set_switches
-        banner = Symbol(getval(client.switches, "--banner", ifelse(interactiveinput, "yes", "no")))
+        # The atreplinit hook emits the banner itself when replaying scrollback, so
+        # suppress the REPL's own to avoid a duplicate.
+        banner = if REPLAY_TARGET[] !== nothing
+            :no
+        else
+            Symbol(getval(client.switches, "--banner", ifelse(interactiveinput, "yes", "no")))
+        end
         histfile = getval(client.switches, "--history-file", "yes") != "no"
         @static if VERSION < v"1.11"
             setglobal!(Base, :have_color, hascolor)

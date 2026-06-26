@@ -252,8 +252,14 @@ fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, cqe_res: i32) vo
     if (cqe_res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
         if (w.ping_pending) {
             w.ping_pending = false;
-            std.debug.print("Worker {d}: ping timed out\n", .{w.id});
-            conductor.retireWorker(w);
+            // A busy worker may legitimately be slow to pong; warn, don't retire.
+            if (w.active_clients > 0) {
+                w.last_pinged = conductor.currentTime(); // hold the slow cadence
+                std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
+            } else {
+                std.debug.print("Worker {d}: ping timed out\n", .{w.id});
+                conductor.retireWorker(w);
+            }
         }
         return;
     }

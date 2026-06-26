@@ -26,7 +26,7 @@ const MSG_TYPE = (
     soft_exit   = 0x40,
     ack         = 0x41,
     sync_clients = 0x50,  # Conductor sends list of active PIDs; worker kills any not in list
-    interrupt_client = 0x60,  # Conductor tells worker to interrupt a client's task
+    drop_session = 0x51,  # Conductor: session label expired; tear down its REPL
     error       = 0xFF,
 )
 

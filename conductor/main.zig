@@ -192,6 +192,7 @@ pub const Conductor = struct {
         palette: ?pal.Palette, // probed once at subscribe
         pid: u32, // matched for teardown on exit/interrupt
         lines_last_printed: usize, // for the cursor-up redraw
+        oneshot: bool, // draw one CPU-resolved frame, then disconnect
     };
 
     // --- Lifecycle ---
@@ -351,15 +352,10 @@ pub const Conductor = struct {
                 }
             },
             .client_interrupt => {
+                // SIGINT the worker process: Julia's runtime throws InterruptException
+                // into the running client task (force-throwing a tight loop after rapid
+                // Ctrl-C). Untargeted, but the common worker serves one client.
                 if (self.active_clients.get(pid)) |info| {
-                    // Two-pronged interrupt:
-                    // 1. Protocol message: cooperative InterruptException delivery
-                    //    via schedule() — works for yielding tasks (sleep, I/O, etc.)
-                    // 2. SIGINT to worker process: triggers Julia's C-level force-throw
-                    //    accumulator — needed for tight loops (while true end).
-                    //    Single SIGINT won't force-throw; rapid Ctrl-C accumulates
-                    //    ~4-6 SIGINTs to cross the threshold, matching julia's behavior.
-                    info.worker.sendInterrupt(pid);
                     if (info.worker.process.id) |wpid|
                         _ = platform.kill(wpid, platform.SIG.INT);
                 }
@@ -721,14 +717,23 @@ pub const Conductor = struct {
                 if (self.tryAssignWorker(w, client_info, .session_label)) |a| return a;
             }
         }
-        // Remote sandboxed workers skip PPID affinity and existing-worker reuse
-        if (sandbox != .remote) {
+        // Skip ppid/recency reuse for remote clients (isolation) and labeled
+        // sessions (their identity is the label, handled above and below).
+        if (sandbox != .remote and !is_labeled_session) {
             // 2. PPID-affinity (interactive flag must match)
             if (self.findWorkerByPpid(list, client_info.ppid, want_interactive, now)) |w| {
                 if (self.tryAssignWorker(w, client_info, .ppid_affinity)) |a| return a;
             }
-            // 3. Second-most-recent available worker (interactive flag must match)
+            // 3. Lightest available worker, sparing the most-recent for ppid reuse
             if (self.tryExistingWorkers(list, client_info, want_interactive, now)) |a| return a;
+        }
+        // 3b. New labeled session: claim an idle worker and tag it, else spawn.
+        if (is_labeled_session and sandbox == .none) {
+            if (self.findClaimableWorker(list, want_interactive, now)) |w| {
+                if (w.session_label != null) self.clearLabel(w); // expired
+                w.session_label = try self.allocator.dupe(u8, session_label.?);
+                if (self.tryAssignWorker(w, client_info, .session_label)) |a| return a;
+            }
         }
         // 4. Spawn new worker
         const w = switch (sandbox) {
@@ -784,19 +789,48 @@ pub const Conductor = struct {
         return null;
     }
 
-    fn tryExistingWorkers(self: *Conductor, list: *WorkerList, client_info: *const worker.ClientInfo, interactive: bool, now: i64) ?WorkerAssignment {
+    // A free worker a new labeled session can take over: no clients, no live label,
+    // matching interactivity. Prefers the warmest (most recently active); null → spawn.
+    fn findClaimableWorker(self: *Conductor, list: *WorkerList, interactive: bool, now: i64) ?*worker.Worker {
         var best: ?*worker.Worker = null;
-        var second: ?*worker.Worker = null;
+        for (list.items) |w| {
+            if (w.active_clients != 0) continue;
+            if (w.session_label != null and !self.isLabelExpired(w, now)) continue;
+            if (w.interactive != interactive) continue;
+            if (best == null or w.last_active > best.?.last_active) best = w;
+        }
+        return best;
+    }
+
+    // Resident size of a worker, or max when unreadable so it's never the lightest.
+    fn workerRss(w: *worker.Worker) u64 {
+        if (w.process.id) |pid| {
+            if (platform.getProcessStats(pid)) |s| return s.rss_bytes;
+        }
+        return std.math.maxInt(u64);
+    }
+
+    // Spare the most-recently-active worker for its ppid owner; among the rest pick
+    // the lightest, so heavy workers stay idle and age out. Recency breaks ties.
+    fn tryExistingWorkers(self: *Conductor, list: *WorkerList, client_info: *const worker.ClientInfo, interactive: bool, now: i64) ?WorkerAssignment {
+        var newest: ?*worker.Worker = null;
         for (list.items) |w| {
             if (!self.isWorkerAvailable(w, interactive, now)) continue;
-            if (best == null or w.last_active > best.?.last_active) {
-                second = best;
-                best = w;
-            } else if (second == null or w.last_active > second.?.last_active) {
-                second = w;
+            if (newest == null or w.last_active > newest.?.last_active) newest = w;
+        }
+        if (newest == null) return null;
+
+        var pick: ?*worker.Worker = null;
+        var pick_rss: u64 = 0;
+        for (list.items) |w| {
+            if (w == newest.? or !self.isWorkerAvailable(w, interactive, now)) continue;
+            const rss = workerRss(w);
+            if (pick == null or rss < pick_rss or (rss == pick_rss and w.last_active > pick.?.last_active)) {
+                pick = w;
+                pick_rss = rss;
             }
         }
-        const chosen = second orelse best orelse return null;
+        const chosen = pick orelse newest.?;
         if (self.isLabelExpired(chosen, now)) self.clearLabel(chosen);
         return self.tryAssignWorker(chosen, client_info, .recent_worker);
     }
@@ -1042,6 +1076,37 @@ pub const Conductor = struct {
         return @max(crf_norm, w.occupancy.read(now, self.activityHalfLife()));
     }
 
+    // Read process stats and fold the CPU figure into the worker's meter, timed
+    // with the ns clock. `half_life_s` blends into the EWMA (live view); null sets
+    // util to the raw rate (one-shot, where two reads a beat apart bracket it).
+    pub fn statWorker(self: *Conductor, w: *worker.Worker, half_life_s: ?f64) ?platform.ProcessStats {
+        const pid = w.process.id orelse return null;
+        const s = platform.getProcessStats(pid) orelse return null;
+        const now_ns: i64 = @intCast(Io.Clock.now(.awake, self.io).nanoseconds);
+        w.cpu.update(now_ns, s.cpu_seconds, half_life_s);
+        return s;
+    }
+
+    // One getProcessStats per worker, caching rss and folding cpu into the meter,
+    // so the status render reads both off the worker (no re-statting) and stays
+    // clock-free. Half-life null sets util to the raw rate (one-shot); a value
+    // blends the EWMA (live). Callers: the live/one-shot driver and the test.
+    pub fn refreshStats(self: *Conductor, half_life_s: ?f64) void {
+        const now_ns: i64 = @intCast(Io.Clock.now(.awake, self.io).nanoseconds);
+        var it = self.workers.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |w| refreshOne(w, now_ns, half_life_s);
+        }
+        if (self.reserve) |r| refreshOne(r, now_ns, half_life_s);
+    }
+
+    fn refreshOne(w: *worker.Worker, now_ns: i64, half_life_s: ?f64) void {
+        const pid = w.process.id orelse return;
+        const s = platform.getProcessStats(pid) orelse return;
+        w.rss = s.rss_bytes;
+        w.cpu.update(now_ns, s.cpu_seconds, half_life_s);
+    }
+
     // Drop crf history. Only ever called for a TTL-culled key (gone cold); a
     // crash/pressure death keeps the key for re-warming, and cleanupWorker — the
     // shared death funnel — has no handle to the crf map, enforcing this.
@@ -1060,12 +1125,10 @@ pub const Conductor = struct {
             self.retireWorker(hit.w);
             // Order matters: both calls read hit.key, which dropPoolEntry frees,
             // so dropColdKey (a content lookup) must run first.
-            if (hit.key) |key| {
-                if (self.workers.getPtr(key)) |list| {
-                    if (list.items.len == 0) {
-                        self.dropColdKey(key);
-                        self.dropPoolEntry(key);
-                    }
+            if (self.workers.getPtr(hit.key)) |list| {
+                if (list.items.len == 0) {
+                    self.dropColdKey(hit.key);
+                    self.dropPoolEntry(hit.key);
                 }
             }
         }
@@ -1081,18 +1144,18 @@ pub const Conductor = struct {
         }
     }
 
-    const Expired = struct { w: *worker.Worker, key: ?[]const u8 };
+    const Expired = struct { w: *worker.Worker, key: []const u8 };
 
     // One at a time, so the caller can retire (mutating the pool) between calls.
+    // The reserve is exempt: it is meant to sit idle ready for the next client, so
+    // idle TTL never culls it (memory pressure still can — see collectDiscretionary
+    // — after which the next client assignment recreates it).
     fn findExpired(self: *Conductor, now: i64) ?Expired {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items) |w| {
                 if (self.isExpired(w, now)) return .{ .w = w, .key = entry.key_ptr.* };
             }
-        }
-        if (self.reserve) |r| {
-            if (self.isExpired(r, now)) return .{ .w = r, .key = null };
         }
         return null;
     }
@@ -1112,21 +1175,23 @@ pub const Conductor = struct {
         // Selection pass: read current RSS and rank ascending by value(). An
         // unreadable footprint (size 0) ranks by activity alone — see workerValue.
         for (cands) |*c| {
-            if (c.w.process.id) |pid| {
-                if (platform.getProcessStats(pid)) |s| c.size = s.rss_bytes;
-            }
+            if (self.statWorker(c.w, @floatFromInt(self.cfg.ping_interval))) |s| c.size = s.rss_bytes;
             c.value = self.workerValue(c.w, c.key, now, c.size);
         }
         std.sort.pdq(Candidate, cands, {}, lessByValue);
-        // Validation pass: read true USS for the bottom 2*cap band, re-rank.
+        // Validation pass: where the selection figure was RSS (Linux), refine the
+        // bottom 2*cap band with true USS and re-rank. Skipped where getProcessStats
+        // already reports the reclaimable footprint cheaply (macOS).
         const band = @min(2 * max_evict_per_episode, cands.len);
-        for (cands[0..band]) |*c| {
-            if (c.w.process.id) |pid| {
-                if (platform.processReclaimable(pid)) |uss| c.size = uss;
+        if (!platform.mem_is_reclaimable) {
+            for (cands[0..band]) |*c| {
+                if (c.w.process.id) |pid| {
+                    if (platform.processReclaimable(pid)) |uss| c.size = uss;
+                }
+                c.value = self.workerValue(c.w, c.key, now, c.size);
             }
-            c.value = self.workerValue(c.w, c.key, now, c.size);
+            std.sort.pdq(Candidate, cands[0..band], {}, lessByValue);
         }
-        std.sort.pdq(Candidate, cands[0..band], {}, lessByValue);
         // Retire the true bottom, re-checking each is still a valid victim (the
         // rank snapshot may predate an assignment from a prior CQE).
         var evicted: usize = 0;
@@ -1289,6 +1354,7 @@ pub const Conductor = struct {
     fn clearLabel(self: *Conductor, w: *worker.Worker) void {
         if (w.session_label) |label| {
             std.debug.print("Worker {d}: clearing label '{s}'\n", .{ w.id, label });
+            w.dropSession(label); // tear down the now-orphaned session REPL before reuse
             self.allocator.free(label);
             w.session_label = null;
         }
@@ -1580,6 +1646,13 @@ pub const Conductor = struct {
         defer if (!held) streams.deinit();
         const live = tty and isLiveStatus(format);
         const palette: ?pal.Palette = if (tty and (format == null or live)) probePalette(&streams) else null;
+        // A styled TTY one-shot is deferred so its CPU meter resolves over a beat;
+        // live holds for repaints; everything else renders once and closes.
+        if (tty and format == null) {
+            try self.subscribeOneshot(streams, palette, pid);
+            held = true;
+            return;
+        }
         const report = self.renderStatus(format, tty, palette) catch |err| {
             std.debug.print("Status: render failed: {}\n", .{err});
             self.finishStreams(&streams, "Failed to generate status report.\n");
@@ -1595,7 +1668,6 @@ pub const Conductor = struct {
         }
     }
 
-    // One-shot and live frames share this, so they render identically.
     fn renderStatus(self: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette) !status.Report {
         return status.render(self, .{
             .format = format,
@@ -1615,6 +1687,8 @@ pub const Conductor = struct {
     const live_heartbeat_ms = 1000;
     const live_cursor_hide = "\x1b[?25l";
     const live_cursor_show = "\x1b[?25h";
+    // Live meter half-life: ~1.4s fades prior activity tracking the 1s heartbeat.
+    const live_cpu_half_life: f64 = 1.4;
 
     // First frame was sent by serveStatus; hide the cursor for the live view and
     // start the heartbeat (dirty stays false, so no redundant immediate repaint).
@@ -1624,12 +1698,32 @@ pub const Conductor = struct {
             .palette = palette,
             .pid = pid,
             .lines_last_printed = lines,
+            .oneshot = false,
         });
+        // Cooked (the probe left it raw) so ^C/^D become SIGINT/EOF and tear down.
+        platform.write(streams.fd(.signals), &[_]u8{ protocol.signals.raw_mode, 0x01, 0x00 });
         platform.write(streams.fd(.stdout), live_cursor_hide);
         if (!self.live_armed) {
             self.event_loop.armLiveTimer(live_heartbeat_ms);
             self.live_armed = true;
         }
+    }
+
+    // One-shot CPU-resolved status: prime every meter now, hold the connection,
+    // and fire a single frame after a beat. fireLive's refreshStats takes the second
+    // reading, so util lands at the busy-cores rate over the window. No frame is
+    // drawn yet and the cursor is left alone, so the delayed frame is a static report.
+    fn subscribeOneshot(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, pid: u32) !void {
+        self.refreshStats(null); // first reading; the deferred fire takes the second
+        try self.live_clients.append(self.allocator, .{
+            .streams = streams,
+            .palette = palette,
+            .pid = pid,
+            .lines_last_printed = 0,
+            .oneshot = true,
+        });
+        self.event_loop.armLiveTimer(live_debounce_ms);
+        self.live_armed = true;
     }
 
     pub fn noteLiveChange(self: *Conductor) void {
@@ -1643,18 +1737,31 @@ pub const Conductor = struct {
         self.fireLive();
     }
 
-    // A disconnected client is reaped via its exit/interrupt notification, not here.
+    // A disconnected live client is reaped via its exit/interrupt notification; a
+    // one-shot disconnects itself in repaintOne after its single frame, so an
+    // all-one-shot fire leaves no clients and the timer stops.
     fn fireLive(self: *Conductor) void {
         if (self.live_clients.items.len == 0) return;
         const had_change = self.dirty;
         self.dirty = false;
-        for (self.live_clients.items) |*lc| self.repaintOne(lc);
+        // Pure one-shots set util to the raw rate; any live watcher uses the EWMA.
+        const all_oneshot = for (self.live_clients.items) |lc| {
+            if (!lc.oneshot) break false;
+        } else true;
+        self.refreshStats(if (all_oneshot) null else live_cpu_half_life);
+        var i: usize = 0;
+        while (i < self.live_clients.items.len) {
+            if (self.repaintOne(&self.live_clients.items[i])) i += 1 else _ = self.live_clients.swapRemove(i);
+        }
+        if (self.live_clients.items.len == 0) return;
         self.event_loop.armLiveTimer(if (had_change) live_debounce_ms else live_heartbeat_ms);
         self.live_armed = true;
     }
 
-    fn repaintOne(self: *Conductor, lc: *LiveClient) void {
-        const report = self.renderStatus("live", true, lc.palette) catch return;
+    // Paint one frame; returns whether the client stays subscribed. A one-shot
+    // gets its single CPU-resolved frame, then is closed and reaped (false).
+    fn repaintOne(self: *Conductor, lc: *LiveClient) bool {
+        const report = self.renderStatus("live", true, lc.palette) catch return !lc.oneshot;
         defer self.allocator.free(report.bytes);
         const fd = lc.streams.fd(.stdout);
         // Wrap in a synchronized update (DEC 2026) so the terminal applies the
@@ -1669,6 +1776,10 @@ pub const Conductor = struct {
         platform.write(fd, report.bytes);
         platform.write(fd, "\x1b[?2026l");
         lc.lines_last_printed = report.lines;
+        if (!lc.oneshot) return true;
+        self.closeStreams(&lc.streams);
+        lc.streams.deinit();
+        return false;
     }
 
     // Remove the live client with `pid` (if any), restoring its cursor. Returns
@@ -1701,15 +1812,13 @@ pub const Conductor = struct {
         streams.conns[@intFromEnum(Stream.signals)].shutdown(self.io, .send) catch {};
     }
 
-    // Probe the terminal palette: raw mode (so replies arrive un-echoed), write
-    // the queries to stdout, read stdin until the CSI 5n sentinel, restore
-    // cooked mode. Returns the palette if any colour reply parsed, else null.
-    // The sentinel (or a byte cap) bounds the read so it can't hang.
+    // Probe the terminal palette: enter raw mode (replies un-echoed), write the
+    // queries, read stdin until the CSI 5n sentinel or a byte cap. Cooked mode is
+    // left for the client's exitClient to restore. Null if no colour reply parsed.
     fn probePalette(streams: *ClientStreams) ?pal.Palette {
         const stdin = streams.fd(.stdin);
         const signals = streams.fd(.signals);
         platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
-        defer platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x00 });
         var qbuf: [pal.query_buf_len]u8 = undefined;
         platform.write(streams.fd(.stdout), pal.writeQueries(&qbuf));
         var buf: [4096]u8 = undefined;

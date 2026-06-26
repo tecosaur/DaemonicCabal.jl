@@ -62,6 +62,7 @@ const WORKER_TERM = VirtualTerm(
 const ACTIVE_TERM = ScopedValue{VirtualTerm}(WORKER_TERM)
 const CLIENT_MODULE = ScopedValue{Module}(Main)
 const CLIENT_REPL = ScopedValue(Ref{REPL.LineEditREPL}())
+const REPLAY_TARGET = ScopedValue{Union{Nothing, Tuple{StreamIO, SyncSession}}}(nothing)
 
 struct ScopedStdin <: Base.AbstractPipe end
 struct ScopedStdout <: Base.AbstractPipe end
