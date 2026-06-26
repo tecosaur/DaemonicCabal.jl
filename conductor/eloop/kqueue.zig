@@ -287,6 +287,7 @@ fn queueWorkerPings(conductor: *Conductor, kq: posix.fd_t) void {
 }
 
 fn maybeQueuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker, now: i64) void {
+    conductor.refreshIdleMemIfStale(w, now);
     if (!w.shouldPing(now, conductor.cfg.ping_interval)) return;
     queuePing(conductor, kq, w);
 }
@@ -321,8 +322,9 @@ fn queuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
 
 fn handleHealthCheck(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
     // Health check timer fired - send a ping if conditions are met
-    const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
-    if (w.active_clients == 0 and !w.ping_pending and !recently_pinged) {
+    const now = conductor.currentTime();
+    conductor.refreshIdleMemIfStale(w, now);
+    if (w.shouldPing(now, conductor.cfg.ping_interval)) {
         queuePing(conductor, kq, w);
     }
 }
@@ -357,6 +359,11 @@ fn handlePongTimeout(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) v
     // Cancel read registration (may fail if already fired - that's fine)
     var changes = [1]c.Kevent{makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
     _ = keventSubmit(kq, &changes);
+    if (w.active_clients > 0) {
+        w.last_pinged = conductor.currentTime();
+        std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
+        return;
+    }
     std.debug.print("Worker {d}: ping timed out\n", .{w.id});
     conductor.retireWorker(w);
 }

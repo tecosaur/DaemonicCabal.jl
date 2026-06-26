@@ -28,14 +28,35 @@ fn decay(dt_s: i64, half_life_s: u64) f64 {
     return std.math.exp2(-@as(f64, @floatFromInt(dt_s)) / @as(f64, @floatFromInt(half_life_s)));
 }
 
-/// Combined recency+frequency (LRFU) for one pool key: summonses, each decaying.
+/// Per-pool-key summon history. `value` is the LRFU recency-frequency score (decayed
+/// summon count). `srtt`/`rttvar` are a Jacobson inter-summon interval estimator
+/// (RFC 6298). Together they set the idle keep-alive budget; `value` alone ranks
+/// workers for pressure eviction.
 pub const Crf = struct {
     value: f64 = 0,
     last_update: i64 = 0,
+    srtt: f64 = 0, // smoothed inter-summon interval (s); 0 until the 2nd summon
+    rttvar: f64 = 0,
 
     pub fn summon(self: *Crf, now: i64, half_life_s: u64) void {
-        self.value = 1 + self.value * decay(now - self.last_update, half_life_s);
+        const gap = now - self.last_update;
+        if (self.value > 0 and gap > 0) {
+            const g: f64 = @floatFromInt(gap);
+            if (self.srtt == 0) {
+                self.srtt = g;
+                self.rttvar = g / 2;
+            } else {
+                self.rttvar = 0.75 * self.rttvar + 0.25 * @abs(self.srtt - g);
+                self.srtt = 0.875 * self.srtt + 0.125 * g;
+            }
+        }
+        self.value = 1 + self.value * decay(gap, half_life_s);
         self.last_update = now;
+    }
+
+    /// RFC 6298 RTO: the cadence's expected next-summon time at a ~99.99% tail.
+    pub fn intervalBudget(self: *const Crf) f64 {
+        return self.srtt + 4 * self.rttvar;
     }
 
     /// Pure read for ranking — does not advance last_update.
@@ -43,8 +64,8 @@ pub const Crf = struct {
         return self.value * decay(now - self.last_update, half_life_s);
     }
 
-    /// Squash unbounded crf into [0,1) to compare with occupancy. c=2 places a
-    /// once-per-half-life cadence at 0.5; monotone, so ranking is unchanged.
+    /// Squash unbounded crf into [0,1) to compare with occupancy. Monotone, so
+    /// ranking order is unchanged.
     pub fn normalize(value: f64) f64 {
         return value / (value + 2.0);
     }
@@ -69,10 +90,6 @@ pub const Occupancy = struct {
 
     pub fn attach(self: *Occupancy, now: i64, half_life_s: u64) void {
         self.fold(now, half_life_s);
-        // A fresh worker (never occupied) starts mid-scale, so its displayed
-        // activity climbs from 0.5 while busy instead of being masked near 0 by
-        // the decaying crf term.
-        if (self.value == 0) self.value = 0.5;
         self.busy = true;
     }
 
@@ -86,6 +103,50 @@ pub const Occupancy = struct {
     pub fn read(self: *const Occupancy, now: i64, half_life_s: u64) f64 {
         const d = decay(now - self.last_update, half_life_s);
         return (if (self.busy) 1 - d else 0) + self.value * d;
+    }
+};
+
+/// The fast signal (~min_ttl) drives pressure ranking + status; the slow one (longer
+/// half-life) scales the idle-cull budget. Transitions touch both so they can't drift.
+pub const Occupancies = struct {
+    fast: Occupancy = .{},
+    slow: Occupancy = .{},
+
+    pub fn attach(self: *Occupancies, now: i64, fast_hl: u64, slow_hl: u64) void {
+        self.fast.attach(now, fast_hl);
+        self.slow.attach(now, slow_hl);
+    }
+
+    pub fn detach(self: *Occupancies, now: i64, fast_hl: u64, slow_hl: u64) void {
+        self.fast.detach(now, fast_hl);
+        self.slow.detach(now, slow_hl);
+    }
+};
+
+/// Smoothed CPU utilisation (busy cores) from cumulative-CPU readings, as an EWMA
+/// over real elapsed time, so sampling can be irregular and opportunistic.
+pub const CpuMeter = struct {
+    util: f64 = 0,
+    last_cpu_s: f64 = 0,
+    last_ns: i64 = 0,
+    primed: bool = false,
+
+    // Fold a cumulative-CPU reading at ns timestamp `now_ns` into util as busy
+    // cores. `half_life_s` blends the rate into the EWMA (live view); null sets
+    // util to the raw rate (one-shot, two reads a beat apart bracket the window).
+    // ns timestamps give finer dt than the conductor's seconds clock.
+    pub fn update(self: *CpuMeter, now_ns: i64, cpu_s: f64, half_life_s: ?f64) void {
+        const dt = @as(f64, @floatFromInt(now_ns - self.last_ns)) / 1_000_000_000.0;
+        if (self.primed and dt > 0) {
+            const rate = @max(0, cpu_s - self.last_cpu_s) / dt;
+            self.util = if (half_life_s) |h| blk: {
+                const d = std.math.exp2(-dt / h);
+                break :blk rate * (1 - d) + self.util * d;
+            } else rate;
+        }
+        self.last_cpu_s = cpu_s;
+        self.last_ns = now_ns;
+        self.primed = true;
     }
 };
 
@@ -104,7 +165,12 @@ pub const Worker = struct {
     ping_pending: bool = false,
     pong_buf: [5]u8 = undefined,
     active_clients: u32,
-    occupancy: Occupancy = .{},
+    occupancy: Occupancies = .{},
+    cpu: CpuMeter = .{},
+    // Cached footprint in bytes (RSS on Linux, phys_footprint on macOS), written by
+    // Conductor.refreshOne for status + eviction sizing.
+    mem: u64 = 0,
+    mem_at: i64 = 0, // seconds: last sample time, gating the idle-ping refresh
     sandboxed: bool = false,
     interactive: bool = false,
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
@@ -333,9 +399,12 @@ pub const Worker = struct {
         try readExact(self.socket, &payload);
     }
 
+    // Idle: liveness ping. Busy: slower count-reconcile ping (miss tolerated).
+    const busy_ping_factor = 4;
     pub fn shouldPing(self: *const Worker, now: i64, ping_interval: u64) bool {
-        return !self.ping_pending and self.active_clients == 0
-            and now - self.last_pinged >= @as(i64, @intCast(ping_interval));
+        if (self.ping_pending) return false;
+        const interval: u64 = if (self.active_clients == 0) ping_interval else ping_interval * busy_ping_factor;
+        return now - self.last_pinged >= @as(i64, @intCast(interval));
     }
 
     /// Send ping without waiting for response (for async ping via event loop)
@@ -371,15 +440,13 @@ pub const Worker = struct {
         self.writeHeader(.soft_exit, 0);
     }
 
-    /// Ask the worker to interrupt a specific client's task via InterruptException.
-    /// Fire-and-forget: no ack is read, so this returns immediately and does not
-    /// block subsequent interrupt attempts. The worker will process the message
-    /// asynchronously on its main (interactive) thread.
-    pub fn sendInterrupt(self: *Worker, pid: u32) void {
-        self.writeHeader(.interrupt_client, 4);
-        var pid_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &pid_buf, pid, .little);
-        platform.write(self.socket, &pid_buf);
+    /// Tell the worker to tear down an expired session's REPL. Fire-and-forget.
+    pub fn dropSession(self: *Worker, label: []const u8) void {
+        self.writeHeader(.drop_session, @intCast(2 + label.len));
+        var len_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_buf, @intCast(label.len), .little);
+        platform.write(self.socket, &len_buf);
+        platform.write(self.socket, label);
     }
 
     /// Send list of active PIDs to worker; worker kills any clients not in list.
@@ -407,6 +474,31 @@ pub const Worker = struct {
         var count_buf: [2]u8 = undefined;
         try readExact(self.socket, &count_buf);
         return std.mem.readInt(u16, &count_buf, .little);
+    }
+
+    /// Read-only query of the worker's live client PIDs into `buf` (excess dropped).
+    pub fn queryClients(self: *Worker, buf: []u32) ![]u32 {
+        self.writeHeader(.query_clients, 0);
+        const header = try self.readHeader();
+        if (header.msg_type != .clients) {
+            std.debug.print("Worker {d}: queryClients expected clients, got {s} ({s})\n", .{
+                self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
+            });
+            return error.UnexpectedResponse;
+        }
+        var count_buf: [2]u8 = undefined;
+        try readExact(self.socket, &count_buf);
+        const count = std.mem.readInt(u16, &count_buf, .little);
+        var n: usize = 0;
+        for (0..count) |_| {
+            var pid_buf: [4]u8 = undefined;
+            try readExact(self.socket, &pid_buf);
+            if (n < buf.len) {
+                buf[n] = std.mem.readInt(u32, &pid_buf, .little);
+                n += 1;
+            }
+        }
+        return buf[0..n];
     }
 
     pub const SocketPaths = struct {

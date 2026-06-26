@@ -83,7 +83,17 @@ end
             Base.show_sym(io, nameof(m))
         end
     end
-    pushfirst!(Base.repl_hooks, repl -> CLIENT_REPL[][] = repl)
+    # Runs at the banner→prompt seam. Banner + replay go to the client's private
+    # stdout (not session.out) so they aren't recaptured into history.
+    pushfirst!(Base.repl_hooks, function (repl)
+        CLIENT_REPL[][] = repl
+        target = REPLAY_TARGET[]
+        if target !== nothing
+            (stdout, session) = target
+            REPL.banner(IOContext(stdout, :color => something(ACTIVE_TERM[].have_color, false)))
+            replay_history(stdout, session.history)
+        end
+    end)
 end
 
 # Tell the client to flip its terminal between raw (REPL reading input) and cooked

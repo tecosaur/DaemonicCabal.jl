@@ -61,13 +61,36 @@ fn sysctlUint(comptime name: [:0]const u8) ?u64 {
     };
 }
 
-// macOS only (mach task_vm_info). FreeBSD/OpenBSD return null — their kinfo_proc
-// ABI struct can't be validated without a real host — so eviction ranks by
-// activity alone there.
+// True: the size from getProcessStats is already the reclaimable (USS-equivalent)
+// figure, so the eviction selection pass is authoritative and needs no separate
+// processReclaimable validation pass (see runEvictionEpisode). macOS phys_footprint
+// is both cheap (same syscall) and accurate; FreeBSD/OpenBSD report nothing.
+pub const mem_is_reclaimable = builtin.os.tag == .macos;
+
+// macOS per-process stats via libproc's proc_pid_rusage, which works on any
+// same-user process — unlike task_info, whose task_for_pid port is denied to
+// unprivileged callers. Size is phys_footprint, not resident_size: it excludes
+// shared clean pages (the sysimage every worker maps) and is what we reclaim by
+// killing the worker. FreeBSD/OpenBSD return null (kinfo_proc ABI unverifiable).
 pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
     if (builtin.os.tag != .macos) return null;
-    const vm = darwinTaskVmInfo(pid) orelse return null;
-    return .{ .rss_bytes = vm.resident_size, .cpu_seconds = 0 };
+    const ru = darwinRusage(pid) orelse return null;
+    const cpu_ns: f64 = @floatFromInt(machToNanos(ru.ri_user_time + ru.ri_system_time));
+    return .{ .mem_bytes = ru.ri_phys_footprint, .cpu_seconds = cpu_ns / 1_000_000_000.0 };
+}
+
+// ri_user_time / ri_system_time are mach time units (1:1 with ns on Intel, 125:3
+// on Apple Silicon), so scale by the timebase. Cached after the first read.
+var timebase: ?c.mach_timebase_info_data = null;
+fn machToNanos(ticks: u64) u64 {
+    const tb = timebase orelse blk: {
+        var info: c.mach_timebase_info_data = .{ .numer = 1, .denom = 1 };
+        _ = c.mach_timebase_info(&info);
+        if (info.denom == 0) info = .{ .numer = 1, .denom = 1 };
+        timebase = info;
+        break :blk info;
+    };
+    return ticks * tb.numer / tb.denom;
 }
 
 // Reclaimable footprint. On macOS, phys_footprint is the per-task private memory
@@ -75,20 +98,33 @@ pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
 // (eviction falls back to RSS, here also null).
 pub fn processReclaimable(pid: posix.pid_t) ?u64 {
     if (builtin.os.tag != .macos) return null;
-    const vm = darwinTaskVmInfo(pid) orelse return null;
-    return vm.phys_footprint;
+    const ru = darwinRusage(pid) orelse return null;
+    return ru.ri_phys_footprint;
 }
 
-// task_for_pid usually succeeds for the conductor's own children, but may be
-// denied (sandbox/entitlement) — null then, and callers degrade gracefully.
-fn darwinTaskVmInfo(pid: posix.pid_t) ?c.task_vm_info_data_t {
+// rusage_info_v0 from <libproc.h>/<sys/resource.h>; field order and widths are
+// load-bearing (the kernel fills it by offset). V0 carries everything we need —
+// CPU time, RSS, and phys_footprint.
+const RUSAGE_INFO_V0: c_int = 0;
+const rusage_info_v0 = extern struct {
+    ri_uuid: [16]u8,
+    ri_user_time: u64,
+    ri_system_time: u64,
+    ri_pkg_idle_wkups: u64,
+    ri_interrupt_wkups: u64,
+    ri_pageins: u64,
+    ri_wired_size: u64,
+    ri_resident_size: u64,
+    ri_phys_footprint: u64,
+    ri_proc_start_abstime: u64,
+    ri_proc_exit_abstime: u64,
+};
+extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *anyopaque) c_int;
+
+fn darwinRusage(pid: posix.pid_t) ?rusage_info_v0 {
     if (builtin.os.tag != .macos) return null;
-    var port: c.mach_port_name_t = undefined;
-    if (c.task_for_pid(c.mach_task_self(), pid, &port) != 0) return null;
-    var info: c.task_vm_info_data_t = undefined;
-    var count: c.mach_msg_type_number_t = c.TASK.VM.INFO_COUNT;
-    const rc = c.task_info(port, c.TASK.VM.INFO, @ptrCast(&info), &count);
-    if (rc != 0) return null;
+    var info: rusage_info_v0 = undefined;
+    if (proc_pid_rusage(@intCast(pid), RUSAGE_INFO_V0, @ptrCast(&info)) != 0) return null;
     return info;
 }
 

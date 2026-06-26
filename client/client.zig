@@ -251,7 +251,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
         std.fmt.bufPrint(&conductor_path_buf, "{s}/conductor.sock", .{runtime_dir}) catch return error.NameTooLong;
     const parsed = protocol.parseAddress(raw_path) catch {
         std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and unix paths are supported.\n", .{raw_path});
-        std.process.exit(1);
+        exitClient(1);
     };
     transport_mode = parsed.mode;
     conductor_path = parsed.addr;
@@ -299,7 +299,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
         .macos => "launchctl kickstart -k gui/$(id -u)/net.julialang.julia-daemon",
         else => "pkill -f julia-conductor && julia-conductor &",
     } });
-    std.process.exit(127);
+    exitClient(127);
 }
 
 fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args, addr_skip: [2]usize, sync_skip: usize) !void {
@@ -401,10 +401,17 @@ fn runEventLoop(sync_mode: bool) !void {
         sync_mode,
     );
     notifyExit();
-    std.process.exit(exit_code);
+    exitClient(exit_code);
 }
 
 // --- Helpers ---
+
+// Exit restoring cooked mode first; std.process.exit skips main's defer, which
+// would otherwise leave the terminal raw. No-op unless raw mode was entered.
+fn exitClient(code: u8) noreturn {
+    platform.setRawMode(false);
+    std.process.exit(code);
+}
 
 fn connectUnix(path: []const u8) !Io.net.Stream {
     return (try Io.net.UnixAddress.init(path)).connect(io);
@@ -417,7 +424,7 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Str
         const host = conductorHost();
         if (host.len + raw.len > addr_buf.len) {
             std.debug.print("Worker " ++ label ++ " address too long\n", .{});
-            std.process.exit(127);
+            exitClient(127);
         }
         @memcpy(addr_buf[0..host.len], host);
         @memcpy(addr_buf[host.len..][0..raw.len], raw);
@@ -426,7 +433,7 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Str
     const mode = (protocol.parseAddress(addr) catch unreachable).mode;
     const stream = protocol.connectAddress(io, mode, addr) catch |e| {
         std.debug.print("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ addr, e });
-        std.process.exit(127);
+        exitClient(127);
     };
     if (mode == .unix) Io.Dir.deleteFileAbsolute(io, raw) catch {};
     return stream;

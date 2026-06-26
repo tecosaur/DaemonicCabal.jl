@@ -122,6 +122,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                 const w: *worker.Worker = @ptrFromInt(user_data & ~@as(u64, 1));
                 if (!conductor.isLiveWorker(w)) continue; // stale completion for a retired worker
                 if ((user_data & 1) != 0) {
+                    conductor.refreshIdleMemIfStale(w, conductor.currentTime());
                     const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
                     if (w.active_clients == 0 and !w.ping_pending and !recently_pinged) {
                         queuePing(ring, w, &ping_timeout_ts);
@@ -234,6 +235,7 @@ fn queueWorkerPings(conductor: *Conductor, ring: *linux.IoUring, timeout_ts: *li
 }
 
 fn maybeQueuePing(conductor: *Conductor, ring: *linux.IoUring, w: *worker.Worker, timeout_ts: *linux.kernel_timespec, now: i64) void {
+    conductor.refreshIdleMemIfStale(w, now);
     if (!w.shouldPing(now, conductor.cfg.ping_interval)) return;
     queuePing(ring, w, timeout_ts);
 }
@@ -252,8 +254,14 @@ fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, cqe_res: i32) vo
     if (cqe_res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
         if (w.ping_pending) {
             w.ping_pending = false;
-            std.debug.print("Worker {d}: ping timed out\n", .{w.id});
-            conductor.retireWorker(w);
+            // A busy worker may legitimately be slow to pong; warn, don't retire.
+            if (w.active_clients > 0) {
+                w.last_pinged = conductor.currentTime(); // hold the slow cadence
+                std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
+            } else {
+                std.debug.print("Worker {d}: ping timed out\n", .{w.id});
+                conductor.retireWorker(w);
+            }
         }
         return;
     }

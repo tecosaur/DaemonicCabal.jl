@@ -14,11 +14,13 @@ Switches (a '*' marks the default value, if applicable):
 
  -v, --version              Display version information
  -h, --help                 Print this message
- --project[=<dir>|@.]       Set <dir> as the home project/environment
+ -P, --project[=<dir>|@.]    Set <dir> as the home project/environment
  -e, --eval <expr>          Evaluate <expr>
  -E, --print <expr>         Evaluate <expr> and display the result
  -L, --load <file>          Load <file> immediately on all processors
  -i                         Interactive mode; REPL runs and `isinteractive()` is true
+ -t, --threads <N|auto>[,<M|auto>]  Launch N threads (and M interactive threads)
+ -q, --quiet                Quiet startup: no banner, suppress REPL warnings
  --banner={yes|no|auto*}    Enable or disable startup banner
  --color={yes|no|auto*}     Enable or disable color text
  --history-file={yes*|no}   Load or save history
@@ -68,7 +70,9 @@ With a label, multiple clients share the same session:
 ~$ juliaclient --session=shared -e 'push!(data, 4); data'  # [1, 2, 3, 4]
 #+end_example
 
-Labeled sessions bypass the per-worker client limit.
+Labeled sessions bypass the per-worker client limit, and workers holding idle
+labelled sessions persist for longer, their minimum lifetime is the geometric
+mean of =MIN_TTL= and =MAX_TTL=.
 
 ** Collaborative sessions (=--sync=)
 

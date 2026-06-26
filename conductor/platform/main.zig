@@ -55,6 +55,7 @@ pub const WaitPidResult = shared.WaitPidResult;
 pub const waitpidNonBlocking = shared.waitpidNonBlocking;
 pub const ProcessStats = shared.ProcessStats;
 pub const getProcessStats = shared.getProcessStats;
+pub const mem_is_reclaimable = shared.mem_is_reclaimable;
 pub const processReclaimable = shared.processReclaimable;
 pub const MemInfo = shared.MemInfo;
 pub const readPsiSomeAvg10 = shared.readPsiSomeAvg10;

@@ -16,15 +16,14 @@ include("broadcastio.jl")
 # Bytes of recent session output retained for replay to newly attaching clients.
 const SYNC_HISTORY_BYTES = 64 * 1024
 
-mutable struct SyncSession
-    const mergedin::Base.PipeEndpoint
-    const writesink::Base.PipeEndpoint
-    const out::BroadcastWriter{StreamIO}
-    const err::BroadcastWriter{StreamIO}
-    const signals::Vector{StreamIO}
-    const history::OutputHistory
-    interactive_count::Int
-    const repl::Base.RefValue{REPL.LineEditREPL}
+struct SyncSession
+    mergedin::Base.PipeEndpoint
+    writesink::Base.PipeEndpoint
+    out::BroadcastWriter{StreamIO}
+    err::BroadcastWriter{StreamIO}
+    signals::Vector{StreamIO}
+    history::OutputHistory
+    repl::Base.RefValue{REPL.LineEditREPL}
 end
 
 @static if VERSION >= v"1.11"
