@@ -239,13 +239,13 @@ pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const 
 // small int. The router calls these as fns on Windows (vs consts on POSIX), so
 // they must stay fns. GetStdHandle is cheap and per-process-stable — no caching.
 pub fn getStdinHandle() posix.fd_t {
-    return @bitCast(STD_INPUT_HANDLE);
+    return GetStdHandle(STD_INPUT_HANDLE);
 }
 pub fn getStdoutHandle() posix.fd_t {
-    return @bitCast(STD_OUTPUT_HANDLE);
+    return GetStdHandle(STD_OUTPUT_HANDLE);
 }
 pub fn getStderrHandle() posix.fd_t {
-    return @bitCast(STD_ERROR_HANDLE);
+    return GetStdHandle(STD_ERROR_HANDLE);
 }
 
 // Raw terminal mode → GetConsoleMode/SetConsoleMode on a console handle.
