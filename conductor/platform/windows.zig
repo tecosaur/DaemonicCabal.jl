@@ -1,0 +1,416 @@
+// SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
+// SPDX-License-Identifier: MPL-2.0
+//
+// Windows platform module.
+//
+// On POSIX the router (main.zig) splits work between a raw-primitives impl
+// (linux.zig / bsd.zig) and a shared-logic layer (posix.zig). Windows has no
+// POSIX to share, so posix.zig is *never imported* (see main.zig:
+// `const shared = if (os != .windows) @import("posix.zig") else impl;`) and
+// windows.zig must export BOTH buckets itself.
+//
+// HANDLE note: POSIX unifies everything behind a small-int fd; Windows has no
+// unified namespace, BUT under our design every socket is an AFD endpoint
+// handle created by std.Io — a plain overlapped-capable HANDLE. So `close`
+// is always `CloseHandle` here, and socket read/write are
+// NtDeviceIoControlFile(AFD.RECEIVE/SEND) IOCTLs, not recv/send (there is no
+// ws2_32 layer at all — see AFD.md for the full map).
+//
+// Stubs below are implementation bookmarks: signatures kept where the router
+// or callers pin them down, bodies inert so the file compiles.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const win32 = std.os.windows;
+const posix = std.posix;
+
+// Base Win32 types from std, unqualified for readable extern signatures below.
+const BOOL = win32.BOOL;
+const DWORD = win32.DWORD;
+const ULONG = win32.ULONG;
+const WORD = win32.WORD;
+const HANDLE = win32.HANDLE;
+const FILETIME = win32.FILETIME;
+
+// =============================================================================
+// Win32 bindings missing from std.os.windows (0.16 binds only a handful of
+// helpers — GetCurrentProcessId, GetCurrentProcess, GetLastError, CloseHandle,
+// GetProcessHeap, peb/teb...; kernel32.zig has only CreateProcessW; ntdll.zig
+// has the full NT surface incl. NtCreateFile/NtDeviceIoControlFile and all
+// AFD structs live in std.os.windows.AFD). std.os.windows supplies the base
+// types (HANDLE, DWORD, BOOL, ULONG, FILETIME, COORD...). All declarations
+// below are pub so the eloop (eloop/windows.zig) can reuse them.
+// NOTE: linked automatically — zig build-exe resolves kernel32/psapi without
+// -l flags (verified).
+// =============================================================================
+
+pub const STD_INPUT_HANDLE: DWORD = @bitCast(@as(i32, -10));
+pub const STD_OUTPUT_HANDLE: DWORD = @bitCast(@as(i32, -11));
+pub const STD_ERROR_HANDLE: DWORD = @bitCast(@as(i32, -12));
+
+pub const CTRL_C_EVENT: DWORD = 0;
+pub const CTRL_BREAK_EVENT: DWORD = 1;
+pub const CTRL_CLOSE_EVENT: DWORD = 2;
+pub const CTRL_LOGOFF_EVENT: DWORD = 5;
+pub const CTRL_SHUTDOWN_EVENT: DWORD = 6;
+
+pub const FILE_TYPE_CHAR: DWORD = 0x0002;
+pub const STILL_ACTIVE: DWORD = 259;
+pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+
+pub const HANDLER_ROUTINE = fn (dwCtrlType: DWORD) callconv(.winapi) BOOL;
+pub const PHANDLER_ROUTINE = *const HANDLER_ROUTINE;
+pub const WAITORTIMERCALLBACK = *const fn (lpParameter: ?*anyopaque, timer_or_wait_fired: BOOL) callconv(.winapi) void;
+
+pub const OVERLAPPED = extern struct {
+    Internal: usize,
+    InternalHigh: usize,
+    Union: extern struct {
+        Offset: u32,
+        OffsetHigh: u32,
+    },
+    hEvent: HANDLE,
+};
+// NOTE: IO_STATUS_BLOCK (std.os.windows) and OVERLAPPED share the first two
+// fields (Internal/InternalHigh ≡ u.Status/Information), so an iosb pointer
+// from NtDeviceIoControlFile can be cast to *OVERLAPPED for IOCP retrieval.
+
+pub const MEMORYSTATUSEX = extern struct {
+    dwLength: DWORD,
+    dwMemoryLoad: DWORD,
+    ullTotalPhys: u64,
+    ullAvailPhys: u64,
+    ullTotalPageFile: u64,
+    ullAvailPageFile: u64,
+    ullTotalVirtual: u64,
+    ullAvailVirtual: u64,
+    ullAvailExtendedVirtual: u64,
+};
+
+pub const PROCESS_MEMORY_COUNTERS_EX = extern struct {
+    cb: DWORD,
+    PageFaultCount: DWORD,
+    PeakWorkingSetSize: usize,
+    WorkingSetSize: usize,
+    QuotaPeakPagedPoolUsage: usize,
+    QuotaPagedPoolUsage: usize,
+    QuotaPeakNonPagedPoolUsage: usize,
+    QuotaNonPagedPoolUsage: usize,
+    PagefileUsage: usize,
+    PeakPagefileUsage: usize,
+    PrivateUsage: usize,
+};
+
+pub const SMALL_RECT = extern struct {
+    Left: i16,
+    Top: i16,
+    Right: i16,
+    Bottom: i16,
+};
+
+pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+    dwSize: win32.COORD,
+    dwCursorPosition: win32.COORD,
+    wAttributes: WORD,
+    srWindow: SMALL_RECT,
+    dwMaximumWindowSize: win32.COORD,
+};
+
+// --- kernel32 ---
+pub extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) HANDLE;
+pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *DWORD) BOOL;
+pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) BOOL;
+pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) BOOL;
+pub extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) BOOL;
+pub extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) ?HANDLE;
+pub extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) BOOL;
+pub extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) BOOL;
+pub extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) DWORD;
+pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: *const anyopaque, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*OVERLAPPED) BOOL;
+pub extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*OVERLAPPED) BOOL;
+pub extern "kernel32" fn GetFileType(hFile: HANDLE) DWORD;
+pub extern "kernel32" fn SetConsoleCtrlHandler(handler_routine: ?PHANDLER_ROUTINE, add: BOOL) BOOL;
+pub extern "kernel32" fn GetProcessTimes(hProcess: HANDLE, lpCreationTime: *FILETIME, lpExitTime: *FILETIME, lpKernelTime: *FILETIME, lpUserTime: *FILETIME) BOOL;
+pub extern "kernel32" fn GenerateConsoleCtrlEvent(dwCtrlEvent: DWORD, dwProcessGroupId: DWORD) BOOL;
+
+// --- psapi ---
+pub extern "psapi" fn GetProcessMemoryInfo(hProcess: HANDLE, ppsmemCounters: *PROCESS_MEMORY_COUNTERS_EX, cb: DWORD) BOOL;
+
+// NOTE: no ws2_32 bindings at all — sockets are AFD endpoint handles from
+// std.Io, driven via std.os.windows.ntdll.NtDeviceIoControlFile + the AFD
+// IOCTLs/structs in std.os.windows (AFD.RECEIVE/SEND/WAIT_FOR_LISTEN/ACCEPT/
+// BIND/START_LISTEN/SOCKOPT...). See AFD.md for the POSIX→AFD translation.
+
+/// Format into either an allocator (returns owned slice) or a `[]u8` buffer (returns sub-slice).
+pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
+    if (@TypeOf(out) == std.mem.Allocator)
+        return std.fmt.allocPrint(out, fmt, args)
+    else
+        return std.fmt.bufPrint(out, fmt, args) catch error.NameTooLong;
+}
+
+// =============================================================================
+// Bucket 1 — raw primitives (router: `pub const X = impl.X`)
+// =============================================================================
+
+// Signal set passed to `kill`. No real signals on Windows [Signals]. Callers
+// use exactly four values (grep `platform.SIG.`): INT, TERM, KILL, USR1. USR1
+// is client-only (live-status repaint); TERM/KILL both mean "kill it" via
+// TerminateProcess. IGN/PIPE are posix.zig-internal, never cross on Windows.
+pub const SIG = enum { INT, TERM, KILL, USR1 };
+
+// → GetCurrentProcessId()
+pub fn getpid() void {}
+
+// No direct analog — Windows doesn't track PPID. Hack: NtQueryInformationProcess
+// with ProcessBasicInformation (ntdll, unstable). Grep callers first; likely unused.
+pub fn getppid() void {}
+
+// Low-level write, used directly by posix_signals.zig on POSIX. On Windows that
+// async-signal-safety constraint is gone (SetConsoleCtrlHandler runs in its own
+// thread), so plain synchronous WriteFile suffices. Called on stdio handles
+// returned by getStdinHandle etc. — keep the same handle type across all of them.
+// Loop to cover short writes, like the POSIX impl.
+pub fn write(fd: posix.fd_t, buf: []const u8) void {
+    _ = fd;
+    _ = buf;
+}
+
+// No general kill(pid, sig). KILL/TERM → OpenProcess + TerminateProcess
+// (always "kill", no graceful SIGTERM). INT → GenerateConsoleCtrlEvent
+// (CTRL_C_EVENT, pid_group) only if the worker shares the conductor's console;
+// else a named-pipe message / Event object. USR1 → no analog; the conductor's
+// USR1 path (posix_signals.zig:51 live-status repaint) should be dropped or
+// remapped to a pipe message.
+pub fn kill(pid: posix.pid_t, sig: SIG) usize {
+    _ = pid;
+    _ = sig;
+    return 1;
+}
+
+// → NtCreateFile(\Device\Afd\Endpoint) mirroring std.Io's openSocketAfd
+// (Threaded.zig:12348) — or just take the handle from an std.Io-created
+// socket. No WSAStartup: AFD sits below WinSock2 entirely (see AFD.md).
+pub fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
+    _ = family;
+    _ = sock_type;
+    return null;
+}
+
+// → AFD.CONNECT IOCTL (netConnectIpWindows/netConnectUnixWindows shape).
+pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
+    _ = fd;
+    _ = addr;
+    _ = len;
+    return false;
+}
+
+// → CloseHandle — our sockets are plain HANDLEs (AFD endpoints), so there is
+// no closesocket distinction at all.
+pub fn rawClose(fd: posix.fd_t) void {
+    _ = fd;
+}
+
+// No /run/user/$UID on Windows → %LOCALAPPDATA%\julia-daemon. The env var is
+// set for every interactive login; read it std-only with NO libc (build.jl
+// links none): `std.process.Environ{ .block = .global }` reads the live
+// process env from the PEB via ntdll (Environ.zig:488) — the same mechanism
+// `std.process.Init.environ_map` is built from, so nothing needs plumbing
+// through this signature. getAlloc returns owned WTF-8 []u8; errors
+// OutOfMemory | EnvironmentVariableMissing | InvalidWtf8. Persisted per-user,
+// NOT auto-cleaned like /run/user — the cleanupRuntimeDir wart still has work
+// to do (named pipes are kernel objects, auto-cleaned on handle close, so no
+// stale-inode problem). Keep the POSIX arg shape for router symmetry, ignore
+// xdg_runtime_dir and home.
+pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const u8 {
+    const env: std.process.Environ = .{ .block = .global };
+    const appdata = try env.getAlloc(std.heap.page_allocator, "LOCALAPPDATA");
+    defer std.heap.page_allocator.free(appdata);
+    return print(out, "{s}/julia-daemon", .{appdata});
+}
+
+// test "defaultRuntimeDir resolves %LOCALAPPDATA%\\julia-daemon" {
+//     var buf: [1024]u8 = undefined;
+//     const dir = try defaultRuntimeDir(&buf, null, null);
+//     try std.testing.expect(std.mem.endsWith(u8, dir, "julia-daemon"));
+// }
+
+// → GetStdHandle(STD_INPUT_HANDLE / STDOUT / STDERR). Returns a HANDLE, not a
+// small int. The router calls these as fns on Windows (vs consts on POSIX), so
+// they must stay fns. GetStdHandle is cheap and per-process-stable — no caching.
+pub fn getStdinHandle() posix.fd_t {
+    return @bitCast(STD_INPUT_HANDLE);
+}
+pub fn getStdoutHandle() posix.fd_t {
+    return @bitCast(STD_OUTPUT_HANDLE);
+}
+pub fn getStderrHandle() posix.fd_t {
+    return @bitCast(STD_ERROR_HANDLE);
+}
+
+// Raw terminal mode → GetConsoleMode/SetConsoleMode on a console handle.
+// raw = clear ENABLE_LINE_INPUT + ENABLE_ECHO_INPUT. Restore = re-set the saved
+// mode (keep a saved-mode var like posix.zig's `saved_termios`). NOTE: the
+// router binds `setRawMode = impl.setRawMode` on Windows (NOT the shared
+// no-fd `setRawModeStdin` wrapper), so this takes the fd, not nothing.
+pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
+    _ = stdin;
+    _ = raw;
+}
+
+// =============================================================================
+// Bucket 2 — shared logic (router: `pub const X = shared.X`, where on Windows
+// shared === impl). Must be re-implemented, not copied: they call POSIX-only
+// API on POSIX. Reference shapes: posix.zig.
+// =============================================================================
+
+// → NtDeviceIoControlFile(AFD.SEND) with SEND_INFO/WSABUF. Loop for short
+// writes (match POSIX impl).
+pub fn socketWrite(fd: posix.fd_t, buf: []const u8) void {
+    _ = fd;
+    _ = buf;
+}
+
+// → NtDeviceIoControlFile(AFD.RECEIVE) with RECV_INFO/WSABUF. Return 0 on
+// error (matches posix.zig behavior — ConnectionResetByPeer silent, others
+// logged).
+pub fn socketRead(fd: posix.fd_t, buf: []u8) usize {
+    _ = fd;
+    _ = buf;
+    return 0;
+}
+
+// Every handle we manage is a plain HANDLE (AFD endpoints included), so this
+// is just CloseHandle — no socket-vs-file dispatch needed. Kept as its own fn
+// for router symmetry with POSIX.
+pub fn close(fd: posix.fd_t) void {
+    _ = fd;
+}
+
+// → child.id (std.process.spawn). Verify std.process.Child.id's type on
+// Windows once we link.
+pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
+    return child.id orelse 0;
+}
+
+pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };
+
+// POSIX waitpid(WNOHANG). Windows waits on the process HANDLE, not the PID:
+// WaitForSingleObject(handle, 0) to poll, GetExitCodeProcess for the status.
+// The POSIX impl takes a bare pid; Windows needs a handle — either keep a
+// pid→handle map in the conductor or change the signature (touches callers).
+pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
+    _ = pid;
+    return .{ .pid = 0, .exited = true };
+}
+
+pub const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };
+
+// → GetProcessMemoryInfo (psapi) → PROCESS_MEMORY_COUNTERS_EX.WorkingSetSize
+// (RSS-equivalent) + GetProcessTimes → kernel+user FILETIME → seconds.
+// Needs OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, ...) on the pid —
+// same pid-vs-handle caveat as waitpidNonBlocking.
+pub fn getProcessStats(pid: posix.pid_t) ?ProcessStats {
+    _ = pid;
+    return null;
+}
+
+// false: WorkingSetSize is RSS, not USS. A true USS-equivalent needs a
+// VirtualQueryEx walk. Match Linux's `false` so the eviction pass calls
+// processReclaimable as a fallback.
+pub const mem_is_reclaimable = false;
+
+// null unless we implement the VirtualQueryEx walk. Returning null makes the
+// caller fall back to RSS (mem_bytes) — the documented escape hatch in posix.zig.
+pub fn processReclaimable(pid: posix.pid_t) ?u64 {
+    _ = pid;
+    return null;
+}
+
+pub const MemInfo = struct { available: u64, total: u64 };
+
+// No PSI on Windows → null. pressure.zig's PSI branch goes inert and falls
+// back to the level path (readMemInfo). TTL-only if readMemInfo also returns null.
+pub fn readPsiSomeAvg10() ?f64 {
+    return null;
+}
+
+// → GlobalMemoryStatusEx → MEMORYSTATUSEX.ullAvailPhys / .ullTotalPhys.
+// Set .dwLength = @sizeOf(MEMORYSTATUSEX) before the call — load-bearing,
+// the API returns ERROR_INVALID_PARAMETER if dwLength is wrong.
+pub fn readMemInfo() ?MemInfo {
+    return null;
+}
+
+// No PPID tracking → null. bsd.zig already returns null; the caller (orphan-
+// worker detection) must tolerate null. Grep to verify it's only used there.
+pub fn getParentName(pid: posix.pid_t, buf: []u8) ?[]const u8 {
+    _ = pid;
+    _ = buf;
+    return null;
+}
+
+// → AFD.SOCKOPT with SOL_SOCKET/SO_RCVTIMEO, value = DWORD milliseconds
+// (NOT a timeval) — multiply seconds by 1000. Silently ignore errors
+// (matches posix.zig `catch {}`).
+pub fn setRecvTimeout(socket: posix.fd_t, seconds: u32) void {
+    _ = socket;
+    _ = seconds;
+}
+
+// → AFD.SOCKOPT with IPPROTO_TCP/TCP_NODELAY, &c_int{1}. Same numeric
+// constants as POSIX (6, 1).
+pub fn setTcpNodelay(socket: posix.fd_t) void {
+    _ = socket;
+}
+
+// → GetConsoleScreenBufferInfo(handle) → CONSOLE_SCREEN_BUFFER_INFO;
+// rows = srWindow.Bottom - Top + 1, cols = srWindow.Right - Left + 1 (or
+// .dwSize for the buffer, not the window). null if not a console handle.
+pub fn getTerminalSize(fd: posix.fd_t) ?struct { rows: u16, cols: u16 } {
+    _ = fd;
+    return null;
+}
+
+// → GetFileType(handle) == FILE_TYPE_CHAR, or GetConsoleMode(handle) succeeds.
+// posix.zig derives isatty from getTerminalSize != null — same trick works
+// here, one impl for both.
+pub fn isatty(fd: posix.fd_t) bool {
+    _ = fd;
+    return false;
+}
+
+// Client-side handler routing SIGINT between raw/cooked modes. This struct is
+// type-safe as-is (no POSIX API in it) — copy verbatim from posix.zig.
+pub const SignalHandler = struct {
+    sockets_ptr: *anyopaque,
+    write_fn: *const fn (*anyopaque, []const u8) void,
+    notify_exit_fn: *const fn () void,
+    notify_interrupt_fn: *const fn () void,
+    pub fn writeStdio(self: SignalHandler, data: []const u8) void {
+        self.write_fn(self.sockets_ptr, data);
+    }
+    pub fn notifyExit(self: SignalHandler) void {
+        self.notify_exit_fn();
+    }
+    pub fn notifyInterrupt(self: SignalHandler) void {
+        self.notify_interrupt_fn();
+    }
+};
+
+// → SetConsoleCtrlHandler(handler_fn, TRUE). Runs in its own kernel-spawned
+// thread — no self-pipe, no async-signal-safety, normal sync usable. Map:
+//   CTRL_C_EVENT / CTRL_BREAK_EVENT → raw: writeStdio("\x03"), cooked: notifyInterrupt()
+//   CTRL_CLOSE_EVENT / CTRL_LOGOFF_EVENT / CTRL_SHUTDOWN_EVENT → notifyExit()
+// No SIGPIPE equivalent needed (no SIGPIPE on Windows; broken-socket writes
+// fail via the AFD.SEND status).
+pub fn registerSignalHandlers(handler: SignalHandler) void {
+    _ = handler;
+}
+
+// =============================================================================
+// Excluded — the router binds these inline on Windows, NOT through impl. Do
+// NOT define here; doing so would be dead code the router never reaches.
+//   - isLoopback       → main.zig inline no-op (returns true) on Windows
+//   - setWorkerRawMode → main.zig inline no-op (fn f(_: bool) void {}) on Windows
+// =============================================================================

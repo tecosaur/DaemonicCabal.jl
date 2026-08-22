@@ -35,7 +35,7 @@ pub const eventLoopImpl = if (builtin.os.tag == .linux)
 else if (builtin.os.tag.isBSD())
     @import("eloop/kqueue.zig")
 else
-    @compileError("unsupported OS");
+    @import("eloop/windows.zig");
 
 const readExact = protocol.readExact;
 const randomSocketPath = protocol.randomSocketPath;
@@ -53,24 +53,24 @@ const VERSION_STRING = "juliaclient " ++ VERSION ++ "\n";
 
 const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
     .linux =>
-        \\Daemon management (systemd):
-        \\
-        \\ systemctl --user {start | stop | restart | status} julia-daemon
-        \\
+    \\Daemon management (systemd):
+    \\
+    \\ systemctl --user {start | stop | restart | status} julia-daemon
+    \\
     ,
     .macos =>
-        \\Daemon management (launchd):
-        \\
-        \\ launchctl {start | stop} org.julialang.julia-daemon
-        \\ tail -f ~/Library/Logs/julia-daemon.log
-        \\
+    \\Daemon management (launchd):
+    \\
+    \\ launchctl {start | stop} org.julialang.julia-daemon
+    \\ tail -f ~/Library/Logs/julia-daemon.log
+    \\
     ,
     else =>
-        \\Daemon management:
-        \\
-        \\ pgrep -f julia-conductor   (status)
-        \\ pkill -f julia-conductor   (stop)
-        \\
+    \\Daemon management:
+    \\
+    \\ pgrep -f julia-conductor   (status)
+    \\ pkill -f julia-conductor   (stop)
+    \\
     ,
 };
 
@@ -854,8 +854,7 @@ pub const Conductor = struct {
                 self.syncWorkerClients(w);
                 return true;
             },
-            error.WouldBlock, error.EndOfStream, error.BrokenPipe, error.ConnectionResetByPeer,
-            error.UnexpectedResponse, error.WorkerError => {
+            error.WouldBlock, error.EndOfStream, error.BrokenPipe, error.ConnectionResetByPeer, error.UnexpectedResponse, error.WorkerError => {
                 self.retireWorker(w);
                 return true;
             },
@@ -1056,7 +1055,10 @@ pub const Conductor = struct {
         };
         w.softExit();
         self.pending_kills.append(self.allocator, .{
-            .w = w, .pid = pid, .stage = .soft, .deadline = self.currentTime() + retire_grace_s,
+            .w = w,
+            .pid = pid,
+            .stage = .soft,
+            .deadline = self.currentTime() + retire_grace_s,
         }) catch {
             _ = platform.kill(pid, platform.SIG.KILL);
             _ = platform.waitpidNonBlocking(pid);
@@ -1433,10 +1435,18 @@ pub const Conductor = struct {
         for (env) |e| {
             var is_identity = false;
             for (sandbox_identity_keys) |k|
-                if (std.mem.eql(u8, e.key, k)) { is_identity = true; };
-            if (!is_identity) { result[n] = e; n += 1; }
+                if (std.mem.eql(u8, e.key, k)) {
+                    is_identity = true;
+                };
+            if (!is_identity) {
+                result[n] = e;
+                n += 1;
+            }
         }
-        for (sandbox_identity_vars) |e| { result[n] = e; n += 1; }
+        for (sandbox_identity_vars) |e| {
+            result[n] = e;
+            n += 1;
+        }
         return result[0..n];
     }
 
@@ -1717,8 +1727,10 @@ pub const Conductor = struct {
             created += 1;
         }
         self.sendSocketPaths(client_socket, .{
-            .stdin = listeners[0].addr, .stdout = listeners[1].addr,
-            .stderr = listeners[2].addr, .signals = listeners[3].addr,
+            .stdin = listeners[0].addr,
+            .stdout = listeners[1].addr,
+            .stderr = listeners[2].addr,
+            .signals = listeners[3].addr,
         });
         var conns: [4]Io.net.Stream = undefined;
         var accepted: usize = 0;
