@@ -443,9 +443,19 @@ pub fn getStderrHandle() posix.fd_t {
 // mode (keep a saved-mode var like posix.zig's `saved_termios`). NOTE: the
 // router binds `setRawMode = impl.setRawMode` on Windows (NOT the shared
 // no-fd `setRawModeStdin` wrapper), so this takes the fd, not nothing.
+var saved_mode: ?DWORD = null;
 pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
-    _ = stdin;
-    _ = raw;
+    if (raw) {
+        var mode: DWORD = undefined;
+        if (!GetConsoleMode(stdin, &mode)) {
+            return;
+        }
+        if (saved_mode == null) saved_mode = mode;
+        SetConsoleMode(stdin, 0x03);
+    } else {
+        SetConsoleMode(stdin, saved_mode);
+        saved_mode = null;
+    }
 }
 
 // =============================================================================
