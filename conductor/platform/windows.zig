@@ -141,6 +141,133 @@ pub extern "psapi" fn GetProcessMemoryInfo(hProcess: HANDLE, ppsmemCounters: *PR
 // IOCTLs/structs in std.os.windows (AFD.RECEIVE/SEND/WAIT_FOR_LISTEN/ACCEPT/
 // BIND/START_LISTEN/SOCKOPT...). See AFD.md for the POSIX→AFD translation.
 
+// =============================================================================
+// AFD plumbing — every Windows socket is an AFD endpoint handle (the object
+// std.Io creates under Io.net); these helpers issue the IOCTLs synchronously.
+// Reference shapes: std.Io.Threaded openSocketAfd (Threaded.zig:12348),
+// socketOptionAfd (:12052), bindSocketIpAfd/bindSocketUnixAfd (:12402/:12421),
+// netConnectIpWindows/netConnectUnixWindows (:12090/:12145).
+// =============================================================================
+
+const ntdll = win32.ntdll;
+const wthreaded = std.Io.Threaded;
+
+/// APC callback that flips a done flag — mirror of Threaded.flagApc (:9729).
+fn afdDoneApc(userdata: ?*anyopaque, _: *win32.IO_STATUS_BLOCK, _: win32.ULONG) align(2) callconv(.winapi) void {
+    const done: *bool = @ptrCast(userdata.?);
+    done.* = true;
+}
+
+/// Alertable sleep until the next APC fires (Threaded.waitForApcOrAlert :1554).
+fn waitForApcOrAlert() void {
+    const forever: win32.LARGE_INTEGER = std.math.minInt(win32.LARGE_INTEGER);
+    _ = ntdll.NtDelayExecution(.TRUE, &forever);
+}
+
+/// Run one AFD IOCTL to completion on this thread: pended IRP + APC +
+/// alertable wait. Threaded.deviceIoControl's (:18504) nonblocking branch
+/// minus the cancellation machinery — no cancel context outside Io threads.
+/// Returns the transfer count (IO_STATUS_BLOCK.Information; byte count for
+/// data IOCTLS, opaque for others).
+pub fn syncAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: []u8) !usize {
+    var iosb: win32.IO_STATUS_BLOCK = undefined;
+    var done = false;
+    switch (ntdll.NtDeviceIoControlFile(
+        h,
+        null,
+        &afdDoneApc,
+        &done,
+        &iosb,
+        code,
+        if (in.len > 0) in.ptr else null,
+        @intCast(in.len),
+        if (out.len > 0) out.ptr else null,
+        @intCast(out.len),
+    )) {
+        .PENDING, .SUCCESS => while (!done) waitForApcOrAlert(),
+        else => |status| return win32.unexpectedStatus(status),
+    }
+    switch (iosb.u.Status) {
+        .SUCCESS => return iosb.Information,
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
+/// Create a stream-mode AFD endpoint — the real object behind every socket.
+/// Mirror of Threaded.openSocketAfd (:12348), stream mode only. Doubles as the
+/// accept-path child-handle factory for the event loop.
+pub fn openAfdEndpoint(family: posix.sa_family_t) !posix.fd_t {
+    const mode_protocol = try wthreaded.posixSocketModeProtocol(family, .stream, null);
+    var handle: HANDLE = undefined;
+    var iosb: win32.IO_STATUS_BLOCK = undefined;
+    switch (ntdll.NtCreateFile(
+        &handle,
+        .{
+            .STANDARD = .{ .RIGHTS = .{ .WRITE_DAC = true }, .SYNCHRONIZE = true },
+            .GENERIC = .{ .WRITE = true, .READ = true },
+        },
+        &.{
+            .ObjectName = @constCast(&win32.UNICODE_STRING.init(
+                win32.AFD.DEVICE_NAME ++ .{ '\\', 'E', 'n', 'd', 'p', 'o', 'i', 'n', 't' },
+            )),
+        },
+        &iosb,
+        null,
+        .{},
+        .{ .READ = true, .WRITE = true },
+        .OPEN_IF,
+        .{ .IO = .ASYNCHRONOUS },
+        &win32.AFD.OPEN_PACKET.FULL_EA_INFORMATION{
+            .Value = .{
+                .EndpointType = .{}, // stream: no CONNECTIONLESS / MESSAGEMODE / RAW bits
+                .GroupID = 0,
+                .AddressFamily = family,
+                .SocketType = @bitCast(mode_protocol[0]),
+                .Protocol = @bitCast(mode_protocol[1]),
+                .TransportDeviceNameLength = 0,
+                .TransportDeviceName = undefined,
+            },
+        },
+        @sizeOf(win32.AFD.OPEN_PACKET.FULL_EA_INFORMATION),
+    )) {
+        .SUCCESS => return handle,
+        .PROTOCOL_NOT_SUPPORTED => return error.AddressFamilyUnsupported,
+        .NO_SUCH_FILE => return error.ProtocolUnsupportedByAddressFamily,
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
+/// AFD.SOCKOPT wrapper (mirror of Threaded.socketOptionAfd :12052).
+pub fn afdSockopt(
+    h: HANDLE,
+    mode: win32.AFD.SOCKOPT_INFO.Mode,
+    level: i32,
+    optname: u32,
+    opt_val: []u8,
+) !void {
+    _ = try syncAfdControl(h, win32.IOCTL.AFD.SOCKOPT, @as([]const u8, @ptrCast(&win32.AFD.SOCKOPT_INFO{
+        .mode = mode,
+        .level = level,
+        .optname = optname,
+        .optval = opt_val.ptr,
+        .optlen = opt_val.len,
+    })), &.{});
+}
+
+/// AFD.BIND wrapper (bindSocketIpAfd / bindSocketUnixAfd shape :12402/:12421):
+/// `addr_bytes` is a raw sockaddr (family + payload), truncated to its length.
+pub fn afdBind(h: HANDLE, mode: win32.AFD.BIND_INFO.MODE, addr_bytes: []const u8) !void {
+    const Storage = extern struct { info: win32.AFD.BIND_INFO, addr: [128]u8 };
+    var storage: Storage = .{ .info = .{ .Mode = mode }, .addr = undefined };
+    @memcpy(storage.addr[0..addr_bytes.len], addr_bytes);
+    _ = try syncAfdControl(
+        h,
+        win32.IOCTL.AFD.BIND,
+        @as([]const u8, @ptrCast(&storage))[0 .. @offsetOf(Storage, "addr") + addr_bytes.len],
+        @as([]u8, @ptrCast(&storage.addr)),
+    );
+}
+
 /// Format into either an allocator (returns owned slice) or a `[]u8` buffer (returns sub-slice).
 pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
     if (@TypeOf(out) == std.mem.Allocator)
@@ -159,12 +286,13 @@ pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 
 // TerminateProcess. IGN/PIPE are posix.zig-internal, never cross on Windows.
 pub const SIG = enum { INT, TERM, KILL, USR1 };
 
-// → GetCurrentProcessId()
-pub fn getpid() void {}
+pub fn getpid() DWORD {
+    win32.GetCurrentProcessId();
+}
 
 // No direct analog — Windows doesn't track PPID. Hack: NtQueryInformationProcess
 // with ProcessBasicInformation (ntdll, unstable). Grep callers first; likely unused.
-pub fn getppid() void {}
+pub fn getppid() DWORD {}
 
 // Low-level write, used directly by posix_signals.zig on POSIX. On Windows that
 // async-signal-safety constraint is gone (SetConsoleCtrlHandler runs in its own
@@ -188,27 +316,95 @@ pub fn kill(pid: posix.pid_t, sig: SIG) usize {
     return 1;
 }
 
-// → NtCreateFile(\Device\Afd\Endpoint) mirroring std.Io's openSocketAfd
-// (Threaded.zig:12348) — or just take the handle from an std.Io-created
-// socket. No WSAStartup: AFD sits below WinSock2 entirely (see AFD.md).
+// → NtCreateFile(\Device\Afd\Endpoint): create the AFD stream endpoint that
+// underlies every Windows socket (mirror of Threaded.openSocketAfd,
+// Threaded.zig:12348). No WSAStartup — AFD sits below WinSock2 entirely.
 pub fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
-    _ = family;
-    _ = sock_type;
-    return null;
+    if (sock_type != posix.SOCK.STREAM) {
+        std.debug.print("rawSocket: only SOCK.STREAM supported (got {d})\n", .{sock_type});
+        return null;
+    }
+    return openAfdEndpoint(@intCast(family)) catch |err| {
+        std.debug.print("rawSocket: AFD endpoint creation failed: {}\n", .{err});
+        return null;
+    };
 }
 
-// → AFD.CONNECT IOCTL (netConnectIpWindows/netConnectUnixWindows shape).
+fn connectAfd(h: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
+    switch (addr.family) {
+        posix.AF.INET, posix.AF.INET6 => {
+            var one: bool = true;
+            try afdSockopt(h, .set, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.REUSE_UNICASTPORT, @as([]u8, @ptrCast(&one))[0..1]);
+            // Bind unspecified(:0), same family as the target
+            // (netConnectIpWindows :12103-12109 shape).
+            var bind_addr: [28]u8 = [_]u8{0} ** 28;
+            const blen: usize = switch (addr.family) {
+                posix.AF.INET => blk: {
+                    std.mem.writeInt(u16, bind_addr[0..2], posix.AF.INET, .little);
+                    break :blk @sizeOf(posix.sockaddr.in);
+                },
+                else => blk: {
+                    std.mem.writeInt(u16, bind_addr[0..2], posix.AF.INET6, .little);
+                    break :blk @sizeOf(posix.sockaddr.in6);
+                },
+            };
+            try afdBind(h, .Active, bind_addr[0..blen]);
+        },
+        posix.AF.UNIX => {
+            if (!std.Io.net.has_unix_sockets) return error.AddressFamilyUnsupported;
+            const un: *const posix.sockaddr.un = @ptrCast(@alignCast(addr));
+            const path_len = std.mem.indexOfScalar(u8, &un.path, 0) orelse un.path.len;
+            if (path_len == 0) return error.AbstractNamespaceUnsupported;
+            // Filesystem paths publish their name via the SO.UNIX_PATH
+            // special-option (netConnectUnixWindows :12154-12169 shape).
+            const wps = try wthreaded.sliceToPrefixedFileW(null, un.path[0..path_len], .{ .allow_relative = false });
+            var unix_path: win32.AFD.SOCKOPT_INFO.UNIX_PATH = .{ .Path = undefined };
+            @memcpy(unix_path.Path[0..wps.len], wps.data[0..wps.len]);
+            unix_path.Path[wps.len] = 0;
+            try afdSockopt(
+                h,
+                .special,
+                0,
+                win32.ws2_32.SO.UNIX_PATH,
+                @as([]u8, @ptrCast(&unix_path))[0 .. @offsetOf(win32.AFD.SOCKOPT_INFO.UNIX_PATH, "Path") + @sizeOf(win32.WCHAR) * wps.len],
+            );
+            // Empty-name bind: full-length zeroed sockaddr_un with just the
+            // family set (addressUnixToPosix("") shape — Windows AFD wants
+            // the whole struct).
+            var empty_un: posix.sockaddr.un = std.mem.zeroes(posix.sockaddr.un);
+            empty_un.family = posix.AF.UNIX;
+            try afdBind(h, .Unix, @as([*]const u8, @ptrCast(&empty_un))[0..@sizeOf(posix.sockaddr.un)]);
+        },
+        else => return error.AddressFamilyUnsupported,
+    }
+    // CONNECT input = { Reserved0: [3]usize = 0 } followed by the sockaddr
+    // bytes (netConnect*Windows :12110-12116 / :12176-12182 shape).
+    const ConnectStorage = extern struct { reserved: [3]usize, addr: [128]u8 };
+    var storage: ConnectStorage = .{ .reserved = @splat(0), .addr = undefined };
+    @memcpy(storage.addr[0..len], @as([*]const u8, @ptrCast(addr))[0..len]);
+    _ = try syncAfdControl(
+        h,
+        win32.IOCTL.AFD.CONNECT,
+        @as([]const u8, @ptrCast(&storage))[0 .. @offsetOf(ConnectStorage, "addr") + len],
+        &.{},
+    );
+}
+
+// → AFD.CONNECT IOCTL (see connectAfd). Takes the same POSIX-ish args as the
+// linux impl; errors are logged and reported as `false` (matches sibling
+// primitives' bool contract).
 pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
-    _ = fd;
-    _ = addr;
-    _ = len;
-    return false;
+    connectAfd(fd, addr, len) catch |err| {
+        std.debug.print("rawConnect failed: {}\n", .{err});
+        return false;
+    };
+    return true;
 }
 
 // → CloseHandle — our sockets are plain HANDLEs (AFD endpoints), so there is
 // no closesocket distinction at all.
 pub fn rawClose(fd: posix.fd_t) void {
-    _ = fd;
+    win32.CloseHandle(fd);
 }
 
 // No /run/user/$UID on Windows → %LOCALAPPDATA%\julia-daemon. The env var is
@@ -228,12 +424,6 @@ pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const 
     defer std.heap.page_allocator.free(appdata);
     return print(out, "{s}/julia-daemon", .{appdata});
 }
-
-// test "defaultRuntimeDir resolves %LOCALAPPDATA%\\julia-daemon" {
-//     var buf: [1024]u8 = undefined;
-//     const dir = try defaultRuntimeDir(&buf, null, null);
-//     try std.testing.expect(std.mem.endsWith(u8, dir, "julia-daemon"));
-// }
 
 // → GetStdHandle(STD_INPUT_HANDLE / STDOUT / STDERR). Returns a HANDLE, not a
 // small int. The router calls these as fns on Windows (vs consts on POSIX), so
