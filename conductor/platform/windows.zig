@@ -243,7 +243,7 @@ pub fn afdSockopt(
     mode: win32.AFD.SOCKOPT_INFO.Mode,
     level: i32,
     optname: u32,
-    opt_val: []u8,
+    opt_val: []const u8,
 ) !void {
     _ = try syncAfdControl(h, win32.IOCTL.AFD.SOCKOPT, @as([]const u8, @ptrCast(&win32.AFD.SOCKOPT_INFO{
         .mode = mode,
@@ -268,6 +268,68 @@ pub fn afdBind(h: HANDLE, mode: win32.AFD.BIND_INFO.MODE, addr_bytes: []const u8
     );
 }
 
+/// One overlapped AFD.SEND, synchronous wait (syncAfdControl shape). Returns
+/// bytes sent; short sends are possible — callers loop.
+fn afdSend(h: HANDLE, bytes: []const u8) !usize {
+    var iovecs = [_]win32.AFD.WSABUF(.@"const"){.{ .len = @intCast(bytes.len), .buf = bytes.ptr }};
+    var info: win32.AFD.SEND_INFO = .{
+        .BufferArray = &iovecs,
+        .BufferCount = 1,
+        .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+        .TdiFlags = .{},
+    };
+    return dataTransferAfd(h, win32.IOCTL.AFD.SEND, std.mem.asBytes(&info), null, 0);
+}
+
+/// One overlapped AFD.RECEIVE, synchronous wait. Disconnect/reset statuses
+/// report 0 (EOF-ish); genuinely unexpected statuses error.
+fn afdRecv(h: HANDLE, buf: []u8) !usize {
+    var iovecs = [_]win32.AFD.WSABUF(.@"var"){.{ .len = @intCast(buf.len), .buf = buf.ptr }};
+    var info: win32.AFD.RECV_INFO = .{
+        .BufferArray = &iovecs,
+        .BufferCount = 1,
+        .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+        .TdiFlags = .{ .NORMAL = true },
+    };
+    const out_ptr: ?[*]u8 = if (buf.len > 0) buf.ptr else null;
+    return dataTransferAfd(
+        h,
+        win32.IOCTL.AFD.RECEIVE,
+        std.mem.asBytes(&info),
+        out_ptr,
+        buf.len,
+    );
+}
+
+/// Issue one data IOCTL, wait for APC completion, map status → byte count.
+fn dataTransferAfd(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out_len: usize) !usize {
+    var iosb: win32.IO_STATUS_BLOCK = undefined;
+    var done = false;
+    switch (ntdll.NtDeviceIoControlFile(
+        h,
+        null,
+        &afdDoneApc,
+        &done,
+        &iosb,
+        code,
+        in.ptr,
+        @intCast(in.len),
+        out,
+        @intCast(out_len),
+    )) {
+        .PENDING, .SUCCESS => while (!done) waitForApcOrAlert(),
+        else => |status| return win32.unexpectedStatus(status),
+    }
+    switch (iosb.u.Status) {
+        .SUCCESS => return iosb.Information,
+        // Peer closed / hard reset read as EOF-0, matching posix.zig's
+        // silent ConnectionResetByPeer handling and protocol.readExact's
+        // n==0 → EndOfStream contract.
+        .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => return 0,
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
 /// Format into either an allocator (returns owned slice) or a `[]u8` buffer (returns sub-slice).
 pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
     if (@TypeOf(out) == std.mem.Allocator)
@@ -287,21 +349,21 @@ pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 
 pub const SIG = enum { INT, TERM, KILL, USR1 };
 
 pub fn getpid() DWORD {
-    win32.GetCurrentProcessId();
+    return win32.GetCurrentProcessId();
 }
 
-// No direct analog — Windows doesn't track PPID. Hack: NtQueryInformationProcess
-// with ProcessBasicInformation (ntdll, unstable). Grep callers first; likely unused.
-pub fn getppid() DWORD {}
+// No direct analog — Windows doesn't track PPID. Callers must tolerate 0 /
+// null (getParentName also returns null). Hack if ever needed:
+// NtQueryInformationProcess with ProcessBasicInformation (ntdll, unstable).
+pub fn getppid() DWORD {
+    return 0;
+}
 
-// Low-level write, used directly by posix_signals.zig on POSIX. On Windows that
-// async-signal-safety constraint is gone (SetConsoleCtrlHandler runs in its own
-// thread), so plain synchronous WriteFile suffices. Called on stdio handles
-// returned by getStdinHandle etc. — keep the same handle type across all of them.
-// Loop to cover short writes, like the POSIX impl.
+// Low-level write. On POSIX this backs posix_signals.zig; on Windows every
+// current caller passes an AFD socket (worker.zig / main.zig streams), so it
+// routes through the SEND loop like platform.write does there.
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
-    _ = fd;
-    _ = buf;
+    socketWrite(fd, buf);
 }
 
 // No general kill(pid, sig). KILL/TERM → OpenProcess + TerminateProcess
@@ -443,17 +505,19 @@ pub fn getStderrHandle() posix.fd_t {
 // mode (keep a saved-mode var like posix.zig's `saved_termios`). NOTE: the
 // router binds `setRawMode = impl.setRawMode` on Windows (NOT the shared
 // no-fd `setRawModeStdin` wrapper), so this takes the fd, not nothing.
+const ENABLE_LINE_INPUT: DWORD = 0x0002;
+const ENABLE_ECHO_INPUT: DWORD = 0x0004;
 var saved_mode: ?DWORD = null;
 pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
     if (raw) {
         var mode: DWORD = undefined;
-        if (!GetConsoleMode(stdin, &mode)) {
+        if (!GetConsoleMode(stdin, &mode).toBool()) {
             return;
         }
         if (saved_mode == null) saved_mode = mode;
-        SetConsoleMode(stdin, 0x03);
-    } else {
-        SetConsoleMode(stdin, saved_mode);
+        _ = SetConsoleMode(stdin, mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+    } else if (saved_mode) |mode| {
+        _ = SetConsoleMode(stdin, mode);
         saved_mode = null;
     }
 }
@@ -464,31 +528,36 @@ pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
 // API on POSIX. Reference shapes: posix.zig.
 // =============================================================================
 
-// → NtDeviceIoControlFile(AFD.SEND) with SEND_INFO/WSABUF. Loop for short
-// writes (match POSIX impl).
+// → AFD.SEND. Loop for short writes (match POSIX impl).
 pub fn socketWrite(fd: posix.fd_t, buf: []const u8) void {
-    _ = fd;
-    _ = buf;
+    var sent: usize = 0;
+    while (sent < buf.len) {
+        const n = afdSend(fd, buf[sent..]) catch {
+            // posix.zig keeps socket writes silent on failure.
+            return;
+        };
+        if (n == 0) return;
+        sent += n;
+    }
 }
 
-// → NtDeviceIoControlFile(AFD.RECEIVE) with RECV_INFO/WSABUF. Return 0 on
-// error (matches posix.zig behavior — ConnectionResetByPeer silent, others
-// logged).
+// → AFD.RECEIVE. Return 0 on error (matches posix.zig behavior —
+// ConnectionResetByPeer silent, others logged).
 pub fn socketRead(fd: posix.fd_t, buf: []u8) usize {
-    _ = fd;
-    _ = buf;
-    return 0;
+    return afdRecv(fd, buf) catch |err| {
+        std.debug.print("socketRead error: {}\n", .{err});
+        return 0;
+    };
 }
 
 // Every handle we manage is a plain HANDLE (AFD endpoints included), so this
 // is just CloseHandle — no socket-vs-file dispatch needed. Kept as its own fn
 // for router symmetry with POSIX.
 pub fn close(fd: posix.fd_t) void {
-    _ = fd;
+    win32.CloseHandle(fd);
 }
 
-// → child.id (std.process.spawn). Verify std.process.Child.id's type on
-// Windows once we link.
+// → child.id (std.process.spawn).
 pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
     return child.id orelse 0;
 }
@@ -539,7 +608,10 @@ pub fn readPsiSomeAvg10() ?f64 {
 // Set .dwLength = @sizeOf(MEMORYSTATUSEX) before the call — load-bearing,
 // the API returns ERROR_INVALID_PARAMETER if dwLength is wrong.
 pub fn readMemInfo() ?MemInfo {
-    return null;
+    var ms = std.mem.zeroes(MEMORYSTATUSEX);
+    ms.dwLength = @sizeOf(MEMORYSTATUSEX);
+    if (!GlobalMemoryStatusEx(&ms).toBool()) return null;
+    return .{ .available = ms.ullAvailPhys, .total = ms.ullTotalPhys };
 }
 
 // No PPID tracking → null. bsd.zig already returns null; the caller (orphan-
@@ -554,30 +626,32 @@ pub fn getParentName(pid: posix.pid_t, buf: []u8) ?[]const u8 {
 // (NOT a timeval) — multiply seconds by 1000. Silently ignore errors
 // (matches posix.zig `catch {}`).
 pub fn setRecvTimeout(socket: posix.fd_t, seconds: u32) void {
-    _ = socket;
-    _ = seconds;
+    const timeout_ms: DWORD = seconds * 1000;
+    afdSockopt(socket, .set, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.RCVTIMEO, std.mem.asBytes(&timeout_ms)) catch {};
 }
 
 // → AFD.SOCKOPT with IPPROTO_TCP/TCP_NODELAY, &c_int{1}. Same numeric
 // constants as POSIX (6, 1).
 pub fn setTcpNodelay(socket: posix.fd_t) void {
-    _ = socket;
+    const one: c_int = 1;
+    afdSockopt(socket, .set, win32.ws2_32.IPPROTO.TCP, win32.ws2_32.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
 }
 
 // → GetConsoleScreenBufferInfo(handle) → CONSOLE_SCREEN_BUFFER_INFO;
-// rows = srWindow.Bottom - Top + 1, cols = srWindow.Right - Left + 1 (or
-// .dwSize for the buffer, not the window). null if not a console handle.
+// rows = srWindow.Bottom - Top + 1, cols = srWindow.Right - Left + 1. null if
+// not a console handle.
 pub fn getTerminalSize(fd: posix.fd_t) ?struct { rows: u16, cols: u16 } {
-    _ = fd;
-    return null;
+    var csbi = std.mem.zeroes(CONSOLE_SCREEN_BUFFER_INFO);
+    if (!GetConsoleScreenBufferInfo(fd, &csbi).toBool()) return null;
+    return .{
+        .rows = @intCast(csbi.srWindow.Bottom - csbi.srWindow.Top + 1),
+        .cols = @intCast(csbi.srWindow.Right - csbi.srWindow.Left + 1),
+    };
 }
 
-// → GetFileType(handle) == FILE_TYPE_CHAR, or GetConsoleMode(handle) succeeds.
-// posix.zig derives isatty from getTerminalSize != null — same trick works
-// here, one impl for both.
+// → GetFileType(handle) == FILE_TYPE_CHAR.
 pub fn isatty(fd: posix.fd_t) bool {
-    _ = fd;
-    return false;
+    return GetFileType(fd) == FILE_TYPE_CHAR;
 }
 
 // Client-side handler routing SIGINT between raw/cooked modes. This struct is
