@@ -57,6 +57,17 @@ pub const CTRL_SHUTDOWN_EVENT: DWORD = 6;
 pub const FILE_TYPE_CHAR: DWORD = 0x0002;
 pub const STILL_ACTIVE: DWORD = 259;
 pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+pub const PROCESS_TERMINATE: DWORD = 0x0001;
+pub const PROCESS_SYNCHRONIZE: DWORD = 0x00100000;
+const WAIT_OBJECT_0: DWORD = 0x00000000;
+const WAIT_TIMEOUT: DWORD = 0x00000102;
+
+// POSIX-style pids ride around as fd_t (*anyopaque) in this codebase; real
+// Windows PIDs are DWORD — all our pids originate from CreateProcess, so
+// ptr-int roundtrip never loses bits.
+fn openProcessFor(pid: posix.pid_t, access: DWORD) ?HANDLE {
+    return OpenProcess(access, win32.BOOL.FALSE, @as(u32, @truncate(@intFromPtr(pid))));
+}
 
 pub const HANDLER_ROUTINE = fn (dwCtrlType: DWORD) callconv(.winapi) BOOL;
 pub const PHANDLER_ROUTINE = *const HANDLER_ROUTINE;
@@ -366,16 +377,19 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
     socketWrite(fd, buf);
 }
 
-// No general kill(pid, sig). KILL/TERM → OpenProcess + TerminateProcess
-// (always "kill", no graceful SIGTERM). INT → GenerateConsoleCtrlEvent
-// (CTRL_C_EVENT, pid_group) only if the worker shares the conductor's console;
-// else a named-pipe message / Event object. USR1 → no analog; the conductor's
-// USR1 path (posix_signals.zig:51 live-status repaint) should be dropped or
-// remapped to a pipe message.
+// No general kill(pid, sig) on Windows: every signal is TerminateProcess
+// (the always-"SIGKILL" primitive). INT deliberately ≡ TERM (option A):
+// GenerateConsoleCtrlEvent only reaches console-sharing process groups, and
+// spawned workers aren't one. USR1 has no callers on Windows (verified) —
+// no-op success. Returns 0 success / 1 failure (bsd.zig shape).
 pub fn kill(pid: posix.pid_t, sig: SIG) usize {
-    _ = pid;
-    _ = sig;
-    return 1;
+    switch (sig) {
+        .KILL, .TERM, .INT => {},
+        .USR1 => return 0,
+    }
+    const h = openProcessFor(pid, PROCESS_TERMINATE) orelse return 1;
+    defer win32.CloseHandle(h);
+    return if (TerminateProcess(h, 1).toBool()) 0 else 1;
 }
 
 // → NtCreateFile(\Device\Afd\Endpoint): create the AFD stream endpoint that
@@ -564,24 +578,47 @@ pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
 
 pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };
 
-// POSIX waitpid(WNOHANG). Windows waits on the process HANDLE, not the PID:
-// WaitForSingleObject(handle, 0) to poll, GetExitCodeProcess for the status.
-// The POSIX impl takes a bare pid; Windows needs a handle — either keep a
-// pid→handle map in the conductor or change the signature (touches callers).
+// POSIX waitpid(WNOHANG) equivalent: poll the process handle with a zero
+// timeout. The POSIX impl takes a bare pid; we OpenProcess per call — same
+// order as Linux's /proc reaping cost and no pid→handle bookkeeping.
+// Process gone (open fails) reads as "exited", matching ECHILD treatment.
 pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
-    _ = pid;
-    return .{ .pid = 0, .exited = true };
+    const h = openProcessFor(pid, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION) orelse
+        return .{ .pid = pid, .exited = true };
+    defer win32.CloseHandle(h);
+    const state = WaitForSingleObject(h, 0);
+    return .{ .pid = pid, .exited = state != WAIT_TIMEOUT };
 }
 
 pub const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };
 
+// FILETIME is two DWORDs of 100ns units since 1601 — durations only need the
+// raw count, not the epoch offset.
+fn filetimeToU64(ft: FILETIME) u64 {
+    return @as(u64, ft.dwHighDateTime) << 32 | @as(u64, ft.dwLowDateTime);
+}
+
 // → GetProcessMemoryInfo (psapi) → PROCESS_MEMORY_COUNTERS_EX.WorkingSetSize
-// (RSS-equivalent) + GetProcessTimes → kernel+user FILETIME → seconds.
-// Needs OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, ...) on the pid —
-// same pid-vs-handle caveat as waitpidNonBlocking.
+// (RSS-equivalent) + GetProcessTimes → kernel+user seconds.
 pub fn getProcessStats(pid: posix.pid_t) ?ProcessStats {
-    _ = pid;
-    return null;
+    const h = openProcessFor(pid, PROCESS_QUERY_LIMITED_INFORMATION) orelse return null;
+    defer win32.CloseHandle(h);
+
+    var pmc = std.mem.zeroes(PROCESS_MEMORY_COUNTERS_EX);
+    pmc.cb = @sizeOf(PROCESS_MEMORY_COUNTERS_EX);
+    if (!GetProcessMemoryInfo(h, &pmc, pmc.cb).toBool()) return null;
+
+    var creation: FILETIME = undefined;
+    var exit_t: FILETIME = undefined;
+    var kernel: FILETIME = undefined;
+    var user: FILETIME = undefined;
+    if (!GetProcessTimes(h, &creation, &exit_t, &kernel, &user).toBool()) return null;
+
+    const cpu_100ns: f64 = @floatFromInt(filetimeToU64(kernel) + filetimeToU64(user));
+    return .{
+        .mem_bytes = pmc.WorkingSetSize,
+        .cpu_seconds = cpu_100ns / 10_000_000.0,
+    };
 }
 
 // false: WorkingSetSize is RSS, not USS. A true USS-equivalent needs a
