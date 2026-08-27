@@ -143,6 +143,7 @@ pub extern "kernel32" fn GetFileType(hFile: HANDLE) DWORD;
 pub extern "kernel32" fn SetConsoleCtrlHandler(handler_routine: ?PHANDLER_ROUTINE, add: BOOL) BOOL;
 pub extern "kernel32" fn GetProcessTimes(hProcess: HANDLE, lpCreationTime: *FILETIME, lpExitTime: *FILETIME, lpKernelTime: *FILETIME, lpUserTime: *FILETIME) BOOL;
 pub extern "kernel32" fn GenerateConsoleCtrlEvent(dwCtrlEvent: DWORD, dwProcessGroupId: DWORD) BOOL;
+pub extern "kernel32" fn GetProcessId(hProcess: HANDLE) DWORD;
 
 // --- psapi ---
 pub extern "psapi" fn GetProcessMemoryInfo(hProcess: HANDLE, ppsmemCounters: *PROCESS_MEMORY_COUNTERS_EX, cb: DWORD) BOOL;
@@ -571,9 +572,11 @@ pub fn close(fd: posix.fd_t) void {
     win32.CloseHandle(fd);
 }
 
-// → child.id (std.process.spawn).
-pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
-    return child.id orelse 0;
+// → numeric Windows PID for display/logging. Child.id on Windows is the
+// process HANDLE (std.process.Child.Id = HANDLE, "On Windows this is the
+// hProcess"), not a pid — GetProcessId recovers the number callers print.
+pub fn getChildPid(child: anytype) DWORD {
+    return if (child.id) |process| GetProcessId(process) else 0;
 }
 
 pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };

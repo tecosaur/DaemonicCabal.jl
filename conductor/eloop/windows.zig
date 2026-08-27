@@ -120,7 +120,7 @@ const TimerCtx = struct { iocp: HANDLE, key: usize, timer: HANDLE };
 /// One-shot timers must still be deleted (Period=0 doesn't free the handle), so
 /// delete here — the callback is the last thing that touches the timer.
 fn iocpTimerCallback(lpParameter: ?*anyopaque, _: BOOL) callconv(.winapi) void {
-    const ctx: *TimerCtx = @ptrCast(lpParameter orelse return);
+    const ctx: *TimerCtx = @ptrCast(@alignCast(lpParameter orelse return));
     _ = PostQueuedCompletionStatus(ctx.iocp, 0, ctx.key, null);
     _ = DeleteTimerQueueTimer(null, ctx.timer, null);
     std.heap.page_allocator.destroy(ctx);
@@ -141,7 +141,6 @@ fn scheduleTimer(iocp: HANDLE, key: usize, delay_ms: u64) void {
 fn dueTimeRelMs(ms: u64) DWORD {
     return @bitCast(-@as(i32, @intCast(ms)) * 10_000);
 }
-
 
 // =============================================================================
 // EventLoop
@@ -170,8 +169,15 @@ pub const EventLoop = struct {
 
     // → CloseHandle(iocp).
     pub fn deinit(self: *EventLoop) void {
-        _ = CloseHandle(self.iocp);
+        _ = win32.CloseHandle(self.iocp);
         g_console_iocp = null;
+    }
+
+    /// Fire a one-shot timer `delay_ms` out that wakes `run` with `key`.
+    /// Generic wrapper over scheduleTimer — used by run() for the periodic
+    /// ping/pressure arms and reusable for anything else.
+    pub fn armOneShot(self: *EventLoop, key: usize, delay_ms: u64) void {
+        scheduleTimer(self.iocp, key, delay_ms);
     }
 
     /// Arm the unified live-repaint timer `delay_ms` out (Conductor picks the delay).
@@ -180,7 +186,7 @@ pub const EventLoop = struct {
     // (CreateWaitableTimerW/SetWaitableTimer) waited on by a helper thread.
     // Completion key: the live-timer key (cf. UDATA_LIVE_TIMER in kqueue.zig).
     pub fn armLiveTimer(self: *EventLoop, delay_ms: u64) void {
-        scheduleTimer(self.iocp, @intFromEnum(EventLocation.live_timer), delay_ms);
+        self.armOneShot(@intFromEnum(EventLocation.live_timer), delay_ms);
     }
 
     /// Schedule a health check for a worker after a short delay (1 second).
@@ -188,7 +194,7 @@ pub const EventLoop = struct {
     /// branch can tell a health-check completion apart from a pong read — the
     /// same ptr-tagging the POSIX loops use.
     pub fn scheduleHealthCheck(self: *EventLoop, w: *worker.Worker) void {
-        scheduleTimer(self.iocp, @intFromPtr(w) | 1, 1000);
+        self.armOneShot(@intFromPtr(w) | 1, 1000);
     }
 
     /// Cancel in-flight ops referencing `w`. Drain any partial pong synchronously
@@ -206,6 +212,91 @@ pub const EventLoop = struct {
         w.ping_pending = false;
     }
 };
+
+// =============================================================================
+// Async op plumbing — port-routed AFD issuers
+// =============================================================================
+//
+// Synchronous setup calls use platform.syncAfdControl (issue+APC-wait inline).
+// Loop-owned ops instead issue-and-return: NtDeviceIoControlFile with
+// ApcRoutine=null routes the completion packet to OUR port under `apc_ctx`
+// (= completion key). One GetQueuedCompletionStatus park multiplexes every
+// in-flight op plus external posts (timers/console handler).
+//
+// Heap-backed per-op context: the kernel writes into `iosb` until completion,
+// and GQCS hands us &iosb back as *OVERLAPPED (layout-compatible prefix), so
+// casting it straight back recovers the whole context. Payload buffers that
+// the driver also dereferences (out-storage for WAIT_FOR_LISTEN, the RECV_INFO
+// input chain for RECEIVE) live INSIDE the context and thus outlive the IRP.
+
+const ntdll = win32.ntdll;
+
+/// Pending AFD.WAIT_FOR_LISTEN on the listener. Exactly one outstanding at a
+/// time; freed by the dispatcher after the sync ACCEPT half finishes.
+const AcceptWait = extern struct {
+    iosb: win32.IO_STATUS_BLOCK,
+    response: extern struct {
+        info: win32.AFD.LISTEN_RESPONSE_INFO,
+        addr_bytes: [128]u8, // peer sockaddr written by the driver
+    },
+};
+
+/// Pending overlapped AFD.RECEIVE for one worker's pong (5 bytes into
+/// w.pong_buf — stable storage owned by the Worker). Keyed by @intFromPtr(w);
+/// freed after dispatch or ping-timeout cancel.
+const PongRead = extern struct {
+    iosb: win32.IO_STATUS_BLOCK,
+    iovec: [1]win32.AFD.WSABUF(.@"var"),
+    info: win32.AFD.RECV_INFO,
+};
+
+/// Issue one overlapped AFD IOCTL to our port and return immediately.
+/// `.SUCCESS` inline and `.PENDING` both surface later as a port packet whose
+/// OVERLAPPED* == `iosb` (AFD.md caveat: success-inline packets still post on
+/// associated handles) — uniform handling upstream.
+fn issueAfd(
+    h: HANDLE,
+    code: win32.CTL_CODE,
+    key: usize,
+    in: []const u8,
+    out: []u8,
+    iosb: *win32.IO_STATUS_BLOCK,
+) !void {
+    switch (ntdll.NtDeviceIoControlFile(
+        h,
+        null,
+        null,
+        @ptrFromInt(key),
+        iosb,
+        code,
+        if (in.len > 0) in.ptr else null,
+        @intCast(in.len),
+        if (out.len > 0) out.ptr else null,
+        @intCast(out.len),
+    )) {
+        .SUCCESS, .PENDING => {},
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
+/// Queue the async half of an accept: WAIT_FOR_LISTEN under the accept key.
+/// On its completion the dispatcher runs the synchronous child-open +
+/// AFD.ACCEPT half (mirrors netAcceptWindows' inline second IOCTL — cheap,
+/// the TCP handshake is already done by then).
+fn issueAcceptWait(listener: HANDLE) !*AcceptWait {
+    const aw = try std.heap.page_allocator.create(AcceptWait);
+    errdefer std.heap.page_allocator.destroy(aw);
+    aw.* = .{ .iosb = undefined, .response = undefined };
+    try issueAfd(
+        listener,
+        win32.IOCTL.AFD.WAIT_FOR_LISTEN,
+        @intFromEnum(EventLocation.accept),
+        &.{},
+        @as([]u8, @ptrCast(&aw.response)),
+        &aw.iosb,
+    );
+    return aw;
+}
 
 // =============================================================================
 // Main loop
@@ -236,55 +327,78 @@ pub const EventLoop = struct {
 // we extract .socket.handle, CreateIoCompletionPort them onto our port, and
 // issue AFD IOCTLs with ApcRoutine=null so completions land here. See AFD.md.
 pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
-    const iocp = &conductor.event_loop.iocp;
-    var signal_buf: [16]u8 = undefined;
-    var server_fd = server.socket.handle;
-    var ping_timeout_ms = conductor.cfg.ping_timeout * 1000;
+    const iocp: HANDLE = conductor.event_loop.iocp;
+
+    // Associate the std.Io-created listener AFD handle with our port under
+    // the accept key — from here on its completions route to this loop.
+    const listener = server.socket.handle;
+    if (CreateIoCompletionPort(listener, iocp, @intFromEnum(EventLocation.accept), 0) == null) {
+        std.debug.print("Fatal: failed to associate listener with IOCP\n", .{});
+        return;
+    }
 
     const pressure_active = conductor.pressure_monitor.active();
 
-    // queue initial operations
-    while (true) {
-        var need_rearm_accept = false;
-        var need_rearm_ping_timer = false;
-        var need_rearm_pressure_timer = false;
-
-        var pool_changed = false;
-
-        var key: usize = undefined;
-        var overlapped: OVERLAPPED = undefined;
-        _ = GetQueuedCompletionStatus(iocp, null, &key, &overlapped, @intCast(9999999));
-         // last arg should be INFINITE from (ioapiset.h)
-        if (key >= 0x1000) {
-            const w: *worker.Worker = @ptrFromInt(key & ~@as(u64, 1));
-            if (!conductor.isLiveWorker(w)) continue; // stale completion check
-            if ((key & 1) != 0) {
-                conductor.refreshIdleMemIfStale(w, conductor.currentTime());
-                const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
-                if (w.active_clients == 0 and !w.ping_pending and !recently_pinged) {
-                    queuePing(iocp, w, ping_timeout_ms);
-                }
-            } else {
-                // finish this
-                handlePongResponse(conductor, w)
-            }
-        }
-        switch (@as(EventLocation, @enumFromInt(key))) {
-            .accept => {
-                AcceptEx(sListenSocket: usize, sAcceptSocket: usize, lpOutputBuffer: *anyopaque, dwReceiveDataLength: u32, dwLocalAddressLength: u32, dwRemoteAddressLength: u32, lpdwBytesReceived: *u32, lpOverlapped: *OVERLAPPED)
-            },
-            .signal => {
-
-            }
-        }
-
+    // Initial one-shot timers; the dispatcher re-arms each on fire.
+    conductor.event_loop.armOneShot(
+        @intFromEnum(EventLocation.ping_timer),
+        conductor.cfg.ping_interval * 1000,
+    );
+    if (pressure_active) {
+        // min(5s, ping_interval); plain if — @min's literal-cap narrowing
+        // would type the result as u3 and overflow on *1000.
+        const pressure_s: u64 = if (conductor.cfg.ping_interval < 5) conductor.cfg.ping_interval else 5;
+        conductor.event_loop.armOneShot(
+            @intFromEnum(EventLocation.pressure_timer),
+            pressure_s * 1000,
+        );
     }
 
+    // Queue the first overlapped WAIT_FOR_LISTEN. Ownership of the context
+    // passes to the loop body: after its completion is dispatched (child open
+    // + sync AFD.ACCEPT), it frees the ctx and re-issues a new wait.
+    _ = issueAcceptWait(listener) catch |err| {
+        std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
+        return;
+    };
+
+    while (true) {
+        // TODO(next pass): GQCS wait + dispatch by completion key:
+        //   - worker keys (>= 0x1000): pong completion (ovl != null → PongRead)
+        //     vs ping timeout / health check (ovl == null timer post),
+        //   - accept key: child open + sync ACCEPT + handleConnectionFd + re-issue,
+        //   - signal: gracefulShutdown + return,
+        //   - ping/pressure timers: sweep/enforce/ping-queue + armOneShot rearm,
+        //   - live_timer: onLiveTimer (no rearm).
+    }
 }
 
-
+// Ping cycle, IOCP edition. sendPing() already pushes the header synchronously
+// via platform.write (as in POSIX); then issue the overlapped pong RECEIVE
+// keyed by @intFromPtr(w), and pair it with a one-shot timeout under the SAME
+// key — the dispatcher distinguishes them by the OVERLAPPED pointer being our
+// PongRead iosb (data arrived) vs null (timer-posted completion). Failure to
+// issue resets ping_pending and leaks nothing (mirrors linux.zig's error path).
 fn queuePing(iocp: HANDLE, w: *worker.Worker, timeout_ms: u64) void {
     w.sendPing();
-    // draw the rest of the owl
+    const pr = std.heap.page_allocator.create(PongRead) catch {
+        w.ping_pending = false;
+        return;
+    };
+    pr.* = .{
+        .iosb = undefined,
+        .iovec = .{.{ .len = w.pong_buf.len, .buf = &w.pong_buf }},
+        .info = .{
+            .BufferArray = @ptrCast(&pr.iovec),
+            .BufferCount = 1,
+            .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+            .TdiFlags = .{ .NORMAL = true },
+        },
+    };
+    issueAfd(w.socket, win32.IOCTL.AFD.RECEIVE, @intFromPtr(w), std.mem.asBytes(&pr.info), &.{}, &pr.iosb) catch {
+        std.heap.page_allocator.destroy(pr);
+        w.ping_pending = false;
+        return;
+    };
+    scheduleTimer(iocp, @intFromPtr(w), timeout_ms);
 }
-
