@@ -499,7 +499,14 @@ pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const 
     const env: std.process.Environ = .{ .block = .global };
     const appdata = try env.getAlloc(std.heap.page_allocator, "LOCALAPPDATA");
     defer std.heap.page_allocator.free(appdata);
-    return print(out, "{s}/julia-daemon", .{appdata});
+    const slice = @constCast(try print(out, "{s}/julia-daemon", .{appdata}));
+    // Forward slashes throughout: these paths end up embedded in Julia source
+    // (worker -e snippets), where a backslash starts an escape sequence. Julia,
+    // Zig's path handling, and the NT/AFD layers all accept `/` on Windows.
+    for (slice) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    return slice;
 }
 
 // → GetStdHandle(STD_INPUT_HANDLE / STDOUT / STDERR). Returns a HANDLE, not a

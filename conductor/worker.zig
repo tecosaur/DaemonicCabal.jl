@@ -236,10 +236,17 @@ pub const Worker = struct {
         var setup = try createListener(io, .unix, effective_runtime_dir, "wsetup.sock", "", &path_buf);
         defer setup.server.deinit(io);
         defer Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
+        // The paths are embedded in Julia source below, where a `\` starts an
+        // escape sequence — normalize to forward slashes regardless of where
+        // the runtime dir came from (env override included).
+        const setup_addr_jl = try std.mem.replaceOwned(u8, allocator, setup.addr, "\\", "/");
+        defer allocator.free(setup_addr_jl);
+        const socket_path_jl = try std.mem.replaceOwned(u8, allocator, cfg.socket_path, "\\", "/");
+        defer allocator.free(socket_path_jl);
         const eval_expr = try std.fmt.allocPrint(
             allocator,
             "using DaemonWorker; DaemonWorker.runworker(\"{s}\", {d}, \"{s}\")",
-            .{ setup.addr, id, cfg.socket_path },
+            .{ setup_addr_jl, id, socket_path_jl },
         );
         defer allocator.free(eval_expr);
         // Rendered once for both spawn paths. Passed after worker_args so a
