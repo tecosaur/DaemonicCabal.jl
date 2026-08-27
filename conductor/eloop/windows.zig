@@ -22,6 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const win32 = std.os.windows;
+const posix = std.posix;
 const Io = std.Io;
 
 const main = @import("../main.zig");
@@ -338,6 +339,12 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     }
 
     const pressure_active = conductor.pressure_monitor.active();
+    const ping_timeout_ms = conductor.cfg.ping_timeout * 1000;
+    // One outstanding pong read per worker at most; the map is what makes a
+    // packet "ours" — anything not in here is a stray from a synchronous op
+    // on an associated socket and is ignored whole (never dereference ovl).
+    var ping_reads: std.AutoHashMapUnmanaged(*worker.Worker, *PongRead) = .{};
+    defer ping_reads.deinit(std.heap.page_allocator);
 
     // Initial one-shot timers; the dispatcher re-arms each on fire.
     conductor.event_loop.armOneShot(
@@ -363,24 +370,230 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     };
 
     while (true) {
-        // TODO(next pass): GQCS wait + dispatch by completion key:
-        //   - worker keys (>= 0x1000): pong completion (ovl != null → PongRead)
-        //     vs ping timeout / health check (ovl == null timer post),
-        //   - accept key: child open + sync ACCEPT + handleConnectionFd + re-issue,
-        //   - signal: gracefulShutdown + return,
-        //   - ping/pressure timers: sweep/enforce/ping-queue + armOneShot rearm,
-        //   - live_timer: onLiveTimer (no rearm).
+        var bytes: DWORD = 0;
+        var key: usize = 0;
+        var ovl: ?*win32ext.OVERLAPPED = null;
+        var pool_changed = false;
+        if (!GetQueuedCompletionStatus(iocp, &bytes, &key, &ovl, INFINITE).toBool() and ovl == null) {
+            // FALSE + null ovl = the port itself failed (never expected with
+            // an infinite wait); FALSE + non-null ovl is a *failed op*
+            // completion whose status lives in its iosb — dispatched normally.
+            std.debug.print("Fatal: GetQueuedCompletionStatus failed\n", .{});
+            return;
+        }
+
+        // ---- worker events (ptr keys >= 0x1000, bit 0: 1=health check,
+        // 0=pong/timeout — same tagging as the POSIX loops) ----
+        if (key >= 0x1000) {
+            const w: *worker.Worker = @ptrFromInt(key & ~@as(usize, 1));
+            if ((key & 1) != 0) {
+                // Health-check timer: ping an idle worker if eligible.
+                if (!conductor.isLiveWorker(w)) continue;
+                conductor.refreshIdleMemIfStale(w, conductor.currentTime());
+                const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
+                if (w.active_clients == 0 and !w.ping_pending and !recently_pinged) {
+                    queuePing(iocp, &ping_reads, w, ping_timeout_ms);
+                }
+                conductor.noteLiveChange();
+                continue;
+            }
+            if (ovl != null) {
+                // A packet with a non-null ovl under a worker key is ours to
+                // act on ONLY if we have a live PongRead for it — synchronous
+                // ops on the associated socket (ping writes, syncClients…)
+                // also post packets whose iosb belongs to *their* frame.
+                if (ping_reads.fetchRemove(w)) |kv| {
+                    const pr = kv.value;
+                    const status = pr.iosb.u.Status;
+                    std.heap.page_allocator.destroy(pr);
+                    if (conductor.isLiveWorker(w)) {
+                        switch (status) {
+                            .SUCCESS => handlePongResponse(conductor, w, @intCast(bytes)),
+                            // Cancelled by the timeout path — nothing left to do.
+                            .CANCELLED => {},
+                            else => {
+                                std.debug.print("Worker {d}: pong failed (status {any})\n", .{ w.id, status });
+                                conductor.retireWorker(w);
+                            },
+                        }
+                        conductor.noteLiveChange();
+                    }
+                }
+                // else: stray packet from a sync op — ignore, never touch ovl.
+            } else {
+                // Timer-posted (ovl == null): the pong timed out. Cancel the
+                // still-pended RECEIVE; its CANCELLED packet is ignored via
+                // the map-miss rule above.
+                if (!conductor.isLiveWorker(w)) continue;
+                if (ping_reads.fetchRemove(w)) |kv| {
+                    var scratch: win32.IO_STATUS_BLOCK = undefined;
+                    _ = ntdll.NtCancelIoFileEx(w.socket, &kv.value.iosb, &scratch);
+                    std.heap.page_allocator.destroy(kv.value);
+                }
+                handlePongTimeout(conductor, w);
+                conductor.noteLiveChange();
+            }
+            continue;
+        }
+
+        switch (@as(EventLocation, @enumFromInt(key))) {
+            .accept => {
+                const aw: *AcceptWait = @ptrCast(@alignCast(ovl.?));
+                defer std.heap.page_allocator.destroy(aw);
+                switch (aw.iosb.u.Status) {
+                    .SUCCESS => {
+                        const family: posix.sa_family_t =
+                            std.mem.readInt(u16, aw.response.addr_bytes[0..2], .little);
+                        const child = win32ext.openAfdEndpoint(family) catch |err| {
+                            std.debug.print("Accept: child endpoint failed: {}\n", .{err});
+                            rearmAccept(listener) catch return;
+                            continue;
+                        };
+                        defer platform.close(child);
+                        // Sync ACCEPT half — cheap, handshake already done.
+                        _ = win32ext.syncAfdControl(
+                            listener,
+                            win32.IOCTL.AFD.ACCEPT,
+                            std.mem.asBytes(&win32.AFD.ACCEPT_INFO{
+                                .UseSAN = .FALSE,
+                                .Sequence = aw.response.info.Sequence,
+                                .AcceptHandle = child,
+                            }),
+                            &.{},
+                        ) catch |err| {
+                            std.debug.print("Accept: AFD.ACCEPT failed: {}\n", .{err});
+                            rearmAccept(listener) catch return;
+                            continue;
+                        };
+                        // The child is never port-associated, so the sync
+                        // request reads inside handleConnectionFd post no
+                        // packets we'd trip over.
+                        const peer = main.PeerInfo{};
+                        conductor.handleConnectionFd(child, &peer) catch |err| {
+                            std.debug.print("Client handling failed: {}\n", .{err});
+                        };
+                    },
+                    else => |status| std.debug.print("Accept error: {any}\n", .{status}),
+                }
+                rearmAccept(listener) catch return;
+                pool_changed = true;
+            },
+            .signal => {
+                std.debug.print("\nShutdown requested, stopping workers...\n", .{});
+                conductor.gracefulShutdown();
+                return;
+            },
+            .ping_timer => {
+                if (!pressure_active) conductor.sweepPendingKills();
+                conductor.enforceMaxTtl();
+                queueWorkerPings(conductor, iocp, &ping_reads, ping_timeout_ms);
+                conductor.event_loop.armOneShot(
+                    @intFromEnum(EventLocation.ping_timer),
+                    conductor.cfg.ping_interval * 1000,
+                );
+                pool_changed = true;
+            },
+            .pressure_timer => {
+                conductor.sweepPendingKills();
+                conductor.runEvictionEpisode();
+                conductor.event_loop.armOneShot(
+                    @intFromEnum(EventLocation.pressure_timer),
+                    (if (conductor.cfg.ping_interval < 5) conductor.cfg.ping_interval else 5) * 1000,
+                );
+                pool_changed = true;
+            },
+            .live_timer => conductor.onLiveTimer(),
+            .ignored, _ => {},
+        }
+        if (pool_changed) conductor.noteLiveChange();
     }
 }
 
+const INFINITE: DWORD = 0xFFFFFFFF;
+
+/// Re-issue the overlapped WAIT_FOR_LISTEN after an accept dispatch.
+/// Error = fatal (no new clients could ever arrive) — callers return.
+fn rearmAccept(listener: HANDLE) !void {
+    _ = try issueAcceptWait(listener);
+}
+
+// Health checking — direct ports of the linux.zig trio, ring→IOCP edition.
+
+fn queueWorkerPings(
+    conductor: *Conductor,
+    iocp: HANDLE,
+    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *PongRead),
+    timeout_ms: u64,
+) void {
+    const now = conductor.currentTime();
+    var it = conductor.workers.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.items) |w| {
+            maybeQueuePing(conductor, iocp, ping_reads, w, timeout_ms, now);
+        }
+    }
+    if (conductor.reserve) |r| maybeQueuePing(conductor, iocp, ping_reads, r, timeout_ms, now);
+}
+
+fn maybeQueuePing(
+    conductor: *Conductor,
+    iocp: HANDLE,
+    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *PongRead),
+    w: *worker.Worker,
+    timeout_ms: u64,
+    now: i64,
+) void {
+    conductor.refreshIdleMemIfStale(w, now);
+    if (!w.shouldPing(now, conductor.cfg.ping_interval)) return;
+    queuePing(iocp, ping_reads, w, timeout_ms);
+}
+
+/// Handle a completed pong read (`bytes` transferred). Mirror of linux.zig's
+/// post-CANCELED path: drain short reads, then processPong.
+fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, bytes: usize) void {
+    w.ping_pending = false;
+    if (bytes < w.pong_buf.len) {
+        protocol.readExact(w.socket, w.pong_buf[bytes..]) catch {
+            std.debug.print("Worker {d}: pong short read\n", .{w.id});
+            conductor.retireWorker(w);
+            return;
+        };
+    }
+    conductor.processPong(w, &w.pong_buf);
+}
+
+/// The paired timeout fired first. Mirror of kqueue.zig's handlePongTimeout:
+/// a busy worker gets a slow-cadence pass; an idle one is retired.
+fn handlePongTimeout(conductor: *Conductor, w: *worker.Worker) void {
+    if (!w.ping_pending) return; // pong actually beat the timer
+    w.ping_pending = false;
+    if (w.active_clients > 0) {
+        w.last_pinged = conductor.currentTime();
+        std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
+        return;
+    }
+    std.debug.print("Worker {d}: ping timed out\n", .{w.id});
+    conductor.retireWorker(w);
+}
+
 // Ping cycle, IOCP edition. sendPing() already pushes the header synchronously
-// via platform.write (as in POSIX); then issue the overlapped pong RECEIVE
-// keyed by @intFromPtr(w), and pair it with a one-shot timeout under the SAME
-// key — the dispatcher distinguishes them by the OVERLAPPED pointer being our
-// PongRead iosb (data arrived) vs null (timer-posted completion). Failure to
-// issue resets ping_pending and leaks nothing (mirrors linux.zig's error path).
-fn queuePing(iocp: HANDLE, w: *worker.Worker, timeout_ms: u64) void {
+// via platform.write (as in POSIX); then associate the socket with our port
+// (first ping does it; later calls are harmless re-associations) and issue the
+// overlapped pong RECEIVE keyed by @intFromPtr(w), paired with a one-shot
+// timeout under the SAME key — the dispatcher tells them apart by ovl being
+// our PongRead iosb (data) vs null (timer post). All failure paths reset
+// ping_pending and leak nothing (mirrors linux.zig's error path).
+fn queuePing(
+    iocp: HANDLE,
+    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *PongRead),
+    w: *worker.Worker,
+    timeout_ms: u64,
+) void {
     w.sendPing();
+    if (CreateIoCompletionPort(w.socket, iocp, @intFromPtr(w), 0) == null) {
+        w.ping_pending = false;
+        return;
+    }
     const pr = std.heap.page_allocator.create(PongRead) catch {
         w.ping_pending = false;
         return;
@@ -396,6 +609,15 @@ fn queuePing(iocp: HANDLE, w: *worker.Worker, timeout_ms: u64) void {
         },
     };
     issueAfd(w.socket, win32.IOCTL.AFD.RECEIVE, @intFromPtr(w), std.mem.asBytes(&pr.info), &.{}, &pr.iosb) catch {
+        std.heap.page_allocator.destroy(pr);
+        w.ping_pending = false;
+        return;
+    };
+    // Map insert is what makes the eventual packet "ours". On OOM: cancel the
+    // IRP and drop — the CANCELLED packet lands as a map-miss and is ignored.
+    ping_reads.put(std.heap.page_allocator, w, pr) catch {
+        var scratch: win32.IO_STATUS_BLOCK = undefined;
+        _ = ntdll.NtCancelIoFileEx(w.socket, &pr.iosb, &scratch);
         std.heap.page_allocator.destroy(pr);
         w.ping_pending = false;
         return;

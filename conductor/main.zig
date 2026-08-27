@@ -1611,7 +1611,7 @@ pub const Conductor = struct {
                 if (w.process.id) |pid| {
                     const result = platform.waitpidNonBlocking(pid);
                     if (result.exited) continue;
-                    if (result.pid == 0) return true;
+                    if (platform.pidIsNull(result.pid)) return true;
                 }
             }
         }
@@ -1622,7 +1622,7 @@ pub const Conductor = struct {
             if (r.process.id) |pid| {
                 const result = platform.waitpidNonBlocking(pid);
                 if (result.exited) return false;
-                if (result.pid == 0) return true;
+                if (platform.pidIsNull(result.pid)) return true;
             }
         }
         return false;

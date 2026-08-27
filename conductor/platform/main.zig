@@ -63,6 +63,23 @@ pub const MemInfo = shared.MemInfo;
 pub const readPsiSomeAvg10 = shared.readPsiSomeAvg10;
 pub const readMemInfo = shared.readMemInfo;
 pub const getParentName = shared.getParentName;
+
+/// Shared code tracks pids as plain integers; the platform carrier differs
+/// (POSIX: i32, Windows: pointer-typed). Bridge integer pids into the
+/// platform's carrier type here instead of @intCast-ing at call sites.
+pub fn pidFromInt(pid: u32) std.posix.pid_t {
+    return if (os == .windows)
+        @ptrFromInt(@as(usize, pid))
+    else
+        @intCast(pid);
+}
+/// The POSIX waitpid "no news (WNOHANG) → 0" sentinel, carrier-agnostic.
+pub fn pidIsNull(p: std.posix.pid_t) bool {
+    return if (os == .windows) @intFromPtr(p) == 0 else p == 0;
+}
+pub fn getParentNamePid(pid: u32, buf: []u8) ?[]const u8 {
+    return getParentName(pidFromInt(pid), buf);
+}
 pub const setRecvTimeout = shared.setRecvTimeout;
 pub const setTcpNodelay = shared.setTcpNodelay;
 pub const getTerminalSize = shared.getTerminalSize;
