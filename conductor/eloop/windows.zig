@@ -244,49 +244,69 @@ pub const EventLoop = struct {
 // the driver also dereferences (out-storage for WAIT_FOR_LISTEN, the RECV_INFO
 // input chain for RECEIVE) live INSIDE the context and thus outlive the IRP.
 
-
-// --- Accept thread -------------------------------------------------------
-// The raw AFD WAIT_FOR_LISTEN + AFD.ACCEPT pair works for unix (afd_smoke)
-// but AFD.ACCEPT returns STATUS_INVALID_PARAMETER for TCP on this machine
-// despite being byte-identical to std's netAcceptWindows shape. Rather than
-// chase kernel internals, accept on a helper thread via std.Io's own
-// blocking accept — the exact path worker spawn already exercises — and hand
-// each connection to the loop as a posted completion. ponytail: revisit raw
-// AFD accept only if the helper thread ever proves costly.
+// --- Accept machinery (raw AFD, fully port-routed) ------------------------
+// WAIT_FOR_LISTEN and AFD.ACCEPT are BOTH issued via issueAfd (ApcRoutine =
+// null) — the listener is IOCP-associated, and associated handles reject
+// APC-routed I/O (INVALID_PARAMETER; that's what killed the earlier attempt
+// that ran the ACCEPT half through the APC-based syncAfdControl). Two heap
+// contexts are outstanding at most, one per phase; the packet's lpOverlapped
+// (== the ctx's iosb, field 0) identifies which phase completed.
 const accept_key: usize = 0xE0;
 
-const AcceptConn = struct { stream: posix.fd_t };
+const AcceptWait = extern struct {
+    iosb: win32.IO_STATUS_BLOCK,
+    response: extern struct {
+        info: win32.AFD.LISTEN_RESPONSE_INFO,
+        addr_bytes: [128]u8, // peer sockaddr written by the driver
+    },
+};
 
-const AcceptThreadArgs = struct { iocp: HANDLE, server: *Io.net.Server, io: Io };
+const AcceptOp = extern struct {
+    iosb: win32.IO_STATUS_BLOCK,
+    info: win32.AFD.ACCEPT_INFO,
+    child: posix.fd_t,
+};
 
-fn acceptThreadProc(param: ?*anyopaque) callconv(.winapi) DWORD {
-    const args: *AcceptThreadArgs = @ptrCast(@alignCast(param orelse return 1));
-    while (true) {
-        const stream = args.server.accept(args.io) catch |err| {
-            std.debug.print("[conductor] accept: {}\n", .{err}); // debug:
-            continue;
-        };
-        const conn = std.heap.page_allocator.create(AcceptConn) catch {
-            platform.close(stream.socket.handle);
-            continue;
-        };
-        conn.* = .{ .stream = stream.socket.handle };
-        // The ctx pointer rides in the lpOverlapped slot (per-IRP token).
-        if (!win32ext.PostQueuedCompletionStatus(args.iocp, 0, accept_key, @ptrCast(conn)).toBool()) {
-            std.heap.page_allocator.destroy(conn);
-            return 0; // port dead — conductor shutting down
-        }
-    }
+fn issueAcceptWait(listener: HANDLE) !*AcceptWait {
+    const aw = try std.heap.page_allocator.create(AcceptWait);
+    errdefer std.heap.page_allocator.destroy(aw);
+    aw.* = .{ .iosb = undefined, .response = undefined };
+    try win32ext.issueAfd(
+        listener,
+        win32.IOCTL.AFD.WAIT_FOR_LISTEN,
+        &.{},
+        @as([]u8, @ptrCast(&aw.response)),
+        &aw.iosb,
+    );
+    return aw;
 }
 
-/// Pending overlapped AFD.RECEIVE for one worker's pong (5 bytes into
-/// w.pong_buf — stable storage owned by the Worker). Keyed by @intFromPtr(w);
-/// freed after dispatch or ping-timeout cancel.
-const PongRead = extern struct {
-    iosb: win32.IO_STATUS_BLOCK,
-    iovec: [1]win32.AFD.WSABUF(.@"var"),
-    info: win32.AFD.RECV_INFO,
-};
+/// Queue the ACCEPT half for an indicated connection. `aw` (the completed
+/// WAIT_FOR_LISTEN ctx) is freed here; the child handle rides in the op ctx
+/// until the ACCEPT completes.
+fn issueAcceptOp(listener: HANDLE, aw: *AcceptWait) !*AcceptOp {
+    const family: posix.sa_family_t =
+        std.mem.readInt(u16, aw.response.addr_bytes[0..2], .little);
+    const child = try win32ext.openAfdEndpoint(family);
+    errdefer win32.CloseHandle(child);
+    const op = try std.heap.page_allocator.create(AcceptOp);
+    errdefer std.heap.page_allocator.destroy(op);
+    op.* = .{
+        .iosb = undefined,
+        .info = .{
+            .UseSAN = .FALSE,
+            .Sequence = aw.response.info.Sequence,
+            .AcceptHandle = child,
+        },
+        .child = child,
+    };
+    try win32ext.issueAfd(listener, win32.IOCTL.AFD.ACCEPT, std.mem.asBytes(&op.info), &.{}, &op.iosb);
+    return op;
+}
+
+// Pong reads use win32ext.AfdRecvCtx + win32ext.issueAfdRecv (shared with
+// the client eloop): 5 bytes into w.pong_buf — stable storage owned by the
+// Worker. Keyed by @intFromPtr(w); ctx freed after dispatch or cancel.
 
 // =============================================================================
 // Main loop
@@ -318,24 +338,30 @@ const PongRead = extern struct {
 // and issue AFD IOCTLs with ApcRoutine=null so completions land here.
 // CRITICAL NT rule: an IOCP-associated handle REJECTS any I/O that supplies
 // an APC routine (STATUS_INVALID_PARAMETER) — APC and completion-port routing
-// are mutually exclusive per handle. Therefore:
-//   - the listener is NOT associated (the accept thread uses std.Io's
-//     blocking APC-based accept on it, and posts results to the port);
-//   - ALL ops on worker sockets must be port-routed (ApcRoutine=null);
-//     sync APC-based calls on them will fail (see AFD.md).
-// See AFD.md for the full routing semantics.
+// are mutually exclusive per handle. Therefore EVERY op on an associated
+// handle (listener, worker sockets) is port-routed via issueAfd, and sync
+// call sites on them go through the Event+token path (platform syncViaPort;
+// tokens are reaped at the top of this loop). The listener is associated
+// again since the accept became fully port-routed. See AFD.md.
 pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     const iocp: HANDLE = conductor.event_loop.iocp;
 
-    // NOTE: the listener deliberately stays UNASSOCIATED — the accept thread
-    // issues blocking APC-based accepts on it.
+    // Associate the listener under the accept key: both accept phases
+    // (WAIT_FOR_LISTEN, AFD.ACCEPT) are issued port-routed.
+    const listener = server.socket.handle;
+    if (win32ext.CreateIoCompletionPort(listener, iocp, accept_key, 0) == null) {
+        std.debug.print("Fatal: failed to associate listener with IOCP\n", .{});
+        return;
+    }
+    win32ext.markAssociated(listener);
 
     const pressure_active = conductor.pressure_monitor.active();
     const ping_timeout_ms = conductor.cfg.ping_timeout * 1000;
     // One outstanding pong read per worker at most; the map is what makes a
-    // packet "ours" — anything not in here is a stray from a synchronous op
-    // on an associated socket and is ignored whole (never dereference ovl).
-    var ping_reads: std.AutoHashMapUnmanaged(*worker.Worker, *PongRead) = .{};
+    // pong packet "ours" — packets under a worker key whose ovl doesn't
+    // match the mapped ctx are completions of Event-path sync ops (reaped
+    // above) or strays, and are never dereferenced here.
+    var ping_reads: std.AutoHashMapUnmanaged(*worker.Worker, *win32ext.AfdRecvCtx) = .{};
     defer ping_reads.deinit(std.heap.page_allocator);
 
     // Initial one-shot timers; the dispatcher re-arms each on fire.
@@ -353,32 +379,21 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         );
     }
 
-    // Accept on a helper thread (std.Io blocking accept — proven path); each
-    // connection arrives here as a posted completion under accept_key.
-    const accept_args = std.heap.page_allocator.create(AcceptThreadArgs) catch {
-        std.debug.print("Fatal: accept thread ctx alloc failed\n", .{});
-        return;
-    };
-    accept_args.* = .{ .iocp = iocp, .server = server, .io = conductor.io };
-    _ = CreateThread(null, 0, &acceptThreadProc, accept_args, 0, null) orelse {
-        std.debug.print("Fatal: failed to start accept thread\n", .{});
-        return;
-    };
+    // Queue the first WAIT_FOR_LISTEN.
+    var pending_wait: ?*AcceptWait = armAcceptWait(listener) orelse return;
+    var pending_accept: ?*AcceptOp = null;
 
-    std.debug.print("[conductor] loop entered — waiting\n", .{}); // debug:
     while (true) {
         var bytes: DWORD = 0;
         var key: usize = 0;
         var ovl: ?*win32ext.OVERLAPPED = null;
         var pool_changed = false;
-        // Bounded wait: a timeout print proves the port is being waited on
-        // and lets us distinguish "silent port" from "packet misrouted".
+        // Bounded wait: on timeout (no completions) the loop simply cycles —
+        // FALSE + null ovl is only a timeout here, never a port failure.
         const ok = win32ext.GetQueuedCompletionStatus(iocp, &bytes, &key, &ovl, 15_000).toBool();
         if (!ok and ovl == null) {
-            std.debug.print("[conductor] wait timeout — port silent\n", .{}); // debug:
             continue;
         }
-        std.debug.print("[conductor] woke: key={d} ovl={} bytes={d} ok={}\n", .{ key, ovl != null, bytes, ok }); // debug:
 
         // Sync-op tokens (event-based ops on associated handles) are reaped
         // here — their packets carry association keys and would otherwise
@@ -404,7 +419,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
             }
             if (ovl != null) {
                 // A packet under a worker key is ours to act on ONLY if the
-                // ovl token matches our pending PongRead for that worker —
+                // ovl token matches our pending AfdRecvCtx for that worker —
                 // synchronous ops on the associated socket (ping writes,
                 // syncClients…) also post packets here, with their own frame
                 // pointers as ovl.
@@ -447,17 +462,45 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         }
 
         if (key == accept_key) {
-            // Posted exclusively by the accept thread — ovl is the conn ctx.
-            const conn: *AcceptConn = @ptrCast(@alignCast(ovl orelse continue));
-            defer std.heap.page_allocator.destroy(conn);
-            const child = conn.stream;
-            std.debug.print("[conductor] accepted child, dispatching\n", .{}); // debug:
-            const peer = main.PeerInfo{};
-            conductor.handleConnectionFd(child, &peer) catch |err| {
-                std.debug.print("Client handling failed: {}\n", .{err});
-            };
-            platform.close(child);
-            pool_changed = true;
+            // Two phases share this key (same handle). The packet's
+            // lpOverlapped token — pointer-compared against the pending
+            // slots — identifies the phase. No other ops touch the
+            // associated listener, so anything else is impossible.
+            if (pending_wait != null and
+                ovl == @as(?*win32ext.OVERLAPPED, @ptrCast(pending_wait.?)))
+            {
+                // WAIT_FOR_LISTEN completed: open the child, queue the ACCEPT.
+                const aw = pending_wait.?;
+                pending_wait = null;
+                defer std.heap.page_allocator.destroy(aw);
+                if (aw.iosb.u.Status == .SUCCESS) {
+                    pending_accept = issueAcceptOp(listener, aw) catch |err| {
+                        std.debug.print("Accept: op queue failed: {}\n", .{err});
+                        pending_wait = armAcceptWait(listener) orelse return;
+                        continue;
+                    };
+                } else {
+                    pending_wait = armAcceptWait(listener) orelse return;
+                }
+            } else if (pending_accept != null and
+                ovl == @as(?*win32ext.OVERLAPPED, @ptrCast(pending_accept.?)))
+            {
+                // AFD.ACCEPT completed: connection is fully ours to handle.
+                const op = pending_accept.?;
+                pending_accept = null;
+                defer std.heap.page_allocator.destroy(op);
+                defer win32.CloseHandle(op.child);
+                if (op.iosb.u.Status == .SUCCESS) {
+                    const peer = main.PeerInfo{};
+                    conductor.handleConnectionFd(op.child, &peer) catch |err| {
+                        std.debug.print("Client handling failed: {}\n", .{err});
+                    };
+                    pool_changed = true;
+                }
+                // Re-arm the listen phase for the next connection.
+                pending_wait = armAcceptWait(listener) orelse return;
+            }
+            continue;
         } else switch (@as(EventLocation, @enumFromInt(key))) {
             .signal => {
                 std.debug.print("\nShutdown requested, stopping workers...\n", .{});
@@ -490,12 +533,21 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     }
 }
 
+/// Queue a WAIT_FOR_LISTEN; fatal failure prints and returns null (no new
+/// clients could ever arrive — callers exit the loop).
+fn armAcceptWait(listener: HANDLE) ?*AcceptWait {
+    return issueAcceptWait(listener) catch |err| {
+        std.debug.print("Fatal: failed to queue accept: {}\n", .{err});
+        return null;
+    };
+}
+
 // Health checking — direct ports of the linux.zig trio, ring→IOCP edition.
 
 fn queueWorkerPings(
     conductor: *Conductor,
     iocp: HANDLE,
-    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *PongRead),
+    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *win32ext.AfdRecvCtx),
     timeout_ms: u64,
 ) void {
     const now = conductor.currentTime();
@@ -511,7 +563,7 @@ fn queueWorkerPings(
 fn maybeQueuePing(
     conductor: *Conductor,
     iocp: HANDLE,
-    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *PongRead),
+    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *win32ext.AfdRecvCtx),
     w: *worker.Worker,
     timeout_ms: u64,
     now: i64,
@@ -554,11 +606,11 @@ fn handlePongTimeout(conductor: *Conductor, w: *worker.Worker) void {
 // (first ping does it; later calls are harmless re-associations) and issue the
 // overlapped pong RECEIVE keyed by @intFromPtr(w), paired with a one-shot
 // timeout under the SAME key — the dispatcher tells them apart by ovl being
-// our PongRead iosb (data) vs null (timer post). All failure paths reset
+// our AfdRecvCtx iosb (data) vs null (timer post). All failure paths reset
 // ping_pending and leak nothing (mirrors linux.zig's error path).
 fn queuePing(
     iocp: HANDLE,
-    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *PongRead),
+    ping_reads: *std.AutoHashMapUnmanaged(*worker.Worker, *win32ext.AfdRecvCtx),
     w: *worker.Worker,
     timeout_ms: u64,
 ) void {
@@ -568,22 +620,7 @@ fn queuePing(
         return;
     }
     win32ext.markAssociated(w.socket);
-    const pr = std.heap.page_allocator.create(PongRead) catch {
-        w.ping_pending = false;
-        return;
-    };
-    pr.* = .{
-        .iosb = undefined,
-        .iovec = .{.{ .len = w.pong_buf.len, .buf = &w.pong_buf }},
-        .info = .{
-            .BufferArray = @ptrCast(&pr.iovec),
-            .BufferCount = 1,
-            .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
-            .TdiFlags = .{ .NORMAL = true },
-        },
-    };
-    win32ext.issueAfd(w.socket, win32.IOCTL.AFD.RECEIVE, std.mem.asBytes(&pr.info), &.{}, &pr.iosb) catch {
-        std.heap.page_allocator.destroy(pr);
+    const pr = win32ext.issueAfdRecv(w.socket, &w.pong_buf) catch {
         w.ping_pending = false;
         return;
     };

@@ -102,6 +102,20 @@ pub const setWorkerRawMode = if (os != .windows) shared.setWorkerRawMode else st
 pub const setWorkerExecuting = if (os != .windows) shared.setWorkerExecuting else struct {
     fn f(_: bool) void {}
 }.f;
+// Client console configuration (VT processing + UTF-8 codepages). POSIX
+// consoles need none of it — terminals decode UTF-8 and ANSI natively.
+pub const setupConsoleIo = if (os == .windows) impl.setupConsoleIo else struct {
+    fn f(stdout: std.posix.fd_t, stderr: std.posix.fd_t) ?*anyopaque {
+        _ = stdout;
+        _ = stderr;
+        return null;
+    }
+}.f;
+pub const restoreConsoleIo = if (os == .windows) impl.restoreConsoleIo else struct {
+    fn f(saved: ?*anyopaque) void {
+        _ = saved;
+    }
+}.f;
 
 // Time (common implementation)
 pub fn timeSeconds(io: Io) i64 {

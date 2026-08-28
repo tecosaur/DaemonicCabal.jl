@@ -24,31 +24,9 @@ const Location = enum(u64) {
 
 const buf_size = 1024;
 
-/// Heap-backed context for one in-flight AFD.RECEIVE on a worker stream
-/// socket; lives from issue to completion dispatch. iosb first: GQCS hands
-/// back &iosb as *OVERLAPPED (layout-compatible prefix).
-const RecvCtx = extern struct {
-    iosb: win32.IO_STATUS_BLOCK,
-    iovec: [1]win32.AFD.WSABUF(.@"var"),
-    info: win32.AFD.RECV_INFO,
-};
-
-fn issueRecv(h: posix.fd_t, buf: []u8) !*RecvCtx {
-    const ctx = try std.heap.page_allocator.create(RecvCtx);
-    errdefer std.heap.page_allocator.destroy(ctx);
-    ctx.* = .{
-        .iosb = undefined,
-        .iovec = .{.{ .len = @intCast(buf.len), .buf = buf.ptr }},
-        .info = .{
-            .BufferArray = @ptrCast(&ctx.iovec),
-            .BufferCount = 1,
-            .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
-            .TdiFlags = .{ .NORMAL = true },
-        },
-    };
-    try platform.issueAfd(h, win32.IOCTL.AFD.RECEIVE, std.mem.asBytes(&ctx.info), &.{}, &ctx.iosb);
-    return ctx;
-}
+// Receive contexts come from the shared platform plumbing:
+// platform.AfdRecvCtx + platform.issueAfdRecv (same ctx the conductor uses
+// for pong reads).
 
 // --- stdin helper thread -------------------------------------------------
 // Console/pipe stdin can't join the IOCP, so this thread blocks in ReadFile
@@ -99,7 +77,6 @@ pub fn run(
     const port = platform.CreateIoCompletionPort(win32.INVALID_HANDLE_VALUE, null, 0, 0) orelse
         return error.IocpCreateFailed;
     defer win32.CloseHandle(port);
-    std.debug.print("[eloop] port created\n", .{}); // debug:
 
     // Start the stdin helper before anything can block the loop.
     const args = try std.heap.page_allocator.create(StdinArgs);
@@ -115,15 +92,14 @@ pub fn run(
     // Associate the three read streams and queue their first receives.
     const stream_fds = [3]posix.fd_t{ stdout_fd, stderr_fd, signals_fd };
     var bufs: [3][buf_size]u8 = undefined;
-    var ctxs: [3]?*RecvCtx = .{ null, null, null };
+    var ctxs: [3]?*platform.AfdRecvCtx = .{ null, null, null };
     for (stream_fds, 0..) |fd, i| {
         const loc: Location = @enumFromInt(i);
         if (platform.CreateIoCompletionPort(fd, port, @intFromEnum(loc), 0) == null)
             return error.IocpAssociateFailed;
         platform.markAssociated(fd);
-        ctxs[i] = try issueRecv(fd, &bufs[i]);
+        ctxs[i] = try platform.issueAfdRecv(fd, &bufs[i]);
     }
-    std.debug.print("[eloop] 3 streams associated, initial receives queued\n", .{}); // debug:
 
     // Wait for: stdout+stderr EOF (guarantees output flushed) and exit code
     // (from the signals socket). Signals EOF without an exit code means the
@@ -140,9 +116,10 @@ pub fn run(
         }
         // A non-enum key can only be a stray packet from a synchronous op on
         // an associated socket (signal_parser writes); ignore whole — never
-        // touch its ovl, which belongs to the issuer's frame.
+        // touch its ovl, which belongs to the issuer's frame. With the
+        // Event+token reaping above this should be unreachable; warn if not.
         if (key >= 3) {
-            std.debug.print("[eloop] stray key={d}\n", .{key}); // debug:
+            std.debug.print("event loop: stray completion (key={d}) — ignoring\n", .{key});
             continue;
         }
         // Sync-op tokens (event-based ops on associated handles) are reaped
@@ -150,7 +127,6 @@ pub fn run(
         if (ovl) |op| {
             if (platform.reapSyncOp(op)) continue;
         }
-        std.debug.print("[eloop] wake loc={s} bytes={d}\n", .{ @tagName(@as(Location, @enumFromInt(key))), bytes }); // debug:
         const loc: Location = @enumFromInt(key);
         const idx: usize = @intFromEnum(loc);
 
@@ -162,15 +138,13 @@ pub fn run(
         switch (loc) {
             .worker_stdout, .worker_stderr => {
                 if (status == .SUCCESS and bytes > 0) {
-                    std.debug.print("[eloop] forwarding {d} bytes to local\n", .{bytes}); // debug:
                     const dst = if (loc == .worker_stdout)
                         platform.getStdoutHandle()
                     else
                         platform.getStderrHandle();
                     platform.writeFile(dst, bufs[idx][0..@intCast(bytes)]);
-                    ctxs[idx] = try issueRecv(stream_fds[idx], &bufs[idx]);
+                    ctxs[idx] = try platform.issueAfdRecv(stream_fds[idx], &bufs[idx]);
                 } else {
-                    std.debug.print("[eloop] {s} EOF (status={any})\n", .{ @tagName(loc), status }); // debug:
                     // EOF (graceful close, 0 bytes, or stream error).
                     eof[idx] = true;
                 }
@@ -179,13 +153,11 @@ pub fn run(
                 if (status == .SUCCESS and bytes > 0) {
                     switch (signal_parser.feed(bufs[idx][0..@intCast(bytes)], signals_fd)) {
                         .exit => |code| {
-                            std.debug.print("[eloop] exit code from signals: {d}\n", .{code}); // debug:
                             exit_code = code;
                         },
-                        .none => ctxs[idx] = try issueRecv(signals_fd, &bufs[idx]),
+                        .none => ctxs[idx] = try platform.issueAfdRecv(signals_fd, &bufs[idx]),
                     }
                 } else if (exit_code == null) {
-                    std.debug.print("[eloop] signals EOF\n", .{}); // debug:
                     exit_code = 1;
                 }
             },

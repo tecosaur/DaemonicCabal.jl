@@ -144,6 +144,10 @@ pub extern "kernel32" fn SetConsoleCtrlHandler(handler_routine: ?PHANDLER_ROUTIN
 pub extern "kernel32" fn GetProcessTimes(hProcess: HANDLE, lpCreationTime: *FILETIME, lpExitTime: *FILETIME, lpKernelTime: *FILETIME, lpUserTime: *FILETIME) BOOL;
 pub extern "kernel32" fn GenerateConsoleCtrlEvent(dwCtrlEvent: DWORD, dwProcessGroupId: DWORD) BOOL;
 pub extern "kernel32" fn GetProcessId(hProcess: HANDLE) DWORD;
+pub extern "kernel32" fn SetConsoleOutputCP(wVersionID: DWORD) BOOL;
+pub extern "kernel32" fn GetConsoleOutputCP() DWORD;
+pub extern "kernel32" fn SetConsoleCP(wVersionID: DWORD) BOOL;
+pub extern "kernel32" fn GetConsoleCP() DWORD;
 
 // --- IOCP (used by both the conductor and client event loops; nowhere in std) ---
 pub const INFINITE: DWORD = 0xFFFFFFFF;
@@ -384,6 +388,36 @@ pub fn issueAfd(
         .SUCCESS, .PENDING => {},
         else => |status| return win32.unexpectedStatus(status),
     }
+}
+
+/// Heap-backed context for one in-flight overlapped AFD.RECEIVE. iosb is
+/// field 0: the packet's lpOverlapped (== the ApcContext we passed) casts
+/// straight back to the context. Shared by the conductor (pong reads) and
+/// the client (worker stream reads).
+pub const AfdRecvCtx = extern struct {
+    iosb: win32.IO_STATUS_BLOCK,
+    iovec: [1]win32.AFD.WSABUF(.@"var"),
+    info: win32.AFD.RECV_INFO,
+};
+
+/// Allocate + issue one overlapped AFD.RECEIVE of `buf` on `h`. The handle
+/// must be port-associated; the ctx pointer is the per-op token the event
+/// loop recovers from the packet's lpOverlapped.
+pub fn issueAfdRecv(h: posix.fd_t, buf: []u8) !*AfdRecvCtx {
+    const ctx = try std.heap.page_allocator.create(AfdRecvCtx);
+    errdefer std.heap.page_allocator.destroy(ctx);
+    ctx.* = .{
+        .iosb = undefined,
+        .iovec = .{.{ .len = @intCast(buf.len), .buf = buf.ptr }},
+        .info = .{
+            .BufferArray = @ptrCast(&ctx.iovec),
+            .BufferCount = 1,
+            .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+            .TdiFlags = .{ .NORMAL = true },
+        },
+    };
+    try issueAfd(h, win32.IOCTL.AFD.RECEIVE, std.mem.asBytes(&ctx.info), &.{}, &ctx.iosb);
+    return ctx;
 }
 
 /// AFD.BIND wrapper (bindSocketIpAfd / bindSocketUnixAfd shape :12402/:12421):
@@ -659,12 +693,17 @@ pub fn getStderrHandle() posix.fd_t {
 }
 
 // Raw terminal mode → GetConsoleMode/SetConsoleMode on a console handle.
-// raw = clear ENABLE_LINE_INPUT + ENABLE_ECHO_INPUT. Restore = re-set the saved
-// mode (keep a saved-mode var like posix.zig's `saved_termios`). NOTE: the
+// raw = clear ENABLE_LINE_INPUT + ENABLE_ECHO_INPUT and enable
+// ENABLE_VIRTUAL_TERMINAL_INPUT (arrow/home/end keys then arrive as VT
+// sequences the worker's LineEdit parses; without it non-character keys are
+// never delivered at all). ENABLE_PROCESSED_INPUT stays on so Ctrl-C keeps
+// routing through SetConsoleCtrlHandler. Restore = re-set the saved mode
+// (keep a saved-mode var like posix.zig's `saved_termios`). NOTE: the
 // router binds `setRawMode = impl.setRawMode` on Windows (NOT the shared
 // no-fd `setRawModeStdin` wrapper), so this takes the fd, not nothing.
 const ENABLE_LINE_INPUT: DWORD = 0x0002;
 const ENABLE_ECHO_INPUT: DWORD = 0x0004;
+const ENABLE_VIRTUAL_TERMINAL_INPUT: DWORD = 0x0200;
 var saved_mode: ?DWORD = null;
 pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
     if (raw) {
@@ -673,11 +712,61 @@ pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
             return;
         }
         if (saved_mode == null) saved_mode = mode;
-        _ = SetConsoleMode(stdin, mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+        _ = SetConsoleMode(stdin, (mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_VIRTUAL_TERMINAL_INPUT);
     } else if (saved_mode) |mode| {
         _ = SetConsoleMode(stdin, mode);
         saved_mode = null;
     }
+}
+
+// --- Client console configuration (VT processing + UTF-8 codepages) ---------
+// The client renders everything the worker/conductor emit — UTF-8 text and
+// ANSI escapes. Windows consoles need explicit opt-in for both: VT processing
+// or escapes print literally (colors/layout clobbered), and without CP_UTF8
+// UTF-8 bytes render through the OEM codepage (mojibake). Save/restore so
+// the user's terminal returns to its previous state.
+
+pub const ConsoleSaved = struct {
+    stdout: posix.fd_t,
+    stderr: posix.fd_t,
+    out_mode: DWORD,
+    err_mode: DWORD,
+    out_cp: DWORD,
+    in_cp: DWORD,
+};
+
+/// Configure the client's console handles for UTF-8 + VT output. Returns an
+/// opaque saved-state for restoreConsoleIo, or null when stdout is not a
+/// console (redirected output — nothing to configure).
+pub fn setupConsoleIo(stdout: posix.fd_t, stderr: posix.fd_t) ?*anyopaque {
+    var out_mode: DWORD = undefined;
+    if (!GetConsoleMode(stdout, &out_mode).toBool()) return null;
+    const saved = std.heap.page_allocator.create(ConsoleSaved) catch return null;
+    saved.* = .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .out_mode = out_mode,
+        .err_mode = 0,
+        .out_cp = GetConsoleOutputCP(),
+        .in_cp = GetConsoleCP(),
+    };
+    _ = SetConsoleMode(stdout, out_mode | win32.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    // stderr is commonly the same console; best-effort (may be redirected).
+    if (GetConsoleMode(stderr, &saved.err_mode).toBool())
+        _ = SetConsoleMode(stderr, saved.err_mode | win32.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    _ = SetConsoleOutputCP(65001); // CP_UTF8
+    _ = SetConsoleCP(65001);
+    return saved;
+}
+
+pub fn restoreConsoleIo(saved: ?*anyopaque) void {
+    const state: *ConsoleSaved = @ptrCast(@alignCast(saved orelse return));
+    _ = SetConsoleMode(state.stdout, state.out_mode);
+    if (GetConsoleMode(state.stderr, &state.err_mode).toBool())
+        _ = SetConsoleMode(state.stderr, state.err_mode);
+    _ = SetConsoleOutputCP(state.out_cp);
+    _ = SetConsoleCP(state.in_cp);
+    std.heap.page_allocator.destroy(state);
 }
 
 // =============================================================================
