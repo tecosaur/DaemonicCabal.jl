@@ -89,7 +89,13 @@ pub const getTerminalSize = shared.getTerminalSize;
 pub const isatty = shared.isatty;
 pub const SignalHandler = shared.SignalHandler;
 pub const registerSignalHandlers = shared.registerSignalHandlers;
-pub const setRawMode = if (os != .windows) shared.setRawModeStdin else impl.setRawMode;
+pub const setRawMode = if (os != .windows) shared.setRawModeStdin else struct {
+    // One-arg client shape (POSIX setRawModeStdin parity): the fd is always
+    // the local console stdin handle.
+    fn f(raw: bool) void {
+        impl.setRawMode(impl.getStdinHandle(), raw);
+    }
+}.f;
 pub const setWorkerRawMode = if (os != .windows) shared.setWorkerRawMode else struct {
     fn f(_: bool) void {}
 }.f;

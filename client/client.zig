@@ -12,6 +12,8 @@ const eloop = if (builtin.os.tag == .linux)
     @import("eloop/linux.zig")
 else if (builtin.os.tag.isBSD())
     @import("eloop/kqueue.zig")
+else if (builtin.os.tag == .windows)
+    @import("eloop/windows.zig")
 else
     @compileError("unsupported OS");
 
@@ -71,7 +73,7 @@ const EnvInfo = struct {
     home: ?[]const u8,
 };
 
-const EnvBlock = std.process.Environ.Block;
+// (EnvBlock alias removed — inputs are normalized to UTF-8 slices in main.)
 
 // Signal parser with buffering for fragmented reads.
 // Protocol: <id:u8><len:u8><data> (may contain multiple signals)
@@ -201,10 +203,12 @@ fn registerSignalHandlers() void {
 // --- Main pipeline ---
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var env = scanEnv(init.environ.block);
-    const addr_arg = extractAddressArg(init.args.vector);
+    var inputs = try normalizeInputs(std.heap.page_allocator, init.args.vector, init.environ.block);
+    defer inputs.deinit();
+    var env = scanEnv(inputs.env);
+    const addr_arg = extractAddressArg(inputs.args);
     if (addr_arg.value) |addr| env.server_path = addr;
-    const sync_arg = extractSyncArg(init.args.vector);
+    const sync_arg = extractSyncArg(inputs.args);
     // Set raw mode for TTY to avoid line buffering
     const is_tty = platform.isatty(platform.getStdinHandle());
     if (is_tty) platform.setRawMode(true);
@@ -214,16 +218,85 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (transport_mode == .tcp) protocol.setTcpNodelay(conductor.socket.handle);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor.socket.handle };
-    try sendClientInfo(&w, env, is_tty, init.args, addr_arg.skip, sync_arg.skip);
+    try sendClientInfo(&w, env, is_tty, inputs.args, addr_arg.skip, sync_arg.skip);
     // Get worker socket paths (conductor may request full env on cache miss)
-    sockets = try connectToWorker(conductor, &w, env, init.environ.block);
+    sockets = try connectToWorker(conductor, &w, env, inputs.env);
     // Forward signals to worker instead of terminating
     registerSignalHandlers();
     signal_parser.sync_mode = sync_arg.sync;
     try runEventLoop(sync_arg.sync);
 }
 
-fn scanEnv(block: EnvBlock) EnvInfo {
+// --- OS input normalization -------------------------------------------------
+// argv and environ arrive in the native carrier per OS (POSIX: u8 pointer
+// arrays; Windows: one flat UTF-16 buffer each). Normalize to UTF-8 slices
+// once so everything downstream is carrier-agnostic. Index positions
+// (including argv 0) are preserved, keeping the skip-index machinery aligned.
+const InputLists = struct {
+    arena: std.heap.ArenaAllocator,
+    args: []const []const u8,
+    env: []const []const u8,
+
+    fn deinit(self: *InputLists) void {
+        self.arena.deinit();
+    }
+};
+
+/// Convert one flat UTF-16 buffer (null-separated segments) to UTF-8 segments.
+fn utf8Segments(a: std.mem.Allocator, wide: []const u16) ![]const []const u8 {
+    const utf8 = try std.unicode.wtf16LeToWtf8Alloc(a, wide);
+    var segs: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, utf8, 0);
+    while (it.next()) |seg| {
+        if (seg.len > 0) try segs.append(a, seg);
+    }
+    return segs.items;
+}
+
+fn normalizeInputs(gpa: std.mem.Allocator, args_vector: anytype, env_block: anytype) !InputLists {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    switch (builtin.os.tag) {
+        .windows => {
+            // The global env lives in the PEB as a wide, double-null-
+            // terminated block; enumerate under FastPebLock like std's
+            // createMap does (std offers no public iterator over it).
+            const peb = std.os.windows.peb();
+            _ = std.os.windows.ntdll.RtlEnterCriticalSection(peb.FastPebLock);
+            defer _ = std.os.windows.ntdll.RtlLeaveCriticalSection(peb.FastPebLock);
+            var kvs: std.ArrayList([]const u8) = .empty;
+            const block: [*:0]u16 = peb.ProcessParameters.Environment;
+            var i: usize = 0;
+            while (block[i] != 0) {
+                const start = i;
+                while (block[i] != 0) : (i += 1) {}
+                const kv = try std.unicode.wtf16LeToWtf8Alloc(a, block[start..i]);
+                try kvs.append(a, kv);
+                i += 1; // entry-terminating null
+            }
+            return .{
+                .arena = arena,
+                .args = try utf8Segments(a, args_vector),
+                .env = kvs.items,
+            };
+        },
+        else => {
+            var args: std.ArrayList([]const u8) = .empty;
+            for (args_vector) |entry| {
+                if (entry) |e| try args.append(a, std.mem.span(e));
+            }
+            var env: std.ArrayList([]const u8) = .empty;
+            for (env_block.slice) |entry_opt| {
+                const e = entry_opt orelse break;
+                try env.append(a, std.mem.span(e));
+            }
+            return .{ .arena = arena, .args = args.items, .env = env.items };
+        },
+    }
+}
+
+fn scanEnv(kvs: []const []const u8) EnvInfo {
     var info = EnvInfo{ .fingerprint = 0, .count = 0, .server_path = null, .runtime_dir = null, .xdg_runtime_dir = null, .home = null };
     const env_vars = .{
         .{ "JULIA_DAEMON_SERVER=", "server_path" },
@@ -231,9 +304,7 @@ fn scanEnv(block: EnvBlock) EnvInfo {
         .{ "XDG_RUNTIME_DIR=", "xdg_runtime_dir" },
         .{ "HOME=", "home" },
     };
-    for (block.slice) |entry_opt| {
-        const entry = entry_opt orelse break;
-        const kv = std.mem.span(entry);
+    for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // benchmarking noise
         info.count += 1;
         // XOR hash for order-independent fingerprint
@@ -309,7 +380,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     exitClient(127);
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args, addr_skip: [2]usize, sync_skip: usize) !void {
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, args: []const []const u8, addr_skip: [2]usize, sync_skip: usize) !void {
     // Header: magic + flags + reserved + pid + ppid
     w.writeInt(u32, protocol.client.magic);
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty }));
@@ -331,23 +402,23 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.pr
     // it because it's not skipped from the args sent on the wire.
     const skip_count = @as(u16, if (addr_skip[0] != sentinel) 1 else 0) +
         @as(u16, if (addr_skip[1] != sentinel) 1 else 0);
-    w.writeInt(u16, @intCast(raw_args.vector.len - skip_count));
-    for (raw_args.vector, 0..) |arg_ptr, i| {
+    w.writeInt(u16, @intCast(args.len - skip_count));
+    for (args, 0..) |arg, i| {
         if (i == addr_skip[0] or i == addr_skip[1]) continue;
         _ = sync_skip; // --sync stays in the forwarded args
-        w.writeLenPrefixed(u16, std.mem.span(arg_ptr));
+        w.writeLenPrefixed(u16, arg);
     }
     w.flush();
 }
 
-fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, block: EnvBlock) !SocketSet {
+fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) !SocketSet {
     var buf: [1024]u8 = undefined;
     var sr = conductor.reader(io, &buf);
     const reader = &sr.interface;
     // First byte is either '?' (env request) or low byte of stdin path length
     const first_byte = try reader.takeByte();
     if (first_byte == protocol.client.env_request) {
-        sendFullEnv(w, env, block);
+        sendFullEnv(w, env, kvs);
     }
     // Read 4 length-prefixed socket paths: stdin, stdout, stderr, signals
     // (reconstruct first path length if we already consumed the first byte)
@@ -386,10 +457,9 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     return result;
 }
 
-fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
+fn sendFullEnv(w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) void {
     w.writeInt(u16, env.count);
-    for (block.slice) |entry_opt| {
-        const kv = std.mem.span(entry_opt orelse break);
+    for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue;
         const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
         w.writeLenPrefixed(u16, kv[0..eq]);
@@ -457,8 +527,8 @@ fn readPidAndSignal(pid_path: []const u8) bool {
     const content = Io.Dir.readFile(.cwd(), io, pid_path, &buf) catch return false;
     const pid_str = std.mem.trimEnd(u8, content, &.{ '\n', '\r', ' ' });
     const pid = std.fmt.parseInt(i32, pid_str, 10) catch return false;
-    // Send SIGUSR1
-    _ = platform.kill(pid, platform.SIG.USR1);
+    // Send SIGUSR1 (live-repaint poke; a no-op on Windows — no signal analog)
+    _ = platform.kill(platform.pidFromInt(@intCast(pid)), platform.SIG.USR1);
     return true;
 }
 
@@ -545,10 +615,9 @@ const SyncArg = struct {
     skip: usize, // index to omit when forwarding; sentinel = unused
 };
 
-fn extractSyncArg(vector: []const ?[*:0]const u8) SyncArg {
-    for (vector, 0..) |entry, i| {
+fn extractSyncArg(args: []const []const u8) SyncArg {
+    for (args, 0..) |arg, i| {
         if (i == 0) continue;
-        const arg = std.mem.span(entry orelse continue);
         if (std.mem.eql(u8, arg, "--")) return .{ .sync = false, .skip = sentinel };
         if (std.mem.eql(u8, arg, "--sync"))
             return .{ .sync = true, .skip = sentinel }; // keep in forwarded args
@@ -561,11 +630,10 @@ const AddressArg = struct {
     skip: [2]usize, // indices to omit when forwarding; sentinel = unused
 };
 
-fn extractAddressArg(vector: []const ?[*:0]const u8) AddressArg {
+fn extractAddressArg(args: []const []const u8) AddressArg {
     const none = AddressArg{ .value = null, .skip = .{ sentinel, sentinel } };
-    for (vector, 0..) |entry, i| {
+    for (args, 0..) |arg, i| {
         if (i == 0) continue;
-        const arg = std.mem.span(entry orelse continue);
         if (std.mem.eql(u8, arg, "--")) return none;
         // --address=<value> or -a<value>
         if (std.mem.startsWith(u8, arg, "--address="))
@@ -574,8 +642,8 @@ fn extractAddressArg(vector: []const ?[*:0]const u8) AddressArg {
             return .{ .value = arg[2..], .skip = .{ i, sentinel } };
         // --address <value> or -a <value>
         if (std.mem.eql(u8, arg, "--address") or std.mem.eql(u8, arg, "-a")) {
-            const next = if (i + 1 < vector.len) vector[i + 1] else null;
-            if (next) |v| return .{ .value = std.mem.span(v), .skip = .{ i, i + 1 } };
+            const next: ?[]const u8 = if (i + 1 < args.len) args[i + 1] else null;
+            if (next) |v| return .{ .value = v, .skip = .{ i, i + 1 } };
             return none;
         }
     }
