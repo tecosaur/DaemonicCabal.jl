@@ -145,6 +145,12 @@ pub extern "kernel32" fn GetProcessTimes(hProcess: HANDLE, lpCreationTime: *FILE
 pub extern "kernel32" fn GenerateConsoleCtrlEvent(dwCtrlEvent: DWORD, dwProcessGroupId: DWORD) BOOL;
 pub extern "kernel32" fn GetProcessId(hProcess: HANDLE) DWORD;
 
+// --- IOCP (used by both the conductor and client event loops; nowhere in std) ---
+pub const INFINITE: DWORD = 0xFFFFFFFF;
+pub extern "kernel32" fn CreateIoCompletionPort(FileHandle: HANDLE, ExistingCompletionPort: ?HANDLE, CompletionKey: usize, NumberOfConcurrentThreads: DWORD) ?HANDLE;
+pub extern "kernel32" fn GetQueuedCompletionStatus(CompletionPort: HANDLE, lpNumberOfBytesTransferred: *DWORD, lpCompletionKey: *usize, lpOverlapped: ?*?*OVERLAPPED, dwMilliseconds: DWORD) BOOL;
+pub extern "kernel32" fn PostQueuedCompletionStatus(CompletionPort: HANDLE, dwNumberOfBytesTransferred: DWORD, dwCompletionKey: usize, lpOverlapped: ?*OVERLAPPED) BOOL;
+
 // --- psapi ---
 pub extern "psapi" fn GetProcessMemoryInfo(hProcess: HANDLE, ppsmemCounters: *PROCESS_MEMORY_COUNTERS_EX, cb: DWORD) BOOL;
 
@@ -266,6 +272,37 @@ pub fn afdSockopt(
     })), &.{});
 }
 
+/// Issue one overlapped AFD IOCTL to a completion port and return immediately.
+/// The handle must already be port-associated; `key` rides in `apc_ctx` and
+/// comes back as the packet's completion key. `.SUCCESS` inline and `.PENDING`
+/// both surface later as a port packet whose OVERLAPPED* == `iosb` (AFD.md
+/// caveat: success-inline packets still post on associated handles) — uniform
+/// handling upstream.
+pub fn issueAfd(
+    h: HANDLE,
+    code: win32.CTL_CODE,
+    key: usize,
+    in: []const u8,
+    out: []u8,
+    iosb: *win32.IO_STATUS_BLOCK,
+) !void {
+    switch (ntdll.NtDeviceIoControlFile(
+        h,
+        null,
+        null,
+        @ptrFromInt(key),
+        iosb,
+        code,
+        if (in.len > 0) in.ptr else null,
+        @intCast(in.len),
+        if (out.len > 0) out.ptr else null,
+        @intCast(out.len),
+    )) {
+        .SUCCESS, .PENDING => {},
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
 /// AFD.BIND wrapper (bindSocketIpAfd / bindSocketUnixAfd shape :12402/:12421):
 /// `addr_bytes` is a raw sockaddr (family + payload), truncated to its length.
 pub fn afdBind(h: HANDLE, mode: win32.AFD.BIND_INFO.MODE, addr_bytes: []const u8) !void {
@@ -376,6 +413,19 @@ pub fn getppid() DWORD {
 // routes through the SEND loop like platform.write does there.
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
     socketWrite(fd, buf);
+}
+
+// WriteFile path — for console/pipe/file HANDLEs (client stdout/stderr), which
+// are NOT sockets and must not go through AFD.SEND. Loop for short writes;
+// silent on failure, matching the POSIX write contract.
+pub fn writeFile(fd: posix.fd_t, buf: []const u8) void {
+    var off: usize = 0;
+    while (off < buf.len) {
+        var written: DWORD = 0;
+        if (!WriteFile(fd, @ptrCast(buf[off..].ptr), @intCast(buf.len - off), &written, null).toBool()) return;
+        if (written == 0) return;
+        off += written;
+    }
 }
 
 // No general kill(pid, sig) on Windows: every signal is TerminateProcess

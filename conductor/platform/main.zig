@@ -23,6 +23,9 @@ pub const SIG = impl.SIG;
 pub const getpid = impl.getpid;
 pub const getppid = impl.getppid;
 pub const write = impl.write;
+// Console/pipe/file-handle writes (client stdout/stderr): WriteFile on
+// Windows, same as write on POSIX where fds are unified.
+pub const writeFile = if (os != .windows) impl.write else impl.writeFile;
 pub const kill = impl.kill;
 pub const rawSocket = impl.rawSocket;
 pub const rawConnect = impl.rawConnect;

@@ -8,7 +8,7 @@
 // the I/O up front (overlapped) and the kernel says "done". Per WINDOWS.md
 // "I/O multiplexing", the cleanest structure converts EVERYTHING — signals,
 // timers, accepts, reads — into completions posted to one IOCP, and waits on a
-// single GetQueuedCompletionStatus(Ex). The console-control handler and timer
+// single win32ext.GetQueuedCompletionStatus(Ex). The console-control handler and timer
 // callbacks run in their own threads; they just PostQueuedCompletionStatus —
 // the self-pipe trick's Windows equivalent.
 //
@@ -32,6 +32,7 @@ const protocol = @import("../protocol.zig");
 const worker = @import("../worker.zig");
 
 const EventLocation = protocol.EventLocation;
+const ntdll = win32.ntdll;
 
 // Base Win32 types from std, unqualified for readable extern signatures below.
 const BOOL = win32.BOOL;
@@ -44,11 +45,10 @@ const HANDLE = win32.HANDLE;
 const win32ext = @import("../platform/windows.zig");
 
 // =============================================================================
-// Win32 bindings missing from std.os.windows — IOCP + timer queue only.
-// Linked automatically (zig build-exe resolves kernel32 without -l flags).
-// Everything else comes from std: CloseHandle (std.os.windows), cancel via
-// ntdll.NtCancelIoFileEx, socket I/O via ntdll.NtDeviceIoControlFile +
-// AFD IOCTLs (see AFD.md). SetConsoleCtrlHandler + OVERLAPPED +
+// Win32 bindings missing from std.os.windows — timer queue only. The IOCP
+// trio, INFINITE, issueAfd, and all AFD helpers live in platform/windows.zig
+// (shared with the client event loop). Linked automatically (zig build-exe
+// resolves kernel32 without -l flags). SetConsoleCtrlHandler + OVERLAPPED +
 // WAITORTIMERCALLBACK come from platform/windows.zig below.
 //
 // Sockets are AFD endpoint handles created by std.Io (plain overlapped
@@ -60,9 +60,6 @@ const win32ext = @import("../platform/windows.zig");
 pub const WT_EXECUTEDEFAULT: ULONG = 0;
 pub const WT_EXECUTEONLYONCE: ULONG = 0x00000008;
 
-pub extern "kernel32" fn CreateIoCompletionPort(FileHandle: HANDLE, ExistingCompletionPort: ?HANDLE, CompletionKey: usize, NumberOfConcurrentThreads: DWORD) ?HANDLE;
-pub extern "kernel32" fn GetQueuedCompletionStatus(CompletionPort: HANDLE, lpNumberOfBytesTransferred: *DWORD, lpCompletionKey: *usize, lpOverlapped: ?*?*win32ext.OVERLAPPED, dwMilliseconds: DWORD) BOOL;
-pub extern "kernel32" fn PostQueuedCompletionStatus(CompletionPort: HANDLE, dwNumberOfBytesTransferred: DWORD, dwCompletionKey: usize, lpOverlapped: ?*win32ext.OVERLAPPED) BOOL;
 pub extern "kernel32" fn CreateTimerQueueTimer(phNewTimer: *HANDLE, TimerQueue: ?HANDLE, Callback: win32ext.WAITORTIMERCALLBACK, Parameter: ?*anyopaque, DueTime: DWORD, Period: DWORD, Flags: ULONG) BOOL;
 pub extern "kernel32" fn DeleteTimerQueueTimer(TimerQueue: ?HANDLE, Timer: HANDLE, CompletionEvent: ?HANDLE) BOOL;
 
@@ -94,7 +91,7 @@ var g_console_iocp: ?HANDLE = null;
 fn consoleCtrlHandler(dwCtrlType: DWORD) callconv(.winapi) BOOL {
     _ = dwCtrlType;
     if (g_console_iocp) |iocp| {
-        _ = PostQueuedCompletionStatus(iocp, 0, @intFromEnum(EventLocation.signal), null);
+        _ = win32ext.PostQueuedCompletionStatus(iocp, 0, @intFromEnum(EventLocation.signal), null);
     }
     return win32.BOOL.TRUE;
 }
@@ -122,7 +119,7 @@ const TimerCtx = struct { iocp: HANDLE, key: usize, timer: HANDLE };
 /// delete here — the callback is the last thing that touches the timer.
 fn iocpTimerCallback(lpParameter: ?*anyopaque, _: BOOL) callconv(.winapi) void {
     const ctx: *TimerCtx = @ptrCast(@alignCast(lpParameter orelse return));
-    _ = PostQueuedCompletionStatus(ctx.iocp, 0, ctx.key, null);
+    _ = win32ext.PostQueuedCompletionStatus(ctx.iocp, 0, ctx.key, null);
     _ = DeleteTimerQueueTimer(null, ctx.timer, null);
     std.heap.page_allocator.destroy(ctx);
 }
@@ -148,19 +145,19 @@ fn dueTimeRelMs(ms: u64) DWORD {
 // =============================================================================
 
 // IOCP core. `iocp` is the completion port every handle is associated with
-// (CreateIoCompletionPort(handle, iocp, key, 0)); the key is the per-handle
+// (win32ext.CreateIoCompletionPort(handle, iocp, key, 0)); the key is the per-handle
 // cookie (kqueue's udata / io_uring's user_data equivalent). The `entries`
 // param from the router (`EventLoop.init(64)` in main.zig) is meaningless
 // here — IOCP has no queue depth; ignore it.
 pub const EventLoop = struct {
     iocp: win32.HANDLE,
 
-    // → CreateIoCompletionPort(INVALID_HANDLE_VALUE, null, 0, 0) creates a
+    // → win32ext.CreateIoCompletionPort(INVALID_HANDLE_VALUE, null, 0, 0) creates a
     // bare port. Return .{ .iocp = port }.
     pub fn init(_: u13) !EventLoop {
         // INVALID_HANDLE_VALUE + null port → a bare completion port (no handle
         // associated; everything is posted to it, per WINDOWS.md I/O multiplexing).
-        const port = CreateIoCompletionPort(win32.INVALID_HANDLE_VALUE, null, 0, 0) orelse
+        const port = win32ext.CreateIoCompletionPort(win32.INVALID_HANDLE_VALUE, null, 0, 0) orelse
             return error.IocpCreateFailed;
         // Hand the port to the console-control handler (installSignalHandlers
         // is a free function with no other way to reach it); see g_console_iocp.
@@ -230,7 +227,6 @@ pub const EventLoop = struct {
 // the driver also dereferences (out-storage for WAIT_FOR_LISTEN, the RECV_INFO
 // input chain for RECEIVE) live INSIDE the context and thus outlive the IRP.
 
-const ntdll = win32.ntdll;
 
 /// Pending AFD.WAIT_FOR_LISTEN on the listener. Exactly one outstanding at a
 /// time; freed by the dispatcher after the sync ACCEPT half finishes.
@@ -251,35 +247,6 @@ const PongRead = extern struct {
     info: win32.AFD.RECV_INFO,
 };
 
-/// Issue one overlapped AFD IOCTL to our port and return immediately.
-/// `.SUCCESS` inline and `.PENDING` both surface later as a port packet whose
-/// OVERLAPPED* == `iosb` (AFD.md caveat: success-inline packets still post on
-/// associated handles) — uniform handling upstream.
-fn issueAfd(
-    h: HANDLE,
-    code: win32.CTL_CODE,
-    key: usize,
-    in: []const u8,
-    out: []u8,
-    iosb: *win32.IO_STATUS_BLOCK,
-) !void {
-    switch (ntdll.NtDeviceIoControlFile(
-        h,
-        null,
-        null,
-        @ptrFromInt(key),
-        iosb,
-        code,
-        if (in.len > 0) in.ptr else null,
-        @intCast(in.len),
-        if (out.len > 0) out.ptr else null,
-        @intCast(out.len),
-    )) {
-        .SUCCESS, .PENDING => {},
-        else => |status| return win32.unexpectedStatus(status),
-    }
-}
-
 /// Queue the async half of an accept: WAIT_FOR_LISTEN under the accept key.
 /// On its completion the dispatcher runs the synchronous child-open +
 /// AFD.ACCEPT half (mirrors netAcceptWindows' inline second IOCTL — cheap,
@@ -288,7 +255,7 @@ fn issueAcceptWait(listener: HANDLE) !*AcceptWait {
     const aw = try std.heap.page_allocator.create(AcceptWait);
     errdefer std.heap.page_allocator.destroy(aw);
     aw.* = .{ .iosb = undefined, .response = undefined };
-    try issueAfd(
+    try win32ext.issueAfd(
         listener,
         win32.IOCTL.AFD.WAIT_FOR_LISTEN,
         @intFromEnum(EventLocation.accept),
@@ -303,7 +270,7 @@ fn issueAcceptWait(listener: HANDLE) !*AcceptWait {
 // Main loop
 // =============================================================================
 
-// → GetQueuedCompletionStatus(iocp, ...) dispatch loop, mirroring linux.zig's
+// → win32ext.GetQueuedCompletionStatus(iocp, ...) dispatch loop, mirroring linux.zig's
 // structure: wait → dispatch by completion key → rearm. Keys needed (cf.
 // UDATA_* in kqueue.zig):
 //   accept          overlapped accept on the listener: associate its
@@ -333,7 +300,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     // Associate the std.Io-created listener AFD handle with our port under
     // the accept key — from here on its completions route to this loop.
     const listener = server.socket.handle;
-    if (CreateIoCompletionPort(listener, iocp, @intFromEnum(EventLocation.accept), 0) == null) {
+    if (win32ext.CreateIoCompletionPort(listener, iocp, @intFromEnum(EventLocation.accept), 0) == null) {
         std.debug.print("Fatal: failed to associate listener with IOCP\n", .{});
         return;
     }
@@ -374,7 +341,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         var key: usize = 0;
         var ovl: ?*win32ext.OVERLAPPED = null;
         var pool_changed = false;
-        if (!GetQueuedCompletionStatus(iocp, &bytes, &key, &ovl, INFINITE).toBool() and ovl == null) {
+        if (!win32ext.GetQueuedCompletionStatus(iocp, &bytes, &key, &ovl, win32ext.INFINITE).toBool() and ovl == null) {
             // FALSE + null ovl = the port itself failed (never expected with
             // an infinite wait); FALSE + non-null ovl is a *failed op*
             // completion whose status lives in its iosb — dispatched normally.
@@ -509,8 +476,6 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     }
 }
 
-const INFINITE: DWORD = 0xFFFFFFFF;
-
 /// Re-issue the overlapped WAIT_FOR_LISTEN after an accept dispatch.
 /// Error = fatal (no new clients could ever arrive) — callers return.
 fn rearmAccept(listener: HANDLE) !void {
@@ -590,7 +555,7 @@ fn queuePing(
     timeout_ms: u64,
 ) void {
     w.sendPing();
-    if (CreateIoCompletionPort(w.socket, iocp, @intFromPtr(w), 0) == null) {
+    if (win32ext.CreateIoCompletionPort(w.socket, iocp, @intFromPtr(w), 0) == null) {
         w.ping_pending = false;
         return;
     }
@@ -608,7 +573,7 @@ fn queuePing(
             .TdiFlags = .{ .NORMAL = true },
         },
     };
-    issueAfd(w.socket, win32.IOCTL.AFD.RECEIVE, @intFromPtr(w), std.mem.asBytes(&pr.info), &.{}, &pr.iosb) catch {
+    win32ext.issueAfd(w.socket, win32.IOCTL.AFD.RECEIVE, @intFromPtr(w), std.mem.asBytes(&pr.info), &.{}, &pr.iosb) catch {
         std.heap.page_allocator.destroy(pr);
         w.ping_pending = false;
         return;
