@@ -719,12 +719,14 @@ pub fn getParentName(pid: posix.pid_t, buf: []u8) ?[]const u8 {
     return null;
 }
 
-// → AFD.SOCKOPT with SOL_SOCKET/SO_RCVTIMEO, value = DWORD milliseconds
-// (NOT a timeval) — multiply seconds by 1000. Silently ignore errors
-// (matches posix.zig `catch {}`).
+// SO_RCVTIMEO is not supported on raw AFD handles: AFD.SOCKOPT rejects it
+// (NOT_SUPPORTED), and ws2_32's setsockopt would too — our handles never went
+// through WSAStartup's socket table. Blocking reads on worker sockets rely on
+// worker liveness instead. Upgrade path if a hang ever proves real: an AFD
+// RECEIVE with an event + NtWaitForSingleObject timeout wrapper.
 pub fn setRecvTimeout(socket: posix.fd_t, seconds: u32) void {
-    const timeout_ms: DWORD = seconds * 1000;
-    afdSockopt(socket, .set, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.RCVTIMEO, std.mem.asBytes(&timeout_ms)) catch {};
+    _ = socket;
+    _ = seconds;
 }
 
 // → AFD.SOCKOPT with IPPROTO_TCP/TCP_NODELAY, &c_int{1}. Same numeric

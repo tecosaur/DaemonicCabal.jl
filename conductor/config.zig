@@ -3,6 +3,7 @@
 
 // Configuration loading from environment variables
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
 
@@ -60,15 +61,22 @@ pub const Config = struct {
             try platform.defaultRuntimeDir(allocator, env.get("XDG_RUNTIME_DIR"), env.get("HOME"));
         errdefer allocator.free(runtime_dir);
         const server_env = env.get("JULIA_DAEMON_SERVER");
-        const parsed = protocol.parseAddress(server_env orelse
-            try std.fmt.allocPrint(allocator, "{s}/conductor.sock", .{runtime_dir})) catch {
-            std.debug.print("Error: unsupported scheme in JULIA_DAEMON_SERVER={s}\nOnly tcp:// and unix paths are supported.\n", .{server_env.?});
+        // Windows: default to TCP loopback on the protocol default port.
+        // Julia speaks libuv named pipes for path-style sockets, not Win10
+        // AF_UNIX — a unix-socket conductor is unreachable for workers.
+        // (Fixed port = the existing default_tcp_port discovery semantics.)
+        const default_addr = if (builtin.os.tag == .windows)
+            try std.fmt.allocPrint(allocator, "tcp://127.0.0.1:{d}", .{protocol.default_tcp_port})
+        else
+            try std.fmt.allocPrint(allocator, "{s}/conductor.sock", .{runtime_dir});
+        defer allocator.free(default_addr);
+        const parsed = protocol.parseAddress(server_env orelse default_addr) catch {
+            std.debug.print("Error: unsupported scheme in JULIA_DAEMON_SERVER={s}\nOnly tcp:// and unix paths are supported.\n", .{server_env orelse ""});
             return error.UnsupportedScheme;
         };
-        const socket_path = if (server_env != null)
-            try allocator.dupe(u8, parsed.addr)
-        else
-            parsed.addr;
+        // parsed.addr slices the input (default_addr or the env string) —
+        // dupe so socket_path owns its memory regardless of which came through.
+        const socket_path = try allocator.dupe(u8, parsed.addr);
         const transport = parsed.mode;
         const bind_address: []const u8 = if (env.get("JULIA_DAEMON_BIND")) |b|
             b

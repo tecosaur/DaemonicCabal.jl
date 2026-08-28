@@ -325,7 +325,11 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
     const runtime_dir = env.runtime_dir orelse
         try platform.defaultRuntimeDir(&runtime_dir_buf, env.xdg_runtime_dir, env.home);
-    const raw_path = env.server_path orelse
+    // Windows default: TCP loopback on the protocol default port (Julia-side
+    // transport constraint; matches the conductor's windows default).
+    const raw_path = env.server_path orelse if (builtin.os.tag == .windows)
+        "tcp://127.0.0.1"
+    else
         std.fmt.bufPrint(&conductor_path_buf, "{s}/conductor.sock", .{runtime_dir}) catch return error.NameTooLong;
     const parsed = protocol.parseAddress(raw_path) catch {
         std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and unix paths are supported.\n", .{raw_path});

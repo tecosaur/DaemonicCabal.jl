@@ -233,9 +233,24 @@ pub const Worker = struct {
         } else runtime_dir;
         // Conductor and worker are always on the same machine, so use a
         // Unix socket regardless of the client-facing transport mode.
-        var setup = try createListener(io, .unix, effective_runtime_dir, "wsetup.sock", "", &path_buf);
+        // On Windows the setup socket must be TCP: Julia connects via libuv,
+        // which maps path-style sockets to named pipes — it cannot reach an
+        // AF_UNIX listener. Ephemeral loopback port, passed through the -e
+        // snippet as "127.0.0.1:PORT".
+        var setup = if (builtin.os.tag == .windows) blk: {
+            const listener = try protocol.listenAddress(io, .tcp, "127.0.0.1:0");
+            const addr = try std.fmt.allocPrint(
+                allocator,
+                "127.0.0.1:{d}",
+                .{listener.socket.address.getPort()},
+            );
+            errdefer allocator.free(addr);
+            break :blk protocol.Listener{ .server = listener, .addr = addr };
+        } else try createListener(io, .unix, effective_runtime_dir, "wsetup.sock", "", &path_buf);
         defer setup.server.deinit(io);
-        defer Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
+        // Windows setup sockets are TCP — there is no socket file to delete.
+        defer if (builtin.os.tag != .windows) Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
+        defer if (builtin.os.tag == .windows) allocator.free(setup.addr);
         // The paths are embedded in Julia source below, where a `\` starts an
         // escape sequence — normalize to forward slashes regardless of where
         // the runtime dir came from (env override included).

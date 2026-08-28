@@ -93,7 +93,21 @@ fn consoleCtrlHandler(dwCtrlType: DWORD) callconv(.winapi) BOOL {
     if (g_console_iocp) |iocp| {
         _ = win32ext.PostQueuedCompletionStatus(iocp, 0, @intFromEnum(EventLocation.signal), null);
     }
+    // Watchdog: if the loop is parked in an unalertable blocking call, the
+    // completion above is never drained — force-exit so Ctrl-C always works.
+    _ = CreateThread(null, 0, &watchdogProc, null, 0, null);
     return win32.BOOL.TRUE;
+}
+
+extern "kernel32" fn CreateThread(lpThreadAttributes: ?*anyopaque, dwStackSize: usize, lpStartAddress: *const fn (?*anyopaque) callconv(.winapi) DWORD, lpParameter: ?*anyopaque, dwCreationFlags: DWORD, lpThreadId: ?*DWORD) ?HANDLE;
+extern "kernel32" fn Sleep(dwMilliseconds: DWORD) void;
+extern "kernel32" fn GetCurrentProcess() HANDLE;
+
+fn watchdogProc(_: ?*anyopaque) callconv(.winapi) DWORD {
+    Sleep(5000);
+    std.debug.print("\nCtrl-C: forced exit (event loop unresponsive)\n", .{});
+    _ = win32ext.TerminateProcess(GetCurrentProcess(), 130);
+    return 0;
 }
 
 pub fn installSignalHandlers() !void {
