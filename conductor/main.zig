@@ -337,6 +337,7 @@ pub const Conductor = struct {
         var magic_buf: [4]u8 = undefined;
         try readExact(socket, &magic_buf);
         const magic = std.mem.readInt(u32, &magic_buf, .little);
+        std.debug.print("[conductor] magic read: {x}\n", .{magic}); // debug:
         if (magic == protocol.client.magic) {
             try self.handleClient(socket, peer);
         } else if (magic == protocol.notification.magic) {
@@ -388,7 +389,9 @@ pub const Conductor = struct {
 
     fn handleClient(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) !void {
         const is_remote = peer.isRemote(self.cfg.transport);
+        std.debug.print("[conductor] handleClient: reading request (remote={})\n", .{is_remote}); // debug:
         var request = try self.readClientRequest(socket, is_remote);
+        std.debug.print("[conductor] handleClient: request read\n", .{}); // debug:
         defer request.deinit(self.allocator);
         self.client_counter += 1;
         // Handle special commands

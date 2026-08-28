@@ -33,7 +33,7 @@ const RecvCtx = extern struct {
     info: win32.AFD.RECV_INFO,
 };
 
-fn issueRecv(h: posix.fd_t, loc: Location, buf: []u8) !*RecvCtx {
+fn issueRecv(h: posix.fd_t, buf: []u8) !*RecvCtx {
     const ctx = try std.heap.page_allocator.create(RecvCtx);
     errdefer std.heap.page_allocator.destroy(ctx);
     ctx.* = .{
@@ -46,7 +46,7 @@ fn issueRecv(h: posix.fd_t, loc: Location, buf: []u8) !*RecvCtx {
             .TdiFlags = .{ .NORMAL = true },
         },
     };
-    try platform.issueAfd(h, win32.IOCTL.AFD.RECEIVE, @intFromEnum(loc), std.mem.asBytes(&ctx.info), &.{}, &ctx.iosb);
+    try platform.issueAfd(h, win32.IOCTL.AFD.RECEIVE, std.mem.asBytes(&ctx.info), &.{}, &ctx.iosb);
     return ctx;
 }
 
@@ -99,6 +99,7 @@ pub fn run(
     const port = platform.CreateIoCompletionPort(win32.INVALID_HANDLE_VALUE, null, 0, 0) orelse
         return error.IocpCreateFailed;
     defer win32.CloseHandle(port);
+    std.debug.print("[eloop] port created\n", .{}); // debug:
 
     // Start the stdin helper before anything can block the loop.
     const args = try std.heap.page_allocator.create(StdinArgs);
@@ -119,8 +120,10 @@ pub fn run(
         const loc: Location = @enumFromInt(i);
         if (platform.CreateIoCompletionPort(fd, port, @intFromEnum(loc), 0) == null)
             return error.IocpAssociateFailed;
-        ctxs[i] = try issueRecv(fd, loc, &bufs[i]);
+        platform.markAssociated(fd);
+        ctxs[i] = try issueRecv(fd, &bufs[i]);
     }
+    std.debug.print("[eloop] 3 streams associated, initial receives queued\n", .{}); // debug:
 
     // Wait for: stdout+stderr EOF (guarantees output flushed) and exit code
     // (from the signals socket). Signals EOF without an exit code means the
@@ -138,7 +141,16 @@ pub fn run(
         // A non-enum key can only be a stray packet from a synchronous op on
         // an associated socket (signal_parser writes); ignore whole — never
         // touch its ovl, which belongs to the issuer's frame.
-        if (key >= 3) continue;
+        if (key >= 3) {
+            std.debug.print("[eloop] stray key={d}\n", .{key}); // debug:
+            continue;
+        }
+        // Sync-op tokens (event-based ops on associated handles) are reaped
+        // before dispatch — their packets carry the same association keys.
+        if (ovl) |op| {
+            if (platform.reapSyncOp(op)) continue;
+        }
+        std.debug.print("[eloop] wake loc={s} bytes={d}\n", .{ @tagName(@as(Location, @enumFromInt(key))), bytes }); // debug:
         const loc: Location = @enumFromInt(key);
         const idx: usize = @intFromEnum(loc);
 
@@ -150,13 +162,15 @@ pub fn run(
         switch (loc) {
             .worker_stdout, .worker_stderr => {
                 if (status == .SUCCESS and bytes > 0) {
+                    std.debug.print("[eloop] forwarding {d} bytes to local\n", .{bytes}); // debug:
                     const dst = if (loc == .worker_stdout)
                         platform.getStdoutHandle()
                     else
                         platform.getStderrHandle();
                     platform.writeFile(dst, bufs[idx][0..@intCast(bytes)]);
-                    ctxs[idx] = try issueRecv(stream_fds[idx], loc, &bufs[idx]);
+                    ctxs[idx] = try issueRecv(stream_fds[idx], &bufs[idx]);
                 } else {
+                    std.debug.print("[eloop] {s} EOF (status={any})\n", .{ @tagName(loc), status }); // debug:
                     // EOF (graceful close, 0 bytes, or stream error).
                     eof[idx] = true;
                 }
@@ -164,10 +178,14 @@ pub fn run(
             .signals => {
                 if (status == .SUCCESS and bytes > 0) {
                     switch (signal_parser.feed(bufs[idx][0..@intCast(bytes)], signals_fd)) {
-                        .exit => |code| exit_code = code,
-                        .none => ctxs[idx] = try issueRecv(signals_fd, loc, &bufs[idx]),
+                        .exit => |code| {
+                            std.debug.print("[eloop] exit code from signals: {d}\n", .{code}); // debug:
+                            exit_code = code;
+                        },
+                        .none => ctxs[idx] = try issueRecv(signals_fd, &bufs[idx]),
                     }
                 } else if (exit_code == null) {
+                    std.debug.print("[eloop] signals EOF\n", .{}); // debug:
                     exit_code = 1;
                 }
             },

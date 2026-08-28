@@ -203,27 +203,35 @@ fn registerSignalHandlers() void {
 // --- Main pipeline ---
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    std.debug.print("[client] start\n", .{}); // debug:
     var inputs = try normalizeInputs(std.heap.page_allocator, init.args.vector, init.environ.block);
     defer inputs.deinit();
+    std.debug.print("[client] inputs: {d} args, {d} env kvs\n", .{ inputs.args.len, inputs.env.len }); // debug:
     var env = scanEnv(inputs.env);
     const addr_arg = extractAddressArg(inputs.args);
     if (addr_arg.value) |addr| env.server_path = addr;
     const sync_arg = extractSyncArg(inputs.args);
+    std.debug.print("[client] server={?s} addr={?s} sync={}\n", .{ env.server_path, addr_arg.value, sync_arg.sync }); // debug:
     // Set raw mode for TTY to avoid line buffering
     const is_tty = platform.isatty(platform.getStdinHandle());
     if (is_tty) platform.setRawMode(true);
     defer platform.setRawMode(false);
+    std.debug.print("[client] tty={} — connecting to conductor\n", .{is_tty}); // debug:
     // Connect to conductor and send client info
     const conductor = try connectToConductor(env);
+    std.debug.print("[client] conductor connected\n", .{}); // debug:
     if (transport_mode == .tcp) protocol.setTcpNodelay(conductor.socket.handle);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor.socket.handle };
     try sendClientInfo(&w, env, is_tty, inputs.args, addr_arg.skip, sync_arg.skip);
+    std.debug.print("[client] info sent — awaiting worker sockets\n", .{}); // debug:
     // Get worker socket paths (conductor may request full env on cache miss)
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
+    std.debug.print("[client] worker sockets connected\n", .{}); // debug:
     // Forward signals to worker instead of terminating
     registerSignalHandlers();
     signal_parser.sync_mode = sync_arg.sync;
+    std.debug.print("[client] entering event loop\n", .{}); // debug:
     try runEventLoop(sync_arg.sync);
 }
 
@@ -275,9 +283,15 @@ fn normalizeInputs(gpa: std.mem.Allocator, args_vector: anytype, env_block: anyt
                 try kvs.append(a, kv);
                 i += 1; // entry-terminating null
             }
+            // argv: the CommandLine is ONE space-separated string (not null-
+            // separated) — use std's tokenizer, which handles quoting and
+            // yields argv0 first, matching POSIX index alignment.
+            var arg_it = try std.process.Args.Iterator.initAllocator(.{ .vector = args_vector }, a);
+            var args: std.ArrayList([]const u8) = .empty;
+            while (arg_it.next()) |arg| try args.append(a, arg);
             return .{
                 .arena = arena,
-                .args = try utf8Segments(a, args_vector),
+                .args = args.items,
                 .env = kvs.items,
             };
         },
@@ -338,8 +352,14 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     transport_mode = parsed.mode;
     conductor_path = parsed.addr;
     const addr = conductor_path;
+    std.debug.print("[client] connecting to {s} ({s})\n", .{ addr, @tagName(transport_mode) }); // debug:
     // First attempt
-    if (protocol.connectAddress(io, transport_mode, addr)) |stream| return stream else |_| {}
+    if (protocol.connectAddress(io, transport_mode, addr)) |stream| {
+        std.debug.print("[client] connected\n", .{}); // debug:
+        return stream;
+    } else |err| {
+        std.debug.print("[client] connect failed: {}\n", .{err}); // debug:
+    }
     // In TCP mode, no PID file / SIGUSR1 recovery — just retry briefly
     if (transport_mode == .tcp) {
         var attempts: u32 = 0;
@@ -421,6 +441,7 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, kvs
     const reader = &sr.interface;
     // First byte is either '?' (env request) or low byte of stdin path length
     const first_byte = try reader.takeByte();
+    std.debug.print("[client] conductor reply byte: {d} ('{c}')\n", .{ first_byte, if (first_byte >= 0x20 and first_byte < 0x7f) first_byte else '?' }); // debug:
     if (first_byte == protocol.client.env_request) {
         sendFullEnv(w, env, kvs);
     }
@@ -449,6 +470,7 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, kvs
     if (signals_len > signals_buf.len) return error.NameTooLong;
     const signals_path = signals_buf[0..signals_len];
     try reader.readSliceAll(signals_path);
+    std.debug.print("[client] worker paths: in='{s}' out='{s}' err='{s}' sig='{s}'\n", .{ stdin_path, stdout_path, stderr_path, signals_path }); // debug:
     conductor.close(io);
     // Connect to worker sockets (and clean up socket files in unix mode)
     const result = SocketSet{
@@ -499,6 +521,7 @@ fn connectUnix(path: []const u8) !Io.net.Stream {
 }
 
 fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Stream {
+    std.debug.print("[client] connecting worker {s} socket ('{s}')\n", .{ label, raw }); // debug:
     // In TCP mode the conductor sends just `:port` — prepend the conductor host
     var addr_buf: [max_socket_path]u8 = undefined;
     const addr = if (raw.len > 0 and raw[0] == ':') blk: {

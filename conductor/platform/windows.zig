@@ -188,6 +188,9 @@ fn waitForApcOrAlert() void {
 /// Returns the transfer count (IO_STATUS_BLOCK.Information; byte count for
 /// data IOCTLS, opaque for others).
 pub fn syncAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: []u8) !usize {
+    // Associated handles reject APC delivery — route via the Event+token path.
+    if (associated_handles.contains(@intFromPtr(h)))
+        return syncViaPort(h, code, in, if (out.len > 0) out.ptr else null, out.len);
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     var done = false;
     switch (ntdll.NtDeviceIoControlFile(
@@ -272,16 +275,96 @@ pub fn afdSockopt(
     })), &.{});
 }
 
+// --- IOCP-associated handle support -----------------------------------------
+// An IOCP-associated handle REJECTS APC-routed I/O (INVALID_PARAMETER — see
+// AFD.md). Sync ops on such handles therefore go through syncViaPort: issue
+// with an auto-reset Event (packet still posts to the port), block on the
+// event, and leave a heap token for the event loop to reap (reapSyncOp).
+// All registry access happens on the event-loop thread (sync ops on
+// associated handles are only issued from there).
+
+const IoStatusToken = struct { iosb: win32.IO_STATUS_BLOCK };
+
+var associated_handles: std.AutoHashMapUnmanaged(usize, void) = .empty;
+var sync_tokens: std.AutoHashMapUnmanaged(usize, *IoStatusToken) = .empty;
+var g_sync_event: ?HANDLE = null;
+
+pub fn markAssociated(fd: posix.fd_t) void {
+    associated_handles.put(std.heap.page_allocator, @intFromPtr(fd), {}) catch {};
+}
+
+pub extern "kernel32" fn CreateEventW(lpEventAttributes: ?*anyopaque, bManualReset: DWORD, bInitialState: DWORD, lpName: ?[*:0]const u16) ?HANDLE;
+const WAIT_FAILED: DWORD = 0xFFFFFFFF;
+
+fn ensureEvent() !HANDLE {
+    if (g_sync_event) |ev| return ev;
+    // Auto-reset: each completed sync op wakes exactly one waiter.
+    const ev = CreateEventW(null, 0, 0, null) orelse return error.EventCreateFailed;
+    g_sync_event = ev;
+    return ev;
+}
+
+/// Remove one completed sync-op token from the registry. Returns true if
+/// `ovl` belonged to a syncViaPort operation (the event loop should then
+/// ignore the packet — the result was already consumed via the Event).
+pub fn reapSyncOp(ovl: *OVERLAPPED) bool {
+    if (sync_tokens.fetchRemove(@intFromPtr(ovl))) |kv| {
+        std.heap.page_allocator.destroy(kv.value);
+        return true;
+    }
+    return false;
+}
+
+/// Synchronous completion for ASSOCIATED handles: issue with an Event,
+/// block until completion, return the transfer count. The completion packet
+/// is left in the port with `&tok.iosb` as its lpOverlapped token — the
+/// event loop reaps it via reapSyncOp.
+fn syncViaPort(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out_len: usize) !usize {
+    const tok = std.heap.page_allocator.create(IoStatusToken) catch return error.OutOfMemory;
+    errdefer std.heap.page_allocator.destroy(tok);
+    tok.* = .{ .iosb = undefined };
+    const ev = try ensureEvent();
+    // Register before issuing: the packet can land in the port (and be
+    // reaped) as soon as the IRP completes.
+    try sync_tokens.put(std.heap.page_allocator, @intFromPtr(&tok.iosb), tok);
+    switch (ntdll.NtDeviceIoControlFile(
+        h,
+        ev,
+        null,
+        @ptrCast(&tok.iosb),
+        &tok.iosb,
+        code,
+        if (in.len > 0) in.ptr else null,
+        @intCast(in.len),
+        if (out_len > 0) out else null,
+        @intCast(out_len),
+    )) {
+        .SUCCESS, .PENDING => {},
+        else => |status| {
+            _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
+            return win32.unexpectedStatus(status);
+        },
+    }
+    if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED)
+        return error.EventWaitFailed;
+    switch (tok.iosb.u.Status) {
+        // Peer close / reset read as EOF-0 — same contract as dataTransferAfd.
+        .SUCCESS => return tok.iosb.Information,
+        .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => return 0,
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
 /// Issue one overlapped AFD IOCTL to a completion port and return immediately.
-/// The handle must already be port-associated; `key` rides in `apc_ctx` and
-/// comes back as the packet's completion key. `.SUCCESS` inline and `.PENDING`
-/// both surface later as a port packet whose OVERLAPPED* == `iosb` (AFD.md
-/// caveat: success-inline packets still post on associated handles) — uniform
-/// handling upstream.
+/// The handle must already be port-associated. NT completion semantics (see
+/// AFD.md): the packet's COMPLETION KEY comes from the CreateIoCompletionPort
+/// association; the per-IRP `ApcContext` comes back as the packet's
+/// lpOverlapped — so pass a pointer that identifies the operation (our iosb,
+/// which is field 0 of the owning context, making the cast-back identity).
+/// `.SUCCESS` inline and `.PENDING` both surface later as a port packet.
 pub fn issueAfd(
     h: HANDLE,
     code: win32.CTL_CODE,
-    key: usize,
     in: []const u8,
     out: []u8,
     iosb: *win32.IO_STATUS_BLOCK,
@@ -290,7 +373,7 @@ pub fn issueAfd(
         h,
         null,
         null,
-        @ptrFromInt(key),
+        @ptrCast(iosb),
         iosb,
         code,
         if (in.len > 0) in.ptr else null,
@@ -352,6 +435,9 @@ fn afdRecv(h: HANDLE, buf: []u8) !usize {
 
 /// Issue one data IOCTL, wait for APC completion, map status → byte count.
 fn dataTransferAfd(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out_len: usize) !usize {
+    // Associated handles reject APC delivery — route via the Event+token path.
+    if (associated_handles.contains(@intFromPtr(h)))
+        return syncViaPort(h, code, in, out, out_len);
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     var done = false;
     switch (ntdll.NtDeviceIoControlFile(
@@ -626,6 +712,7 @@ pub fn socketRead(fd: posix.fd_t, buf: []u8) usize {
 // is just CloseHandle — no socket-vs-file dispatch needed. Kept as its own fn
 // for router symmetry with POSIX.
 pub fn close(fd: posix.fd_t) void {
+    _ = associated_handles.remove(@intFromPtr(fd));
     win32.CloseHandle(fd);
 }
 
