@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const platform = @import("platform/main.zig");
 
@@ -77,10 +78,10 @@ pub const notification = struct {
 // Format: id:u8 + len:u8 + data
 pub const signals = struct {
     pub const exit: u8 = 0x01;
-    pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw
+    pub const raw_mode: u8 = 0x02; // data: 0x00 = cooked, 0x01 = raw
     pub const query_size: u8 = 0x03; // response: height(u16) + width(u16)
-    pub const nodelay: u8 = 0x04;    // disable Nagle on stdin+signals (low-latency connection)
-    pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating
+    pub const nodelay: u8 = 0x04; // disable Nagle on stdin+signals (low-latency connection)
+    pub const executing: u8 = 0x05; // data: 0x00 = at prompt, 0x01 = evaluating
 };
 
 // Event user_data encoding for io_uring:
@@ -263,6 +264,12 @@ fn parseHostPort(addr: []const u8) !Io.net.IpAddress {
 pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net.Stream {
     switch (mode) {
         .unix => {
+            // Windows: `.unix` is path-addressed local transport = named pipes
+            // (Julia's libuv dialect — see AFD.md "Named-pipe dialect").
+            if (builtin.os.tag == .windows) {
+                const handle = try platform.connectPipe(addr);
+                return platform.pipeAsStream(handle);
+            }
             const ua = try Io.net.UnixAddress.init(addr);
             return ua.connect(io_ctx);
         },
@@ -276,8 +283,13 @@ pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net
 pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net.Server {
     switch (mode) {
         .unix => {
-            const ua = try Io.net.UnixAddress.init(addr);
-            return ua.listen(io_ctx, .{ .kernel_backlog = 128 });
+            if (builtin.os.tag == .windows) {
+                const handle = try platform.listenPipe(addr);
+                return platform.pipeAsServer(handle);
+            } else {
+                const ua = try Io.net.UnixAddress.init(addr);
+                return ua.listen(io_ctx, .{ .kernel_backlog = 128 });
+            }
         },
         .tcp => {
             const ip = try parseHostPort(addr);

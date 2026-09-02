@@ -346,8 +346,15 @@ pub const Worker = struct {
                 .pgid = if (builtin.os.tag == .windows) null else 0,
             });
         }
-        const worker_stream = try setup.server.accept(io);
-        const socket = worker_stream.socket.handle;
+        const socket = if (builtin.os.tag == .windows) blk: {
+            // Pipe transport: blocking accept on the (unassociated) pipe
+            // listener — Event-wait, no IOCP/APC entanglement at spawn time.
+            try platform.acceptPipeSync(setup.server.socket.handle);
+            break :blk setup.server.socket.handle;
+        } else blk: {
+            const worker_stream = try setup.server.accept(io);
+            break :blk worker_stream.socket.handle;
+        };
         // Set read timeout to avoid blocking conductor if worker becomes unresponsive
         platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
         var magic_buf: [4]u8 = undefined;

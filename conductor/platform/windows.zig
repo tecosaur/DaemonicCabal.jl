@@ -148,6 +148,7 @@ pub extern "kernel32" fn SetConsoleOutputCP(wVersionID: DWORD) BOOL;
 pub extern "kernel32" fn GetConsoleOutputCP() DWORD;
 pub extern "kernel32" fn SetConsoleCP(wVersionID: DWORD) BOOL;
 pub extern "kernel32" fn GetConsoleCP() DWORD;
+extern "kernel32" fn Sleep(dwMilliseconds: DWORD) void;
 
 // --- IOCP (used by both the conductor and client event loops; nowhere in std) ---
 pub const INFINITE: DWORD = 0xFFFFFFFF;
@@ -573,7 +574,7 @@ pub fn connectPipe(name: []const u8) !posix.fd_t {
             .PIPE_BUSY, .OBJECT_NAME_NOT_FOUND => {}, // instance not up yet — retry
             else => |status| return win32.unexpectedStatus(status),
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        Sleep(50); // ~10s total retry budget
     }
     return error.PipeConnectTimeout;
 }
@@ -656,6 +657,38 @@ fn pipeSyncOp(h: posix.fd_t, read: bool, buf: []const u8) !usize {
     };
     if (!associated) std.heap.page_allocator.destroy(tok);
     return result;
+}
+
+/// Masquerade a pipe handle as an Io.net.Server, so transport-agnostic call
+/// sites (createServer/createListener/eloop run) carry it unchanged. std
+/// accept/shutdown must NOT be called on the masquerade — use the pipe
+/// primitives (issuePipeListen/acceptPipeSync); CloseHandle via netClose is
+/// fine.
+pub fn pipeAsServer(handle: posix.fd_t) std.Io.net.Server {
+    return .{
+        .socket = .{ .handle = handle, .address = .{ .ip4 = .unspecified(0) } },
+        .options = .{ .mode = .stream, .protocol = null },
+    };
+}
+
+pub fn pipeAsStream(handle: posix.fd_t) std.Io.net.Stream {
+    return .{ .socket = .{ .handle = handle, .address = .{ .ip4 = .unspecified(0) } } };
+}
+
+/// Blocking accept on a pipe listener (worker spawn path — the handle is
+/// unassociated there, so a plain Event wait delivers the completion).
+pub fn acceptPipeSync(h: posix.fd_t) !void {
+    var iosb: win32.IO_STATUS_BLOCK = undefined;
+    const ev = try ensureEvent();
+    switch (ntdll.NtFsControlFile(h, ev, null, null, &iosb, win32.CTL_CODE.PIPE.LISTEN, null, 0, null, 0)) {
+        .SUCCESS => {},
+        .PENDING => {
+            if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED)
+                return error.EventWaitFailed;
+        },
+        else => |status| return win32.unexpectedStatus(status),
+    }
+    if (iosb.u.Status != .SUCCESS) return win32.unexpectedStatus(iosb.u.Status);
 }
 
 /// AFD.BIND wrapper (bindSocketIpAfd / bindSocketUnixAfd shape :12402/:12421):

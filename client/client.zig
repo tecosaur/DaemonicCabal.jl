@@ -512,7 +512,8 @@ fn exitClient(code: u8) noreturn {
 }
 
 fn connectUnix(path: []const u8) !Io.net.Stream {
-    return (try Io.net.UnixAddress.init(path)).connect(io);
+    // Windows: path-addressed = named pipe (protocol handles the dialect).
+    return protocol.connectAddress(io, .unix, path);
 }
 
 fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Stream {

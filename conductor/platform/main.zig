@@ -105,17 +105,19 @@ pub const setWorkerExecuting = if (os != .windows) shared.setWorkerExecuting els
 // Client console configuration (VT processing + UTF-8 codepages). POSIX
 // consoles need none of it — terminals decode UTF-8 and ANSI natively.
 pub const setupConsoleIo = if (os == .windows) impl.setupConsoleIo else struct {
-    fn f(stdout: std.posix.fd_t, stderr: std.posix.fd_t) ?*anyopaque {
-        _ = stdout;
-        _ = stderr;
+    fn f(_: std.posix.fd_t, _: std.posix.fd_t) ?*anyopaque {
         return null;
     }
 }.f;
 pub const restoreConsoleIo = if (os == .windows) impl.restoreConsoleIo else struct {
-    fn f(saved: ?*anyopaque) void {
-        _ = saved;
-    }
+    fn f(_: ?*anyopaque) void {}
 }.f;
+// Named-pipe transport (windows only).
+pub const pipeAsServer = if (os == .windows) impl.pipeAsServer else undefined;
+pub const pipeAsStream = if (os == .windows) impl.pipeAsStream else undefined;
+pub const acceptPipeSync = if (os == .windows) impl.acceptPipeSync else undefined;
+pub const listenPipe = if (os == .windows) impl.listenPipe else undefined;
+pub const connectPipe = if (os == .windows) impl.connectPipe else undefined;
 
 // Time (common implementation)
 pub fn timeSeconds(io: Io) i64 {
