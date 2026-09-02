@@ -97,7 +97,7 @@ pub fn run(
         const loc: Location = @enumFromInt(i);
         if (platform.CreateIoCompletionPort(fd, port, @intFromEnum(loc), 0) == null)
             return error.IocpAssociateFailed;
-        platform.markAssociated(fd);
+        platform.markAssociated(fd, .afd);
         ctxs[i] = try platform.issueAfdRecv(fd, &bufs[i]);
     }
 

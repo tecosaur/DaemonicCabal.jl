@@ -353,7 +353,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         std.debug.print("Fatal: failed to associate listener with IOCP\n", .{});
         return;
     }
-    win32ext.markAssociated(listener);
+    win32ext.markAssociated(listener, .afd);
 
     const pressure_active = conductor.pressure_monitor.active();
     const ping_timeout_ms = conductor.cfg.ping_timeout * 1000;
@@ -619,7 +619,7 @@ fn queuePing(
         w.ping_pending = false;
         return;
     }
-    win32ext.markAssociated(w.socket);
+    win32ext.markAssociated(w.socket, .afd);
     const pr = win32ext.issueAfdRecv(w.socket, &w.pong_buf) catch {
         w.ping_pending = false;
         return;

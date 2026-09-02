@@ -289,12 +289,20 @@ pub fn afdSockopt(
 
 const IoStatusToken = struct { iosb: win32.IO_STATUS_BLOCK };
 
-var associated_handles: std.AutoHashMapUnmanaged(usize, void) = .empty;
+/// What kind of kernel object an associated handle is — selects the issue
+/// syscall (AFD IOCTLs vs NtReadFile/NtWriteFile) for both async and sync ops.
+pub const HandleKind = enum { afd, pipe };
+
+var associated_handles: std.AutoHashMapUnmanaged(usize, HandleKind) = .empty;
 var sync_tokens: std.AutoHashMapUnmanaged(usize, *IoStatusToken) = .empty;
 var g_sync_event: ?HANDLE = null;
 
-pub fn markAssociated(fd: posix.fd_t) void {
-    associated_handles.put(std.heap.page_allocator, @intFromPtr(fd), {}) catch {};
+pub fn markAssociated(fd: posix.fd_t, kind: HandleKind) void {
+    associated_handles.put(std.heap.page_allocator, @intFromPtr(fd), kind) catch {};
+}
+
+fn kindOf(fd: posix.fd_t) ?HandleKind {
+    return associated_handles.get(@intFromPtr(fd));
 }
 
 pub extern "kernel32" fn CreateEventW(lpEventAttributes: ?*anyopaque, bManualReset: DWORD, bInitialState: DWORD, lpName: ?[*:0]const u16) ?HANDLE;
@@ -418,6 +426,236 @@ pub fn issueAfdRecv(h: posix.fd_t, buf: []u8) !*AfdRecvCtx {
     };
     try issueAfd(h, win32.IOCTL.AFD.RECEIVE, std.mem.asBytes(&ctx.info), &.{}, &ctx.iosb);
     return ctx;
+}
+
+// --- Named pipes (transport v2 — see AFD.md "Named-pipe dialect") ----------
+// Pipe handles are plain overlapped file objects: they associate with the
+// IOCP and obey the same token/reap/syncViaPort machinery as AFD sockets.
+// Only creation and the issue syscalls differ (NtReadFile/NtWriteFile/
+// NtFsControlFile instead of AFD IOCTLs).
+
+var pipe_device: ?HANDLE = null;
+
+/// The NamedPipe device root — pipe names are created RELATIVE to this
+/// (an absolute \??\pipe\<name> ObjectName fails with INVALID_PARAMETER).
+fn pipeDevice() !posix.fd_t {
+    if (pipe_device) |d| return d;
+    var handle: win32.HANDLE = undefined;
+    var iosb: win32.IO_STATUS_BLOCK = undefined;
+    switch (ntdll.NtOpenFile(
+        &handle,
+        .{ .STANDARD = .{ .SYNCHRONIZE = true } },
+        &.{
+            .ObjectName = @constCast(&win32.UNICODE_STRING.init(&comptimeWide("\\Device\\NamedPipe\\"))),
+        },
+        &iosb,
+        .VALID_FLAGS,
+        .{ .IO = .SYNCHRONOUS_NONALERT },
+    )) {
+        .SUCCESS => {
+            pipe_device = handle;
+            return handle;
+        },
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
+fn comptimeWide(comptime name: []const u8) [name.len:0]u16 {
+    var out: [name.len:0]u16 = undefined;
+    for (name, 0..) |c, i| out[i] = c;
+    out[name.len] = 0;
+    return out;
+}
+
+/// Build the NT object name for a pipe: `\??\pipe\<name>`. `name` must be
+/// backslash-only and colon-free (see AFD.md).
+fn pipeObjectName(buf: *[128]u16, name: []const u8) ![]const u16 {
+    const prefix = "\\??\\pipe\\";
+    if (prefix.len + name.len > buf.len - 1) return error.NameTooLong;
+    var i: usize = 0;
+    for (prefix) |c| {
+        buf[i] = c;
+        i += 1;
+    }
+    const n = try std.unicode.utf8ToUtf16Le(buf[i..], name);
+    return buf[0 .. i + n];
+}
+
+/// Create a named pipe server instance (byte-stream, duplex, overlapped;
+/// the libuv dialect — Julia's Sockets.listen/connect interoperate with it).
+pub fn listenPipe(name: []const u8) !posix.fd_t {
+    const device = try pipeDevice();
+    var name_buf: [128]u16 = undefined;
+    const obj_name = try pipeObjectName(&name_buf, name);
+    var ua = win32.UNICODE_STRING.init(obj_name);
+    var handle: win32.HANDLE = undefined;
+    var iosb: win32.IO_STATUS_BLOCK = undefined;
+    var timeout: win32.LARGE_INTEGER = -120 * std.time.ns_per_s / 100;
+    switch (ntdll.NtCreateNamedPipeFile(
+        &handle,
+        .{
+            .SPECIFIC = .{ .FILE_PIPE = .{
+                .READ_DATA = true,
+                .WRITE_DATA = true,
+                .WRITE_ATTRIBUTES = true,
+            } },
+            .STANDARD = .{ .SYNCHRONIZE = true },
+        },
+        &.{
+            .RootDirectory = device,
+            .ObjectName = @constCast(&ua),
+        },
+        &iosb,
+        .{ .READ = true, .WRITE = true },
+        .CREATE,
+        .{ .IO = .ASYNCHRONOUS },
+        .{ .TYPE = .BYTE_STREAM },
+        .{ .MODE = .BYTE_STREAM },
+        .{ .OPERATION = .QUEUE },
+        0xFF, // unlimited instances
+        4096,
+        4096,
+        &timeout,
+    )) {
+        .SUCCESS => return handle,
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
+/// Pend FSCTL.PIPE.LISTEN (the accept equivalent) on a fresh instance.
+/// Port-routed: the completion lands in the event loop's port with the
+/// caller's iosb as token. The listening handle BECOMES the connection.
+pub fn issuePipeListen(h: posix.fd_t, iosb: *win32.IO_STATUS_BLOCK) !void {
+    switch (ntdll.NtFsControlFile(
+        h,
+        null,
+        null,
+        @ptrCast(iosb),
+        iosb,
+        win32.CTL_CODE.PIPE.LISTEN,
+        null,
+        0,
+        null,
+        0,
+    )) {
+        .SUCCESS, .PENDING => {},
+        else => |status| return win32.unexpectedStatus(status),
+    }
+}
+
+/// Connect to a named pipe server (the client half of the dialect — what
+/// Julia's uv_pipe_connect does via CreateFileW). Retries while the server
+/// instance isn't up yet (~10s budget), then fails.
+pub fn connectPipe(name: []const u8) !posix.fd_t {
+    var name_buf: [128]u16 = undefined;
+    const obj_name = try pipeObjectName(&name_buf, name);
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        var handle: win32.HANDLE = undefined;
+        var iosb: win32.IO_STATUS_BLOCK = undefined;
+        var ua = win32.UNICODE_STRING.init(obj_name);
+        switch (ntdll.NtCreateFile(
+            &handle,
+            .{ .GENERIC = .{ .READ = true, .WRITE = true }, .STANDARD = .{ .SYNCHRONIZE = true } },
+            &.{
+                .ObjectName = @constCast(&ua),
+            },
+            &iosb,
+            null,
+            .{},
+            .{ .READ = true, .WRITE = true },
+            .OPEN,
+            .{ .IO = .ASYNCHRONOUS },
+            null,
+            0,
+        )) {
+            .SUCCESS => return handle,
+            .PIPE_BUSY, .OBJECT_NAME_NOT_FOUND => {}, // instance not up yet — retry
+            else => |status| return win32.unexpectedStatus(status),
+        }
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    return error.PipeConnectTimeout;
+}
+
+/// Issue one port-routed NtReadFile; the token doubles as the op context.
+pub fn issuePipeRecv(h: posix.fd_t, buf: []u8) !*IoStatusToken {
+    const tok = try std.heap.page_allocator.create(IoStatusToken);
+    errdefer std.heap.page_allocator.destroy(tok);
+    tok.* = .{ .iosb = undefined };
+    switch (ntdll.NtReadFile(
+        h,
+        null,
+        null,
+        @ptrCast(&tok.iosb),
+        &tok.iosb,
+        buf.ptr,
+        @intCast(buf.len),
+        null,
+        null,
+    )) {
+        .SUCCESS, .PENDING => {},
+        else => |status| return win32.unexpectedStatus(status),
+    }
+    return tok;
+}
+
+/// Issue one port-routed NtWriteFile (fire-and-forget writes).
+pub fn issuePipeSend(h: posix.fd_t, bytes: []const u8) !*IoStatusToken {
+    const tok = try std.heap.page_allocator.create(IoStatusToken);
+    errdefer std.heap.page_allocator.destroy(tok);
+    tok.* = .{ .iosb = undefined };
+    switch (ntdll.NtWriteFile(
+        h,
+        null,
+        null,
+        @ptrCast(&tok.iosb),
+        &tok.iosb,
+        @ptrCast(bytes.ptr),
+        @intCast(bytes.len),
+        null,
+        null,
+    )) {
+        .SUCCESS, .PENDING => {},
+        else => |status| return win32.unexpectedStatus(status),
+    }
+    return tok;
+}
+
+/// Synchronous read/write for ASSOCIATED pipe handles (Event + token, reaped
+/// by the event loop) — pipe handles reject APC-routed I/O just like AFD.
+fn pipeSyncOp(h: posix.fd_t, read: bool, buf: []const u8) !usize {
+    const tok = try std.heap.page_allocator.create(IoStatusToken);
+    errdefer std.heap.page_allocator.destroy(tok);
+    tok.* = .{ .iosb = undefined };
+    const ev = try ensureEvent();
+    const associated = kindOf(h) != null;
+    if (associated) try sync_tokens.put(std.heap.page_allocator, @intFromPtr(&tok.iosb), tok);
+    const stat = if (read)
+        ntdll.NtReadFile(h, ev, null, @ptrCast(&tok.iosb), &tok.iosb, @ptrCast(@constCast(buf.ptr)), @intCast(buf.len), null, null)
+    else
+        ntdll.NtWriteFile(h, ev, null, @ptrCast(&tok.iosb), &tok.iosb, @ptrCast(buf.ptr), @intCast(buf.len), null, null);
+    switch (stat) {
+        .SUCCESS, .PENDING => {},
+        else => |status| {
+            if (!associated) std.heap.page_allocator.destroy(tok);
+            _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
+            return win32.unexpectedStatus(status);
+        },
+    }
+    if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED)
+        return error.EventWaitFailed;
+    const result: usize = switch (tok.iosb.u.Status) {
+        .SUCCESS => tok.iosb.Information,
+        // Disconnect statuses → EOF-0 (pipe dialect: PIPE_BROKEN et al).
+        .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => 0,
+        else => |status| {
+            if (!associated) std.heap.page_allocator.destroy(tok);
+            return win32.unexpectedStatus(status);
+        },
+    };
+    if (!associated) std.heap.page_allocator.destroy(tok);
+    return result;
 }
 
 /// AFD.BIND wrapper (bindSocketIpAfd / bindSocketUnixAfd shape :12402/:12421):
@@ -775,25 +1013,33 @@ pub fn restoreConsoleIo(saved: ?*anyopaque) void {
 // API on POSIX. Reference shapes: posix.zig.
 // =============================================================================
 
-// → AFD.SEND. Loop for short writes (match POSIX impl).
+// → NtDeviceIoControlFile(AFD.SEND) / NtWriteFile, by handle kind.
+// Loop for short writes (match POSIX impl).
 pub fn socketWrite(fd: posix.fd_t, buf: []const u8) void {
     var sent: usize = 0;
     while (sent < buf.len) {
-        const n = afdSend(fd, buf[sent..]) catch {
-            // posix.zig keeps socket writes silent on failure.
-            return;
+        const n = switch (kindOf(fd) orelse .afd) {
+            .pipe => pipeSyncOp(fd, false, buf[sent..]) catch return,
+            .afd => afdSend(fd, buf[sent..]) catch return,
         };
         if (n == 0) return;
         sent += n;
     }
 }
 
-// → AFD.RECEIVE. Return 0 on error (matches posix.zig behavior —
-// ConnectionResetByPeer silent, others logged).
+// → NtDeviceIoControlFile(AFD.RECEIVE) / NtReadFile, by handle kind.
+// Return 0 on error (matches posix.zig behavior — ConnectionResetByPeer
+// silent, others logged).
 pub fn socketRead(fd: posix.fd_t, buf: []u8) usize {
-    return afdRecv(fd, buf) catch |err| {
-        std.debug.print("socketRead error: {}\n", .{err});
-        return 0;
+    return switch (kindOf(fd) orelse .afd) {
+        .pipe => pipeSyncOp(fd, true, buf) catch |err| {
+            std.debug.print("socketRead error: {}\n", .{err});
+            return 0;
+        },
+        .afd => afdRecv(fd, buf) catch |err| {
+            std.debug.print("socketRead error: {}\n", .{err});
+            return 0;
+        },
     };
 }
 
