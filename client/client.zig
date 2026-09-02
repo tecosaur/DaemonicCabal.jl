@@ -71,6 +71,7 @@ const EnvInfo = struct {
     runtime_dir: ?[]const u8,
     xdg_runtime_dir: ?[]const u8,
     home: ?[]const u8,
+    username: ?[]const u8 = null,
 };
 
 // (EnvBlock alias removed — inputs are normalized to UTF-8 slices in main.)
@@ -316,6 +317,7 @@ fn scanEnv(kvs: []const []const u8) EnvInfo {
         .{ "JULIA_DAEMON_RUNTIME=", "runtime_dir" },
         .{ "XDG_RUNTIME_DIR=", "xdg_runtime_dir" },
         .{ "HOME=", "home" },
+        .{ "USERNAME=", "username" },
     };
     for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // benchmarking noise
@@ -338,11 +340,16 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
     const runtime_dir = env.runtime_dir orelse
         try platform.defaultRuntimeDir(&runtime_dir_buf, env.xdg_runtime_dir, env.home);
-    // Windows default: TCP loopback on the protocol default port (Julia-side
-    // transport constraint; matches the conductor's windows default).
-    const raw_path = env.server_path orelse if (builtin.os.tag == .windows)
-        "tcp://127.0.0.1"
-    else
+    // Windows default: the user-scoped named pipe (the conductor's default;
+    // Julia's libuv speaks this dialect, so no TCP involved).
+    const raw_path = env.server_path orelse if (builtin.os.tag == .windows) blk: {
+        const user = env.username orelse "default";
+        break :blk std.fmt.bufPrint(
+            &conductor_path_buf,
+            "\\\\.\\pipe\\julia-daemon\\{s}\\conductor.sock",
+            .{user},
+        ) catch return error.NameTooLong;
+    } else
         std.fmt.bufPrint(&conductor_path_buf, "{s}/conductor.sock", .{runtime_dir}) catch return error.NameTooLong;
     const parsed = protocol.parseAddress(raw_path) catch {
         std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and unix paths are supported.\n", .{raw_path});
@@ -433,39 +440,39 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, args: []const []
 }
 
 fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) !SocketSet {
-    var buf: [1024]u8 = undefined;
-    var sr = conductor.reader(io, &buf);
-    const reader = &sr.interface;
+    // The conductor protocol exchange goes through the platform primitives —
+    // std.Io net reads would issue AFD IOCTLs that pipes reject.
+    const r = protocol.BufReader{ .fd = conductor.socket.handle };
     // First byte is either '?' (env request) or low byte of stdin path length
-    const first_byte = try reader.takeByte();
+    const first_byte = try r.readInt(u8);
     if (first_byte == protocol.client.env_request) {
         sendFullEnv(w, env, kvs);
     }
     // Read 4 length-prefixed socket paths: stdin, stdout, stderr, signals
     // (reconstruct first path length if we already consumed the first byte)
     const stdin_len: usize = if (first_byte == protocol.client.env_request)
-        try reader.takeInt(u16, .little)
+        try r.readInt(u16)
     else
-        @as(u16, first_byte) | (@as(u16, try reader.takeByte()) << 8);
+        @as(u16, first_byte) | (@as(u16, try r.readInt(u8)) << 8);
     var stdin_buf: [max_socket_path]u8 = undefined;
     if (stdin_len > stdin_buf.len) return error.NameTooLong;
     const stdin_path = stdin_buf[0..stdin_len];
-    try reader.readSliceAll(stdin_path);
-    const stdout_len: usize = try reader.takeInt(u16, .little);
+    try r.readSlice(stdin_path);
+    const stdout_len: usize = try r.readInt(u16);
     var stdout_buf: [max_socket_path]u8 = undefined;
     if (stdout_len > stdout_buf.len) return error.NameTooLong;
     const stdout_path = stdout_buf[0..stdout_len];
-    try reader.readSliceAll(stdout_path);
-    const stderr_len: usize = try reader.takeInt(u16, .little);
+    try r.readSlice(stdout_path);
+    const stderr_len: usize = try r.readInt(u16);
     var stderr_buf: [max_socket_path]u8 = undefined;
     if (stderr_len > stderr_buf.len) return error.NameTooLong;
     const stderr_path = stderr_buf[0..stderr_len];
-    try reader.readSliceAll(stderr_path);
-    const signals_len: usize = try reader.takeInt(u16, .little);
+    try r.readSlice(stderr_path);
+    const signals_len: usize = try r.readInt(u16);
     var signals_buf: [max_socket_path]u8 = undefined;
     if (signals_len > signals_buf.len) return error.NameTooLong;
     const signals_path = signals_buf[0..signals_len];
-    try reader.readSliceAll(signals_path);
+    try r.readSlice(signals_path);
     conductor.close(io);
     // Connect to worker sockets (and clean up socket files in unix mode)
     const result = SocketSet{
@@ -534,7 +541,9 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Str
         std.debug.print("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ addr, e });
         exitClient(127);
     };
-    if (mode == .unix) Io.Dir.deleteFileAbsolute(io, raw) catch {};
+    // Windows: path-addressed transport = named pipes — no file to delete
+    // (std panics with a statusBug when deleting pipe names).
+    if (mode == .unix and builtin.os.tag != .windows) Io.Dir.deleteFileAbsolute(io, raw) catch {};
     return stream;
 }
 

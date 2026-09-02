@@ -97,8 +97,8 @@ pub fn run(
         const loc: Location = @enumFromInt(i);
         if (platform.CreateIoCompletionPort(fd, port, @intFromEnum(loc), 0) == null)
             return error.IocpAssociateFailed;
-        platform.markAssociated(fd, .afd);
-        ctxs[i] = try platform.issueAfdRecv(fd, &bufs[i]);
+        platform.markAssociated(fd);
+        ctxs[i] = platform.issueAfdRecv(fd, &bufs[i]) orelse return error.StreamDead;
     }
 
     // Wait for: stdout+stderr EOF (guarantees output flushed) and exit code
@@ -143,7 +143,10 @@ pub fn run(
                     else
                         platform.getStderrHandle();
                     platform.writeFile(dst, bufs[idx][0..@intCast(bytes)]);
-                    ctxs[idx] = try platform.issueAfdRecv(stream_fds[idx], &bufs[idx]);
+                    // Re-issue; a failure here (PIPE_BROKEN et al) means the
+                    // conductor closed the stream — same as EOF.
+                    ctxs[idx] = platform.issueAfdRecv(stream_fds[idx], &bufs[idx]);
+                    if (ctxs[idx] == null) eof[idx] = true;
                 } else {
                     // EOF (graceful close, 0 bytes, or stream error).
                     eof[idx] = true;
@@ -155,7 +158,10 @@ pub fn run(
                         .exit => |code| {
                             exit_code = code;
                         },
-                        .none => ctxs[idx] = try platform.issueAfdRecv(signals_fd, &bufs[idx]),
+                        .none => {
+                            ctxs[idx] = platform.issueAfdRecv(signals_fd, &bufs[idx]);
+                            if (ctxs[idx] == null and exit_code == null) exit_code = 1;
+                        },
                     }
                 } else if (exit_code == null) {
                     exit_code = 1;

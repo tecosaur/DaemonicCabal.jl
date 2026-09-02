@@ -86,8 +86,10 @@ end
 
 # --- Dual transport (Unix sockets / TCP) ---
 
+# Windows pipe specs (\\.\pipe\…) are path-addressed local transport, not TCP.
 is_tcp_address(addr::AbstractString) =
-    !startswith(addr, '/') && !startswith(addr, '.') && !contains(addr, '/') && contains(addr, ':')
+    !startswith(addr, '\\') && !startswith(addr, '/') && !startswith(addr, '.') &&
+    !contains(addr, '/') && contains(addr, ':')
 
 # Connect to an address (Unix path or host:port), setting TCP_NODELAY for TCP sockets
 function connect_to(address::AbstractString)

@@ -61,13 +61,18 @@ pub const Config = struct {
             try platform.defaultRuntimeDir(allocator, env.get("XDG_RUNTIME_DIR"), env.get("HOME"));
         errdefer allocator.free(runtime_dir);
         const server_env = env.get("JULIA_DAEMON_SERVER");
-        // Windows: default to TCP loopback on the protocol default port.
-        // Julia speaks libuv named pipes for path-style sockets, not Win10
-        // AF_UNIX — a unix-socket conductor is unreachable for workers.
-        // (Fixed port = the existing default_tcp_port discovery semantics.)
-        const default_addr = if (builtin.os.tag == .windows)
-            try std.fmt.allocPrint(allocator, "tcp://127.0.0.1:{d}", .{protocol.default_tcp_port})
-        else
+        // Windows: default to the named-pipe transport — a user-scoped pipe
+        // namespace (mirrors POSIX's user-scoped runtime dir; Julia's
+        // libuv speaks this dialect natively). JULIA_DAEMON_SERVER=tcp://…
+        // overrides. JULIA_DAEMON_PORTS is silently ignored (transport != tcp).
+        const default_addr = if (builtin.os.tag == .windows) blk: {
+            const username = env.get("USERNAME") orelse "default";
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "\\\\.\\pipe\\julia-daemon\\{s}\\conductor.sock",
+                .{username},
+            );
+        } else
             try std.fmt.allocPrint(allocator, "{s}/conductor.sock", .{runtime_dir});
         defer allocator.free(default_addr);
         const parsed = protocol.parseAddress(server_env orelse default_addr) catch {

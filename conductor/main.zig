@@ -306,7 +306,9 @@ pub const Conductor = struct {
         };
         var server = try self.createServer();
         defer server.deinit(self.io);
-        defer if (self.cfg.transport == .unix) {
+        // Unix transport cleans up the socket file; on Windows the transport
+        // is a named pipe — the object vanishes with the handle.
+        defer if (self.cfg.transport == .unix and builtin.os.tag != .windows) {
             Io.Dir.deleteFileAbsolute(self.io, self.cfg.socket_path) catch {};
         };
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
@@ -1686,8 +1688,13 @@ pub const Conductor = struct {
 
         fn deinit(self: *ClientStreams) void {
             const io = self.c.io;
+            const windows_pipes = builtin.os.tag == .windows and self.c.cfg.transport == .unix;
             for (self.conns) |conn| conn.close(io);
             for (&self.listeners, self.addrs[0..], self.addr_lens) |*l, *addr, len| {
+                // Pipe transport: the "listener" handle was consumed by the
+                // accept (it IS the connection, closed above) — nothing left
+                // to delete or close.
+                if (windows_pipes) continue;
                 if (self.c.cfg.transport == .unix) Io.Dir.deleteFileAbsolute(io, addr[0..len]) catch {};
                 l.server.deinit(io);
             }
@@ -1716,7 +1723,9 @@ pub const Conductor = struct {
         var listeners: [4]protocol.Listener = undefined;
         var created: usize = 0;
         errdefer for (listeners[0..created]) |*l| {
-            if (mode == .unix) Io.Dir.deleteFileAbsolute(self.io, l.addr) catch {};
+            // Windows pipe transport: no socket file to delete (and std panics
+            // deleting pipe names).
+            if (mode == .unix and builtin.os.tag != .windows) Io.Dir.deleteFileAbsolute(self.io, l.addr) catch {};
             l.server.deinit(self.io);
         };
         for (0..4) |i| {
@@ -1736,7 +1745,14 @@ pub const Conductor = struct {
         var accepted: usize = 0;
         errdefer for (conns[0..accepted]) |c| c.close(self.io);
         for (0..4) |i| {
-            conns[i] = try listeners[i].server.accept(self.io);
+            if (builtin.os.tag == .windows and mode == .unix) {
+                // Pipe transport: blocking accept on the listener (which IS
+                // the connection once LISTEN completes).
+                try platform.acceptPipeSync(listeners[i].server.socket.handle);
+                conns[i] = platform.pipeAsStream(listeners[i].server.socket.handle);
+            } else {
+                conns[i] = try listeners[i].server.accept(self.io);
+            }
             accepted += 1;
         }
         var streams = ClientStreams{ .c = self, .listeners = listeners, .conns = conns, .port_set_idx = port_set_idx };
@@ -1928,10 +1944,16 @@ pub const Conductor = struct {
 
     // Shut down stdout/stderr and signal a clean client exit (no content write).
     fn closeStreams(self: *Conductor, streams: *ClientStreams) void {
-        streams.conns[@intFromEnum(Stream.stdout)].shutdown(self.io, .send) catch {};
-        streams.conns[@intFromEnum(Stream.stderr)].shutdown(self.io, .send) catch {};
+        // Pipe handles reject std.Io shutdown (AFD IOCTL) — the client sees
+        // EOF via the pipe break on close; skip the half-close entirely.
+        if (!(builtin.os.tag == .windows and self.cfg.transport == .unix)) {
+            streams.conns[@intFromEnum(Stream.stdout)].shutdown(self.io, .send) catch {};
+            streams.conns[@intFromEnum(Stream.stderr)].shutdown(self.io, .send) catch {};
+        }
         platform.write(streams.fd(.signals), &[_]u8{ protocol.signals.exit, 0x01, 0x00 });
-        streams.conns[@intFromEnum(Stream.signals)].shutdown(self.io, .send) catch {};
+        if (!(builtin.os.tag == .windows and self.cfg.transport == .unix)) {
+            streams.conns[@intFromEnum(Stream.signals)].shutdown(self.io, .send) catch {};
+        }
     }
 
     // Probe the terminal palette: enter raw mode (replies un-echoed), write the

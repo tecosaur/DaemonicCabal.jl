@@ -243,6 +243,10 @@ pub fn parseAddress(raw: []const u8) error{UnsupportedScheme}!Address {
             return .{ .mode = .tcp, .addr = raw[sep + 3 ..] };
         return error.UnsupportedScheme;
     }
+    // Windows pipe specs (\\.\pipe\…, \\?\pipe\…, or any \\ name) are
+    // path-addressed local transport, not host:port.
+    if (builtin.os.tag == .windows and std.mem.startsWith(u8, raw, "\\\\"))
+        return .{ .mode = .unix, .addr = raw };
     if (raw.len > 0 and raw[0] != '/' and raw[0] != '.' and
         std.mem.indexOfScalar(u8, raw, '/') == null)
         return .{ .mode = .tcp, .addr = raw };
@@ -310,6 +314,14 @@ pub fn createListener(
 ) !Listener {
     switch (mode) {
         .unix => {
+            // Windows: path-addressed local transport = named pipes. The
+            // random name carries a drive-letter colon — legal in NT pipe
+            // names, and only zig↔zig ever touches these.
+            if (builtin.os.tag == .windows) {
+                const path = try randomSocketPath(io_ctx, runtime_dir, suffix, buf);
+                const handle = try platform.listenPipe(path);
+                return .{ .server = platform.pipeAsServer(handle), .addr = path };
+            }
             const path = try randomSocketPath(io_ctx, runtime_dir, suffix, buf);
             const unix_addr = try Io.net.UnixAddress.init(path);
             return .{ .server = try unix_addr.listen(io_ctx, .{}), .addr = path };

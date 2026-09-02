@@ -118,6 +118,18 @@ pub const pipeAsStream = if (os == .windows) impl.pipeAsStream else undefined;
 pub const acceptPipeSync = if (os == .windows) impl.acceptPipeSync else undefined;
 pub const listenPipe = if (os == .windows) impl.listenPipe else undefined;
 pub const connectPipe = if (os == .windows) impl.connectPipe else undefined;
+pub const pipeState = if (os == .windows) impl.pipeState else struct {
+    fn f(handle: std.posix.fd_t) ?u32 {
+        _ = handle;
+        return null;
+    }
+}.f;
+pub const dupHandle = if (os == .windows) impl.dupHandle else struct {
+    fn f(handle: std.posix.fd_t) std.posix.fd_t {
+        _ = handle;
+        unreachable;
+    }
+}.f;
 
 // Time (common implementation)
 pub fn timeSeconds(io: Io) i64 {

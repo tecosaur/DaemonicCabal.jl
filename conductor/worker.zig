@@ -233,11 +233,25 @@ pub const Worker = struct {
         } else runtime_dir;
         // Conductor and worker are always on the same machine, so use a
         // Unix socket regardless of the client-facing transport mode.
-        // On Windows the setup socket must be TCP: Julia connects via libuv,
-        // which maps path-style sockets to named pipes — it cannot reach an
-        // AF_UNIX listener. Ephemeral loopback port, passed through the -e
-        // snippet as "127.0.0.1:PORT".
-        var setup = if (builtin.os.tag == .windows) blk: {
+        // Windows pipe transport: the setup listener is a named pipe in the
+        // same per-user namespace as the conductor socket. CRITICAL: for
+        // pipes the listening handle IS the connection after accept, so the
+        // deinit below must be skipped (the handle lives on as Worker.socket).
+        const setup_is_connection = builtin.os.tag == .windows and cfg.transport == .unix;
+        var setup = if (setup_is_connection) blk: {
+            const ns_end = std.mem.lastIndexOfScalar(u8, cfg.socket_path, '\\') orelse
+                return error.InvalidPipeName;
+            const token: u64 = @truncate(@as(u96, @bitCast(Io.Clock.now(.awake, io).nanoseconds)));
+            const setup_name = try std.fmt.allocPrint(
+                allocator,
+                "{s}\\wsetup-{d}-{x}.sock",
+                .{ cfg.socket_path[0..ns_end], id, @as(u64, @bitCast(token)) },
+            );
+            errdefer allocator.free(setup_name);
+            const handle = try platform.listenPipe(setup_name);
+            errdefer platform.close(handle);
+            break :blk protocol.Listener{ .server = platform.pipeAsServer(handle), .addr = setup_name };
+        } else if (builtin.os.tag == .windows) blk: {
             const listener = try protocol.listenAddress(io, .tcp, "127.0.0.1:0");
             const addr = try std.fmt.allocPrint(
                 allocator,
@@ -247,8 +261,8 @@ pub const Worker = struct {
             errdefer allocator.free(addr);
             break :blk protocol.Listener{ .server = listener, .addr = addr };
         } else try createListener(io, .unix, effective_runtime_dir, "wsetup.sock", "", &path_buf);
-        defer setup.server.deinit(io);
-        // Windows setup sockets are TCP — there is no socket file to delete.
+        defer if (!setup_is_connection) setup.server.deinit(io);
+        // Windows setup sockets (pipe or TCP) have no socket file to delete.
         defer if (builtin.os.tag != .windows) Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
         defer if (builtin.os.tag == .windows) allocator.free(setup.addr);
         // The paths are embedded in Julia source below, where a `\` starts an
@@ -346,7 +360,7 @@ pub const Worker = struct {
                 .pgid = if (builtin.os.tag == .windows) null else 0,
             });
         }
-        const socket = if (builtin.os.tag == .windows) blk: {
+        const socket = if (setup_is_connection) blk: {
             // Pipe transport: blocking accept on the (unassociated) pipe
             // listener — Event-wait, no IOCP/APC entanglement at spawn time.
             try platform.acceptPipeSync(setup.server.socket.handle);

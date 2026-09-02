@@ -281,6 +281,46 @@ fn issueAcceptWait(listener: HANDLE) !*AcceptWait {
     return aw;
 }
 
+/// Pend FSCTL.PIPE.LISTEN on a fresh named-pipe instance (pipe transport).
+/// On completion the instance handle IS the connected pipe.
+const PipeListenCtx = extern struct {
+    iosb: win32.IO_STATUS_BLOCK,
+    handle: posix.fd_t,
+};
+
+/// Create a fresh pipe instance + pend LISTEN (each completed LISTEN consumes
+/// its instance, so re-arms create new ones). Fatal failure → null.
+fn armPipeListen(iocp: HANDLE, name: []const u8) ?*PipeListenCtx {
+    const handle = platform.listenPipe(name) catch |err| {
+        std.debug.print("Fatal: failed to create pipe listener: {}\n", .{err});
+        return null;
+    };
+    // Port-associate BEFORE pending the LISTEN — CreateIoCompletionPort is
+    // the KERNEL association (completion routing); markAssociated is only
+    // the userspace registry for sync-op dispatch. Both are required: the
+    // registry alone leaves the LISTEN completion undeliverable (no event,
+    // no APC, no port) and the instance deaf.
+    if (win32ext.CreateIoCompletionPort(handle, iocp, accept_key, 0) == null) {
+        win32.CloseHandle(handle);
+        std.debug.print("Fatal: failed to associate pipe listener with IOCP\n", .{});
+        return null;
+    }
+    win32ext.markAssociated(handle);
+    const ctx = std.heap.page_allocator.create(PipeListenCtx) catch {
+        win32.CloseHandle(handle);
+        std.debug.print("Fatal: pipe listen ctx alloc failed\n", .{});
+        return null;
+    };
+    ctx.* = .{ .iosb = undefined, .handle = handle };
+    win32ext.issuePipeListen(handle, &ctx.iosb) catch |err| {
+        std.debug.print("Fatal: failed to queue pipe listen: {}\n", .{err});
+        win32.CloseHandle(handle);
+        std.heap.page_allocator.destroy(ctx);
+        return null;
+    };
+    return ctx;
+}
+
 /// Queue the ACCEPT half for an indicated connection. `aw` (the completed
 /// WAIT_FOR_LISTEN ctx) is freed here; the child handle rides in the op ctx
 /// until the ACCEPT completes.
@@ -346,14 +386,16 @@ fn issueAcceptOp(listener: HANDLE, aw: *AcceptWait) !*AcceptOp {
 pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     const iocp: HANDLE = conductor.event_loop.iocp;
 
-    // Associate the listener under the accept key: both accept phases
-    // (WAIT_FOR_LISTEN, AFD.ACCEPT) are issued port-routed.
+    // Associate the listener under the accept key: both transports
+    // (pipe: FSCTL.PIPE.LISTEN; tcp: WAIT_FOR_LISTEN + AFD.ACCEPT) are issued
+    // port-routed from here.
     const listener = server.socket.handle;
     if (win32ext.CreateIoCompletionPort(listener, iocp, accept_key, 0) == null) {
         std.debug.print("Fatal: failed to associate listener with IOCP\n", .{});
         return;
     }
-    win32ext.markAssociated(listener, .afd);
+    win32ext.markAssociated(listener);
+    const pipe_transport = conductor.cfg.transport == .unix;
 
     const pressure_active = conductor.pressure_monitor.active();
     const ping_timeout_ms = conductor.cfg.ping_timeout * 1000;
@@ -379,9 +421,29 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         );
     }
 
-    // Queue the first WAIT_FOR_LISTEN.
-    var pending_wait: ?*AcceptWait = armAcceptWait(listener) orelse return;
+    // Initial accept arming, per transport: pipes pend a single
+    // FSCTL.PIPE.LISTEN on the createServer instance (each completed LISTEN
+    // turns that instance into a connection, so every re-arm creates a fresh
+    // instance); sockets use the two-phase WFL/ACCEPT machinery on one
+    // long-lived listener handle.
+    var pending_wait: ?*AcceptWait = null;
     var pending_accept: ?*AcceptOp = null;
+    var pending_pipe_listen: ?*PipeListenCtx = null;
+    if (pipe_transport) {
+        const ctx = std.heap.page_allocator.create(PipeListenCtx) catch {
+            std.debug.print("Fatal: pipe listen ctx alloc failed\n", .{});
+            return;
+        };
+        ctx.* = .{ .iosb = undefined, .handle = listener };
+        win32ext.issuePipeListen(listener, &ctx.iosb) catch |err| {
+            std.debug.print("Fatal: failed to queue pipe listen: {}\n", .{err});
+            std.heap.page_allocator.destroy(ctx);
+            return;
+        };
+        pending_pipe_listen = ctx;
+    } else {
+        pending_wait = armAcceptWait(listener) orelse return;
+    }
 
     while (true) {
         var bytes: DWORD = 0;
@@ -462,43 +524,80 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         }
 
         if (key == accept_key) {
-            // Two phases share this key (same handle). The packet's
-            // lpOverlapped token — pointer-compared against the pending
-            // slots — identifies the phase. No other ops touch the
-            // associated listener, so anything else is impossible.
-            if (pending_wait != null and
-                ovl == @as(?*win32ext.OVERLAPPED, @ptrCast(pending_wait.?)))
-            {
-                // WAIT_FOR_LISTEN completed: open the child, queue the ACCEPT.
-                const aw = pending_wait.?;
-                pending_wait = null;
-                defer std.heap.page_allocator.destroy(aw);
-                if (aw.iosb.u.Status == .SUCCESS) {
-                    pending_accept = issueAcceptOp(listener, aw) catch |err| {
-                        std.debug.print("Accept: op queue failed: {}\n", .{err});
-                        pending_wait = armAcceptWait(listener) orelse return;
-                        continue;
+            if (pipe_transport) {
+                // Pipe accept: single phase — the LISTENed handle IS the
+                // connection. Re-arm (fresh instance + LISTEN) BEFORE
+                // dispatching, so a new client can connect while we serve.
+                const ctx: *PipeListenCtx = @ptrCast(@alignCast(ovl orelse continue));
+                const expected: ?*win32ext.OVERLAPPED = if (pending_pipe_listen) |p| @ptrCast(p) else null;
+                if (ovl != expected) continue; // stray
+                pending_pipe_listen = null;
+                defer std.heap.page_allocator.destroy(ctx);
+                if (ctx.iosb.u.Status == .SUCCESS) {
+                    // Release the name slot BEFORE creating the next instance:
+                    // a server create of the same name fails ACCESS_DENIED
+                    // while the previous instance's handle is still open (the
+                    // previous handle holds rights the new create's share mode
+                    // cannot cover). The connection survives via a dup.
+                    const conn = platform.dupHandle(ctx.handle) catch |err| {
+                        std.debug.print("Fatal: pipe conn dup failed: {}\n", .{err});
+                        platform.close(ctx.handle);
+                        return;
                     };
-                } else {
-                    pending_wait = armAcceptWait(listener) orelse return;
-                }
-            } else if (pending_accept != null and
-                ovl == @as(?*win32ext.OVERLAPPED, @ptrCast(pending_accept.?)))
-            {
-                // AFD.ACCEPT completed: connection is fully ours to handle.
-                const op = pending_accept.?;
-                pending_accept = null;
-                defer std.heap.page_allocator.destroy(op);
-                defer win32.CloseHandle(op.child);
-                if (op.iosb.u.Status == .SUCCESS) {
+                    platform.close(ctx.handle);
+                    pending_pipe_listen = armPipeListen(iocp, conductor.cfg.socket_path) orelse {
+                        platform.close(conn);
+                        return;
+                    };
+                    std.debug.print("[conductor] pipe connection accepted, dispatching\n", .{}); // debug:
                     const peer = main.PeerInfo{};
-                    conductor.handleConnectionFd(op.child, &peer) catch |err| {
+                    conductor.handleConnectionFd(conn, &peer) catch |err| {
                         std.debug.print("Client handling failed: {}\n", .{err});
                     };
+                    platform.close(conn);
                     pool_changed = true;
+                } else {
+                    pending_pipe_listen = armPipeListen(iocp, conductor.cfg.socket_path) orelse return;
                 }
-                // Re-arm the listen phase for the next connection.
-                pending_wait = armAcceptWait(listener) orelse return;
+            } else {
+                // Two phases share this key (same handle). The packet's
+                // lpOverlapped token — pointer-compared against the pending
+                // slots — identifies the phase. No other ops touch the
+                // associated listener, so anything else is impossible.
+                if (pending_wait != null and
+                    ovl == @as(?*win32ext.OVERLAPPED, @ptrCast(pending_wait.?)))
+                {
+                    // WAIT_FOR_LISTEN completed: open the child, queue the ACCEPT.
+                    const aw = pending_wait.?;
+                    pending_wait = null;
+                    defer std.heap.page_allocator.destroy(aw);
+                    if (aw.iosb.u.Status == .SUCCESS) {
+                        pending_accept = issueAcceptOp(listener, aw) catch |err| {
+                            std.debug.print("Accept: op queue failed: {}\n", .{err});
+                            pending_wait = armAcceptWait(listener) orelse return;
+                            continue;
+                        };
+                    } else {
+                        pending_wait = armAcceptWait(listener) orelse return;
+                    }
+                } else if (pending_accept != null and
+                    ovl == @as(?*win32ext.OVERLAPPED, @ptrCast(pending_accept.?)))
+                {
+                    // AFD.ACCEPT completed: connection is fully ours to handle.
+                    const op = pending_accept.?;
+                    pending_accept = null;
+                    defer std.heap.page_allocator.destroy(op);
+                    defer win32.CloseHandle(op.child);
+                    if (op.iosb.u.Status == .SUCCESS) {
+                        const peer = main.PeerInfo{};
+                        conductor.handleConnectionFd(op.child, &peer) catch |err| {
+                            std.debug.print("Client handling failed: {}\n", .{err});
+                        };
+                        pool_changed = true;
+                    }
+                    // Re-arm the listen phase for the next connection.
+                    pending_wait = armAcceptWait(listener) orelse return;
+                }
             }
             continue;
         } else switch (@as(EventLocation, @enumFromInt(key))) {
@@ -619,8 +718,8 @@ fn queuePing(
         w.ping_pending = false;
         return;
     }
-    win32ext.markAssociated(w.socket, .afd);
-    const pr = win32ext.issueAfdRecv(w.socket, &w.pong_buf) catch {
+    win32ext.markAssociated(w.socket);
+    const pr = win32ext.issueAfdRecv(w.socket, &w.pong_buf) orelse {
         w.ping_pending = false;
         return;
     };
