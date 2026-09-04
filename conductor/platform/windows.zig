@@ -188,7 +188,7 @@ fn waitForApcOrAlert() void {
 /// data IOCTLS, opaque for others).
 pub fn syncAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: []u8) !usize {
     // Associated handles reject APC delivery — route via the Event+token path.
-    if (associated.contains(@intFromPtr(h)))
+    if (isAssociated(h))
         return syncViaPort(h, code, in, if (out.len > 0) out.ptr else null, out.len);
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     var done = false;
@@ -300,14 +300,6 @@ var registry_lock: win32.SRWLOCK = win32.SRWLOCK_INIT;
 pub extern "kernel32" fn AcquireSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
 pub extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
 
-// Sync-op event, per thread. Sync ops run on multiple threads (event loop,
-// client stdin helper, console-control handler); a shared auto-reset Event
-// would cross-signal between threads — one thread returns from
-// WaitForSingleObject while its IRP is still in flight and reads a
-// half-written iosb. One CreateEventW per thread; every thread here is
-// long-lived.
-threadlocal var g_sync_event: ?HANDLE = null;
-
 /// The kernel-object kind of `fd` (set at creation by our primitives; handles
 /// created by std.Io default to `.afd` at the dispatch sites).
 pub fn handleKind(fd: posix.fd_t) ?HandleKind {
@@ -341,11 +333,11 @@ pub extern "kernel32" fn CreateEventW(lpEventAttributes: ?*anyopaque, bManualRes
 const WAIT_FAILED: DWORD = 0xFFFFFFFF;
 
 fn ensureEvent() !HANDLE {
-    if (g_sync_event) |ev| return ev;
-    // Auto-reset: each completed sync op wakes exactly one waiter.
-    const ev = CreateEventW(null, 0, 0, null) orelse return error.EventCreateFailed;
-    g_sync_event = ev;
-    return ev;
+    // One auto-reset event per synchronous operation. The binaries use
+    // -fsingle-threaded even though they create helper/control-handler threads;
+    // Zig therefore treats threadlocal variables as globals. Reusing one event
+    // would let those threads wake each other and read the wrong iosb.
+    return CreateEventW(null, 0, 0, null) orelse error.EventCreateFailed;
 }
 
 /// Remove one completed sync-op token from the registry. Returns true if
@@ -371,6 +363,7 @@ fn syncViaPort(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out
     errdefer std.heap.page_allocator.destroy(tok);
     tok.* = .{ .iosb = undefined };
     const ev = try ensureEvent();
+    defer win32.CloseHandle(ev);
     // Register before issuing: the packet can land in the port (and be
     // reaped) as soon as the IRP completes.
     AcquireSRWLockExclusive(&registry_lock);
@@ -728,6 +721,7 @@ fn pipeSyncOp(h: posix.fd_t, read: bool, buf: []const u8) !usize {
     const tok = try std.heap.page_allocator.create(IoStatusToken);
     tok.* = .{ .iosb = undefined };
     const ev = try ensureEvent();
+    defer win32.CloseHandle(ev);
     AcquireSRWLockExclusive(&registry_lock);
     const is_assoc = associated.contains(@intFromPtr(h));
     var registered = false;
@@ -806,6 +800,7 @@ pub fn pipeAsStream(handle: posix.fd_t) std.Io.net.Stream {
 pub fn acceptPipeSync(h: posix.fd_t) !void {
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = try ensureEvent();
+    defer win32.CloseHandle(ev);
     switch (ntdll.NtFsControlFile(h, ev, null, null, &iosb, win32.CTL_CODE.PIPE.LISTEN, null, 0, null, 0)) {
         .SUCCESS => {},
         .PENDING => {
@@ -867,7 +862,7 @@ fn afdRecv(h: HANDLE, buf: []u8) !usize {
 /// Issue one data IOCTL, wait for APC completion, map status → byte count.
 fn dataTransferAfd(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out_len: usize) !usize {
     // Associated handles reject APC delivery — route via the Event+token path.
-    if (associated.contains(@intFromPtr(h)))
+    if (isAssociated(h))
         return syncViaPort(h, code, in, out, out_len);
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     var done = false;

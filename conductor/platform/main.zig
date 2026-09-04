@@ -101,8 +101,8 @@ pub const setWorkerExecuting = if (os != .windows) shared.setWorkerExecuting els
 // Client console configuration (VT processing + UTF-8 codepages). POSIX
 // consoles need none of it — terminals decode UTF-8 and ANSI natively.
 pub const setupConsoleIo = if (os == .windows) impl.setupConsoleIo else struct {
-    fn f() noreturn {
-        @compileError("windows only");
+    fn f(_: std.posix.fd_t, _: std.posix.fd_t) ?*anyopaque {
+        return null;
     }
 }.f;
 pub const restoreConsoleIo = if (os == .windows) impl.restoreConsoleIo else struct {

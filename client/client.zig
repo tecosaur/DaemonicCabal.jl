@@ -573,10 +573,11 @@ fn notifyExit() void {
     platform.socketWrite(stream.socket.handle, &buf);
 }
 
-/// Signal-handler-safe interrupt notification using raw POSIX syscalls.
-/// Connects to the conductor, sends a client_interrupt notification, and closes.
-/// Uses raw syscalls (not std.Io) to avoid corrupting io_uring state.
-/// Silently returns on any error — the \x03 stdin path provides the fallback.
+/// Interrupt notification without std.Io: raw sockets on POSIX, native named
+/// pipes on Windows. Connects to the conductor, sends client_interrupt, and
+/// closes. POSIX needs signal-safe syscalls; Windows invokes this on a separate
+/// console-handler thread. Silently returns on error — the \x03 stdin path is
+/// the prompt-mode fallback.
 fn notifyInterruptRaw() void {
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
@@ -584,6 +585,16 @@ fn notifyInterruptRaw() void {
     std.mem.writeInt(u32, buf[5..9], @intCast(platform.getpid()), .little);
     switch (transport_mode) {
         .unix => {
+            // On Windows, path-addressed local transport is a named pipe, not
+            // AF_UNIX. The console handler runs on its own thread, so the
+            // synchronous native pipe primitive is safe here (unlike std.Io's
+            // global single-threaded context).
+            if (comptime builtin.os.tag == .windows) {
+                const fd = platform.connectPipe(conductor_path) catch return;
+                defer platform.rawClose(fd);
+                platform.socketWrite(fd, &buf);
+                return;
+            }
             const fd = platform.rawSocket(posix.AF.UNIX, posix.SOCK.STREAM) orelse return;
             defer platform.rawClose(fd);
             var addr = std.mem.zeroes(posix.sockaddr.un);
