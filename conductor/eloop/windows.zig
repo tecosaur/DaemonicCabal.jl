@@ -427,6 +427,10 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     var pending_accept: ?*AcceptOp = null;
     var pending_pipe_listen: ?*PipeListenCtx = null;
     if (pipe_transport) {
+        // The initial ctx BORROWS the server's listener handle (owned by
+        // Conductor.run, which skips server.deinit for this transport).
+        // Its accept-path close below is therefore the handle's only close.
+        // Every re-arm creates a fresh ctx-OWNED instance.
         const ctx = std.heap.page_allocator.create(PipeListenCtx) catch {
             std.debug.print("Fatal: pipe listen ctx alloc failed\n", .{});
             return;
@@ -536,6 +540,10 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     // while the previous instance's handle is still open (the
                     // previous handle holds rights the new create's share mode
                     // cannot cover). The connection survives via a dup.
+                    // This close is the handle's only close: the initial ctx
+                    // borrowed the server's listener (server.deinit skipped
+                    // for this transport — see Conductor.run), re-arms own
+                    // their handles.
                     const conn = platform.dupHandle(ctx.handle) catch |err| {
                         std.debug.print("Fatal: pipe conn dup failed: {}\n", .{err});
                         platform.close(ctx.handle);

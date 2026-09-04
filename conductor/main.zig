@@ -305,7 +305,13 @@ pub const Conductor = struct {
             Io.Dir.deleteFileAbsolute(self.io, g_pid_path) catch {};
         };
         var server = try self.createServer();
-        defer server.deinit(self.io);
+        // Pipe transport (Windows): the eloop's accept path CONSUMES the
+        // listening handle — a completed FSCTL.PIPE.LISTEN turns the instance
+        // into the connection, and the accept path closes it after duping.
+        // A deinit here would CloseHandle a stale (recyclable) value.
+        // POSIX transports and Windows-TCP deinit normally.
+        defer if (!(builtin.os.tag == .windows and self.cfg.transport == .unix))
+            server.deinit(self.io);
         // Unix transport cleans up the socket file; on Windows the transport
         // is a named pipe — the object vanishes with the handle.
         defer if (self.cfg.transport == .unix and builtin.os.tag != .windows) {
