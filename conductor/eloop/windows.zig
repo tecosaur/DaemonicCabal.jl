@@ -298,20 +298,20 @@ fn armPipeListen(iocp: HANDLE, name: []const u8) ?*PipeListenCtx {
     // registry alone leaves the LISTEN completion undeliverable (no event,
     // no APC, no port) and the instance deaf.
     if (win32ext.CreateIoCompletionPort(handle, iocp, accept_key, 0) == null) {
-        win32.CloseHandle(handle);
+        platform.close(handle);
         std.debug.print("Fatal: failed to associate pipe listener with IOCP\n", .{});
         return null;
     }
     win32ext.markAssociated(handle);
     const ctx = std.heap.page_allocator.create(PipeListenCtx) catch {
-        win32.CloseHandle(handle);
+        platform.close(handle);
         std.debug.print("Fatal: pipe listen ctx alloc failed\n", .{});
         return null;
     };
     ctx.* = .{ .iosb = undefined, .handle = handle };
     win32ext.issuePipeListen(handle, &ctx.iosb) catch |err| {
         std.debug.print("Fatal: failed to queue pipe listen: {}\n", .{err});
-        win32.CloseHandle(handle);
+        platform.close(handle);
         std.heap.page_allocator.destroy(ctx);
         return null;
     };
@@ -325,7 +325,7 @@ fn issueAcceptOp(listener: HANDLE, aw: *AcceptWait) !*AcceptOp {
     const family: posix.sa_family_t =
         std.mem.readInt(u16, aw.response.addr_bytes[0..2], .little);
     const child = try win32ext.openAfdEndpoint(family);
-    errdefer win32.CloseHandle(child);
+    errdefer platform.close(child);
     const op = try std.heap.page_allocator.create(AcceptOp);
     errdefer std.heap.page_allocator.destroy(op);
     op.* = .{
@@ -592,7 +592,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     const op = pending_accept.?;
                     pending_accept = null;
                     defer std.heap.page_allocator.destroy(op);
-                    defer win32.CloseHandle(op.child);
+                    defer platform.close(op.child);
                     if (op.iosb.u.Status == .SUCCESS) {
                         const peer = main.PeerInfo{};
                         conductor.handleConnectionFd(op.child, &peer) catch |err| {

@@ -291,6 +291,15 @@ pub const HandleKind = enum { afd, pipe };
 var handle_kinds: std.AutoHashMapUnmanaged(usize, HandleKind) = .empty;
 var associated: std.AutoHashMapUnmanaged(usize, void) = .empty;
 var sync_tokens: std.AutoHashMapUnmanaged(usize, *IoStatusToken) = .empty;
+
+// Registry lock: these maps are touched from multiple threads (event loop,
+// client stdin helper, console-control handler) — e.g. the client's stdin
+// thread closes its socket on EOF while the loop thread marks associations.
+// SRWLOCK: pointer-sized, zero-initialized, no init call.
+var registry_lock: win32.SRWLOCK = win32.SRWLOCK_INIT;
+pub extern "kernel32" fn AcquireSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
+pub extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
+
 // Sync-op event, per thread. Sync ops run on multiple threads (event loop,
 // client stdin helper, console-control handler); a shared auto-reset Event
 // would cross-signal between threads — one thread returns from
@@ -302,12 +311,16 @@ threadlocal var g_sync_event: ?HANDLE = null;
 /// The kernel-object kind of `fd` (set at creation by our primitives; handles
 /// created by std.Io default to `.afd` at the dispatch sites).
 pub fn handleKind(fd: posix.fd_t) ?HandleKind {
+    AcquireSRWLockExclusive(&registry_lock);
+    defer ReleaseSRWLockExclusive(&registry_lock);
     return handle_kinds.get(@intFromPtr(fd));
 }
 
 /// Mark `fd` as port-associated (its async completions land in the loop's
 /// port; sync ops then go through the Event+token path).
 pub fn markAssociated(fd: posix.fd_t) void {
+    AcquireSRWLockExclusive(&registry_lock);
+    defer ReleaseSRWLockExclusive(&registry_lock);
     associated.put(std.heap.page_allocator, @intFromPtr(fd), {}) catch {};
 }
 
@@ -315,6 +328,8 @@ pub fn markAssociated(fd: posix.fd_t) void {
 /// port exactly once until closed (CreateIoCompletionPort then fails with
 /// INVALID_PARAMETER) — callers gate association on this.
 pub fn isAssociated(fd: posix.fd_t) bool {
+    AcquireSRWLockExclusive(&registry_lock);
+    defer ReleaseSRWLockExclusive(&registry_lock);
     return associated.contains(@intFromPtr(fd));
 }
 
@@ -337,8 +352,11 @@ fn ensureEvent() !HANDLE {
 /// `ovl` belonged to a syncViaPort operation (the event loop should then
 /// ignore the packet — the result was already consumed via the Event).
 pub fn reapSyncOp(ovl: *OVERLAPPED) bool {
-    if (sync_tokens.fetchRemove(@intFromPtr(ovl))) |kv| {
-        std.heap.page_allocator.destroy(kv.value);
+    AcquireSRWLockExclusive(&registry_lock);
+    const kv = sync_tokens.fetchRemove(@intFromPtr(ovl));
+    ReleaseSRWLockExclusive(&registry_lock);
+    if (kv) |entry| {
+        std.heap.page_allocator.destroy(entry.value);
         return true;
     }
     return false;
@@ -355,7 +373,12 @@ fn syncViaPort(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out
     const ev = try ensureEvent();
     // Register before issuing: the packet can land in the port (and be
     // reaped) as soon as the IRP completes.
-    try sync_tokens.put(std.heap.page_allocator, @intFromPtr(&tok.iosb), tok);
+    AcquireSRWLockExclusive(&registry_lock);
+    sync_tokens.put(std.heap.page_allocator, @intFromPtr(&tok.iosb), tok) catch {
+        ReleaseSRWLockExclusive(&registry_lock);
+        return error.OutOfMemory;
+    };
+    ReleaseSRWLockExclusive(&registry_lock);
     switch (ntdll.NtDeviceIoControlFile(
         h,
         ev,
@@ -370,12 +393,22 @@ fn syncViaPort(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out
     )) {
         .SUCCESS, .PENDING => {},
         else => |status| {
+            AcquireSRWLockExclusive(&registry_lock);
             _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
+            ReleaseSRWLockExclusive(&registry_lock);
             return win32.unexpectedStatus(status);
         },
     }
-    if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED)
+    if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED) {
+        // Deregister BEFORE the errdefer destroys the token — a dangling
+        // registry entry would make reapSyncOp free it again. (A failed wait
+        // on our own valid event is effectively unreachable; if the packet
+        // already landed, the stray guards in the loops ignore it.)
+        AcquireSRWLockExclusive(&registry_lock);
+        _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
+        ReleaseSRWLockExclusive(&registry_lock);
         return error.EventWaitFailed;
+    }
     switch (tok.iosb.u.Status) {
         // Peer close / reset read as EOF-0 — same contract as dataTransferAfd.
         .SUCCESS => return tok.iosb.Information,
@@ -563,6 +596,8 @@ pub fn listenPipe(name: []const u8) !posix.fd_t {
         null,
     ) orelse return error.PipeCreateFailed;
     errdefer win32.CloseHandle(handle);
+    AcquireSRWLockExclusive(&registry_lock);
+    defer ReleaseSRWLockExclusive(&registry_lock);
     handle_kinds.put(std.heap.page_allocator, @intFromPtr(handle), .pipe) catch {};
     return handle;
 }
@@ -625,7 +660,9 @@ pub fn connectPipe(name: []const u8) !posix.fd_t {
         0,
     )) {
         .SUCCESS => {
+            AcquireSRWLockExclusive(&registry_lock);
             handle_kinds.put(std.heap.page_allocator, @intFromPtr(handle), .pipe) catch {};
+            ReleaseSRWLockExclusive(&registry_lock);
             return handle;
         },
         .PIPE_BUSY, .OBJECT_NAME_NOT_FOUND => {}, // instance not up yet — retry
@@ -634,50 +671,6 @@ pub fn connectPipe(name: []const u8) !posix.fd_t {
         Sleep(50); // ~10s total retry budget
     }
     return error.PipeConnectTimeout;
-}
-
-/// Issue one port-routed NtReadFile; the token doubles as the op context.
-pub fn issuePipeRecv(h: posix.fd_t, buf: []u8) !*IoStatusToken {
-    const tok = try std.heap.page_allocator.create(IoStatusToken);
-    errdefer std.heap.page_allocator.destroy(tok);
-    tok.* = .{ .iosb = undefined };
-    switch (ntdll.NtReadFile(
-        h,
-        null,
-        null,
-        @ptrCast(&tok.iosb),
-        &tok.iosb,
-        buf.ptr,
-        @intCast(buf.len),
-        null,
-        null,
-    )) {
-        .SUCCESS, .PENDING => {},
-        else => |status| return win32.unexpectedStatus(status),
-    }
-    return tok;
-}
-
-/// Issue one port-routed NtWriteFile (fire-and-forget writes).
-pub fn issuePipeSend(h: posix.fd_t, bytes: []const u8) !*IoStatusToken {
-    const tok = try std.heap.page_allocator.create(IoStatusToken);
-    errdefer std.heap.page_allocator.destroy(tok);
-    tok.* = .{ .iosb = undefined };
-    switch (ntdll.NtWriteFile(
-        h,
-        null,
-        null,
-        @ptrCast(&tok.iosb),
-        &tok.iosb,
-        @ptrCast(bytes.ptr),
-        @intCast(bytes.len),
-        null,
-        null,
-    )) {
-        .SUCCESS, .PENDING => {},
-        else => |status| return win32.unexpectedStatus(status),
-    }
-    return tok;
 }
 
 /// Query the named-pipe state of a handle (debug): 1=disconnected, 2=listening,
@@ -715,6 +708,8 @@ pub fn dupHandle(h: posix.fd_t) !posix.fd_t {
     var out: win32.HANDLE = undefined;
     if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &out, 0, win32.BOOL.FALSE, DUPLICATE_SAME_ACCESS).toBool())
         return error.DuplicateHandleFailed;
+    AcquireSRWLockExclusive(&registry_lock);
+    defer ReleaseSRWLockExclusive(&registry_lock);
     if (handle_kinds.get(@intFromPtr(h))) |kind|
         handle_kinds.put(std.heap.page_allocator, @intFromPtr(out), kind) catch {};
     return out;
@@ -724,36 +719,66 @@ extern "kernel32" fn GetCurrentProcess() HANDLE;
 extern "kernel32" fn DuplicateHandle(hSourceProcessHandle: HANDLE, hSourceHandle: HANDLE, hTargetProcessHandle: HANDLE, lpTargetHandle: *HANDLE, dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwOptions: DWORD) BOOL;
 const DUPLICATE_SAME_ACCESS: DWORD = 2;
 
-/// Synchronous read/write for ASSOCIATED pipe handles (Event + token, reaped
-/// by the event loop) — pipe handles reject APC-routed I/O just like AFD.
+/// Synchronous read/write for pipe handles. Associated handles go Event +
+/// token (reaped by the event loop); unassociated ones are private to the
+/// caller — the token is destroyed here on every exit. No errdefer: ownership
+/// differs by path (associated tokens live in the registry for reapSyncOp,
+/// private tokens are ours), so each exit disposes explicitly.
 fn pipeSyncOp(h: posix.fd_t, read: bool, buf: []const u8) !usize {
     const tok = try std.heap.page_allocator.create(IoStatusToken);
-    errdefer std.heap.page_allocator.destroy(tok);
     tok.* = .{ .iosb = undefined };
     const ev = try ensureEvent();
+    AcquireSRWLockExclusive(&registry_lock);
     const is_assoc = associated.contains(@intFromPtr(h));
-    if (is_assoc) try sync_tokens.put(std.heap.page_allocator, @intFromPtr(&tok.iosb), tok);
+    var registered = false;
+    if (is_assoc) {
+        registered = true;
+        sync_tokens.put(std.heap.page_allocator, @intFromPtr(&tok.iosb), tok) catch {
+            registered = false;
+        };
+    }
+    ReleaseSRWLockExclusive(&registry_lock);
+    if (is_assoc and !registered) {
+        std.heap.page_allocator.destroy(tok);
+        return error.OutOfMemory;
+    }
     const stat = if (read)
         ntdll.NtReadFile(h, ev, null, @ptrCast(&tok.iosb), &tok.iosb, @ptrCast(@constCast(buf.ptr)), @intCast(buf.len), null, null)
     else
         ntdll.NtWriteFile(h, ev, null, @ptrCast(&tok.iosb), &tok.iosb, @ptrCast(buf.ptr), @intCast(buf.len), null, null);
     switch (stat) {
         .SUCCESS, .PENDING => {},
-        else => |status| {
-            if (!is_assoc) std.heap.page_allocator.destroy(tok);
+        else => {
+            // No IRP in flight after a synchronous failure — deregister, then
+            // we own the token again.
+            AcquireSRWLockExclusive(&registry_lock);
             _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
-            return win32.unexpectedStatus(status);
+            ReleaseSRWLockExclusive(&registry_lock);
+            std.heap.page_allocator.destroy(tok);
+            return win32.unexpectedStatus(stat);
         },
     }
-    if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED)
+    if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED) {
+        // See syncViaPort: unreachable in practice (our own valid event);
+        // deregister and destroy rather than leave a dangling entry.
+        AcquireSRWLockExclusive(&registry_lock);
+        _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
+        ReleaseSRWLockExclusive(&registry_lock);
+        std.heap.page_allocator.destroy(tok);
         return error.EventWaitFailed;
+    }
     const result: usize = switch (tok.iosb.u.Status) {
         .SUCCESS => tok.iosb.Information,
         // Disconnect statuses → EOF-0 (pipe dialect: PIPE_BROKEN et al).
+        // Success-like: the packet landed, so an associated token stays
+        // registered for reapSyncOp.
         .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => 0,
-        else => |status| {
-            if (!is_assoc) std.heap.page_allocator.destroy(tok);
-            return win32.unexpectedStatus(status);
+        else => {
+            AcquireSRWLockExclusive(&registry_lock);
+            _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
+            ReleaseSRWLockExclusive(&registry_lock);
+            std.heap.page_allocator.destroy(tok);
+            return win32.unexpectedStatus(tok.iosb.u.Status);
         },
     };
     if (!is_assoc) std.heap.page_allocator.destroy(tok);
@@ -1020,9 +1045,11 @@ pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.sockle
 }
 
 // → CloseHandle — our sockets are plain HANDLEs (AFD endpoints), so there is
-// no closesocket distinction at all.
+// no closesocket distinction at all. Routes through close() so the registry
+// (handle_kinds / associated) is cleaned up too — stale entries would
+// misroute a recycled handle value.
 pub fn rawClose(fd: posix.fd_t) void {
-    win32.CloseHandle(fd);
+    close(fd);
 }
 
 // No /run/user/$UID on Windows → %LOCALAPPDATA%\julia-daemon. The env var is
@@ -1180,8 +1207,10 @@ pub fn socketRead(fd: posix.fd_t, buf: []u8) usize {
 // is just CloseHandle — no socket-vs-file dispatch needed. Kept as its own fn
 // for router symmetry with POSIX.
 pub fn close(fd: posix.fd_t) void {
+    AcquireSRWLockExclusive(&registry_lock);
     _ = associated.remove(@intFromPtr(fd));
     _ = handle_kinds.remove(@intFromPtr(fd));
+    ReleaseSRWLockExclusive(&registry_lock);
     win32.CloseHandle(fd);
 }
 
