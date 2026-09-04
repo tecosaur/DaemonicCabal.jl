@@ -56,18 +56,13 @@ pub const CTRL_SHUTDOWN_EVENT: DWORD = 6;
 
 pub const FILE_TYPE_CHAR: DWORD = 0x0002;
 pub const STILL_ACTIVE: DWORD = 259;
-pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
-pub const PROCESS_TERMINATE: DWORD = 0x0001;
-pub const PROCESS_SYNCHRONIZE: DWORD = 0x00100000;
 const WAIT_OBJECT_0: DWORD = 0x00000000;
 const WAIT_TIMEOUT: DWORD = 0x00000102;
 
-// POSIX-style pids ride around as fd_t (*anyopaque) in this codebase; real
-// Windows PIDs are DWORD — all our pids originate from CreateProcess, so
-// ptr-int roundtrip never loses bits.
-fn openProcessFor(pid: posix.pid_t, access: DWORD) ?HANDLE {
-    return OpenProcess(access, win32.BOOL.FALSE, @as(u32, @truncate(@intFromPtr(pid))));
-}
+// "Pids" in this codebase are `std.process.Child.Id` values. On Windows that
+// is the child's PROCESS HANDLE (pid_t == HANDLE in std), NOT a numeric PID —
+// use it directly for wait/terminate/stats. OpenProcess(pid) would be wrong:
+// it expects a numeric PID, and handle values are small multiples of 4.
 
 pub const HANDLER_ROUTINE = fn (dwCtrlType: DWORD) callconv(.winapi) BOOL;
 pub const PHANDLER_ROUTINE = *const HANDLER_ROUTINE;
@@ -133,7 +128,6 @@ pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *DWORD) 
 pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) BOOL;
 pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) BOOL;
 pub extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) BOOL;
-pub extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) ?HANDLE;
 pub extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) BOOL;
 pub extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) BOOL;
 pub extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) DWORD;
@@ -297,7 +291,13 @@ pub const HandleKind = enum { afd, pipe };
 var handle_kinds: std.AutoHashMapUnmanaged(usize, HandleKind) = .empty;
 var associated: std.AutoHashMapUnmanaged(usize, void) = .empty;
 var sync_tokens: std.AutoHashMapUnmanaged(usize, *IoStatusToken) = .empty;
-var g_sync_event: ?HANDLE = null;
+// Sync-op event, per thread. Sync ops run on multiple threads (event loop,
+// client stdin helper, console-control handler); a shared auto-reset Event
+// would cross-signal between threads — one thread returns from
+// WaitForSingleObject while its IRP is still in flight and reads a
+// half-written iosb. One CreateEventW per thread; every thread here is
+// long-lived.
+threadlocal var g_sync_event: ?HANDLE = null;
 
 /// The kernel-object kind of `fd` (set at creation by our primitives; handles
 /// created by std.Io default to `.afd` at the dispatch sites).
@@ -309,6 +309,13 @@ pub fn handleKind(fd: posix.fd_t) ?HandleKind {
 /// port; sync ops then go through the Event+token path).
 pub fn markAssociated(fd: posix.fd_t) void {
     associated.put(std.heap.page_allocator, @intFromPtr(fd), {}) catch {};
+}
+
+/// True if `fd` was already marked. A kernel handle can be associated with a
+/// port exactly once until closed (CreateIoCompletionPort then fails with
+/// INVALID_PARAMETER) — callers gate association on this.
+pub fn isAssociated(fd: posix.fd_t) bool {
+    return associated.contains(@intFromPtr(fd));
 }
 
 fn kindOf(fd: posix.fd_t) HandleKind {
@@ -914,18 +921,17 @@ pub fn writeFile(fd: posix.fd_t, buf: []const u8) void {
 }
 
 // No general kill(pid, sig) on Windows: every signal is TerminateProcess
-// (the always-"SIGKILL" primitive). INT deliberately ≡ TERM (option A):
-// GenerateConsoleCtrlEvent only reaches console-sharing process groups, and
-// spawned workers aren't one. USR1 has no callers on Windows (verified) —
-// no-op success. Returns 0 success / 1 failure (bsd.zig shape).
+// (the always-"SIGKILL" primitive) on the child's handle. INT deliberately ≡
+// TERM (option A): GenerateConsoleCtrlEvent only reaches console-sharing
+// process groups, and spawned workers aren't one. USR1 has no callers on
+// Windows (verified) — no-op success. Returns 0 success / 1 failure
+// (bsd.zig shape).
 pub fn kill(pid: posix.pid_t, sig: SIG) usize {
     switch (sig) {
         .KILL, .TERM, .INT => {},
         .USR1 => return 0,
     }
-    const h = openProcessFor(pid, PROCESS_TERMINATE) orelse return 1;
-    defer win32.CloseHandle(h);
-    return if (TerminateProcess(h, 1).toBool()) 0 else 1;
+    return if (TerminateProcess(pid, 1).toBool()) 0 else 1;
 }
 
 // → NtCreateFile(\Device\Afd\Endpoint): create the AFD stream endpoint that
@@ -1188,15 +1194,12 @@ pub fn getChildPid(child: anytype) DWORD {
 
 pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };
 
-// POSIX waitpid(WNOHANG) equivalent: poll the process handle with a zero
-// timeout. The POSIX impl takes a bare pid; we OpenProcess per call — same
-// order as Linux's /proc reaping cost and no pid→handle bookkeeping.
-// Process gone (open fails) reads as "exited", matching ECHILD treatment.
+// POSIX waitpid(WNOHANG) equivalent: poll the child's handle with a zero
+// timeout. The POSIX impl takes a bare pid; the handle we hold survives the
+// child's exit, so no zombie-avoidance or pid-recycling concerns. WAIT_FAILED
+// reads as "exited" (matches the POSIX impl's error tolerance).
 pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
-    const h = openProcessFor(pid, PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION) orelse
-        return .{ .pid = pid, .exited = true };
-    defer win32.CloseHandle(h);
-    const state = WaitForSingleObject(h, 0);
+    const state = WaitForSingleObject(pid, 0);
     return .{ .pid = pid, .exited = state != WAIT_TIMEOUT };
 }
 
@@ -1209,20 +1212,18 @@ fn filetimeToU64(ft: FILETIME) u64 {
 }
 
 // → GetProcessMemoryInfo (psapi) → PROCESS_MEMORY_COUNTERS_EX.WorkingSetSize
-// (RSS-equivalent) + GetProcessTimes → kernel+user seconds.
+// (RSS-equivalent) + GetProcessTimes → kernel+user seconds. `pid` is the
+// child's PROCESS handle (full access — see the pids note at the top).
 pub fn getProcessStats(pid: posix.pid_t) ?ProcessStats {
-    const h = openProcessFor(pid, PROCESS_QUERY_LIMITED_INFORMATION) orelse return null;
-    defer win32.CloseHandle(h);
-
     var pmc = std.mem.zeroes(PROCESS_MEMORY_COUNTERS_EX);
     pmc.cb = @sizeOf(PROCESS_MEMORY_COUNTERS_EX);
-    if (!GetProcessMemoryInfo(h, &pmc, pmc.cb).toBool()) return null;
+    if (!GetProcessMemoryInfo(pid, &pmc, pmc.cb).toBool()) return null;
 
     var creation: FILETIME = undefined;
     var exit_t: FILETIME = undefined;
     var kernel: FILETIME = undefined;
     var user: FILETIME = undefined;
-    if (!GetProcessTimes(h, &creation, &exit_t, &kernel, &user).toBool()) return null;
+    if (!GetProcessTimes(pid, &creation, &exit_t, &kernel, &user).toBool()) return null;
 
     const cpu_100ns: f64 = @floatFromInt(filetimeToU64(kernel) + filetimeToU64(user));
     return .{
@@ -1321,19 +1322,60 @@ pub const SignalHandler = struct {
     }
 };
 
-// → SetConsoleCtrlHandler(handler_fn, TRUE). Runs in its own kernel-spawned
-// thread — no self-pipe, no async-signal-safety, normal sync usable. Map:
-//   CTRL_C_EVENT / CTRL_BREAK_EVENT → raw: writeStdio("\x03"), cooked: notifyInterrupt()
-//   CTRL_CLOSE_EVENT / CTRL_LOGOFF_EVENT / CTRL_SHUTDOWN_EVENT → notifyExit()
-// No SIGPIPE equivalent needed (no SIGPIPE on Windows; broken-socket writes
-// fail via the AFD.SEND status).
+// Worker state tracking, mirroring posix.zig: whether the client's terminal is
+// raw (REPL reading input) and whether user code is evaluating. The console
+// handler routes on both.
+var worker_raw: bool = false;
+pub fn setWorkerRawMode(raw: bool) void {
+    worker_raw = raw;
+}
+var worker_executing: bool = false;
+pub fn setWorkerExecuting(executing: bool) void {
+    worker_executing = executing;
+}
+
+// Set once before SetConsoleCtrlHandler enables delivery — same write-once
+// invariant as posix.zig's g_signal_handler.
+var g_signal_handler: ?SignalHandler = null;
+
+// Console control handler: runs on a kernel-spawned thread (no async-
+// signal-safety constraints, normal sync usable). Mirrors posix.zig's
+// signalAction:
+//   Ctrl-C / Ctrl-Break → raw & at prompt: \x03 to worker stdin (LineEdit
+//     interrupt); otherwise notifyInterrupt (worker-side InterruptException).
+//   Close / logoff / shutdown → notifyExit, then exit 130 (shell convention
+//     for "killed by signal 2"). The console is going away; the terminal
+//     state (raw mode / codepages) needs no restore.
+// ponytail: \x03 and a stdin-thread write can interleave on the same
+// byte-mode pipe (two threads). 1-byte vs chunk corruption; acceptable until
+// proven real — same primitive the POSIX handler uses.
+fn clientCtrlHandler(dwCtrlType: DWORD) callconv(.winapi) BOOL {
+    const handler = g_signal_handler orelse return win32.BOOL.FALSE;
+    switch (dwCtrlType) {
+        CTRL_C_EVENT, CTRL_BREAK_EVENT => {
+            if (worker_raw and !worker_executing)
+                handler.writeStdio("\x03")
+            else
+                handler.notifyInterrupt();
+        },
+        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT => {
+            handler.notifyExit();
+            std.process.exit(130);
+        },
+        else => return win32.BOOL.FALSE,
+    }
+    // TRUE swallows the event: FALSE would also run the default handler,
+    // terminating the process before the interrupt/exit is delivered.
+    return win32.BOOL.TRUE;
+}
+
 pub fn registerSignalHandlers(handler: SignalHandler) void {
-    _ = handler;
+    g_signal_handler = handler;
+    _ = SetConsoleCtrlHandler(&clientCtrlHandler, win32.BOOL.TRUE);
 }
 
 // =============================================================================
 // Excluded — the router binds these inline on Windows, NOT through impl. Do
 // NOT define here; doing so would be dead code the router never reaches.
-//   - isLoopback       → main.zig inline no-op (returns true) on Windows
-//   - setWorkerRawMode → main.zig inline no-op (fn f(_: bool) void {}) on Windows
+//   - isLoopback → main.zig inline no-op (returns true) on Windows
 // =============================================================================

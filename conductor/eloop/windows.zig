@@ -147,11 +147,8 @@ fn scheduleTimer(iocp: HANDLE, key: usize, delay_ms: u64) void {
     _ = CreateTimerQueueTimer(&ctx.timer, null, &iocpTimerCallback, ctx, dueTimeRelMs(delay_ms), 0, WT_EXECUTEDEFAULT);
 }
 
-// todo: overflows check.
-// ponytail: @intCast(ms) to i32 panics above ~214,748 ms (~36 min); current
-// callers pass seconds-scale delays. Clamp if long delays ever matter.
 fn dueTimeRelMs(ms: u64) DWORD {
-    return @bitCast(-@as(i32, @intCast(ms)) * 10_000);
+    return @intCast(@min(ms, std.math.maxInt(u32)));
 }
 
 // =============================================================================
@@ -702,7 +699,7 @@ fn handlePongTimeout(conductor: *Conductor, w: *worker.Worker) void {
 
 // Ping cycle, IOCP edition. sendPing() already pushes the header synchronously
 // via platform.write (as in POSIX); then associate the socket with our port
-// (first ping does it; later calls are harmless re-associations) and issue the
+// (first ping only — isAssociated guard) and issue the
 // overlapped pong RECEIVE keyed by @intFromPtr(w), paired with a one-shot
 // timeout under the SAME key — the dispatcher tells them apart by ovl being
 // our AfdRecvCtx iosb (data) vs null (timer post). All failure paths reset
@@ -714,11 +711,16 @@ fn queuePing(
     timeout_ms: u64,
 ) void {
     w.sendPing();
-    if (win32ext.CreateIoCompletionPort(w.socket, iocp, @intFromPtr(w), 0) == null) {
-        w.ping_pending = false;
-        return;
+    // Associate on the FIRST ping only: a handle can join a completion port
+    // exactly once until closed — a second CreateIoCompletionPort fails with
+    // INVALID_PARAMETER, which previously abandoned every subsequent ping.
+    if (!win32ext.isAssociated(w.socket)) {
+        if (win32ext.CreateIoCompletionPort(w.socket, iocp, @intFromPtr(w), 0) == null) {
+            w.ping_pending = false;
+            return;
+        }
+        win32ext.markAssociated(w.socket);
     }
-    win32ext.markAssociated(w.socket);
     const pr = win32ext.issueAfdRecv(w.socket, &w.pong_buf) orelse {
         w.ping_pending = false;
         return;

@@ -96,38 +96,52 @@ pub const setRawMode = if (os != .windows) shared.setRawModeStdin else struct {
         impl.setRawMode(impl.getStdinHandle(), raw);
     }
 }.f;
-pub const setWorkerRawMode = if (os != .windows) shared.setWorkerRawMode else struct {
-    fn f(_: bool) void {}
-}.f;
-pub const setWorkerExecuting = if (os != .windows) shared.setWorkerExecuting else struct {
-    fn f(_: bool) void {}
-}.f;
+pub const setWorkerRawMode = if (os != .windows) shared.setWorkerRawMode else impl.setWorkerRawMode;
+pub const setWorkerExecuting = if (os != .windows) shared.setWorkerExecuting else impl.setWorkerExecuting;
 // Client console configuration (VT processing + UTF-8 codepages). POSIX
 // consoles need none of it — terminals decode UTF-8 and ANSI natively.
 pub const setupConsoleIo = if (os == .windows) impl.setupConsoleIo else struct {
-    fn f(_: std.posix.fd_t, _: std.posix.fd_t) ?*anyopaque {
-        return null;
+    fn f() noreturn {
+        @compileError("windows only");
     }
 }.f;
 pub const restoreConsoleIo = if (os == .windows) impl.restoreConsoleIo else struct {
     fn f(_: ?*anyopaque) void {}
 }.f;
 // Named-pipe transport (windows only).
-pub const pipeAsServer = if (os == .windows) impl.pipeAsServer else undefined;
-pub const pipeAsStream = if (os == .windows) impl.pipeAsStream else undefined;
-pub const acceptPipeSync = if (os == .windows) impl.acceptPipeSync else undefined;
-pub const listenPipe = if (os == .windows) impl.listenPipe else undefined;
-pub const connectPipe = if (os == .windows) impl.connectPipe else undefined;
+pub const pipeAsServer = if (os == .windows) impl.pipeAsServer else struct {
+    fn f() noreturn {
+        @compileError("windows only");
+    }
+}.f;
+pub const pipeAsStream = if (os == .windows) impl.pipeAsStream else struct {
+    fn f() noreturn {
+        @compileError("windows only");
+    }
+}.f;
+pub const acceptPipeSync = if (os == .windows) impl.acceptPipeSync else struct {
+    fn f() noreturn {
+        @compileError("windows only");
+    }
+}.f;
+pub const listenPipe = if (os == .windows) impl.listenPipe else struct {
+    fn f() noreturn {
+        @compileError("windows only");
+    }
+}.f;
+pub const connectPipe = if (os == .windows) impl.connectPipe else struct {
+    fn f() noreturn {
+        @compileError("windows only");
+    }
+}.f;
 pub const pipeState = if (os == .windows) impl.pipeState else struct {
-    fn f(handle: std.posix.fd_t) ?u32 {
-        _ = handle;
-        return null;
+    fn f() noreturn {
+        @compileError("windows only");
     }
 }.f;
 pub const dupHandle = if (os == .windows) impl.dupHandle else struct {
-    fn f(handle: std.posix.fd_t) std.posix.fd_t {
-        _ = handle;
-        unreachable;
+    fn f() noreturn {
+        @compileError("windows only");
     }
 }.f;
 
