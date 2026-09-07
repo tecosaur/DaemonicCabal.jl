@@ -298,7 +298,7 @@ fn normalizeInputs(gpa: std.mem.Allocator, args_vector: anytype, env_block: anyt
         else => {
             var args: std.ArrayList([]const u8) = .empty;
             for (args_vector) |entry| {
-                if (entry) |e| try args.append(a, std.mem.span(e));
+                try args.append(a, std.mem.span(entry));
             }
             var env: std.ArrayList([]const u8) = .empty;
             for (env_block.slice) |entry_opt| {

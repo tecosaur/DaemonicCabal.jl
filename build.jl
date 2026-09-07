@@ -1,6 +1,7 @@
 #!/usr/bin/env -S julia --startup-file=no
 using TOML
 using Pkg
+using SHA
 
 staged::Bool = false
 release::Bool = false
@@ -40,11 +41,11 @@ if staged && !isnothing(rev)
     exit(1)
 end
 
-const ZIG = joinpath(@__DIR__, "zig", "zig")
+const ZIG = something(Sys.which("zig"), joinpath(@__DIR__, "zig", "zig"))
 const BASE_FLAGS = ["-fsingle-threaded", "-fPIE"]
 const BINARIES = [
-    ("julia-conductor", "conductor/main.zig"),
-    ("juliaclient",     "client/client.zig"),
+    ("julia-conductor" * (Sys.iswindows() ? ".exe" : ""), "conductor/main.zig"),
+    ("juliaclient" * (Sys.iswindows() ? ".exe" : ""),     "client/client.zig"),
 ]
 const SERVICE_NAME = "julia-daemon"
 const SERVICE_FILE = joinpath(get(ENV, "XDG_CONFIG_HOME",
@@ -140,8 +141,8 @@ function build()
             ("freebsd", "arm",     String[]),
             ("openbsd", "x86_64",  String[]),
             ("openbsd", "aarch64", String[]),
-            # ("windows", "x86_64",  String[]),
-            # ("windows", "aarch64", String[]),
+            ("windows", "x86_64",  String[]),
+            ("windows", "aarch64", String[]),
         ]
         # Cross-compile, package, and collect artifact metadata
         artifacts = mktempdir() do workdir
@@ -151,7 +152,7 @@ function build()
                                flags=[flags; extra; "-target"; "$arch-$os"])
                 tarball = joinpath(builddir, "$os-$arch.tar.gz")
                 run(`tar -czf $tarball -C $workdir .`)
-                sha = first(eachsplit(readchomp(`sha256sum $tarball`)))
+                sha = open(io -> bytes2hex(sha256(io)), tarball)
                 treehash = bytes2hex(Pkg.GitTools.tree_hash(workdir))
                 for (name, _) in BINARIES
                     rm(joinpath(workdir, name), force=true)
