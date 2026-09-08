@@ -70,6 +70,13 @@ pub const getParentName = shared.getParentName;
 /// Shared code tracks pids as plain integers; the platform carrier differs
 /// (POSIX: i32, Windows: pointer-typed). Bridge integer pids into the
 /// platform's carrier type here instead of @intCast-ing at call sites.
+///
+/// WINDOWS CAVEAT: on Windows the carrier is a HANDLE, so this only produces
+/// a usable value when the integer is a truncated *spawn handle* being
+/// round-tripped (conductor-internal bookkeeping). A wire/OS pid — e.g. a
+/// client's getpid() from the protocol — is a numeric PID, not a handle:
+/// never dereference the result; pass it through to OS calls that take
+/// numeric pids (see getParentName for the one sanctioned OpenProcess case).
 pub fn pidFromInt(pid: u32) std.posix.pid_t {
     return if (os == .windows)
         @ptrFromInt(@as(usize, pid))

@@ -131,6 +131,8 @@ pub extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) BOOL;
 pub extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) BOOL;
 pub extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) BOOL;
 pub extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) DWORD;
+pub extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: win32.BOOL, dwProcessId: DWORD) ?HANDLE;
+pub extern "kernel32" fn QueryFullProcessImageNameW(hProcess: HANDLE, dwFlags: DWORD, lpExeName: [*]u16, lpdwSize: *DWORD) win32.BOOL;
 pub extern "kernel32" fn WaitForMultipleObjects(nCount: DWORD, lpHandles: [*]const HANDLE, bWaitAll: win32.BOOL, dwMilliseconds: DWORD) DWORD;
 pub extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*OVERLAPPED) BOOL;
 pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: *const anyopaque, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*OVERLAPPED) BOOL;
@@ -752,6 +754,17 @@ fn pipeSyncOp(h: posix.fd_t, read: bool, buf: []const u8) !usize {
         ntdll.NtWriteFile(h, ev, null, @ptrCast(&tok.iosb), &tok.iosb, @ptrCast(buf.ptr), @intCast(buf.len), null, null);
     switch (stat) {
         .SUCCESS, .PENDING => {},
+        // Synchronous disconnect (e.g. worker closed stdin while console
+        // input was in flight) — no IRP, no packet coming. EOF-0 quietly;
+        // unexpectedStatus prints before the caller can swallow it, so it
+        // must never see these.
+        .PIPE_BROKEN, .PIPE_DISCONNECTED, .PIPE_CLOSING, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => {
+            AcquireSRWLockExclusive(&registry_lock);
+            _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
+            ReleaseSRWLockExclusive(&registry_lock);
+            std.heap.page_allocator.destroy(tok);
+            return 0;
+        },
         else => {
             // No IRP in flight after a synchronous failure — deregister, then
             // we own the token again.
@@ -776,7 +789,7 @@ fn pipeSyncOp(h: posix.fd_t, read: bool, buf: []const u8) !usize {
         // Disconnect statuses → EOF-0 (pipe dialect: PIPE_BROKEN et al).
         // Success-like: the packet landed, so an associated token stays
         // registered for reapSyncOp.
-        .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => 0,
+        .PIPE_BROKEN, .PIPE_DISCONNECTED, .PIPE_CLOSING, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => 0,
         else => {
             AcquireSRWLockExclusive(&registry_lock);
             _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
@@ -818,7 +831,7 @@ pub fn acceptPipeSync(h: posix.fd_t, timeout_ms: u32, proc: ?HANDLE) !void {
         .PENDING => {
             const wait = if (proc) |ph| blk: {
                 const handles = [_]HANDLE{ ev, ph };
-                break :blk WaitForMultipleObjects(handles.len, &handles, @enumFromInt(0), timeout_ms);
+                break :blk WaitForMultipleObjects(handles.len, &handles, win32.BOOL.FALSE, timeout_ms);
             } else WaitForSingleObject(ev, timeout_ms);
             switch (wait) {
                 WAIT_OBJECT_0 => {},
@@ -1316,10 +1329,23 @@ pub fn readMemInfo() ?MemInfo {
 
 // No PPID tracking → null. bsd.zig already returns null; the caller (orphan-
 // worker detection) must tolerate null. Grep to verify it's only used there.
+/// Process image base name for the status report. The pid here arrives via
+/// `getParentNamePid` — a real numeric OS pid (a client's, from the wire),
+/// NOT the spawn-handle-in-`pid_t` that spawned workers carry (see the pid
+/// note above): OpenProcess on the numeric pid is correct in this one case.
 pub fn getParentName(pid: posix.pid_t, buf: []u8) ?[]const u8 {
-    _ = pid;
-    _ = buf;
-    return null;
+    const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+    const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, win32.BOOL.FALSE, @intCast(@intFromPtr(pid))) orelse return null;
+    defer win32.CloseHandle(handle);
+    var wide: [1024]u16 = undefined;
+    var size: DWORD = wide.len;
+    if (QueryFullProcessImageNameW(handle, 0, &wide, &size) == win32.BOOL.FALSE) return null;
+    const full = std.unicode.utf16LeToUtf8Alloc(std.heap.page_allocator, wide[0..size]) catch return null;
+    defer std.heap.page_allocator.free(full);
+    const base = std.fs.path.basename(full);
+    const n = @min(base.len, buf.len);
+    @memcpy(buf[0..n], base[0..n]);
+    return buf[0..n];
 }
 
 // SO_RCVTIMEO is not supported on raw AFD handles: AFD.SOCKOPT rejects it
