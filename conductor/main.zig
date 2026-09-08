@@ -216,6 +216,7 @@ pub const Conductor = struct {
     }
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
+        w.drainStderr(self.io);
         if (w.sandboxed) self.removeSandboxDir(w.id);
         w.deinit();
         self.allocator.destroy(w);

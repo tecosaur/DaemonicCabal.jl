@@ -27,8 +27,12 @@ pub const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
     .windows =>
     \\Daemon management:
     \\
-    \\ Get-Process julia-conductor.exe
-    \\ taskkill /F /IM julia-conductor.exe (stop)
+    \\ Get-Process julia-conductor.exe (check if running)
+    \\ taskkill /F /IM julia-conductor.exe (hard kill)
+    \\ schtasks /{run | end | query} /tn "Julia\JuliaDaemon" (cmd)
+    \\ {Start | Stop | Get}-ScheduledTask "Julia\JuliaDaemon" (powershell/pwsh)
+    \\
+    \\  log: <Install Dir>/conductor.log
     \\
     ,
     else =>

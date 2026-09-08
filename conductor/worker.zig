@@ -150,6 +150,22 @@ pub const CpuMeter = struct {
     }
 };
 
+/// Dump the pipe-buffered stderr of a dead worker to the conductor's stderr
+/// (Windows only: that's where spawn uses .pipe), then consume the handle.
+/// Caller must ensure the process is dead (EOF imminent) or accept blocking.
+/// POSIX uses .inherit (our stderr!) — never touch it.
+fn dumpStderrFile(io: Io, allocator: Allocator, id: u32, stderr: *?std.Io.File) void {
+    if (builtin.os.tag != .windows) return;
+    var f = stderr.* orelse return;
+    stderr.* = null; // callers' cleanup must not double-close
+    defer f.close(io);
+    var buf: [8192]u8 = undefined;
+    var fr = f.reader(io, &buf);
+    const data = fr.interface.allocRemaining(allocator, .limited(1 << 20)) catch return;
+    defer allocator.free(data);
+    if (data.len > 0) std.debug.print("Worker {d} stderr:\n{s}\n", .{ id, data });
+}
+
 pub const Worker = struct {
     allocator: Allocator,
     id: u32,
@@ -370,9 +386,10 @@ pub const Worker = struct {
                 // Parent-end policy: stdin → EOF (client IO is socket-side);
                 // stdout → rogue raw writes fail loudly; stderr → kept open so
                 // pre-scoped init errors can't kill the worker mid-write.
-                // ponytail: stderr is buffered, never drained — a worker
-                // spamming > pipe buffer of raw stderr blocks; drain via the
-                // event loop (or read it out on WorkerDied) if that matters.
+                // Drained on death: see Worker.drainStderr (cleanupWorker).
+                // ponytail: a worker spamming > pipe buffer of raw stderr
+                // while alive still blocks; drain via the event loop if that
+                // ever matters.
                 if (child.stdin) |f| {
                     f.close(io);
                     child.stdin = null; // wait() cleanup must not double-close
@@ -395,6 +412,12 @@ pub const Worker = struct {
                 child.id,
             ) catch |err| {
                 platform.close(setup.server.socket.handle);
+                // Spawn-time death never reaches cleanupWorker; dump the
+                // stderr the worker left in the pipe before dropping it.
+                if (child.id) |pid| {
+                    if (platform.waitpidNonBlocking(pid).exited)
+                        dumpStderrFile(io, allocator, id, &child.stderr);
+                }
                 return err;
             };
             break :blk setup.server.socket.handle;
@@ -424,6 +447,15 @@ pub const Worker = struct {
             .sandboxed = sandboxed,
             .interactive = interactive,
         };
+    }
+
+    /// Dump the pipe-buffered stderr of a dying worker to the conductor's
+    /// stderr (Windows only: that's where spawn uses .pipe), then close it.
+    /// A blocking read is safe: every caller runs after the process was
+    /// killed/reaped, so EOF is imminent. POSIX uses .inherit (our stderr!) —
+    /// never touch it.
+    pub fn drainStderr(self: *Worker, io: Io) void {
+        dumpStderrFile(io, self.allocator, self.id, &self.process.stderr);
     }
 
     /// Record a PPID for session affinity tracking (circular buffer, 0 = empty)
