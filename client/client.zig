@@ -238,7 +238,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (transport_mode == .tcp) protocol.setTcpNodelay(conductor.socket.handle);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor.socket.handle };
-    try sendClientInfo(&w, env, is_tty, inputs.args, addr_arg.skip, sync_arg.skip);
+    const color = is_tty and !hasNoColor(inputs.env);
+    try sendClientInfo(&w, env, is_tty, color, inputs.args, addr_arg.skip, sync_arg.skip);
     // Get worker socket paths (conductor may request full env on cache miss)
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     // Forward signals to worker instead of terminating
@@ -424,10 +425,18 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     exitClient(127);
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, args: []const []const u8, addr_skip: [2]usize, sync_skip: usize) !void {
+fn hasNoColor(env: []const []const u8) bool {
+    // Mirror Base.colored_text: only a non-empty NO_COLOR disables auto color.
+    for (env) |kv| {
+        if (std.mem.startsWith(u8, kv, "NO_COLOR=") and kv.len > "NO_COLOR=".len) return true;
+    }
+    return false;
+}
+
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, args: []const []const u8, addr_skip: [2]usize, sync_skip: usize) !void {
     // Header: magic + flags + reserved + pid + ppid
     w.writeInt(u32, protocol.client.magic);
-    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty }));
+    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color }));
     w.writeSlice(&.{ 0, 0, 0 });
     w.writeInt(u32, @intCast(platform.getpid()));
     w.writeInt(u32, @intCast(platform.getppid()));

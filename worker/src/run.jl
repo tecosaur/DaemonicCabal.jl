@@ -64,7 +64,7 @@ function warm_repl_path()
             derr = errormonitor(@async try read(cerr.out) catch end)
             feeder = errormonitor(@async try write(cin.in, "1+1\n"); close(cin.in) catch end)
             histfile = tempname()
-            client = ClientInfo(true, false, 0, pwd(),
+            client = ClientInfo(true, true, false, 0, pwd(),
                                 ["TERM" => "xterm-256color", "JULIA_HISTORY" => histfile,
                                  "JULIA_DAEMON_REVISE" => "no"],
                                 Tuple{String, String}[],
@@ -117,7 +117,13 @@ function clienthascolor(client::ClientInfo)
     cs = getval(client.switches, "--color", nothing)
     if cs !== nothing
         cs ∈ ("yes", "true", "1", "")
+    elseif client.color
+        # The client already decided (is_tty ∧ ¬NO_COLOR) — trust it. This is
+        # the primary path on Windows, where TERM is typically unset and the
+        # terminfo fallback below would wrongly report no color.
+        true
     elseif client.tty
+        # Fallback for pre-color-bit clients.
         term = getval(client.env, "TERM", "")
         @static if VERSION >= v"1.11"
             haskey(Base.load_terminfo(term), :setaf)

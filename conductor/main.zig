@@ -570,6 +570,7 @@ pub const Conductor = struct {
         defer if (sandbox_env) |e| self.allocator.free(e);
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
+            .color = request.flags.color,
             .force = is_labeled_session,
             .pid = request.pid,
             .ppid = request.ppid,
@@ -616,6 +617,7 @@ pub const Conductor = struct {
         // Remote client's cwd doesn't exist on the host — use host home
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
+            .color = request.flags.color,
             .force = is_labeled_session,
             .pid = request.pid,
             .ppid = request.ppid,

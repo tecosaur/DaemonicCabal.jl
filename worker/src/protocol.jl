@@ -150,6 +150,7 @@ end
 # Client info from CLIENT_RUN message
 struct ClientInfo
     tty::Bool
+    color::Bool  # Client terminal's ANSI capability
     force::Bool  # Bypass capacity check (for labeled sessions)
     pid::Int
     cwd::String
@@ -164,7 +165,8 @@ end
 function read_client_run(conn::IO)
     flags = read(conn, UInt8)
     tty = (flags & 0x01) != 0
-    force = (flags & 0x02) != 0  # Bypass capacity check
+    color = (flags & 0x02) != 0  # Client terminal ANSI capability
+    force = (flags & 0x04) != 0  # Bypass capacity check
     pid = Int(read(conn, UInt32))
     cwd = read_string(conn)
     # Env
@@ -197,6 +199,6 @@ function read_client_run(conn::IO)
         args[i] = read_string(conn)
     end
     port_set = Int(read(conn, UInt16))
-    ClientInfo(tty, force, pid, cwd, env, switches, programfile, args, port_set)
+    ClientInfo(tty, color, force, pid, cwd, env, switches, programfile, args, port_set)
 end
 

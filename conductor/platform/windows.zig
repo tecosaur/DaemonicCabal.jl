@@ -639,38 +639,38 @@ pub fn connectPipe(name: []const u8) !posix.fd_t {
         var handle: win32.HANDLE = undefined;
         var iosb: win32.IO_STATUS_BLOCK = undefined;
         var ua = win32.UNICODE_STRING.init(obj_name);
-    switch (ntdll.NtCreateFile(
-        &handle,
-        .{ .GENERIC = .{ .READ = true, .WRITE = true }, .STANDARD = .{ .SYNCHRONIZE = true } },
-        &.{
-            .ObjectName = @constCast(&ua),
-        },
-        &iosb,
-        null,
-        .{},
-        .{ .READ = true, .WRITE = true },
-        .OPEN,
-        .{ .IO = .ASYNCHRONOUS },
-        null,
-        0,
-    )) {
-        .SUCCESS => {
-            AcquireSRWLockExclusive(&registry_lock);
-            handle_kinds.put(std.heap.page_allocator, @intFromPtr(handle), .pipe) catch {};
-            ReleaseSRWLockExclusive(&registry_lock);
-            return handle;
-        },
-        // Transient pipe-lifecycle states (incl. the conductor's close→recreate
-        // window between client accepts; 0xC00000AC also means "name absent" —
-        // it's what the kernel returns for a nonexistent pipe, not only for a
-        // momentarily instance-less one):
-        .PIPE_BUSY, .OBJECT_NAME_NOT_FOUND, .INSTANCE_NOT_AVAILABLE, .PIPE_NOT_AVAILABLE, .PIPE_CLOSING => {}, // retry
-        else => |status| {
-            if (builtin.mode == .Debug)
-                std.debug.print("[client] connectPipe({s}) status=0x{x:0>8}\n", .{ name, @intFromEnum(status) });
-            return win32.unexpectedStatus(status);
-        },
-    }
+        switch (ntdll.NtCreateFile(
+            &handle,
+            .{ .GENERIC = .{ .READ = true, .WRITE = true }, .STANDARD = .{ .SYNCHRONIZE = true } },
+            &.{
+                .ObjectName = @constCast(&ua),
+            },
+            &iosb,
+            null,
+            .{},
+            .{ .READ = true, .WRITE = true },
+            .OPEN,
+            .{ .IO = .ASYNCHRONOUS },
+            null,
+            0,
+        )) {
+            .SUCCESS => {
+                AcquireSRWLockExclusive(&registry_lock);
+                handle_kinds.put(std.heap.page_allocator, @intFromPtr(handle), .pipe) catch {};
+                ReleaseSRWLockExclusive(&registry_lock);
+                return handle;
+            },
+            // Transient pipe-lifecycle states (incl. the conductor's close→recreate
+            // window between client accepts; 0xC00000AC also means "name absent" —
+            // it's what the kernel returns for a nonexistent pipe, not only for a
+            // momentarily instance-less one):
+            .PIPE_BUSY, .OBJECT_NAME_NOT_FOUND, .INSTANCE_NOT_AVAILABLE, .PIPE_NOT_AVAILABLE, .PIPE_CLOSING => {}, // retry
+            else => |status| {
+                if (builtin.mode == .Debug)
+                    std.debug.print("[client] connectPipe({s}) status=0x{x:0>8}\n", .{ name, @intFromEnum(status) });
+                return win32.unexpectedStatus(status);
+            },
+        }
         Sleep(50); // ~10s total retry budget
     }
     return error.PipeConnectTimeout;

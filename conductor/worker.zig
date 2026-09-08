@@ -606,7 +606,7 @@ pub const Worker = struct {
         const send_buf = try allocator.alloc(u8, payload_size);
         defer allocator.free(send_buf);
         var w = BufWriter{ .buf = send_buf };
-        w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .force = client_info.force }));
+        w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .color = client_info.color, .force = client_info.force }));
         w.writeInt(u32, client_info.pid);
         w.writeLenPrefixed(u16, client_info.cwd);
         w.writeInt(u16, @intCast(client_info.env.len));
@@ -702,6 +702,7 @@ pub const Worker = struct {
 
 pub const ClientInfo = struct {
     tty: bool,
+    color: bool,
     force: bool, // Bypass worker capacity check
     pid: u32,
     ppid: u32,

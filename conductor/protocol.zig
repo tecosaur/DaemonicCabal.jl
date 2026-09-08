@@ -95,7 +95,8 @@ pub const client = struct {
 
     pub const Flags = packed struct(u8) {
         tty: bool,
-        _reserved: u7 = 0,
+        color: bool,
+        _reserved: u6 = 0,
     };
 };
 
@@ -132,8 +133,9 @@ pub const worker = struct {
 
     pub const Flags = packed struct(u8) {
         tty: bool,
+        color: bool,
         force: bool = false, // Bypass capacity check (for labeled sessions)
-        _reserved: u6 = 0,
+        _reserved: u5 = 0,
     };
 };
 
