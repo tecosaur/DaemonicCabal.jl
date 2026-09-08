@@ -361,9 +361,19 @@ pub const Worker = struct {
             });
         }
         const socket = if (setup_is_connection) blk: {
-            // Pipe transport: blocking accept on the (unassociated) pipe
+            // Pipe transport: bounded accept on the (unassociated) pipe
             // listener — Event-wait, no IOCP/APC entanglement at spawn time.
-            try platform.acceptPipeSync(setup.server.socket.handle);
+            // Bounded so a worker that dies or stalls before connecting
+            // surfaces an error instead of wedging the single-threaded loop.
+            const accept_timeout_ms: u32 = @intCast(cfg.ping_timeout * 1000);
+            platform.acceptPipeSync(
+                setup.server.socket.handle,
+                accept_timeout_ms,
+                child.id,
+            ) catch |err| {
+                platform.close(setup.server.socket.handle);
+                return err;
+            };
             break :blk setup.server.socket.handle;
         } else blk: {
             const worker_stream = try setup.server.accept(io);

@@ -112,6 +112,9 @@ const CLIENT_HELP =
 /// Grace per retirement stage; SIGTERM/SIGKILL fire only for a wedged worker.
 const retire_grace_s: i64 = 5;
 
+/// Win32 infinite wait (pipe-listen accept on the client listener blocks by design).
+const INFINITE: u32 = 0xFFFFFFFF;
+
 /// Max workers retired per eviction episode (bounds runaway culling under
 /// sustained exogenous pressure; see WORKER_CACHE.md §Bounding).
 const max_evict_per_episode: usize = 4;
@@ -1754,7 +1757,7 @@ pub const Conductor = struct {
             if (builtin.os.tag == .windows and mode == .unix) {
                 // Pipe transport: blocking accept on the listener (which IS
                 // the connection once LISTEN completes).
-                try platform.acceptPipeSync(listeners[i].server.socket.handle);
+                try platform.acceptPipeSync(listeners[i].server.socket.handle, INFINITE, null);
                 conns[i] = platform.pipeAsStream(listeners[i].server.socket.handle);
             } else {
                 conns[i] = try listeners[i].server.accept(self.io);

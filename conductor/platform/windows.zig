@@ -131,6 +131,8 @@ pub extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) BOOL;
 pub extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) BOOL;
 pub extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) BOOL;
 pub extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) DWORD;
+pub extern "kernel32" fn WaitForMultipleObjects(nCount: DWORD, lpHandles: [*]const HANDLE, bWaitAll: win32.BOOL, dwMilliseconds: DWORD) DWORD;
+pub extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*OVERLAPPED) BOOL;
 pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: *const anyopaque, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*OVERLAPPED) BOOL;
 pub extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*OVERLAPPED) BOOL;
 pub extern "kernel32" fn GetFileType(hFile: HANDLE) DWORD;
@@ -797,19 +799,37 @@ pub fn pipeAsStream(handle: posix.fd_t) std.Io.net.Stream {
 
 /// Blocking accept on a pipe listener (worker spawn path — the handle is
 /// unassociated there, so a plain Event wait delivers the completion).
-pub fn acceptPipeSync(h: posix.fd_t) !void {
+/// Bounded by `timeout_ms`; when `proc` is given (the worker's process
+/// handle), worker exit aborts the wait immediately instead of at timeout.
+pub fn acceptPipeSync(h: posix.fd_t, timeout_ms: u32, proc: ?HANDLE) !void {
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = try ensureEvent();
     defer win32.CloseHandle(ev);
     switch (ntdll.NtFsControlFile(h, ev, null, null, &iosb, win32.CTL_CODE.PIPE.LISTEN, null, 0, null, 0)) {
         .SUCCESS => {},
         .PENDING => {
-            if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED)
-                return error.EventWaitFailed;
+            const wait = if (proc) |ph| blk: {
+                const handles = [_]HANDLE{ ev, ph };
+                break :blk WaitForMultipleObjects(handles.len, &handles, @enumFromInt(0), timeout_ms);
+            } else WaitForSingleObject(ev, timeout_ms);
+            switch (wait) {
+                WAIT_OBJECT_0 => {},
+                // Worker process handle signalled (index 1) — died pre-connect.
+                WAIT_OBJECT_0 + 1 => return cancelPipeListen(h, error.WorkerDied),
+                WAIT_TIMEOUT => return cancelPipeListen(h, error.AcceptTimedOut),
+                else => return error.EventWaitFailed,
+            }
         },
         else => |status| return win32.unexpectedStatus(status),
     }
     if (iosb.u.Status != .SUCCESS) return win32.unexpectedStatus(iosb.u.Status);
+}
+
+/// Abandon a pending pipe LISTEN: cancel the IRP so its completion can never
+/// surface later against a stale iosb, then surface `err`.
+fn cancelPipeListen(h: posix.fd_t, err: anyerror) anyerror {
+    _ = CancelIoEx(h, null); // best effort — caller closes the handle anyway
+    return err;
 }
 
 /// AFD.BIND wrapper (bindSocketIpAfd / bindSocketUnixAfd shape :12402/:12421):
