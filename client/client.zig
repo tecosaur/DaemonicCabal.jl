@@ -210,6 +210,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const addr_arg = extractAddressArg(inputs.args);
     if (addr_arg.value) |addr| env.server_path = addr;
     const sync_arg = extractSyncArg(inputs.args);
+    // --help/--version short-circuit: no daemon connection, no console setup.
+    for (inputs.args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break; // everything after is julia's
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            platform.writeFile(platform.getStdoutHandle(), protocol.CLIENT_HELP);
+            exitClient(0);
+        }
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            platform.writeFile(platform.getStdoutHandle(), protocol.VERSION_STRING);
+            exitClient(0);
+        }
+    }
     // Set raw mode for TTY to avoid line buffering
     const is_tty = platform.isatty(platform.getStdinHandle());
     var saved_console: ?*anyopaque = null;
