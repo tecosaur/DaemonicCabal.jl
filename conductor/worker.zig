@@ -358,7 +358,30 @@ pub const Worker = struct {
             child = try std.process.spawn(io, .{
                 .argv = argv.items,
                 .pgid = if (builtin.os.tag == .windows) null else 0,
+                // Windows: inherited stdio is file-backed when the conductor is
+                // launched headless, and the Julia worker's __init__ dies on it
+                // (uv_pipe_open rejects non-pipe handles). Give real pipes;
+                // POSIX keeps inherit (systemd/launchd fds are uv-fine).
+                .stdin = if (builtin.os.tag == .windows) .pipe else .inherit,
+                .stdout = if (builtin.os.tag == .windows) .pipe else .inherit,
+                .stderr = if (builtin.os.tag == .windows) .pipe else .inherit,
             });
+            if (builtin.os.tag == .windows) {
+                // Parent-end policy: stdin → EOF (client IO is socket-side);
+                // stdout → rogue raw writes fail loudly; stderr → kept open so
+                // pre-scoped init errors can't kill the worker mid-write.
+                // ponytail: stderr is buffered, never drained — a worker
+                // spamming > pipe buffer of raw stderr blocks; drain via the
+                // event loop (or read it out on WorkerDied) if that matters.
+                if (child.stdin) |f| {
+                    f.close(io);
+                    child.stdin = null; // wait() cleanup must not double-close
+                }
+                if (child.stdout) |f| {
+                    f.close(io);
+                    child.stdout = null;
+                }
+            }
         }
         const socket = if (setup_is_connection) blk: {
             // Pipe transport: bounded accept on the (unassociated) pipe

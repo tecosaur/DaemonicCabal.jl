@@ -24,6 +24,8 @@ function install_service(env::Dict)
 	@info "Installing startup item"
 	exec = "cmd.exe /d /c \"\"$BAT_WRAPPER\"\" "
 	run(`reg.exe add $RUNKEY /v JuliaDaemon /t REG_SZ /d $exec /f`)
+	@info "Precompiling DaemonWorker"
+	run(pipeline(`$(worker_executable()) --project=$(installed_worker_project()) -e 'using DaemonWorker'`, stdout, stderr))
 	@info "Starting"
 	run(detach(`cmd.exe /d /c ""$BAT_WRAPPER""`); wait=false)
 

@@ -349,8 +349,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
             "\\\\.\\pipe\\julia-daemon\\{s}\\conductor.sock",
             .{user},
         ) catch return error.NameTooLong;
-    } else
-        std.fmt.bufPrint(&conductor_path_buf, "{s}/conductor.sock", .{runtime_dir}) catch return error.NameTooLong;
+    } else std.fmt.bufPrint(&conductor_path_buf, "{s}/conductor.sock", .{runtime_dir}) catch return error.NameTooLong;
     const parsed = protocol.parseAddress(raw_path) catch {
         std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and unix paths are supported.\n", .{raw_path});
         exitClient(1);
@@ -381,11 +380,15 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
                 Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
                 if (connectUnix(addr)) |stream| return stream else |_| {}
             }
-            // Unix socket still missing but conductor is alive — try default TCP port
-            const tcp_addr = std.fmt.bufPrint(&conductor_path_buf, "localhost:{d}", .{protocol.default_tcp_port}) catch unreachable;
+            // Unix socket still missing but conductor is alive — try default TCP port.
+            // Scratch buffer: `addr`/`conductor_path` alias conductor_path_buf, which
+            // must stay intact for the failure message below.
+            var tcp_buf: [32]u8 = undefined;
+            const tcp_addr = std.fmt.bufPrint(&tcp_buf, "localhost:{d}", .{protocol.default_tcp_port}) catch unreachable;
             if (protocol.connectAddress(io, .tcp, tcp_addr)) |stream| {
                 transport_mode = .tcp;
-                conductor_path = tcp_addr;
+                @memcpy(conductor_path_buf[0..tcp_addr.len], tcp_addr);
+                conductor_path = conductor_path_buf[0..tcp_addr.len];
                 return stream;
             } else |_| {}
         }
@@ -403,6 +406,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     , .{ addr, switch (builtin.os.tag) {
         .linux => "systemctl --user restart julia-daemon",
         .macos => "launchctl kickstart -k gui/$(id -u)/org.julialang.julia-daemon",
+        .windows => "taskkill /F /IM julia-conductor.exe\njulia-conductor.exe",
         else => "pkill -f julia-conductor && julia-conductor &",
     } });
     exitClient(127);

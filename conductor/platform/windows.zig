@@ -660,8 +660,16 @@ pub fn connectPipe(name: []const u8) !posix.fd_t {
             ReleaseSRWLockExclusive(&registry_lock);
             return handle;
         },
-        .PIPE_BUSY, .OBJECT_NAME_NOT_FOUND => {}, // instance not up yet — retry
-        else => |status| return win32.unexpectedStatus(status),
+        // Transient pipe-lifecycle states (incl. the conductor's close→recreate
+        // window between client accepts; 0xC00000AC also means "name absent" —
+        // it's what the kernel returns for a nonexistent pipe, not only for a
+        // momentarily instance-less one):
+        .PIPE_BUSY, .OBJECT_NAME_NOT_FOUND, .INSTANCE_NOT_AVAILABLE, .PIPE_NOT_AVAILABLE, .PIPE_CLOSING => {}, // retry
+        else => |status| {
+            if (builtin.mode == .Debug)
+                std.debug.print("[client] connectPipe({s}) status=0x{x:0>8}\n", .{ name, @intFromEnum(status) });
+            return win32.unexpectedStatus(status);
+        },
     }
         Sleep(50); // ~10s total retry budget
     }
