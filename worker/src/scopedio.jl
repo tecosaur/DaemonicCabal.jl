@@ -39,11 +39,7 @@ function unsafe_pipe!(pipe::Base.PipeEndpoint, tty::Base.TTY)
 end
 
 function unsafe_pipe!(pipe::Base.PipeEndpoint, stream::IOStream)
-    return unsafe_pipe!(pipe, Base.PipeEndpoint(Base.RawFD(fd(stream))))
-end
-
-function unsafe_pipe!(pipe::Base.PipeEndpoint, io::IOContext)
-    return unsafe_pipe!(pipe, io.io)
+    unsafe_pipe!(pipe, Base.PipeEndpoint(Base.RawFD(fd(stream))))
 end
 
 function unsafe_pipe!(pipe::Base.PipeEndpoint, pipe2::Base.PipeEndpoint)
