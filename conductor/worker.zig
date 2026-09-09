@@ -164,6 +164,9 @@ pub const Worker = struct {
     last_pinged: i64,
     ping_pending: bool = false,
     pong_buf: [5]u8 = undefined,
+    // epoll fallback (Linux without io_uring): one-shot timerfds, -1 when unused.
+    epoll_ping_tfd: posix.fd_t = -1,
+    epoll_health_tfd: posix.fd_t = -1,
     active_clients: u32,
     occupancy: Occupancies = .{},
     cpu: CpuMeter = .{},
@@ -360,6 +363,8 @@ pub const Worker = struct {
     pub fn deinit(self: *Worker) void {
         if (self.project) |p| self.allocator.free(p);
         if (self.session_label) |l| self.allocator.free(l);
+        if (self.epoll_ping_tfd >= 0) platform.close(self.epoll_ping_tfd);
+        if (self.epoll_health_tfd >= 0) platform.close(self.epoll_health_tfd);
         platform.close(self.socket);
     }
 
