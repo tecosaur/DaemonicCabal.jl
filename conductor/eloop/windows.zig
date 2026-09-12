@@ -580,7 +580,11 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                 if (ovl != expected) continue; // stray
                 pending_pipe_listen = null;
                 defer std.heap.page_allocator.destroy(ctx);
-                if (ctx.iosb.u.Status == .SUCCESS) {
+                // Both mean "this instance is a live connection": .SUCCESS from
+                // the pended LISTEN completing, .PIPE_CONNECTED from one a client
+                // pre-empted (same rule as armPipeListenConnected, which treats
+                // anything but .PENDING as connected).
+                if (ctx.iosb.u.Status == .SUCCESS or ctx.iosb.u.Status == .PIPE_CONNECTED) {
                     // Release the name slot BEFORE creating the next instance:
                     // a server create of the same name fails ACCESS_DENIED
                     // while the previous instance's handle is still open (the
