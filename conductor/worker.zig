@@ -449,7 +449,7 @@ pub const Worker = struct {
             .process = child,
             .socket = socket,
             .project = null,
-            .julia_channel = julia_channel,
+            .julia_channel = if (julia_channel) |ch| try allocator.dupe(u8, ch) else null,
             .threads = threads,
             .session_label = null,
             .created_at = now,
@@ -480,6 +480,7 @@ pub const Worker = struct {
     pub fn deinit(self: *Worker) void {
         if (self.project) |p| self.allocator.free(p);
         if (self.session_label) |l| self.allocator.free(l);
+        if (self.julia_channel) |c| self.allocator.free(c);
         platform.close(self.socket);
     }
 
