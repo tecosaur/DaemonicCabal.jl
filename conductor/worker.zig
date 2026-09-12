@@ -405,7 +405,11 @@ pub const Worker = struct {
             // listener — Event-wait, no IOCP/APC entanglement at spawn time.
             // Bounded so a worker that dies or stalls before connecting
             // surfaces an error instead of wedging the single-threaded loop.
-            const accept_timeout_ms: u32 = @intCast(cfg.ping_timeout * 1000);
+            // ponytail: fixed 30s — ping_timeout (5s) is a pong budget, not a
+            // boot budget: shim chain + `using DaemonWorker` measured ~7s warm.
+            // Cold first-run precompile can still exceed this; make the spawn
+            // async if that ever bites.
+            const accept_timeout_ms: u32 = 30_000;
             platform.acceptPipeSync(
                 setup.server.socket.handle,
                 accept_timeout_ms,
@@ -415,8 +419,16 @@ pub const Worker = struct {
                 // Spawn-time death never reaches cleanupWorker; dump the
                 // stderr the worker left in the pipe before dropping it.
                 if (child.id) |pid| {
-                    if (platform.waitpidNonBlocking(pid).exited)
-                        dumpStderrFile(io, allocator, id, &child.stderr);
+                    if (!platform.waitpidNonBlocking(pid).exited) {
+                        // A worker that missed the accept window is still cold-
+                        // booting into a pipe we're about to drop — kill it so
+                        // it doesn't finish booting into a dead setup socket.
+                        _ = platform.kill(pid, platform.SIG.KILL);
+                        // Reap before the blocking stderr read below (the
+                        // process must be gone for its pipe end to EOF).
+                        platform.waitpidBlocking(pid);
+                    }
+                    dumpStderrFile(io, allocator, id, &child.stderr);
                 }
                 return err;
             };

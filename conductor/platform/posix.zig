@@ -40,6 +40,12 @@ pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
     return .{ .pid = ret, .exited = ret != 0 };
 }
 
+/// Blocking waitpid: block until the child exits and reap it. Used only where
+/// a child is known to be doomed (spawn accept failure) — EOF is imminent.
+pub fn waitpidBlocking(pid: posix.pid_t) void {
+    _ = std.posix.waitpid(pid, 0) catch {};
+}
+
 /// Per-process memory and cumulative CPU time, for status reporting and eviction
 /// sizing. `mem_bytes` is resident set size on Linux, phys_footprint on macOS (the
 /// reclaimable private memory — see `mem_is_reclaimable`). `cpu_seconds` is total

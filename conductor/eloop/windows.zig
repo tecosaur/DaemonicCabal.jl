@@ -288,6 +288,7 @@ const PipeListenCtx = extern struct {
 /// Create a fresh pipe instance + pend LISTEN (each completed LISTEN consumes
 /// its instance, so re-arms create new ones). Fatal failure → null.
 fn armPipeListen(iocp: HANDLE, name: []const u8) ?*PipeListenCtx {
+    // (see armPipeListenConnected for the pre-connected-instance case)
     const handle = platform.listenPipe(name) catch |err| {
         std.debug.print("Fatal: failed to create pipe listener: {}\n", .{err});
         return null;
@@ -315,6 +316,51 @@ fn armPipeListen(iocp: HANDLE, name: []const u8) ?*PipeListenCtx {
         std.heap.page_allocator.destroy(ctx);
         return null;
     };
+    return ctx;
+}
+
+/// Arm pipe LISTENs until one is genuinely pending, dispatching any instance
+/// that is ALREADY connected. A CreateNamedPipeW instance is in listening
+/// state immediately, so a client can complete its connect between the
+/// instance's creation and the FSCTL.PIPE.LISTEN we pend on it (startup
+/// window before the loop runs, a worker racing its setup pipe, a client
+/// bursting its four stream connects). The LISTEN then completes INLINE with
+/// PIPE_CONNECTED (or SUCCESS) — no IRP, no completion packet, ever. Parking
+/// such a ctx in pending_pipe_listen wedges the conductor permanently:
+/// alive, cycling, but with no listening instance (every client connect →
+/// STATUS_PIPE_BUSY → PipeConnectTimeout).
+fn armPipeListenConnected(
+    conductor: *Conductor,
+    iocp: HANDLE,
+    first: ?*PipeListenCtx,
+) ?*PipeListenCtx {
+    var ctx = first orelse armPipeListen(iocp, conductor.cfg.socket_path) orelse return null;
+    while (ctx.iosb.u.Status != .PENDING) {
+        // Inline completion: the handle IS the connection (same shape as the
+        // accept_key SUCCESS branch below).
+        const conn = platform.dupHandle(ctx.handle) catch |err| {
+            std.debug.print("Fatal: pipe conn dup failed: {}\n", .{err});
+            platform.close(ctx.handle);
+            std.heap.page_allocator.destroy(ctx);
+            return null;
+        };
+        platform.close(ctx.handle);
+        std.heap.page_allocator.destroy(ctx);
+        // Re-arm BEFORE dispatching so a long-serving connection doesn't
+        // deafen new clients; the fresh instance may itself be pre-connected.
+        const next = armPipeListen(iocp, conductor.cfg.socket_path) orelse {
+            platform.close(conn);
+            return null;
+        };
+        std.debug.print("[conductor] pipe connection accepted, dispatching\n", .{});
+        const peer = main.PeerInfo{};
+        conductor.handleConnectionFd(conn, &peer) catch |err| {
+            std.debug.print("Client handling failed: {}\n", .{err});
+        };
+        platform.close(conn);
+        conductor.noteLiveChange();
+        ctx = next;
+    }
     return ctx;
 }
 
@@ -441,7 +487,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
             std.heap.page_allocator.destroy(ctx);
             return;
         };
-        pending_pipe_listen = ctx;
+        pending_pipe_listen = armPipeListenConnected(conductor, iocp, ctx) orelse return;
     } else {
         pending_wait = armAcceptWait(listener) orelse return;
     }
@@ -550,7 +596,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                         return;
                     };
                     platform.close(ctx.handle);
-                    pending_pipe_listen = armPipeListen(iocp, conductor.cfg.socket_path) orelse {
+                    pending_pipe_listen = armPipeListenConnected(conductor, iocp, null) orelse {
                         platform.close(conn);
                         return;
                     };
@@ -562,7 +608,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     platform.close(conn);
                     pool_changed = true;
                 } else {
-                    pending_pipe_listen = armPipeListen(iocp, conductor.cfg.socket_path) orelse return;
+                    pending_pipe_listen = armPipeListenConnected(conductor, iocp, null) orelse return;
                 }
             } else {
                 // Two phases share this key (same handle). The packet's

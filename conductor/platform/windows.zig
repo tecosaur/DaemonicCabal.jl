@@ -615,10 +615,13 @@ pub fn issuePipeListen(h: posix.fd_t, iosb: *win32.IO_STATUS_BLOCK) !void {
         null,
         0,
     )) {
-        // PIPE_CONNECTED: a client opened the instance between its creation
-        // and this LISTEN (e.g. a worker startup notification racing the
-        // eloop's arming) — the connection is live; proceed with dispatch.
-        .SUCCESS, .PENDING, .PIPE_CONNECTED => {},
+        // Record the return status: for a pended IRP the kernel hasn't
+        // necessarily touched the iosb yet, and callers (armPipeListenConnected
+        // in eloop/windows.zig) discriminate on iosb.u.Status before any
+        // completion arrives — undefined there would read as "pre-connected".
+        // Inline SUCCESS/PIPE_CONNECTED already carry the live status; assigning
+        // the return value is idempotent for those.
+        .SUCCESS, .PENDING, .PIPE_CONNECTED => |status| iosb.u.Status = status,
         else => |status| return win32.unexpectedStatus(status),
     }
 }
@@ -828,6 +831,11 @@ pub fn acceptPipeSync(h: posix.fd_t, timeout_ms: u32, proc: ?HANDLE) !void {
     defer win32.CloseHandle(ev);
     switch (ntdll.NtFsControlFile(h, ev, null, null, &iosb, win32.CTL_CODE.PIPE.LISTEN, null, 0, null, 0)) {
         .SUCCESS => {},
+        // A client connected between the instance's creation and this LISTEN
+        // (pipe instances are listening from CreateNamedPipeW on): the call
+        // returns inline with PIPE_CONNECTED — no IRP, no wait, the
+        // connection is live. Treat as a completed accept, not an error.
+        .PIPE_CONNECTED => {},
         .PENDING => {
             const wait = if (proc) |ph| blk: {
                 const handles = [_]HANDLE{ ev, ph };
@@ -840,10 +848,10 @@ pub fn acceptPipeSync(h: posix.fd_t, timeout_ms: u32, proc: ?HANDLE) !void {
                 WAIT_TIMEOUT => return cancelPipeListen(h, error.AcceptTimedOut),
                 else => return error.EventWaitFailed,
             }
+            if (iosb.u.Status != .SUCCESS) return win32.unexpectedStatus(iosb.u.Status);
         },
         else => |status| return win32.unexpectedStatus(status),
     }
-    if (iosb.u.Status != .SUCCESS) return win32.unexpectedStatus(iosb.u.Status);
 }
 
 /// Abandon a pending pipe LISTEN: cancel the IRP so its completion can never
@@ -1266,6 +1274,12 @@ pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };
 pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
     const state = WaitForSingleObject(pid, 0);
     return .{ .pid = pid, .exited = state != WAIT_TIMEOUT };
+}
+
+/// Blocking waitpid: block until the child exits. `pid` is the process handle
+/// we hold (see getChildPid), so the wait is always valid.
+pub fn waitpidBlocking(pid: posix.pid_t) void {
+    _ = WaitForSingleObject(pid, INFINITE);
 }
 
 pub const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };

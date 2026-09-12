@@ -58,6 +58,7 @@ pub const close = shared.close;
 pub const getChildPid = shared.getChildPid;
 pub const WaitPidResult = shared.WaitPidResult;
 pub const waitpidNonBlocking = shared.waitpidNonBlocking;
+pub const waitpidBlocking = shared.waitpidBlocking;
 pub const ProcessStats = shared.ProcessStats;
 pub const getProcessStats = shared.getProcessStats;
 pub const mem_is_reclaimable = shared.mem_is_reclaimable;
