@@ -511,6 +511,87 @@ pub fn issueAfdRecv(h: posix.fd_t, buf: []u8) ?*AfdRecvCtx {
     return null;
 }
 
+/// Issue one overlapped read whose completion signals `ev` (pipes: NtReadFile;
+/// AFD: RECEIVE IOCTL) — issueAfdRecv's kind dispatch, but event-routed so the
+/// caller waits with a deadline instead of handing the op to the loop's port.
+fn issueReadEvent(fd: posix.fd_t, buf: []u8, ev: HANDLE, iosb: *win32.IO_STATUS_BLOCK) !void {
+    switch (kindOf(fd)) {
+        .pipe => switch (ntdll.NtReadFile(fd, ev, null, null, iosb, buf.ptr, @intCast(buf.len), null, null)) {
+            .SUCCESS, .PENDING => {},
+            else => |status| return win32.unexpectedStatus(status),
+        },
+        .afd => {
+            var iovecs = [_]win32.AFD.WSABUF(.@"var"){.{ .len = @intCast(buf.len), .buf = buf.ptr }};
+            var info: win32.AFD.RECV_INFO = .{
+                .BufferArray = &iovecs,
+                .BufferCount = 1,
+                .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
+                .TdiFlags = .{ .NORMAL = true },
+            };
+            switch (ntdll.NtDeviceIoControlFile(
+                fd,
+                ev,
+                null,
+                null,
+                iosb,
+                win32.IOCTL.AFD.RECEIVE,
+                std.mem.asBytes(&info),
+                @intCast(@sizeOf(win32.AFD.RECV_INFO)),
+                null,
+                0,
+            )) {
+                .SUCCESS, .PENDING => {},
+                else => |status| return win32.unexpectedStatus(status),
+            }
+        },
+    }
+}
+
+/// Bounded socketRead, for callers that must not park the event loop on a
+/// stalled peer (the palette probe): the read is issued overlapped against a
+/// private Event and abandoned after `timeout_ms`, returning 0 — the same
+/// "nothing more" contract socketRead's callers handle.
+///
+/// Windows has no per-handle receive timeout to lean on (setRecvTimeout is a
+/// no-op: pipes have no SO_RCVTIMEO at all, and AFD rejects it), so the
+/// deadline has to live on the waiting side. The cancel is *waited out* before
+/// returning: the pending IRP writes into `iosb` and `buf`, both of which are
+/// this frame's, so it must not outlive us.
+pub fn socketReadTimeout(fd: posix.fd_t, buf: []u8, timeout_ms: u32) usize {
+    if (timeout_ms == 0) return socketRead(fd, buf);
+    var iosb: win32.IO_STATUS_BLOCK = undefined;
+    const ev = ensureEvent() catch return socketRead(fd, buf);
+    defer win32.CloseHandle(ev);
+    issueReadEvent(fd, buf, ev, &iosb) catch return 0;
+    switch (WaitForSingleObject(ev, timeout_ms)) {
+        WAIT_OBJECT_0 => {},
+        WAIT_TIMEOUT => {
+            var scratch: win32.IO_STATUS_BLOCK = undefined;
+            _ = ntdll.NtCancelIoFileEx(fd, &iosb, &scratch);
+            _ = WaitForSingleObject(ev, INFINITE);
+            return 0;
+        },
+        else => return 0,
+    }
+    return switch (iosb.u.Status) {
+        .SUCCESS => iosb.Information,
+        // Peer gone, or our own cancellation: "nothing more".
+        .CANCELLED,
+        .GRACEFUL_DISCONNECT,
+        .REMOTE_DISCONNECT,
+        .CONNECTION_RESET,
+        .PIPE_BROKEN,
+        .PIPE_DISCONNECTED,
+        .END_OF_FILE,
+        => 0,
+        // Best-effort caller: match socketRead's log-then-report-nothing shape.
+        else => |status| blk: {
+            std.debug.print("socketReadTimeout: {any}\n", .{status});
+            break :blk 0;
+        },
+    };
+}
+
 // --- Named pipes (transport v2 — see AFD.md "Named-pipe dialect") ----------
 // Pipe handles are plain overlapped file objects: they associate with the
 // IOCP and obey the same token/reap/syncViaPort machinery as AFD sockets.
@@ -848,7 +929,14 @@ pub fn acceptPipeSync(h: posix.fd_t, timeout_ms: u32, proc: ?HANDLE) !void {
                 WAIT_TIMEOUT => return cancelPipeListen(h, error.AcceptTimedOut),
                 else => return error.EventWaitFailed,
             }
-            if (iosb.u.Status != .SUCCESS) return win32.unexpectedStatus(iosb.u.Status);
+            // PIPE_CONNECTED can also be the completion status of a pended
+            // LISTEN (the client connected while the request was outstanding)
+            // — the accept is satisfied either way, exactly as in the inline
+            // case above and in issuePipeListen.
+            switch (iosb.u.Status) {
+                .SUCCESS, .PIPE_CONNECTED => {},
+                else => |status| return win32.unexpectedStatus(status),
+            }
         },
         else => |status| return win32.unexpectedStatus(status),
     }

@@ -29,6 +29,22 @@ pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     };
 }
 
+/// Bounded socketRead: wait up to `timeout_ms` for the fd to become readable
+/// (0 = block forever), then read once. Returns 0 on timeout, EOF or error —
+/// the same "nothing more" contract socketRead's callers already handle.
+/// Callers that must not park the event loop on a stalled peer use this rather
+/// than relying on setsockopt(SO_RCVTIMEO): the deadline applies to this call
+/// only, so no per-fd state is left behind (and Windows has no such socket
+/// option at all — see impl.setRecvTimeout).
+pub fn socketReadTimeout(fd: posix.socket_t, buf: []u8, timeout_ms: u32) usize {
+    if (timeout_ms == 0) return socketRead(fd, buf);
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    _ = posix.poll(&fds, @intCast(@min(timeout_ms, std.math.maxInt(i32)))) catch return 0;
+    // POLLHUP/POLLERR without POLLIN reads as "nothing more" here too.
+    if (fds[0].revents & posix.POLL.IN == 0) return 0;
+    return socketRead(fd, buf);
+}
+
 // Process helpers
 pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
     return child.id orelse 0;

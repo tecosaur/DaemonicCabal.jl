@@ -1906,13 +1906,17 @@ pub const Conductor = struct {
         var qbuf: [pal.query_buf_len]u8 = undefined;
         platform.write(streams.fd(.stdout), pal.writeQueries(&qbuf));
         // This read blocks the event loop; a client that never replies would
-        // otherwise wedge the conductor.
-        platform.setRecvTimeout(stdin, palette_probe_timeout_s);
-        defer platform.setRecvTimeout(stdin, 0);
+        // otherwise wedge the conductor. Bounded per read by socketReadTimeout
+        // rather than SO_RCVTIMEO: Windows handles have no receive timeout to
+        // set, so the deadline has to be passed in and enforced by the waiter
+        // for this to hold on both platforms.
+        // ponytail: the deadline is per read, so a client dribbling one byte
+        // inside each window still holds the loop; make it a total budget if
+        // that ever bites (needs a clock read in this scope).
         var buf: [4096]u8 = undefined;
         var len: usize = 0;
         while (len < buf.len) {
-            const n = platform.socketRead(stdin, buf[len..]);
+            const n = platform.socketReadTimeout(stdin, buf[len..], palette_probe_timeout_s * 1000);
             if (n == 0) break;
             len += n;
             if (std.mem.indexOf(u8, buf[0..len], pal.sentinel) != null) break;
