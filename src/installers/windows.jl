@@ -5,6 +5,7 @@ const PS1_WRAPPER = joinpath(install_dir(), "julia-daemon.ps1")
 const SILENT_LAUNCH_SCRIPT = joinpath(install_dir(), "silent_launch.vbs")
 
 function install_service(env::Dict)
+	stop_service()
 	# this script is the script that actually runs the conductor with the correct environment.
 	open(PS1_WRAPPER, "w") do io
 		envs = join(["\$env:$k = '$v'" for (k, v) in env], "\n")
@@ -53,9 +54,13 @@ function install_service(env::Dict)
 end
 
 function uninstall_service()
+	stop_service()
+	run(ignorestatus(`schtasks /delete /f /tn "Julia\JuliaDaemon"`))
 	if ispath(PS1_WRAPPER)
 		rm(PS1_WRAPPER, force=true)
 	end
-	run(ignorestatus(`taskkill /F /IM julia-conductor.exe`))
-	run(ignorestatus(`schtasks /delete /f /tn "Julia\JuliaDaemon"`))
+end
+function stop_service()
+	run(ignorestatus(`schtasks /end /tn "Julia\JuliaDaemon"`))
+	run(ignorestatus(`taskkill /F /T /IM julia-conductor.exe`))
 end

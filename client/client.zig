@@ -419,7 +419,12 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     , .{ addr, switch (builtin.os.tag) {
         .linux => "systemctl --user restart julia-daemon",
         .macos => "launchctl kickstart -k gui/$(id -u)/org.julialang.julia-daemon",
-        .windows => "taskkill /F /IM julia-conductor.exe\njulia-conductor.exe",
+        // Restart the scheduled task. Note `schtasks /end` only stops the
+        // task's own action process, so this is only a real restart once the
+        // installer's launcher is the thing tracking the daemon; until then
+        // the task reads "Ready" while the conductor runs and /end is a no-op
+        // (the old workaround was taskkill /F /T /IM julia-conductor.exe).
+        .windows => "schtasks /end /tn \"Julia\\JuliaDaemon\"\nschtasks /run /tn \"Julia\\JuliaDaemon\"",
         else => "pkill -f julia-conductor && julia-conductor &",
     } });
     exitClient(127);
