@@ -673,9 +673,14 @@ fn getTerminalSize() struct { height: u16, width: u16 } {
     // A degenerate winsize (ioctl succeeds but reports 0 rows/cols — a pty with
     // no size set, or a terminal mid-teardown) is as useless as no tty: the
     // worker's REPL divides by the column count, so a 0 must never go on the wire.
-    if (platform.getTerminalSize(platform.getStdinHandle())) |size| {
-        if (size.rows != 0 and size.cols != 0)
-            return .{ .height = size.rows, .width = size.cols };
+    // Windows: GetConsoleScreenBufferInfo needs a console OUTPUT handle, and
+    // stdin is an input handle — so query stdout as a fallback (TIOCGWINSZ on
+    // POSIX accepts any tty fd, so this is correct there too).
+    const size = platform.getTerminalSize(platform.getStdinHandle()) orelse
+        platform.getTerminalSize(platform.getStdoutHandle());
+    if (size) |sz| {
+        if (sz.rows != 0 and sz.cols != 0)
+            return .{ .height = sz.rows, .width = sz.cols };
     }
     return .{ .height = 24, .width = 80 }; // fallback
 }
