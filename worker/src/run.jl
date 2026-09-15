@@ -63,16 +63,13 @@ function warm_repl_path()
             dout = errormonitor(@async try read(cout.out) catch end)
             derr = errormonitor(@async try read(cerr.out) catch end)
             feeder = errormonitor(@async try write(cin.in, "1+1\n"); close(cin.in) catch end)
-            histfile = tempname()
             client = ClientInfo(true, false, 0, pwd(),
-                                ["TERM" => "xterm-256color", "JULIA_HISTORY" => histfile,
-                                 "JULIA_DAEMON_REVISE" => "no"],
-                                Tuple{String, String}[],
+                                ["TERM" => "xterm-256color", "JULIA_DAEMON_REVISE" => "no"],
+                                [("--history-file", "no")],
                                 nothing, String[], 0xFFFF)
             runclient(client, cin.out, cout.in, cerr.in, sig.out; owned_streams=())
             close(cout.in); close(cerr.in)
             wait(dout); wait(derr); wait(feeder)
-            rm(histfile; force=true)
         catch e
             @debug "REPL pre-warm failed" exception=(e, catch_backtrace())
         end
