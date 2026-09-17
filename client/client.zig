@@ -371,16 +371,22 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
     conductor_path = parsed.addr;
     const addr = conductor_path;
     // First attempt
+    var no_retry = false;
     if (protocol.connectAddress(io, transport_mode, addr)) |stream| {
         return stream;
     } else |err| {
         std.debug.print("Could not reach the conductor at {s}: {}\n", .{ addr, err });
+        if (err == error.ConnectionTimedOut)
+            std.debug.print("The host did not answer: is the conductor running there, and does a firewall allow the port?\n", .{});
+        no_retry = err == error.ConnectionTimedOut or
+            err == error.NetworkUnreachable or err == error.HostUnreachable;
     }
     // In TCP mode, no PID file / SIGUSR1 recovery — just retry briefly
     if (transport_mode == .tcp) {
         var attempts: u32 = 0;
-        while (attempts < 20) : (attempts += 1) {
+        while (attempts < 20 and !no_retry) : (attempts += 1) {
             Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
+            // A refusal means the conductor may still be starting.
             if (protocol.connectAddress(io, transport_mode, addr)) |stream| return stream else |_| {}
         }
     } else {
@@ -407,6 +413,11 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
         }
     }
     // Give up
+    if (transport_mode == .tcp) std.debug.print(
+        \\For a remote conductor: make sure it runs on that host and that
+        \\the firewall there allows TCP connections to the port.
+        \\
+    , .{});
     std.debug.print(
         \\Failed to connect to {s}
         \\
