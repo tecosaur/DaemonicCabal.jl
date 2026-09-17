@@ -143,6 +143,13 @@ pub const connectPipe = if (os == .windows) impl.connectPipe else struct {
         @compileError("windows only");
     }
 }.f;
+// Windows-only TCP dial: the platform primitives report AFD failures as real
+// errors, where std's connect collapses them into error.Unexpected.
+pub const dialTcp = if (os == .windows) impl.dialTcp else struct {
+    fn f() noreturn {
+        @compileError("windows only");
+    }
+}.f;
 pub const pipeState = if (os == .windows) impl.pipeState else struct {
     fn f() noreturn {
         @compileError("windows only");

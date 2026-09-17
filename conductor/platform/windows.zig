@@ -185,6 +185,20 @@ fn waitForApcOrAlert() void {
     _ = ntdll.NtDelayExecution(.TRUE, &forever);
 }
 
+/// Map the NT statuses an AFD operation can fail with to Zig errors, before
+/// falling back to the generic unexpectedStatus panic-print. Connect callers
+/// rely on this to tell a firewall drop apart from a refusal; the other AFD
+/// ops routed through syncAfdControl never produce these statuses.
+pub fn mapAfdStatus(status: win32.NTSTATUS) anyerror {
+    return switch (status) {
+        .IO_TIMEOUT => error.ConnectionTimedOut,
+        .CONNECTION_REFUSED => error.ConnectionRefused,
+        .NETWORK_UNREACHABLE => error.NetworkUnreachable,
+        .HOST_UNREACHABLE => error.HostUnreachable,
+        else => win32.unexpectedStatus(status),
+    };
+}
+
 /// Run one AFD IOCTL to completion on this thread: pended IRP + APC +
 /// alertable wait. Threaded.deviceIoControl's (:18504) nonblocking branch
 /// minus the cancellation machinery — no cancel context outside Io threads.
@@ -209,11 +223,11 @@ pub fn syncAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: []u8
         @intCast(out.len),
     )) {
         .PENDING, .SUCCESS => while (!done) waitForApcOrAlert(),
-        else => |status| return win32.unexpectedStatus(status),
+        else => |status| return mapAfdStatus(status),
     }
     switch (iosb.u.Status) {
         .SUCCESS => return iosb.Information,
-        else => |status| return win32.unexpectedStatus(status),
+        else => |status| return mapAfdStatus(status),
     }
 }
 
@@ -1105,11 +1119,41 @@ pub fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
     };
 }
 
-fn connectAfd(h: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
+pub fn dialTcp(ip: std.Io.net.IpAddress) !std.Io.net.Stream {
+    const family: posix.sa_family_t = switch (ip) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const fd = rawSocket(family, posix.SOCK.STREAM) orelse return error.SocketCreateFailed;
+    errdefer rawClose(fd);
+    switch (ip) {
+        .ip4 => |a| {
+            var sa: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
+            sa.family = posix.AF.INET;
+            sa.port = std.mem.nativeToBig(u16, a.port);
+            // std's own address4ToPosix does a plain bitCast: the u32 field is
+            // byte-laid-out in network order.
+            sa.addr = @bitCast(a.bytes);
+            try connectAfd(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in));
+        },
+        .ip6 => |a| {
+            var sa: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
+            sa.family = posix.AF.INET6;
+            sa.port = std.mem.nativeToBig(u16, a.port);
+            sa.addr = a.bytes;
+            try connectAfd(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in6));
+        },
+    }
+    return pipeAsStream(fd);
+}
+
+/// Typed connect for callers that branch on the failure reason. `rawConnect`
+/// is the bool-contract wrapper around this.
+pub fn connectAfd(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
     switch (addr.family) {
         posix.AF.INET, posix.AF.INET6 => {
             var one: bool = true;
-            try afdSockopt(h, .set, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.REUSE_UNICASTPORT, @as([]u8, @ptrCast(&one))[0..1]);
+            try afdSockopt(fd, .set, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.REUSE_UNICASTPORT, @as([]u8, @ptrCast(&one))[0..1]);
             // Bind unspecified(:0), same family as the target
             // (netConnectIpWindows :12103-12109 shape).
             var bind_addr: [28]u8 = [_]u8{0} ** 28;
@@ -1123,7 +1167,7 @@ fn connectAfd(h: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t) !voi
                     break :blk @sizeOf(posix.sockaddr.in6);
                 },
             };
-            try afdBind(h, .Active, bind_addr[0..blen]);
+            try afdBind(fd, .Active, bind_addr[0..blen]);
         },
         posix.AF.UNIX => {
             if (!std.Io.net.has_unix_sockets) return error.AddressFamilyUnsupported;
@@ -1137,7 +1181,7 @@ fn connectAfd(h: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t) !voi
             @memcpy(unix_path.Path[0..wps.len], wps.data[0..wps.len]);
             unix_path.Path[wps.len] = 0;
             try afdSockopt(
-                h,
+                fd,
                 .special,
                 0,
                 win32.ws2_32.SO.UNIX_PATH,
@@ -1148,7 +1192,7 @@ fn connectAfd(h: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t) !voi
             // the whole struct).
             var empty_un: posix.sockaddr.un = std.mem.zeroes(posix.sockaddr.un);
             empty_un.family = posix.AF.UNIX;
-            try afdBind(h, .Unix, @as([*]const u8, @ptrCast(&empty_un))[0..@sizeOf(posix.sockaddr.un)]);
+            try afdBind(fd, .Unix, @as([*]const u8, @ptrCast(&empty_un))[0..@sizeOf(posix.sockaddr.un)]);
         },
         else => return error.AddressFamilyUnsupported,
     }
@@ -1158,7 +1202,7 @@ fn connectAfd(h: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t) !voi
     var storage: ConnectStorage = .{ .reserved = @splat(0), .addr = undefined };
     @memcpy(storage.addr[0..len], @as([*]const u8, @ptrCast(addr))[0..len]);
     _ = try syncAfdControl(
-        h,
+        fd,
         win32.IOCTL.AFD.CONNECT,
         @as([]const u8, @ptrCast(&storage))[0 .. @offsetOf(ConnectStorage, "addr") + len],
         &.{},

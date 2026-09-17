@@ -363,6 +363,7 @@ pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net
         },
         .tcp => {
             const ip = try parseHostPort(addr);
+            if (comptime builtin.os.tag == .windows) return platform.dialTcp(ip);
             return ip.connect(io_ctx, .{ .mode = .stream });
         },
     }
