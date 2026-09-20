@@ -1951,6 +1951,7 @@ pub const Conductor = struct {
     fn sendSocketPaths(self: *Conductor, socket: posix.socket_t, paths: worker.Worker.SocketPaths) void {
         var buf: [1024]u8 = undefined;
         var w = protocol.BufWriter{ .buf = &buf };
+        w.writeInt(u8, protocol.client.socket_paths);
         // In TCP mode, send just the port — the client uses the conductor host
         const all = [_][]const u8{ paths.stdin, paths.stdout, paths.stderr, paths.signals };
         for (all) |path| {
