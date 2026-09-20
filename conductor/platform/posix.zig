@@ -50,6 +50,8 @@ pub const peerMountNs = impl.peerMountNs;
 pub const parentPid = impl.parentPid;
 /// Handle on a process that is not our child, immune to pid reuse; null when unsupported.
 pub const pidfdOpen = impl.pidfdOpen;
+/// Signal a process through its pidfd; 0 on success, like `kill`.
+pub const pidfdSignal = impl.pidfdSignal;
 /// A pidfd turns readable once its process has exited.
 pub fn pidfdExited(fd: posix.fd_t) bool {
     var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};

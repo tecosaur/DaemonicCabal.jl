@@ -61,6 +61,9 @@ pub fn parentPid(_: posix.pid_t) ?posix.pid_t {
 pub fn pidfdOpen(_: posix.pid_t) ?posix.fd_t {
     return null;
 }
+pub fn pidfdSignal(_: posix.fd_t, _: SIG) usize {
+    return 1;
+}
 
 /// Exec `argv` as a daemon: its own session, stdio on /dev/null, no inherited
 /// fds. One fork suffices: no parent-death signal exists here.

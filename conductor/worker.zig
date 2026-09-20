@@ -430,6 +430,17 @@ pub const Worker = struct {
         return platform.waitpidNonBlocking(pid).exited;
     }
 
+    /// Signal the worker process. A client-spawned worker is reaped by init the
+    /// moment it dies, so its pid can be recycled before we notice; the pidfd
+    /// cannot be.
+    pub fn signal(self: *const Worker, sig: platform.SIG) void {
+        if (self.pidfd) |fd| {
+            _ = platform.pidfdSignal(fd, sig);
+        } else if (self.process.id) |pid| {
+            _ = platform.kill(pid, sig);
+        }
+    }
+
     /// Record a PPID for session affinity tracking (circular buffer, 0 = empty)
     pub fn recordPpid(self: *Worker, ppid: u32, max_history: u32) void {
         const cap = if (max_history == 0) max_recent_ppids else @min(max_history, max_recent_ppids);
