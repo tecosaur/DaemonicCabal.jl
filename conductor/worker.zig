@@ -173,8 +173,24 @@ pub const Worker = struct {
     mem_at: i64 = 0, // seconds: last sample time, gating the idle-ping refresh
     sandboxed: bool = false,
     interactive: bool = false,
+    pidfd: ?posix.fd_t = null, // exact handle on a client-spawned worker, which is not our child
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
+
+    /// How a worker process comes to exist.
+    pub const Launch = union(enum) {
+        /// Our child, via std.process.spawn.
+        direct,
+        /// Our child, inside a sandbox we build around it (Linux only).
+        sandboxed: struct {
+            environ: *const std.process.Environ.Map,
+            ro_binds: []const []const u8,
+            rw_binds: []const []const u8,
+        },
+        /// Started by the client from the command we send it: it is in a mount
+        /// namespace we cannot see, so only it can start a worker that shares it.
+        client: struct { socket: posix.socket_t, environ: *const std.process.Environ.Map },
+    };
 
     pub fn spawn(
         allocator: Allocator,
@@ -185,38 +201,7 @@ pub const Worker = struct {
         julia_channel: ?[]const u8,
         threads: args.Threads,
         interactive: bool,
-    ) !Worker {
-        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, threads, interactive, false, null, &.{}, &.{});
-    }
-
-    pub fn spawnSandboxed(
-        allocator: Allocator,
-        io: Io,
-        cfg: *const config.Config,
-        id: u32,
-        runtime_dir: []const u8,
-        julia_channel: ?[]const u8,
-        threads: args.Threads,
-        environ_map: *const std.process.Environ.Map,
-        extra_ro_binds: []const []const u8,
-        extra_rw_binds: []const []const u8,
-    ) !Worker {
-        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, threads, false, true, environ_map, extra_ro_binds, extra_rw_binds);
-    }
-
-    fn spawnImpl(
-        allocator: Allocator,
-        io: Io,
-        cfg: *const config.Config,
-        id: u32,
-        runtime_dir: []const u8,
-        julia_channel: ?[]const u8,
-        threads: args.Threads,
-        interactive: bool,
-        sandboxed: bool,
-        environ_map: ?*const std.process.Environ.Map,
-        extra_ro_binds: []const []const u8,
-        extra_rw_binds: []const []const u8,
+        launch: Launch,
     ) !Worker {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         // Sandboxed workers use a per-worker subdirectory so the sandbox
@@ -225,7 +210,7 @@ pub const Worker = struct {
         // so placing the setup socket here makes the worker create its
         // stdio sockets in the same isolated subdirectory.
         var subdir_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const effective_runtime_dir = if (sandboxed and builtin.os.tag == .linux) blk: {
+        const effective_runtime_dir = if (launch == .sandboxed) blk: {
             const subdir = std.fmt.bufPrint(&subdir_buf, "{s}/sandbox-{d}", .{ runtime_dir, id }) catch
                 return error.PathTooLong;
             Io.Dir.createDirAbsolute(io, subdir, .default_dir) catch {};
@@ -249,82 +234,112 @@ pub const Worker = struct {
             break :blk try std.fmt.allocPrint(allocator, "--threads={s}", .{v});
         } else null;
         defer if (threads_arg) |a| allocator.free(a);
-        // Sandboxed spawn: fork+namespace+bind-mounts+exec (Linux only)
-        var child: std.process.Child = undefined;
-        if (sandboxed and builtin.os.tag == .linux) {
-            // execve(2) requires an absolute path — resolve bare command via PATH.
-            // std.process.spawn does this internally, but sandbox uses raw execve.
-            const exe_path = if (std.mem.indexOfScalar(u8, cfg.worker_executable, '/') != null)
-                cfg.worker_executable
-            else if (environ_map.?.get("PATH")) |p|
-                resolveInPath(io, cfg.worker_executable, p) orelse cfg.worker_executable
-            else
-                cfg.worker_executable;
-            // Merge caller-provided ro binds with the worker project dir
-            var ro_binds: [8][]const u8 = undefined;
-            var n_ro: usize = 0;
-            ro_binds[n_ro] = cfg.worker_project;
-            n_ro += 1;
-            if (extra_ro_binds.len > ro_binds.len - n_ro) {
-                std.debug.print("Worker: too many ro binds ({d}), max {d}\n", .{ extra_ro_binds.len + 1, ro_binds.len });
-                return error.TooManyBinds;
-            }
-            for (extra_ro_binds) |b| {
-                ro_binds[n_ro] = b;
+        const environ: ?*const std.process.Environ.Map = switch (launch) {
+            .direct => null,
+            .sandboxed => |s| s.environ,
+            .client => |c| c.environ,
+        };
+        // Raw execve (the sandbox, the client spawning for us) needs an absolute
+        // path; std.process.spawn resolves for itself.
+        const bare = std.mem.indexOfScalar(u8, cfg.worker_executable, '/') == null;
+        const resolved: ?[]const u8 = if (!bare) cfg.worker_executable else if (environ) |env|
+            (if (env.get("PATH")) |p| resolveInPath(io, cfg.worker_executable, p) else null)
+        else
+            null;
+        var child: std.process.Child = switch (launch) {
+            .sandboxed => |s| if (comptime builtin.os.tag != .linux) return error.SandboxUnsupported else blk: {
+                const exe_path = resolved orelse cfg.worker_executable;
+                // Merge caller-provided ro binds with the worker project dir
+                var ro_binds: [8][]const u8 = undefined;
+                var n_ro: usize = 0;
+                ro_binds[n_ro] = cfg.worker_project;
                 n_ro += 1;
-            }
-            const sandbox_cfg = sandbox.SandboxConfig{
-                .julia_executable = exe_path,
-                .julia_channel = julia_channel,
-                .threads_arg = threads_arg,
-                .worker_project = cfg.worker_project,
-                .worker_args = cfg.worker_args,
-                .eval_expr = eval_expr,
-                .host_environ = environ_map.?,
-                .setup_socket_path = setup.addr,
-                .worker_id = id,
-                .host_home = cfg.host_home,
-                .depot_env = environ_map.?.get("JULIA_DEPOT_PATH"),
-                .extra_ro_binds = ro_binds[0..n_ro],
-                .extra_rw_binds = extra_rw_binds,
-                .max_memory = cfg.sandbox_max_memory,
-                .max_cpu = cfg.sandbox_max_cpu,
+                if (s.ro_binds.len > ro_binds.len - n_ro) {
+                    std.debug.print("Worker: too many ro binds ({d}), max {d}\n", .{ s.ro_binds.len + 1, ro_binds.len });
+                    return error.TooManyBinds;
+                }
+                for (s.ro_binds) |b| {
+                    ro_binds[n_ro] = b;
+                    n_ro += 1;
+                }
+                const sandbox_cfg = sandbox.SandboxConfig{
+                    .julia_executable = exe_path,
+                    .julia_channel = julia_channel,
+                    .threads_arg = threads_arg,
+                    .worker_project = cfg.worker_project,
+                    .worker_args = cfg.worker_args,
+                    .eval_expr = eval_expr,
+                    .host_environ = s.environ,
+                    .setup_socket_path = setup.addr,
+                    .worker_id = id,
+                    .host_home = cfg.host_home,
+                    .depot_env = s.environ.get("JULIA_DEPOT_PATH"),
+                    .extra_ro_binds = ro_binds[0..n_ro],
+                    .extra_rw_binds = s.rw_binds,
+                    .max_memory = cfg.sandbox_max_memory,
+                    .max_cpu = cfg.sandbox_max_cpu,
+                };
+                std.debug.print("Spawning sandboxed worker\n", .{});
+                const sandbox_pid = try sandbox.spawnSandboxed(allocator, &sandbox_cfg);
+                // The host-visible PID is the intermediate process (child 1)
+                // which waits on the Julia process inside the PID namespace —
+                // killing it terminates the whole sandbox.
+                break :blk .{ .id = sandbox_pid, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
+            },
+            .direct, .client => blk: {
+                    var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
+                defer argv.deinit();
+                try argv.append(if (launch == .client) resolved orelse return error.ExecutableNotFound else cfg.worker_executable);
+                if (julia_channel) |ch| try argv.append(ch);
+                const project_arg: ?[]const u8 = if (cfg.worker_project.len > 0)
+                    try std.fmt.allocPrint(allocator, "--project={s}", .{cfg.worker_project})
+                else
+                    null;
+                defer if (project_arg) |p| allocator.free(p);
+                if (project_arg) |p| try argv.append(p);
+                {
+                    // Split on spaces; individual args containing spaces are not supported.
+                    var it = std.mem.tokenizeScalar(u8, cfg.worker_args, ' ');
+                    while (it.next()) |arg| try argv.append(arg);
+                }
+                if (threads_arg) |a| try argv.append(a);
+                if (interactive) try argv.append("-i");
+                try argv.append("--eval");
+                try argv.append(eval_expr);
+                break :blk switch (launch) {
+                    .client => |c| handed: {
+                        try sendSpawnRequest(c.socket, argv.items, c.environ);
+                        break :handed .{ .id = null, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
+                    },
+                    else => try std.process.spawn(io, .{
+                        .argv = argv.items,
+                        // Separate process group so terminal SIGINT only goes to conductor
+                        .pgid = if (builtin.os.tag == .windows) null else 0,
+                    }),
+                };
+            },
+        };
+        // A client that fails to spawn must not hang the conductor on the accept.
+        // The client sends nothing more until it has its paths, so its socket
+        // turning readable means it is gone; the ceiling covers a cold precompile.
+        if (launch == .client) {
+            var pfds = [_]posix.pollfd{
+                .{ .fd = setup.server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = launch.client.socket, .events = posix.POLL.IN, .revents = 0 },
             };
-            std.debug.print("Spawning sandboxed worker\n", .{});
-            const sandbox_pid = try sandbox.spawnSandboxed(allocator, &sandbox_cfg);
-            // The host-visible PID is the intermediate process (child 1)
-            // which waits on the Julia process inside the PID namespace —
-            // killing it terminates the whole sandbox.
-            child = .{ .id = sandbox_pid, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
-        } else {
-            // Normal spawn via std.process
-            var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
-            defer argv.deinit();
-            try argv.append(cfg.worker_executable);
-            if (julia_channel) |ch| try argv.append(ch);
-            const project_arg: ?[]const u8 = if (cfg.worker_project.len > 0)
-                try std.fmt.allocPrint(allocator, "--project={s}", .{cfg.worker_project})
-            else
-                null;
-            defer if (project_arg) |p| allocator.free(p);
-            if (project_arg) |p| try argv.append(p);
-            {
-                // Split on spaces; individual args containing spaces are not supported.
-                var it = std.mem.tokenizeScalar(u8, cfg.worker_args, ' ');
-                while (it.next()) |arg| try argv.append(arg);
-            }
-            if (threads_arg) |a| try argv.append(a);
-            if (interactive) try argv.append("-i");
-            try argv.append("--eval");
-            try argv.append(eval_expr);
-            // Spawn in separate process group so terminal SIGINT only goes to conductor
-            child = try std.process.spawn(io, .{
-                .argv = argv.items,
-                .pgid = if (builtin.os.tag == .windows) null else 0,
-            });
+            const ceiling_ms: i32 = @intCast(@min(cfg.ping_timeout * spawn_ceiling_factor * 1000, std.math.maxInt(i32)));
+            if (try posix.poll(&pfds, ceiling_ms) == 0) return error.WorkerSpawnTimeout;
+            if (pfds[1].revents != 0) return error.ClientGone;
         }
         const worker_stream = try setup.server.accept(io);
         const socket = worker_stream.socket.handle;
+        // Not our child: the pid comes from the connection it just made, and only a
+        // pidfd taken now survives pid reuse (waitpid would call it dead at once).
+        var pidfd: ?posix.fd_t = null;
+        if (launch == .client) {
+            child.id = platform.peerPid(socket) orelse return error.UnknownWorkerPid;
+            pidfd = platform.pidfdOpen(child.id.?) orelse return error.PidfdUnsupported;
+        }
         // Set read timeout to avoid blocking conductor if worker becomes unresponsive
         platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
         var magic_buf: [4]u8 = undefined;
@@ -344,9 +359,51 @@ pub const Worker = struct {
             .last_active = now,
             .last_pinged = now,
             .active_clients = 0,
-            .sandboxed = sandboxed,
+            .sandboxed = launch == .sandboxed,
             .interactive = interactive,
+            .pidfd = pidfd,
         };
+    }
+
+    // Ceiling on waiting for a client-spawned worker, as a multiple of
+    // ping_timeout: a fresh depot may have to precompile DaemonWorker first.
+    const spawn_ceiling_factor = 24;
+
+    // The worker reads its policy (max clients, TTLs, Revise) from its environment.
+    const daemon_env_prefix = "JULIA_DAEMON_";
+
+    fn sendSpawnRequest(client_socket: posix.socket_t, argv: []const []const u8, environ: *const std.process.Environ.Map) !void {
+        var buf: [4096]u8 = undefined;
+        var w = protocol.BufWriter{ .buf = &buf };
+        var needed: usize = 5;
+        var nenv: u16 = 0;
+        for (argv) |arg| needed += 2 + arg.len;
+        var it = environ.iterator();
+        while (it.next()) |e| if (std.mem.startsWith(u8, e.key_ptr.*, daemon_env_prefix)) {
+            needed += 3 + e.key_ptr.len + e.value_ptr.len;
+            nenv += 1;
+        };
+        if (needed > buf.len) return error.SpawnRequestTooLong;
+        w.writeInt(u8, protocol.client.spawn_request);
+        w.writeInt(u16, @intCast(argv.len));
+        for (argv) |arg| w.writeLenPrefixed(u16, arg);
+        w.writeInt(u16, nenv);
+        it = environ.iterator();
+        while (it.next()) |e| if (std.mem.startsWith(u8, e.key_ptr.*, daemon_env_prefix)) {
+            w.writeInt(u16, @intCast(e.key_ptr.len + 1 + e.value_ptr.len));
+            w.writeSlice(e.key_ptr.*);
+            w.writeSlice("=");
+            w.writeSlice(e.value_ptr.*);
+        };
+        platform.write(client_socket, w.written());
+    }
+
+    /// Whether the process has ended: exact for a client-spawned worker through
+    /// its pidfd; for a child of ours, reaps it as a side effect.
+    pub fn exited(self: *const Worker) bool {
+        if (self.pidfd) |fd| return platform.pidfdExited(fd);
+        const pid = self.process.id orelse return true;
+        return platform.waitpidNonBlocking(pid).exited;
     }
 
     /// Record a PPID for session affinity tracking (circular buffer, 0 = empty)
@@ -359,6 +416,7 @@ pub const Worker = struct {
     pub fn deinit(self: *Worker) void {
         if (self.project) |p| self.allocator.free(p);
         if (self.session_label) |l| self.allocator.free(l);
+        if (self.pidfd) |fd| platform.close(fd);
         platform.close(self.socket);
     }
 

@@ -44,6 +44,34 @@ pub fn kill(pid: posix.pid_t, sig: SIG) usize {
     const ret = c.kill(pid, sig);
     return if (ret < 0) 1 else 0;
 }
+
+// Client-spawned workers need mount namespaces, which only Linux has.
+pub fn peerPid(_: posix.socket_t) ?posix.pid_t {
+    return null;
+}
+pub fn peerForeignMountNs(_: posix.socket_t) ?u64 {
+    return null;
+}
+pub fn pidfdOpen(_: posix.pid_t) ?posix.fd_t {
+    return null;
+}
+
+/// Exec `argv` as a daemon: its own session, stdio on /dev/null, no inherited
+/// fds. One fork suffices: no parent-death signal exists here.
+pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !void {
+    const exe = argv[0].?;
+    if (c.access(exe, 1) != 0) return error.ExecutableNotFound; // X_OK
+    const pid = c.fork();
+    if (pid < 0) return error.ForkFailed;
+    if (pid != 0) return;
+    _ = c.setsid();
+    const devnull = c.open("/dev/null", .{ .ACCMODE = .RDWR });
+    for (0..3) |fd| _ = c.dup2(devnull, @intCast(fd));
+    var fd: c_int = 3;
+    while (fd < 1024) : (fd += 1) _ = c.close(fd);
+    _ = c.execve(exe, argv, envp);
+    c._exit(127);
+}
 pub fn rawWaitpid(pid: posix.pid_t) posix.pid_t {
     var status: c_int = 0;
     return c.waitpid(pid, &status, 1); // WNOHANG = 1

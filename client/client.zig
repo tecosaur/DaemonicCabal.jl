@@ -346,6 +346,7 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     const reader = &sr.interface;
     while (true) switch (try reader.takeByte()) {
         protocol.client.env_request => sendFullEnv(w, env, block),
+        protocol.client.spawn_request => try spawnWorker(reader, block),
         protocol.client.socket_paths => break,
         else => return error.BadReply,
     };
@@ -365,6 +366,26 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     };
     if (transport_mode == .tcp) protocol.setTcpNodelay(result.signals.socket.handle);
     return result;
+}
+
+/// Start the worker the conductor describes, detached: the conductor cannot see
+/// into this client's mount namespace, so a worker sharing it must be born here.
+fn spawnWorker(reader: *Io.Reader, block: EnvBlock) !void {
+    var strings: [8192]u8 = undefined;
+    var argv: [32]?[*:0]const u8 = undefined;
+    var envp: [1024]?[*:0]const u8 = undefined;
+    var pos: usize = 0;
+    const argc = try reader.takeInt(u16, .little);
+    if (argc == 0 or argc >= argv.len) return error.BadSpawnRequest;
+    for (argv[0..argc]) |*arg| arg.* = (try takeString(reader, &strings, &pos)).ptr;
+    argv[argc] = null;
+    // The daemon's own settings go first, so they shadow ours for the worker.
+    const envc = try reader.takeInt(u16, .little);
+    if (envc + block.slice.len >= envp.len) return error.BadSpawnRequest;
+    for (envp[0..envc]) |*entry| entry.* = (try takeString(reader, &strings, &pos)).ptr;
+    for (block.slice, envp[envc .. envc + block.slice.len]) |ours, *entry| entry.* = ours;
+    envp[envc + block.slice.len] = null;
+    try platform.spawnDetached(@ptrCast(&argv), @ptrCast(&envp));
 }
 
 /// One u16-length-prefixed string, appended NUL-terminated to `strings` at `pos`.

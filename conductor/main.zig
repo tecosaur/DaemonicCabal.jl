@@ -404,18 +404,30 @@ pub const Conductor = struct {
             try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty, request.pid);
             return;
         }
-        // Determine sandbox mode
-        const SandboxMode = enum { none, remote, local };
-        const sandbox_mode: SandboxMode = if (is_remote and (self.cfg.sandbox_remote_clients or request.parsed.hasSwitch("--sandbox")))
+        const project_path = request.project orelse "";
+        const julia_channel = request.parsed.julia_channel;
+        // Thread count is fixed at worker startup, so it's part of pool identity.
+        const threads = resolveThreads(&request);
+        // A local client in a foreign mount namespace is already sandboxed by
+        // something we cannot see into; it spawns its own worker there.
+        var rw_binds: [1][]const u8 = undefined;
+        const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or request.parsed.hasSwitch("--sandbox")))
             .remote
-        else if (request.parsed.hasSwitch("--sandbox"))
-            .local
-        else
-            .none;
+        else if (if (is_remote) null else platform.peerForeignMountNs(socket)) |ns|
+            .{ .client = .{ .socket = socket, .ns = ns } }
+        else if (request.parsed.hasSwitch("--sandbox")) blk: {
+            // When cwd is inside a non-global project, mount the project rw
+            // (subsumes cwd). Otherwise mount just cwd rw.
+            const cwd = trimTrailingSlashes(request.cwd);
+            const proj = trimTrailingSlashes(project_path);
+            const has_local_project = proj.len > 0 and proj[0] != '@';
+            rw_binds = .{if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd};
+            break :blk .{ .local = &rw_binds };
+        } else .none;
         // Platform check: sandboxing requires Linux
-        if (sandbox_mode != .none) {
+        if (sandbox != .none) {
             if (comptime builtin.os.tag != .linux) {
-                const msg = if (sandbox_mode == .remote)
+                const msg = if (sandbox == .remote)
                     "Sandboxed workers are only available on Linux. " ++
                         "Remote TCP clients from non-loopback addresses are rejected.\n"
                 else
@@ -425,11 +437,11 @@ pub const Conductor = struct {
                 return;
             }
             std.debug.print("Client {d}: {s} sandbox\n", .{
-                self.client_counter, if (sandbox_mode == .remote) "remote" else "local",
+                self.client_counter, @tagName(sandbox),
             });
         }
         // Session bypass: allow remote --session=<name> to join existing local workers
-        if (sandbox_mode == .remote) {
+        if (sandbox == .remote) {
             const session_label = request.parsed.getSwitch("--session");
             if (session_label != null and session_label.?.len > 0 and self.cfg.sandbox_session_bypass) {
                 if (self.findWorkerByLabelGlobal(session_label.?)) |w| {
@@ -440,37 +452,20 @@ pub const Conductor = struct {
                 }
             }
         }
-        // Compute worker key and sandbox bind mounts
-        const project_path = request.project orelse "";
-        const julia_channel = request.parsed.julia_channel;
-        // Thread count is fixed at worker startup, so it's part of pool identity.
-        const threads = resolveThreads(&request);
+        // Compute the worker key
         const tkey = args.packThreads(threads);
         const ch = julia_channel orelse "";
-        var rw_binds: [1][]const u8 = undefined;
-        const worker_key = switch (sandbox_mode) {
+        const worker_key = switch (sandbox) {
             .none => try std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
             .remote => try std.fmt.allocPrint(self.allocator, "__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
-            .local => blk: {
-                const cwd = trimTrailingSlashes(request.cwd);
-                const proj = trimTrailingSlashes(project_path);
-                // When cwd is inside a non-global project, mount the project rw
-                // (subsumes cwd). Otherwise mount just cwd rw.
-                const is_named_env = proj.len > 0 and proj[0] == '@';
-                const has_local_project = proj.len > 0 and !is_named_env;
-                const rw_mount: []const u8 = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd;
-                rw_binds = .{rw_mount};
-                // Key encodes rw mount + project so workers only share when their
-                // mount configuration matches.
-                break :blk try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw_mount, proj, ch, tkey });
-            },
+            // Keyed by the client's mount namespace too: a worker sees one sandbox's
+            // filesystem and must never serve another's, nor the host's.
+            .client => |c| try std.fmt.allocPrint(self.allocator, "__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
+            // Key encodes rw mount + project so workers only share when their
+            // mount configuration matches.
+            .local => |binds| try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ binds[0], trimTrailingSlashes(project_path), ch, tkey }),
         };
         defer self.allocator.free(worker_key);
-        const sandbox: SandboxKind = switch (sandbox_mode) {
-            .none => .none,
-            .remote => .remote,
-            .local => .{ .local = &rw_binds },
-        };
         // Validate --sync requires --session=<label>
         if (request.parsed.hasSwitch("--sync")) {
             const session = request.parsed.getSwitch("--session");
@@ -602,6 +597,7 @@ pub const Conductor = struct {
         none,
         remote,
         local: []const []const u8, // rw bind mounts
+        client: struct { socket: posix.socket_t, ns: u64 }, // the client spawns the worker inside its own sandbox
     };
 
     fn assignClientToWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, threads: args.Threads, sandbox: SandboxKind) !void {
@@ -727,7 +723,9 @@ pub const Conductor = struct {
             const explicit_project = for (client_info.switches) |sw| {
                 if (std.mem.eql(u8, sw.name, "--project")) break true;
             } else false;
-            const found = if (explicit_project)
+            // A sandboxed client's label is scoped to its own pool: its filesystem
+            // is not the host's, so joining a host worker by name would escape it.
+            const found = if (explicit_project or sandbox == .client)
                 findWorkerByLabel(list, session_label.?)
             else
                 self.findWorkerByLabelGlobal(session_label.?);
@@ -755,7 +753,8 @@ pub const Conductor = struct {
         }
         // 4. Spawn new worker
         const w = switch (sandbox) {
-            .none => try self.addWorkerToPool(list, project_path, julia_channel, threads, want_interactive),
+            .none => try self.addWorkerToPool(list, project_path, julia_channel, threads, want_interactive, .direct),
+            .client => |c| try self.addWorkerToPool(list, project_path, julia_channel, threads, want_interactive, .{ .client = .{ .socket = c.socket, .environ = self.environ_map } }),
             .remote => try self.addSandboxedWorkerToPool(list, project_path, julia_channel, threads, &.{}),
             .local => |rw_binds| try self.addSandboxedWorkerToPool(list, project_path, julia_channel, threads, rw_binds),
         };
@@ -883,6 +882,7 @@ pub const Conductor = struct {
             julia_channel,
             reserve_threads,
             false, // reserve workers are never interactive
+            .direct,
         );
         self.next_worker_id += 1;
         self.reserve = w;
@@ -890,11 +890,12 @@ pub const Conductor = struct {
         std.debug.print("Reserve worker {d} created (pid {d})\n", .{ w.id, platform.getChildPid(w.process) });
     }
 
-    fn addWorkerToPool(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, threads: args.Threads, interactive: bool) !*worker.Worker {
+    fn addWorkerToPool(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, threads: args.Threads, interactive: bool, launch: worker.Worker.Launch) !*worker.Worker {
         const proj_copy = try self.allocator.dupe(u8, proj);
         errdefer self.allocator.free(proj_copy);
-        // The reserve serves only a non-interactive request whose threads + channel match.
-        const can_use_reserve = if (!interactive) (if (self.reserve) |r| blk: {
+        // The reserve serves only a non-interactive request whose threads + channel
+        // match, and never a client that must spawn inside its own sandbox.
+        const can_use_reserve = if (!interactive and launch == .direct) (if (self.reserve) |r| blk: {
             if (!std.meta.eql(threads, r.threads)) break :blk false;
             const reserve_ch = r.julia_channel;
             if (julia_channel == null and reserve_ch == null) break :blk true;
@@ -924,9 +925,10 @@ pub const Conductor = struct {
                 julia_channel,
                 threads,
                 interactive,
+                launch,
             );
             std.debug.print("Spawning {s}worker {d} (pid {d}) for project {s}{s}{s}\n", .{
-                if (interactive) "interactive " else "",
+                if (launch == .client) "client-spawned " else if (interactive) "interactive " else "",
                 self.next_worker_id,
                 platform.getChildPid(new.process),
                 proj,
@@ -949,6 +951,9 @@ pub const Conductor = struct {
     fn findWorkerByLabelGlobal(self: *Conductor, label: []const u8) ?*worker.Worker {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
+            // Sandboxed pools (`__…__` keys) see a different filesystem; never
+            // hand one of their workers to a caller outside that sandbox.
+            if (std.mem.startsWith(u8, entry.key_ptr.*, "__")) continue;
             if (findWorkerByLabel(entry.value_ptr, label)) |w| return w;
         }
         return null;
@@ -971,7 +976,7 @@ pub const Conductor = struct {
             &[_][]const u8{project_path}
         else
             &[_][]const u8{};
-        w.* = try worker.Worker.spawnSandboxed(
+        w.* = try worker.Worker.spawn(
             self.allocator,
             self.io,
             &self.cfg,
@@ -979,9 +984,8 @@ pub const Conductor = struct {
             self.cfg.runtime_dir,
             julia_channel,
             threads,
-            self.environ_map,
-            proj_ro,
-            rw_binds,
+            false,
+            .{ .sandboxed = .{ .environ = self.environ_map, .ro_binds = proj_ro, .rw_binds = rw_binds } },
         );
         std.debug.print("Spawning sandboxed worker {d} (pid {d}){s}{s}\n", .{
             self.next_worker_id,
@@ -1322,7 +1326,7 @@ pub const Conductor = struct {
         var i: usize = 0;
         while (i < self.pending_kills.items.len) {
             var pk = &self.pending_kills.items[i];
-            if (platform.waitpidNonBlocking(pk.pid).exited) {
+            if (pk.w.exited()) {
                 self.cleanupWorker(pk.w);
                 _ = self.pending_kills.swapRemove(i);
                 continue;
@@ -1597,24 +1601,10 @@ pub const Conductor = struct {
     fn anyWorkerAlive(self: *Conductor) bool {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| {
-                if (w.process.id) |pid| {
-                    const result = platform.waitpidNonBlocking(pid);
-                    if (result.exited) continue;
-                    if (result.pid == 0) return true;
-                }
-            }
+            for (entry.value_ptr.items) |w| if (!w.exited()) return true;
         }
-        for (self.pending_kills.items) |pk| {
-            if (!platform.waitpidNonBlocking(pk.pid).exited) return true;
-        }
-        if (self.reserve) |r| {
-            if (r.process.id) |pid| {
-                const result = platform.waitpidNonBlocking(pid);
-                if (result.exited) return false;
-                if (result.pid == 0) return true;
-            }
-        }
+        for (self.pending_kills.items) |pk| if (!pk.w.exited()) return true;
+        if (self.reserve) |r| return !r.exited();
         return false;
     }
 
