@@ -725,7 +725,7 @@ pub const Conductor = struct {
             } else false;
             // A sandboxed client's label is scoped to its own pool: its filesystem
             // is not the host's, so joining a host worker by name would escape it.
-            const found = if (explicit_project or sandbox == .client)
+            const found = if (explicit_project or sandbox != .none)
                 findWorkerByLabel(list, session_label.?)
             else
                 self.findWorkerByLabelGlobal(session_label.?);
