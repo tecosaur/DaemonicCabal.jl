@@ -403,12 +403,13 @@ pub const Conductor = struct {
         const julia_channel = request.parsed.julia_channel;
         // Thread count is fixed at worker startup, so it's part of pool identity.
         const threads = resolveThreads(&request);
-        // A local client in a foreign mount namespace is already sandboxed by
-        // something we cannot see into; it spawns its own worker there.
+        // A client in another mount namespace is sandboxed by something we cannot
+        // see into, so it spawns its own worker there.
         var rw_binds: [1][]const u8 = undefined;
+        const foreign_ns = if (is_remote) null else platform.peerForeignMountNs(socket);
         const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or request.parsed.hasSwitch("--sandbox")))
             .remote
-        else if (if (is_remote) null else platform.peerForeignMountNs(socket)) |ns|
+        else if (foreign_ns) |ns|
             .{ .client = .{ .socket = socket, .ns = ns } }
         else if (request.parsed.hasSwitch("--sandbox")) blk: {
             // When cwd is inside a non-global project, mount the project rw
@@ -453,8 +454,7 @@ pub const Conductor = struct {
         const worker_key = switch (sandbox) {
             .none => try std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
             .remote => try std.fmt.allocPrint(self.allocator, "__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
-            // Keyed by the client's mount namespace too: a worker sees one sandbox's
-            // filesystem and must never serve another's, nor the host's.
+            // Keyed by mount namespace: a worker never serves another sandbox or the host.
             .client => |c| try std.fmt.allocPrint(self.allocator, "__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
             // Key encodes rw mount + project so workers only share when their
             // mount configuration matches.
@@ -718,8 +718,7 @@ pub const Conductor = struct {
             const explicit_project = for (client_info.switches) |sw| {
                 if (std.mem.eql(u8, sw.name, "--project")) break true;
             } else false;
-            // A sandboxed client's label is scoped to its own pool: its filesystem
-            // is not the host's, so joining a host worker by name would escape it.
+            // A sandboxed client's label stays in its pool: joining a host worker would escape.
             const found = if (explicit_project or sandbox != .none)
                 findWorkerByLabel(list, session_label.?)
             else
@@ -888,8 +887,7 @@ pub const Conductor = struct {
     fn addWorkerToPool(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, threads: args.Threads, interactive: bool, launch: worker.Worker.Launch) !*worker.Worker {
         const proj_copy = try self.allocator.dupe(u8, proj);
         errdefer self.allocator.free(proj_copy);
-        // The reserve serves only a non-interactive request whose threads + channel
-        // match, and never a client that must spawn inside its own sandbox.
+        // The reserve serves only a non-interactive, unsandboxed, threads + channel match.
         const can_use_reserve = if (!interactive and launch == .direct) (if (self.reserve) |r| blk: {
             if (!std.meta.eql(threads, r.threads)) break :blk false;
             const reserve_ch = r.julia_channel;
@@ -946,8 +944,7 @@ pub const Conductor = struct {
     fn findWorkerByLabelGlobal(self: *Conductor, label: []const u8) ?*worker.Worker {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
-            // Sandboxed pools (`__…__` keys) see a different filesystem; never
-            // hand one of their workers to a caller outside that sandbox.
+            // Sandboxed pools (`__…__` keys) never serve a caller outside their sandbox.
             if (std.mem.startsWith(u8, entry.key_ptr.*, "__")) continue;
             if (findWorkerByLabel(entry.value_ptr, label)) |w| return w;
         }

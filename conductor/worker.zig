@@ -18,6 +18,11 @@ const randomSocketPath = protocol.randomSocketPath;
 const createListener = protocol.createListener;
 
 const max_recent_ppids = 32;
+// Ceiling on waiting for a client-spawned worker, as a multiple of ping_timeout:
+// a fresh depot may have to precompile DaemonWorker first.
+const spawn_ceiling_factor = 24;
+// The worker reads its policy (max clients, TTLs, Revise) from its environment.
+const daemon_env_prefix = "JULIA_DAEMON_";
 
 // --- Activity signals ---
 // Lazily-decayed eviction-warmth predictors, combined as max(crf_norm, occupancy).
@@ -177,8 +182,7 @@ pub const Worker = struct {
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
 
-    /// How a worker is confined: not at all, in a sandbox we built, or in the
-    /// client's own sandbox (which we cannot see into).
+    /// Not confined, in a sandbox we built, or in the client's own sandbox.
     pub const Confinement = enum { none, remote, client };
 
     /// How a worker process comes to exist.
@@ -191,8 +195,7 @@ pub const Worker = struct {
             ro_binds: []const []const u8,
             rw_binds: []const []const u8,
         },
-        /// Started by the client from the command we send it: it is in a mount
-        /// namespace we cannot see, so only it can start a worker that shares it.
+        /// Started by the client, inside a mount namespace we cannot see into.
         client: struct { socket: posix.socket_t, environ: *const std.process.Environ.Map },
     };
 
@@ -243,8 +246,7 @@ pub const Worker = struct {
             .sandboxed => |s| s.environ,
             .client => |c| c.environ,
         };
-        // Raw execve (the sandbox, the client spawning for us) needs an absolute
-        // path; std.process.spawn resolves for itself.
+        // Raw execve (sandbox, client spawn) needs an absolute path.
         const bare = std.mem.indexOfScalar(u8, cfg.worker_executable, '/') == null;
         const resolved: ?[]const u8 = if (!bare) cfg.worker_executable else if (environ) |env|
             (if (env.get("PATH")) |p| resolveInPath(io, cfg.worker_executable, p) else null)
@@ -291,7 +293,7 @@ pub const Worker = struct {
                 break :blk .{ .id = sandbox_pid, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
             },
             .direct, .client => blk: {
-                    var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
+                var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
                 defer argv.deinit();
                 try argv.append(if (launch == .client) resolved orelse return error.ExecutableNotFound else cfg.worker_executable);
                 if (julia_channel) |ch| try argv.append(ch);
@@ -323,15 +325,11 @@ pub const Worker = struct {
                 };
             },
         };
-        // Anything that can reach the runtime directory can connect to this
-        // listener ahead of the real worker and pose as it. Take only the process
-        // we launched (or its child, for a sandbox or a launcher that forks), or
-        // for a client launch a process in the client's namespace; drop the rest
-        // and keep listening.
-        // A client that fails to spawn must not hang the conductor here. It sends
-        // nothing more until it has its paths, so its socket turning readable means
-        // it is gone; the deadline covers a cold precompile and is fixed once, so
-        // dropped connections cannot extend it.
+        // Anything reaching the runtime directory can connect first and pose as the
+        // worker: take only the process we launched (or its child), or for a client
+        // launch one in the client's namespace. A client that fails to spawn sends
+        // nothing until it has its paths, so its socket turning readable means it is
+        // gone; the deadline is fixed once so dropped connections cannot extend it.
         const spawn_deadline = platform.timeSeconds(io) + @as(i64, @intCast(cfg.ping_timeout * spawn_ceiling_factor));
         const socket = accepted: while (true) {
             if (launch == .client) {
@@ -381,13 +379,6 @@ pub const Worker = struct {
         };
     }
 
-    // Ceiling on waiting for a client-spawned worker, as a multiple of
-    // ping_timeout: a fresh depot may have to precompile DaemonWorker first.
-    const spawn_ceiling_factor = 24;
-
-    // The worker reads its policy (max clients, TTLs, Revise) from its environment.
-    const daemon_env_prefix = "JULIA_DAEMON_";
-
     fn sendSpawnRequest(client_socket: posix.socket_t, argv: []const []const u8, environ: *const std.process.Environ.Map) !void {
         var buf: [4096]u8 = undefined;
         var w = protocol.BufWriter{ .buf = &buf };
@@ -418,7 +409,7 @@ pub const Worker = struct {
         const peer = platform.peerPid(socket) orelse return true; // no peer credentials on this platform
         return switch (launch) {
             .direct, .sandboxed => peer == child_pid or platform.parentPid(peer) == child_pid,
-            .client => |c| platform.peerMountNs(socket) != null and platform.peerMountNs(socket) == platform.peerMountNs(c.socket),
+            .client => |c| if (platform.peerMountNs(socket)) |ns| ns == platform.peerMountNs(c.socket) else false,
         };
     }
 
@@ -430,9 +421,8 @@ pub const Worker = struct {
         return platform.waitpidNonBlocking(pid).exited;
     }
 
-    /// Signal the worker process. A client-spawned worker is reaped by init the
-    /// moment it dies, so its pid can be recycled before we notice; the pidfd
-    /// cannot be.
+    /// Signal the worker; through the pidfd where we hold one, since a worker
+    /// init reaps can have its pid recycled before we notice it died.
     pub fn signal(self: *const Worker, sig: platform.SIG) void {
         if (self.pidfd) |fd| {
             _ = platform.pidfdSignal(fd, sig);

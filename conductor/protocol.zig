@@ -14,7 +14,7 @@ const platform = @import("platform/main.zig");
 //   3. Client connects to worker sockets for stdio and signals
 pub const client = struct {
     pub const magic: u32 = 0x4A444302; // "JDC\x02" little-endian — v2: framed replies
-    // The conductor's reply is a sequence of frames, each introduced by its kind:
+    // Reply frame kinds:
     pub const env_request: u8 = 0x3F; // '?' - send the full environment (fingerprint cache miss)
     // Spawn your own worker (you are in a mount namespace the conductor cannot see):
     // u16 argc, argc × (u16 len + bytes), then u16 n, n × (u16 len + "KEY=VALUE") of

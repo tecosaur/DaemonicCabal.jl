@@ -41,8 +41,7 @@ pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
 }
 /// Pid of a unix-socket peer as this process sees it; null when unavailable.
 pub const peerPid = impl.peerPid;
-/// Inode of the peer's mount namespace when it differs from ours, i.e. the peer
-/// lives in a sandbox whose filesystem we cannot see; null when same or unknown.
+/// Inode of the peer's mount namespace when it differs from ours; null when same or unknown.
 pub const peerForeignMountNs = impl.peerForeignMountNs;
 /// Inode of the peer's mount namespace; null when unavailable.
 pub const peerMountNs = impl.peerMountNs;
@@ -57,8 +56,8 @@ pub fn pidfdExited(fd: posix.fd_t) bool {
     var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     return (posix.poll(&pfd, 0) catch return true) != 0;
 }
-/// Exec an absolute command detached from the caller (own session, stdio on
-/// /dev/null). Fails before forking when the path is not executable here.
+/// Exec an absolute command as a daemon: own session, stdio on /dev/null, no
+/// inherited fds. Fails before forking when the path is not executable here.
 pub const spawnDetached = impl.spawnDetached;
 
 /// Per-process memory and cumulative CPU time, for status reporting and eviction
