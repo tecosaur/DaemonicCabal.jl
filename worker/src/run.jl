@@ -159,8 +159,8 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     stderrx = IOContext(client_stderr, :color => hascolor)
     exit_code = 0
     try
-        # Inside the try: a failure here (e.g. loading Revise) must still reach the
-        # client as an error and run teardown, or the client waits forever.
+        # Inside the try, so a failure (e.g. loading Revise) reaches the client
+        # rather than leaving it waiting forever.
         mod = prepare_module(client)
         withenv(client.env...) do
             @static if VERSION < v"1.11"

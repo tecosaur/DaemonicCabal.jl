@@ -65,8 +65,7 @@ pub fn pidfdSignal(_: posix.fd_t, _: SIG) usize {
     return 1;
 }
 
-/// Exec `argv` as a daemon: its own session, stdio on /dev/null, no inherited
-/// fds. One fork suffices: no parent-death signal exists here.
+/// One fork suffices: there is no parent-death signal to arm here.
 pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !void {
     const exe = argv[0].?;
     if (c.access(exe, 1) != 0) return error.ExecutableNotFound; // X_OK

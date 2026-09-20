@@ -74,9 +74,8 @@ pub fn peerForeignMountNs(socket: posix.socket_t) ?u64 {
     return if (peer == own) null else peer;
 }
 
-/// Exec `argv` as a daemon: its own session, stdio on /dev/null, no inherited
-/// fds. Forked twice so its parent is init rather than the caller — a worker
-/// arms a parent-death signal, which then means "die with the sandbox".
+/// Forked twice so the parent is init, not the caller: the worker's parent-death
+/// signal then means "die with the sandbox".
 pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !void {
     // Checked here: a missing executable in the grandchild would die unwatched.
     const exe = argv[0].?;

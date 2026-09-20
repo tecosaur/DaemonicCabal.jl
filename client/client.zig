@@ -368,8 +368,8 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     return result;
 }
 
-/// Start the worker the conductor describes, detached: the conductor cannot see
-/// into this client's mount namespace, so a worker sharing it must be born here.
+/// Start the worker the conductor describes, detached, in this client's mount
+/// namespace, which the conductor cannot see into.
 fn spawnWorker(reader: *Io.Reader, block: EnvBlock) !void {
     var strings: [8192]u8 = undefined;
     var argv: [32]?[*:0]const u8 = undefined;
@@ -388,7 +388,6 @@ fn spawnWorker(reader: *Io.Reader, block: EnvBlock) !void {
     try platform.spawnDetached(@ptrCast(&argv), @ptrCast(&envp));
 }
 
-/// One u16-length-prefixed string, appended NUL-terminated to `strings` at `pos`.
 fn takeString(reader: *Io.Reader, strings: []u8, pos: *usize) ![:0]const u8 {
     const len = try reader.takeInt(u16, .little);
     const start = pos.*;
