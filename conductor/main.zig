@@ -153,7 +153,6 @@ pub const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
 /// A retiring worker awaiting reap; owns the `Worker` until then.
 pub const PendingKill = struct {
     w: *worker.Worker,
-    pid: posix.pid_t,
     stage: enum { soft, term },
     deadline: i64,
 };
@@ -244,8 +243,7 @@ pub const Conductor = struct {
         self.cache.deinit();
         self.active_clients.deinit();
         for (self.pending_kills.items) |pk| {
-            _ = platform.kill(pk.pid, platform.SIG.KILL);
-            _ = platform.waitpidNonBlocking(pk.pid);
+            pk.w.signal(platform.SIG.KILL);
             self.cleanupWorker(pk.w);
         }
         self.pending_kills.deinit(self.allocator);
@@ -369,10 +367,7 @@ pub const Conductor = struct {
                 // SIGINT the worker process: Julia's runtime throws InterruptException
                 // into the running client task (force-throwing a tight loop after rapid
                 // Ctrl-C). Untargeted, but the common worker serves one client.
-                if (self.active_clients.get(pid)) |info| {
-                    if (info.worker.process.id) |wpid|
-                        _ = platform.kill(wpid, platform.SIG.INT);
-                }
+                if (self.active_clients.get(pid)) |info| info.worker.signal(platform.SIG.INT);
             },
             .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{pid}),
             .worker_exit => {
@@ -1054,16 +1049,15 @@ pub const Conductor = struct {
 
     // Precondition: `w` is already detached from the pool.
     fn enqueueKill(self: *Conductor, w: *worker.Worker) void {
-        const pid = w.process.id orelse {
+        if (w.process.id == null) {
             self.cleanupWorker(w);
             return;
-        };
+        }
         w.softExit();
         self.pending_kills.append(self.allocator, .{
-            .w = w, .pid = pid, .stage = .soft, .deadline = self.currentTime() + retire_grace_s,
+            .w = w, .stage = .soft, .deadline = self.currentTime() + retire_grace_s,
         }) catch {
-            _ = platform.kill(pid, platform.SIG.KILL);
-            _ = platform.waitpidNonBlocking(pid);
+            w.signal(platform.SIG.KILL);
             self.cleanupWorker(w);
         };
     }
@@ -1333,12 +1327,12 @@ pub const Conductor = struct {
             }
             if (now >= pk.deadline) switch (pk.stage) {
                 .soft => {
-                    _ = platform.kill(pk.pid, platform.SIG.TERM);
+                    pk.w.signal(platform.SIG.TERM);
                     pk.stage = .term;
                     pk.deadline = now + retire_grace_s;
                 },
                 .term => {
-                    _ = platform.kill(pk.pid, platform.SIG.KILL);
+                    pk.w.signal(platform.SIG.KILL);
                     self.cleanupWorker(pk.w);
                     _ = self.pending_kills.swapRemove(i);
                     continue;
@@ -1587,15 +1581,11 @@ pub const Conductor = struct {
     fn signalAllWorkers(self: *Conductor, sig: platform.SIG) void {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| {
-                if (w.process.id) |id| _ = platform.kill(id, sig);
-            }
+            for (entry.value_ptr.items) |w| w.signal(sig);
         }
-        if (self.reserve) |r| {
-            if (r.process.id) |id| _ = platform.kill(id, sig);
-        }
+        if (self.reserve) |r| r.signal(sig);
         // Workers mid-retirement are no longer in the pool but still dying.
-        for (self.pending_kills.items) |pk| _ = platform.kill(pk.pid, sig);
+        for (self.pending_kills.items) |pk| pk.w.signal(sig);
     }
 
     fn anyWorkerAlive(self: *Conductor) bool {

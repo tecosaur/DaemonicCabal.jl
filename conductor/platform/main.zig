@@ -59,6 +59,7 @@ pub const peerMountNs = shared.peerMountNs;
 pub const parentPid = shared.parentPid;
 pub const spawnDetached = shared.spawnDetached;
 pub const pidfdOpen = shared.pidfdOpen;
+pub const pidfdSignal = shared.pidfdSignal;
 pub const pidfdExited = shared.pidfdExited;
 pub const ProcessStats = shared.ProcessStats;
 pub const getProcessStats = shared.getProcessStats;

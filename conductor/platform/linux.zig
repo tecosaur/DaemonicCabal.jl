@@ -47,6 +47,10 @@ pub fn pidfdOpen(pid: posix.pid_t) ?posix.fd_t {
     return if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
 }
 
+pub fn pidfdSignal(fd: posix.fd_t, sig: SIG) usize {
+    return linux.pidfd_send_signal(fd, sig, null, 0);
+}
+
 fn canExec(path: [*:0]const u8) bool {
     return linux.faccessat(linux.AT.FDCWD, path, linux.X_OK, 0) == 0;
 }
