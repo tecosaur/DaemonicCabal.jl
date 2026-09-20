@@ -41,6 +41,69 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
 
 // Raw syscall primitives used by posix.zig shared implementations
 pub const kill = linux.kill;
+
+pub fn pidfdOpen(pid: posix.pid_t) ?posix.fd_t {
+    const rc = linux.pidfd_open(pid, 0);
+    return if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
+}
+
+fn canExec(path: [*:0]const u8) bool {
+    return linux.faccessat(linux.AT.FDCWD, path, linux.X_OK, 0) == 0;
+}
+
+pub fn peerPid(socket: posix.socket_t) ?posix.pid_t {
+    var cred: extern struct { pid: posix.pid_t, uid: posix.uid_t, gid: posix.gid_t } = undefined;
+    var len: posix.socklen_t = @sizeOf(@TypeOf(cred));
+    if (linux.getsockopt(socket, linux.SOL.SOCKET, linux.SO.PEERCRED, @ptrCast(&cred), &len) != 0) return null;
+    return cred.pid;
+}
+
+var own_mount_ns: ?u64 = null; // ours never changes; read once
+pub fn peerForeignMountNs(socket: posix.socket_t) ?u64 {
+    const pid = peerPid(socket) orelse return null;
+    const peer = mountNsInode(pid) orelse return null;
+    const own = own_mount_ns orelse (mountNsInode(linux.getpid()) orelse return null);
+    own_mount_ns = own;
+    return if (peer == own) null else peer;
+}
+
+/// Exec `argv` as a daemon: its own session, stdio on /dev/null, no inherited
+/// fds. Forked twice so its parent is init rather than the caller — a worker
+/// arms a parent-death signal, which then means "die with the sandbox".
+pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !void {
+    // Checked here: a missing executable in the grandchild would die unwatched.
+    const exe = argv[0].?;
+    if (!canExec(exe)) return error.ExecutableNotFound;
+    const pid = linux.fork();
+    if (linux.errno(pid) != .SUCCESS) return error.ForkFailed;
+    if (pid != 0) {
+        var status: u32 = 0;
+        _ = linux.waitpid(@intCast(pid), &status, 0); // the intermediate exits at once
+        return;
+    }
+    _ = linux.setsid();
+    const grandchild = linux.fork();
+    if (linux.errno(grandchild) != .SUCCESS) linux.exit_group(1);
+    if (grandchild != 0) linux.exit_group(0);
+    const devnull: i32 = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0));
+    for (0..3) |fd| _ = linux.dup2(devnull, @intCast(fd));
+    _ = linux.close_range(3, std.math.maxInt(i32), .{ .UNSHARE = false, .CLOEXEC = false });
+    _ = linux.execve(exe, argv, envp);
+    linux.exit_group(127);
+}
+
+// The link reads "mnt:[4026531841]".
+fn mountNsInode(pid: posix.pid_t) ?u64 {
+    var path_buf: [64]u8 = undefined;
+    var link_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/ns/mnt", .{pid}) catch return null;
+    const n = linux.readlink(path, &link_buf, link_buf.len);
+    if (n == 0 or n > link_buf.len) return null;
+    const link = link_buf[0..n];
+    const open = std.mem.indexOfScalar(u8, link, '[') orelse return null;
+    const close = std.mem.indexOfScalar(u8, link, ']') orelse return null;
+    return std.fmt.parseInt(u64, link[open + 1 .. close], 10) catch null;
+}
 pub fn rawWaitpid(pid: posix.pid_t) posix.pid_t {
     var status: u32 = 0;
     const ret = linux.waitpid(pid, &status, linux.W.NOHANG);

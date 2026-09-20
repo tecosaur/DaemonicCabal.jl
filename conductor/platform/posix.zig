@@ -39,6 +39,21 @@ pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
     const ret = impl.rawWaitpid(pid);
     return .{ .pid = ret, .exited = ret != 0 };
 }
+/// Pid of a unix-socket peer as this process sees it; null when unavailable.
+pub const peerPid = impl.peerPid;
+/// Inode of the peer's mount namespace when it differs from ours, i.e. the peer
+/// lives in a sandbox whose filesystem we cannot see; null when same or unknown.
+pub const peerForeignMountNs = impl.peerForeignMountNs;
+/// Handle on a process that is not our child, immune to pid reuse; null when unsupported.
+pub const pidfdOpen = impl.pidfdOpen;
+/// A pidfd turns readable once its process has exited.
+pub fn pidfdExited(fd: posix.fd_t) bool {
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    return (posix.poll(&pfd, 0) catch return true) != 0;
+}
+/// Exec an absolute command detached from the caller (own session, stdio on
+/// /dev/null). Fails before forking when the path is not executable here.
+pub const spawnDetached = impl.spawnDetached;
 
 /// Per-process memory and cumulative CPU time, for status reporting and eviction
 /// sizing. `mem_bytes` is resident set size on Linux, phys_footprint on macOS (the

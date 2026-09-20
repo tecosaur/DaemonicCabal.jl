@@ -119,6 +119,21 @@ The sandbox gives read-write access to:
 Named environments (=@v1.11=, =@debug=, …) resolve as usual but are read-only:
 their packages load, their manifests cannot change.
 
+** Clients already in a sandbox
+
+A client running inside a sandbox of its own (bubblewrap, say) sees a filesystem
+the daemon cannot: the conductor notices the differing mount namespace and asks
+the client to start its worker itself, inside that sandbox, so Julia sees exactly
+what the client sees and writes land where the sandbox says they should. Such
+workers are pooled per sandbox and never serve the host or another sandbox, and
+they die with the sandbox when it has a pid namespace of its own (bubblewrap's
+=--unshare-pid=); without one they linger until their idle TTL. The sandbox only
+needs the daemon's runtime directory bound in at its host path
+(=/run/user/$UID/julia-daemon=); =--sandbox= adds nothing there. The daemon itself
+must share the host's mount namespace for the comparison to mean anything: a
+service hardened with =PrivateTmp= or =ProtectHome= would see every client as
+sandboxed.
+
 ** Remote sandboxing
 
 When listening on TCP (=JULIA_DAEMON_SERVER=tcp://...=), non-loopback connections
