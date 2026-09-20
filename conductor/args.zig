@@ -31,6 +31,7 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
 const optional_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },
     .{ "--status", {} },
+    .{ "--revise", {} },
     .{ "--project", {} },
     .{ "--code-coverage", {} },
     .{ "--track-allocation", {} },
