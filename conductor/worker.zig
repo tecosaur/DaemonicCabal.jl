@@ -287,7 +287,6 @@ pub const Worker = struct {
                 .depot_env = environ_map.?.get("JULIA_DEPOT_PATH"),
                 .extra_ro_binds = ro_binds[0..n_ro],
                 .extra_rw_binds = extra_rw_binds,
-                .empty_environment = cfg.sandbox_empty_environment,
                 .max_memory = cfg.sandbox_max_memory,
                 .max_cpu = cfg.sandbox_max_cpu,
             };

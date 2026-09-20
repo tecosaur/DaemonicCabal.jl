@@ -55,7 +55,6 @@ pub const SandboxConfig = struct {
     depot_env: ?[]const u8 = null, // host JULIA_DEPOT_PATH, verbatim (null = unset)
     extra_ro_binds: []const []const u8 = &.{},
     extra_rw_binds: []const []const u8 = &.{},
-    empty_environment: bool = true,
     max_memory: ?[]const u8,
     max_cpu: ?u32,
 };
@@ -489,7 +488,7 @@ fn mountHome(config: *const SandboxConfig, home: []const u8) SandboxError!void {
         const dst = fmtPath(&dst_buf, "/newroot{s}", .{depot.path}) orelse continue;
         mkdirp(dst);
         if (depot.writable) {
-            mountDepotOverlay(config, depot.path, dst);
+            mountDepotOverlay(depot.path, dst);
         } else {
             var src_buf: [384]u8 = undefined;
             const src = fmtPath(&src_buf, "/oldroot{s}", .{depot.path}) orelse continue;
@@ -539,8 +538,10 @@ pub fn isStrictAncestor(ancestor: []const u8, descendant: []const u8) bool {
 }
 
 /// Mount overlayfs on `depot_dst`, with the host path `depot_src` as the
-/// read-only lower layer. Falls back to a read-only bind if overlay fails.
-fn mountDepotOverlay(config: *const SandboxConfig, depot_src: []const u8, depot_dst: [*:0]const u8) void {
+/// read-only lower layer; fall back to a read-only bind if overlay fails.
+/// `<depot>/environments` is then bound read-only over the overlay, so named
+/// environments (`@v1.x`, `@debug`) resolve but no manifest can change.
+fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) void {
     var opts_buf: [512]u8 = undefined;
     const opts = fmtPath(&opts_buf,
         "upperdir=/ovl-upper,workdir=/ovl-work,lowerdir=/oldroot{s},userxattr",
@@ -550,16 +551,13 @@ fn mountDepotOverlay(config: *const SandboxConfig, depot_src: []const u8, depot_
         var src_buf: [384]u8 = undefined;
         if (fmtPath(&src_buf, "/oldroot{s}", .{depot_src})) |src|
             robindOptional(src, depot_dst);
-        return;
+        return; // the whole depot is already read-only
     };
-    // Mask <depot>/environments so the sandbox can't see or modify host environments
-    if (config.empty_environment) {
-        var env_buf: [384]u8 = undefined;
-        if (fmtPath(&env_buf, "/newroot{s}/environments", .{depot_src})) |env_path| {
-            mkdirE(env_path) catch {};
-            mountTmpfs(env_path, MS_NOSUID | MS_NODEV, "mode=0755") catch {};
-        }
-    }
+    var src_buf: [384]u8 = undefined;
+    var dst_buf: [384]u8 = undefined;
+    const src = fmtPath(&src_buf, "/oldroot{s}/environments", .{depot_src}) orelse return;
+    const dst = fmtPath(&dst_buf, "/newroot{s}/environments", .{depot_src}) orelse return;
+    robindOptional(src, dst);
 }
 
 // --- Cgroup v2 resource limits ---

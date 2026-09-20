@@ -116,7 +116,8 @@ The sandbox gives read-write access to:
   mount subsumes the working directory)
 - Just the *working directory* otherwise (the project is mounted read-only)
 
-Named environments (=@v1.11= etc.) are not mounted read-write.
+Named environments (=@v1.11=, =@debug=, …) resolve as usual but are read-only:
+their packages load, their manifests cannot change.
 
 ** Remote sandboxing
 
@@ -163,7 +164,6 @@ Sandbox configuration (Linux only, applies to both =--sandbox= and remote client
 | Variable                               | Default | Description                                                      |
 |----------------------------------------+---------+------------------------------------------------------------------|
 | =JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS=    | =1=       | Sandbox remote (non-loopback) TCP clients (=0= to disable)         |
-| =JULIA_DAEMON_SANDBOX_EMPTY_ENVIRONMENT= | =1=       | Mask =~/.julia/environments= in sandbox (=0= to expose host envs)    |
 | =JULIA_DAEMON_SANDBOX_MAX_MEMORY=        | /unset/   | Per-sandbox cgroup memory limit (e.g. =4G=, =512M=)                  |
 | =JULIA_DAEMON_SANDBOX_MAX_CPU=           | /unset/   | Per-sandbox cgroup CPU limit as percentage (e.g. =200= = 2 cores)  |
 | =JULIA_DAEMON_SANDBOX_SESSION_BYPASS=    | =0=       | Allow remote =--session=<label>= to join local unsandboxed workers |
