@@ -7,13 +7,15 @@ const platform = @import("platform/main.zig");
 
 // Client ↔ Conductor Protocol
 //   1. Client sends: magic + flags + pid + ppid + cwd + env_fingerprint + args
-//   2. Conductor replies with either:
-//      a. env_request ('?') if fingerprint not cached, then client sends full env
-//      b. Socket paths directly (length-prefixed) if fingerprint cached
+//   2. Conductor replies with a sequence of frames, each introduced by a kind byte:
+//      env_request if the fingerprint is not cached (the client then sends its
+//      full env), and finally socket_paths
 //   3. Client connects to worker sockets for stdio and signals
 pub const client = struct {
-    pub const magic: u32 = 0x4A444301; // "JDC\x01" little-endian
-    pub const env_request: u8 = 0x3F; // '?' - conductor requests full environment
+    pub const magic: u32 = 0x4A444302; // "JDC\x02" little-endian — v2: framed replies
+    // The conductor's reply is a sequence of frames, each introduced by its kind:
+    pub const env_request: u8 = 0x3F; // '?' - send the full environment (fingerprint cache miss)
+    pub const socket_paths: u8 = 0x01; // four len-prefixed paths: stdin, stdout, stderr, signals
 
     pub const Flags = packed struct(u8) {
         tty: bool,

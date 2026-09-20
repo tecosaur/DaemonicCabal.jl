@@ -344,36 +344,17 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     var buf: [1024]u8 = undefined;
     var sr = conductor.reader(io, &buf);
     const reader = &sr.interface;
-    // First byte is either '?' (env request) or low byte of stdin path length
-    const first_byte = try reader.takeByte();
-    if (first_byte == protocol.client.env_request) {
-        sendFullEnv(w, env, block);
-    }
-    // Read 4 length-prefixed socket paths: stdin, stdout, stderr, signals
-    // (reconstruct first path length if we already consumed the first byte)
-    const stdin_len: usize = if (first_byte == protocol.client.env_request)
-        try reader.takeInt(u16, .little)
-    else
-        @as(u16, first_byte) | (@as(u16, try reader.takeByte()) << 8);
-    var stdin_buf: [max_socket_path]u8 = undefined;
-    if (stdin_len > stdin_buf.len) return error.NameTooLong;
-    const stdin_path = stdin_buf[0..stdin_len];
-    try reader.readSliceAll(stdin_path);
-    const stdout_len: usize = try reader.takeInt(u16, .little);
-    var stdout_buf: [max_socket_path]u8 = undefined;
-    if (stdout_len > stdout_buf.len) return error.NameTooLong;
-    const stdout_path = stdout_buf[0..stdout_len];
-    try reader.readSliceAll(stdout_path);
-    const stderr_len: usize = try reader.takeInt(u16, .little);
-    var stderr_buf: [max_socket_path]u8 = undefined;
-    if (stderr_len > stderr_buf.len) return error.NameTooLong;
-    const stderr_path = stderr_buf[0..stderr_len];
-    try reader.readSliceAll(stderr_path);
-    const signals_len: usize = try reader.takeInt(u16, .little);
-    var signals_buf: [max_socket_path]u8 = undefined;
-    if (signals_len > signals_buf.len) return error.NameTooLong;
-    const signals_path = signals_buf[0..signals_len];
-    try reader.readSliceAll(signals_path);
+    while (true) switch (try reader.takeByte()) {
+        protocol.client.env_request => sendFullEnv(w, env, block),
+        protocol.client.socket_paths => break,
+        else => return error.BadReply,
+    };
+    var paths: [4 * (max_socket_path + 1)]u8 = undefined;
+    var pos: usize = 0;
+    const stdin_path = try takeString(reader, &paths, &pos);
+    const stdout_path = try takeString(reader, &paths, &pos);
+    const stderr_path = try takeString(reader, &paths, &pos);
+    const signals_path = try takeString(reader, &paths, &pos);
     conductor.close(io);
     // Connect to worker sockets (and clean up socket files in unix mode)
     const result = SocketSet{
@@ -384,6 +365,17 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     };
     if (transport_mode == .tcp) protocol.setTcpNodelay(result.signals.socket.handle);
     return result;
+}
+
+/// One u16-length-prefixed string, appended NUL-terminated to `strings` at `pos`.
+fn takeString(reader: *Io.Reader, strings: []u8, pos: *usize) ![:0]const u8 {
+    const len = try reader.takeInt(u16, .little);
+    const start = pos.*;
+    if (start + len + 1 > strings.len) return error.NameTooLong;
+    try reader.readSliceAll(strings[start .. start + len]);
+    strings[start + len] = 0;
+    pos.* = start + len + 1;
+    return strings[start .. start + len :0];
 }
 
 fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
