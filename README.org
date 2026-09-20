@@ -143,6 +143,7 @@ Environment variables read at daemon startup:
 | =JULIA_DAEMON_WORKER_ARGS=       | =--startup-file=no=            | Arguments passed to worker processes (split on whitespace)                                                                       |
 | =JULIA_DAEMON_WORKER_PROJECT=    | /(required)/                   | Project for the worker itself (not client projects)                                                                              |
 | =JULIA_DAEMON_WORKER_MAXCLIENTS= | =1=                            | Max clients per worker (0 = unlimited)                                                                                           |
+| =JULIA_DAEMON_RESERVE_WORKER=    | =1=                            | Keep a pre-spawned spare worker warm for the next new project (=0= to disable, e.g. in memory-constrained containers)             |
 | =JULIA_DAEMON_MAX_TTL=           | =7200=                         | Idle worker deadline in seconds; always culled past this (2h). Supersedes =JULIA_DAEMON_WORKER_TTL=, falling back to it when unset |
 | =JULIA_DAEMON_MIN_TTL=           | =120=                          | Protected floor: idle workers younger than this are never evicted under memory pressure                                          |
 | =JULIA_DAEMON_LABEL_TTL=         | =90=                           | Session label retention after last client disconnects (seconds)                                                                  |
