@@ -52,6 +52,12 @@ pub fn peerPid(_: posix.socket_t) ?posix.pid_t {
 pub fn peerForeignMountNs(_: posix.socket_t) ?u64 {
     return null;
 }
+pub fn peerMountNs(_: posix.socket_t) ?u64 {
+    return null;
+}
+pub fn parentPid(_: posix.pid_t) ?posix.pid_t {
+    return null;
+}
 pub fn pidfdOpen(_: posix.pid_t) ?posix.fd_t {
     return null;
 }
