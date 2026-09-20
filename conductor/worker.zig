@@ -319,20 +319,32 @@ pub const Worker = struct {
                 };
             },
         };
-        // A client that fails to spawn must not hang the conductor on the accept.
-        // The client sends nothing more until it has its paths, so its socket
-        // turning readable means it is gone; the ceiling covers a cold precompile.
-        if (launch == .client) {
-            var pfds = [_]posix.pollfd{
-                .{ .fd = setup.server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
-                .{ .fd = launch.client.socket, .events = posix.POLL.IN, .revents = 0 },
-            };
-            const ceiling_ms: i32 = @intCast(@min(cfg.ping_timeout * spawn_ceiling_factor * 1000, std.math.maxInt(i32)));
-            if (try posix.poll(&pfds, ceiling_ms) == 0) return error.WorkerSpawnTimeout;
-            if (pfds[1].revents != 0) return error.ClientGone;
-        }
-        const worker_stream = try setup.server.accept(io);
-        const socket = worker_stream.socket.handle;
+        // Anything that can reach the runtime directory can connect to this
+        // listener ahead of the real worker and pose as it. Take only the process
+        // we launched (or its child, for a sandbox or a launcher that forks), or
+        // for a client launch a process in the client's namespace; drop the rest
+        // and keep listening.
+        // A client that fails to spawn must not hang the conductor here. It sends
+        // nothing more until it has its paths, so its socket turning readable means
+        // it is gone; the deadline covers a cold precompile and is fixed once, so
+        // dropped connections cannot extend it.
+        const spawn_deadline = platform.timeSeconds(io) + @as(i64, @intCast(cfg.ping_timeout * spawn_ceiling_factor));
+        const socket = accepted: while (true) {
+            if (launch == .client) {
+                var pfds = [_]posix.pollfd{
+                    .{ .fd = setup.server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
+                    .{ .fd = launch.client.socket, .events = posix.POLL.IN, .revents = 0 },
+                };
+                const remaining_ms: i32 = @intCast(std.math.clamp((spawn_deadline - platform.timeSeconds(io)) * 1000, 0, std.math.maxInt(i32)));
+                if (try posix.poll(&pfds, remaining_ms) == 0) return error.WorkerSpawnTimeout;
+                if (pfds[1].revents != 0) return error.ClientGone;
+            }
+            const conn = try setup.server.accept(io);
+            if (isExpectedWorker(conn.socket.handle, launch, child.id)) break :accepted conn.socket.handle;
+            std.debug.print("Worker {d}: dropped a setup connection from an unexpected process\n", .{id});
+            platform.close(conn.socket.handle);
+        };
+        errdefer platform.close(socket);
         // Not our child: the pid comes from the connection it just made, and only a
         // pidfd taken now survives pid reuse (waitpid would call it dead at once).
         var pidfd: ?posix.fd_t = null;
@@ -396,6 +408,14 @@ pub const Worker = struct {
             w.writeSlice(e.value_ptr.*);
         };
         platform.write(client_socket, w.written());
+    }
+
+    fn isExpectedWorker(socket: posix.socket_t, launch: Launch, child_pid: ?posix.pid_t) bool {
+        const peer = platform.peerPid(socket) orelse return true; // no peer credentials on this platform
+        return switch (launch) {
+            .direct, .sandboxed => peer == child_pid or platform.parentPid(peer) == child_pid,
+            .client => |c| platform.peerMountNs(socket) != null and platform.peerMountNs(socket) == platform.peerMountNs(c.socket),
+        };
     }
 
     /// Whether the process has ended: exact for a client-spawned worker through

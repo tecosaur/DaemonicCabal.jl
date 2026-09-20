@@ -44,6 +44,10 @@ pub const peerPid = impl.peerPid;
 /// Inode of the peer's mount namespace when it differs from ours, i.e. the peer
 /// lives in a sandbox whose filesystem we cannot see; null when same or unknown.
 pub const peerForeignMountNs = impl.peerForeignMountNs;
+/// Inode of the peer's mount namespace; null when unavailable.
+pub const peerMountNs = impl.peerMountNs;
+/// Parent pid of a process; null when unreadable.
+pub const parentPid = impl.parentPid;
 /// Handle on a process that is not our child, immune to pid reuse; null when unsupported.
 pub const pidfdOpen = impl.pidfdOpen;
 /// A pidfd turns readable once its process has exited.

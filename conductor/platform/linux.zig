@@ -59,9 +59,12 @@ pub fn peerPid(socket: posix.socket_t) ?posix.pid_t {
 }
 
 var own_mount_ns: ?u64 = null; // ours never changes; read once
+pub fn peerMountNs(socket: posix.socket_t) ?u64 {
+    return mountNsInode(peerPid(socket) orelse return null);
+}
+
 pub fn peerForeignMountNs(socket: posix.socket_t) ?u64 {
-    const pid = peerPid(socket) orelse return null;
-    const peer = mountNsInode(pid) orelse return null;
+    const peer = peerMountNs(socket) orelse return null;
     const own = own_mount_ns orelse (mountNsInode(linux.getpid()) orelse return null);
     own_mount_ns = own;
     return if (peer == own) null else peer;
@@ -170,16 +173,21 @@ fn readProc(comptime fmt: []const u8, pid: posix.pid_t, buf: []u8) ?[]const u8 {
 // parent pid from /proc/<pid>/stat (field 4), then reads /proc/<ppid>/comm.
 // Returns null if either step fails (e.g. a remote client with no local /proc).
 pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
+    const ppid = parentPid(pid) orelse return null;
+    const comm = readProc("/proc/{d}/comm", ppid, out) orelse return null;
+    return std.mem.trimEnd(u8, comm, "\n");
+}
+
+// Field 4 of /proc/<pid>/stat, parsed from after the final ')' so a comm string
+// containing spaces or parens is skipped.
+pub fn parentPid(pid: posix.pid_t) ?posix.pid_t {
     var buf: [256]u8 = undefined;
     const content = readProc("/proc/{d}/stat", pid, &buf) orelse return null;
     const close_paren = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
     var fields = std.mem.tokenizeScalar(u8, content[close_paren + 1 ..], ' ');
     _ = fields.next() orelse return null; // field 3: state
-    const ppid_tok = fields.next() orelse return null; // field 4: ppid
-    const ppid = std.fmt.parseInt(posix.pid_t, ppid_tok, 10) catch return null;
-    if (ppid <= 0) return null;
-    const comm = readProc("/proc/{d}/comm", ppid, out) orelse return null;
-    return std.mem.trimEnd(u8, comm, "\n");
+    const ppid = std.fmt.parseInt(posix.pid_t, fields.next() orelse return null, 10) catch return null;
+    return if (ppid > 0) ppid else null;
 }
 
 // False: getProcessStats returns RSS (cheap, from /proc/<pid>/stat), but true USS
