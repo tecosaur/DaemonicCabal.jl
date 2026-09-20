@@ -278,7 +278,7 @@ pub const Conductor = struct {
     }
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
-        if (w.sandboxed) self.removeSandboxDir(w.id);
+        if (w.confinement == .remote) self.removeSandboxDir(w.id);
         w.deinit();
         self.allocator.destroy(w);
     }

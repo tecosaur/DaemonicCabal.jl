@@ -171,11 +171,15 @@ pub const Worker = struct {
     // Conductor.refreshOne for status + eviction sizing.
     mem: u64 = 0,
     mem_at: i64 = 0, // seconds: last sample time, gating the idle-ping refresh
-    sandboxed: bool = false,
+    confinement: Confinement = .none,
     interactive: bool = false,
     pidfd: ?posix.fd_t = null, // exact handle on a client-spawned worker, which is not our child
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
+
+    /// How a worker is confined: not at all, in a sandbox we built, or in the
+    /// client's own sandbox (which we cannot see into).
+    pub const Confinement = enum { none, remote, client };
 
     /// How a worker process comes to exist.
     pub const Launch = union(enum) {
@@ -371,7 +375,7 @@ pub const Worker = struct {
             .last_active = now,
             .last_pinged = now,
             .active_clients = 0,
-            .sandboxed = launch == .sandboxed,
+            .confinement = switch (launch) { .direct => .none, .sandboxed => .remote, .client => .client },
             .interactive = interactive,
             .pidfd = pidfd,
         };
