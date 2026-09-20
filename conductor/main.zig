@@ -310,7 +310,7 @@ pub const Conductor = struct {
             Io.Dir.deleteFileAbsolute(self.io, self.cfg.socket_path) catch {};
         };
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
-        self.createReserveWorker(null) catch |err| {
+        if (self.cfg.reserve_worker) self.createReserveWorker(null) catch |err| {
             std.debug.print("Failed to create reserve worker: {}\n", .{err});
         };
         eventLoopImpl.run(self, &server);
@@ -655,7 +655,7 @@ pub const Conductor = struct {
         std.debug.print("Client {d}: sending socket paths to client\n", .{self.client_counter});
         self.sendSocketPaths(socket, assignment.paths);
         std.debug.print("Client {d}: done\n", .{self.client_counter});
-        if (self.reserve == null) self.createReserveWorker(null) catch |err| {
+        if (self.cfg.reserve_worker and self.reserve == null) self.createReserveWorker(null) catch |err| {
             std.debug.print("Warning: failed to create reserve worker: {}\n", .{err});
         };
     }

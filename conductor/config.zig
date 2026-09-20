@@ -27,6 +27,7 @@ pub const Config = struct {
     memfree_high: MemThreshold, // free-memory exit threshold (must exceed memfree_low)
     port_range: ?PortRange, // from JULIA_DAEMON_PORTS=low-high
     host_home: []const u8, // host user's home dir (for sandbox depot access)
+    reserve_worker: bool, // keep a pre-spawned spare worker warm for the next new project (default: true)
     sandbox_remote_clients: bool, // sandbox remote (non-loopback) TCP clients (default: true)
     sandbox_max_memory: ?[]const u8, // e.g. "4G", "512M" — per-sandbox cgroup memory limit
     sandbox_max_cpu: ?u32, // cgroup cpu.max percentage, e.g. 200 = 2 cores
@@ -85,6 +86,7 @@ pub const Config = struct {
             .worker_args = env.get("JULIA_DAEMON_WORKER_ARGS") orelse "--startup-file=no",
             .worker_project = worker_project,
             .worker_maxclients = parseUint(u32, env.get("JULIA_DAEMON_WORKER_MAXCLIENTS"), 1),
+            .reserve_worker = !std.mem.eql(u8, env.get("JULIA_DAEMON_RESERVE_WORKER") orelse "1", "0"),
             .min_ttl = try parseUintStrict(u64, env.get("JULIA_DAEMON_MIN_TTL"), 120),
             // max_ttl supersedes WORKER_TTL; fall back to it so existing service files keep working.
             .max_ttl = try parseUintStrict(u64, env.get("JULIA_DAEMON_MAX_TTL"), parseUint(u64, env.get("JULIA_DAEMON_WORKER_TTL"), 7200)),
