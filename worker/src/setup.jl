@@ -475,11 +475,43 @@ const CLIENT_ACCEPT_TIMEOUT_S = 30.0
 
 # A bare `accept` blocks the message loop indefinitely, so a client that dies
 # after receiving its paths would stall pings and get the whole worker killed.
-function accept_with_timeout(srv)
-    task = @async accept(srv)
-    timedwait(() -> istaskdone(task), CLIENT_ACCEPT_TIMEOUT_S) === :ok ||
-        throw(ErrorException("client did not connect within $(CLIENT_ACCEPT_TIMEOUT_S)s"))
-    fetch(task)
+# Only the client the conductor named (`pid`, 0 = any) may take the socket:
+# anything else that can reach the runtime directory could connect first and
+# take over the session's terminal.
+function accept_with_timeout(srv, pid::Integer)
+    want = expected_peer(pid)
+    deadline = time() + CLIENT_ACCEPT_TIMEOUT_S
+    while true
+        task = @async accept(srv)
+        timedwait(() -> istaskdone(task), max(deadline - time(), 0.0)) === :ok ||
+            throw(ErrorException("client did not connect within $(CLIENT_ACCEPT_TIMEOUT_S)s"))
+        sock = fetch(task)
+        peer = peer_pid(sock)
+        (pid == 0 || isnothing(peer) || peer == want) && return sock
+        @warn "Dropped a client socket connection from an unexpected process" expected=want actual=peer
+        close(sock)
+    end
+end
+
+# SO_PEERCRED reports the client's pid within our pid namespace, or 0 from outside
+# it. A conductor-sandboxed worker is init of its own namespace with its client
+# outside; a client-spawned worker shares its client's, so there 0 is an outsider.
+expected_peer(pid) = getpid() == 1 ? 0 : pid
+
+# Pid of a unix-socket peer as this process sees it; `nothing` where the platform
+# offers no credentials (TCP, non-Linux), in which case the caller cannot check.
+@static if Sys.islinux()
+    function peer_pid(sock)
+        sock isa Sockets.TCPSocket && return nothing
+        cred = Ref((Cint(0), Cuint(0), Cuint(0)))  # struct ucred: pid, uid, gid
+        len = Ref{Cuint}(sizeof(cred[]))
+        SOL_SOCKET, SO_PEERCRED = 1, 17
+        rc = ccall(:getsockopt, Cint, (Cint, Cint, Cint, Ptr{Cvoid}, Ptr{Cuint}),
+                   Base._fd(sock), SOL_SOCKET, SO_PEERCRED, cred, len)
+        rc == 0 ? Int(cred[][1]) : nothing
+    end
+else
+    peer_pid(::Any) = nothing
 end
 
 function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
@@ -494,8 +526,8 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
     is_tcp = stdin_srv isa Sockets.TCPServer
     t0 = time_ns()
     client_stdin, client_stdout, client_stderr, signals = try
-        accept_with_timeout(stdin_srv), accept_with_timeout(stdout_srv),
-        accept_with_timeout(stderr_srv), accept_with_timeout(signals_srv)
+        accept_with_timeout(stdin_srv, client.pid), accept_with_timeout(stdout_srv, client.pid),
+        accept_with_timeout(stderr_srv, client.pid), accept_with_timeout(signals_srv, client.pid)
     catch
         @lock STATE.lock filter!(e -> last(e) !== client, STATE.clients)
         rethrow()
