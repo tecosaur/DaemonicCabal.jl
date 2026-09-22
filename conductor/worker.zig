@@ -176,14 +176,11 @@ pub const Worker = struct {
     // Conductor.refreshOne for status + eviction sizing.
     mem: u64 = 0,
     mem_at: i64 = 0, // seconds: last sample time, gating the idle-ping refresh
-    confinement: Confinement = .none,
+    launch: LaunchKind = .direct,
     interactive: bool = false,
     pidfd: ?posix.fd_t = null, // exact handle on a client-spawned worker, which is not our child
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
-
-    /// Not confined, in a sandbox we built, or in the client's own sandbox.
-    pub const Confinement = enum { none, remote, client };
 
     /// How a worker process comes to exist.
     pub const Launch = union(enum) {
@@ -198,6 +195,7 @@ pub const Worker = struct {
         /// Started by the client, inside a mount namespace we cannot see into.
         client: struct { socket: posix.socket_t, environ: *const std.process.Environ.Map },
     };
+    pub const LaunchKind = std.meta.Tag(Launch);
 
     pub fn spawn(
         allocator: Allocator,
@@ -373,7 +371,7 @@ pub const Worker = struct {
             .last_active = now,
             .last_pinged = now,
             .active_clients = 0,
-            .confinement = switch (launch) { .direct => .none, .sandboxed => .remote, .client => .client },
+            .launch = launch,
             .interactive = interactive,
             .pidfd = pidfd,
         };

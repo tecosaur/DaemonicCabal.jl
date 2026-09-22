@@ -282,7 +282,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, now: i64) !void
     var it = c.workers.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.items.len == 0) continue;
-        if (entry.value_ptr.items[0].confinement != .none) continue;
+        if (entry.value_ptr.items[0].launch != .direct) continue;
         if (printed_any) try w.writeByte('\n');
         try renderProject(c, w, s, ctx, entry.value_ptr.items, entry.key_ptr.*, now, have_sandboxed);
         printed_any = true;
@@ -296,7 +296,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, now: i64) !void
         var sit = c.workers.iterator();
         while (sit.next()) |entry| {
             for (entry.value_ptr.items) |wk| {
-                if (wk.confinement == .none) continue;
+                if (wk.launch == .direct) continue;
                 seen += 1;
                 try renderWorker(c, w, s, ctx, wk, entry.key_ptr.*, now, false, seen == total);
                 printed_any = true;
@@ -425,15 +425,15 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
         try w.print(" (threads={s})", .{t});
         col += 11 + t.len;
     }
-    switch (wk.confinement) {
-        .none => {},
-        .remote => {
-            try w.writeAll(" (remote)");
-            col += 9;
-        },
-        .client => {
+    switch (wk.launch) {
+        .direct => {},
+        .sandboxed => {
             try w.writeAll(" (sandboxed)");
             col += 12;
+        },
+        .client => {
+            try w.writeAll(" (client sandbox)");
+            col += 17;
         },
     }
     // Pad the identity column so the stats align, then uptime, RSS, CPU%.
@@ -642,7 +642,7 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style, now: i64) !void {
 fn anySandboxed(c: *Conductor) bool {
     var it = c.workers.iterator();
     while (it.next()) |entry| {
-        for (entry.value_ptr.items) |wk| if (wk.confinement != .none) return true;
+        for (entry.value_ptr.items) |wk| if (wk.launch != .direct) return true;
     }
     return false;
 }
@@ -651,7 +651,7 @@ fn countSandboxed(c: *Conductor) usize {
     var n: usize = 0;
     var it = c.workers.iterator();
     while (it.next()) |entry| {
-        for (entry.value_ptr.items) |wk| if (wk.confinement != .none) {
+        for (entry.value_ptr.items) |wk| if (wk.launch != .direct) {
             n += 1;
         };
     }
@@ -755,7 +755,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     const threads_str = try argspec.renderThreads(c.allocator, wk.threads);
     defer if (threads_str) |t| c.allocator.free(t);
     try writeJsonStringOrNull(w, threads_str);
-    try w.print(",\"interactive\":{},\"confinement\":\"{s}\"", .{ wk.interactive, @tagName(wk.confinement) });
+    try w.print(",\"interactive\":{},\"launch\":\"{s}\"", .{ wk.interactive, @tagName(wk.launch) });
     try w.print(",\"created_at\":{d},\"last_active\":{d},\"last_pinged\":{d}", .{ wk.created_at, wk.last_active, wk.last_pinged });
     try w.print(",\"ping_pending\":{},\"active_clients\":{d}", .{ wk.ping_pending, wk.active_clients });
     try w.print(",\"activity\":{d:.4},\"cull_budget_s\":{d}", .{ c.workerActivity(wk, key, now), c.idleBudget(wk, key orelse "") });
