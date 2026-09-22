@@ -475,21 +475,28 @@ const CLIENT_ACCEPT_TIMEOUT_S = 30.0
 
 # A bare `accept` blocks the message loop indefinitely, so a client that dies
 # after receiving its paths would stall pings and get the whole worker killed.
-# Only the client the conductor named may take the socket (`pid` as our kernel
-# will report it; 0 = any): anything else that can reach the runtime directory
-# could connect first and take over the session's terminal.
-function accept_with_timeout(srv, pid::Integer)
+# The servers serve this one client, so the deadline simply closes them and a
+# blocked accept raises. Only the client the conductor named may take a socket
+# (`pid` as our kernel will report it; 0 = any): anything else that can reach the
+# runtime directory could connect first and take over the session's terminal.
+function accept_client_sockets(servers, pid::Integer)
     want = expected_peer(pid)
-    deadline = time() + CLIENT_ACCEPT_TIMEOUT_S
-    while true
-        task = @async accept(srv)
-        timedwait(() -> istaskdone(task), max(deadline - time(), 0.0)) === :ok ||
-            throw(ErrorException("client did not connect within $(CLIENT_ACCEPT_TIMEOUT_S)s"))
-        sock = fetch(task)
-        peer = peer_pid(sock)
-        (pid == 0 || isnothing(peer) || peer == want) && return sock
-        @warn "Dropped a client socket connection from an unexpected process" expected=want actual=peer
-        close(sock)
+    deadline = Timer(_ -> foreach(close, servers), CLIENT_ACCEPT_TIMEOUT_S)
+    try
+        map(servers) do srv
+            while true
+                sock = accept(srv)
+                peer = peer_pid(sock)
+                (pid == 0 || isnothing(peer) || peer == want) && return sock
+                @warn "Dropped a client socket connection from an unexpected process" expected=want actual=peer
+                close(sock)
+            end
+        end
+    catch
+        isopen(deadline) && rethrow()
+        throw(ErrorException("client did not connect within $(CLIENT_ACCEPT_TIMEOUT_S)s"))
+    finally
+        close(deadline)
     end
 end
 
@@ -526,8 +533,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
     is_tcp = stdin_srv isa Sockets.TCPServer
     t0 = time_ns()
     client_stdin, client_stdout, client_stderr, signals = try
-        accept_with_timeout(stdin_srv, client.pid), accept_with_timeout(stdout_srv, client.pid),
-        accept_with_timeout(stderr_srv, client.pid), accept_with_timeout(signals_srv, client.pid)
+        accept_client_sockets((stdin_srv, stdout_srv, stderr_srv, signals_srv), client.pid)
     catch
         @lock STATE.lock filter!(e -> last(e) !== client, STATE.clients)
         rethrow()
