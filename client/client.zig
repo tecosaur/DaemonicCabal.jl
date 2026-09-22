@@ -387,7 +387,17 @@ fn spawnWorker(reader: *Io.Reader, block: EnvBlock) !void {
     for (envp[0..envc]) |*entry| entry.* = (try takeString(reader, &strings, &pos)).ptr;
     for (block.slice, envp[envc .. envc + block.slice.len]) |ours, *entry| entry.* = ours;
     envp[envc + block.slice.len] = null;
-    try platform.spawnDetached(@ptrCast(&argv), @ptrCast(&envp));
+    platform.spawnDetached(@ptrCast(&argv), @ptrCast(&envp)) catch |err| {
+        std.debug.print("Cannot start a Julia worker inside this sandbox: {s} ({s}).\n", .{
+            std.mem.span(argv[0].?), @errorName(err),
+        });
+        if (err == error.ExecutableNotFound) std.debug.print(
+            \\A sandboxed client runs its own worker, so the sandbox must also see the Julia install,
+            \\the DaemonWorker project and the Julia depot (~/.julia or JULIA_DEPOT_PATH).
+            \\
+        , .{});
+        exitClient(127);
+    };
 }
 
 fn takeString(reader: *Io.Reader, strings: []u8, pos: *usize) ![:0]const u8 {

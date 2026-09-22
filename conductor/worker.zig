@@ -18,9 +18,7 @@ const randomSocketPath = protocol.randomSocketPath;
 const createListener = protocol.createListener;
 
 const max_recent_ppids = 32;
-// Ceiling on waiting for a client-spawned worker, as a multiple of ping_timeout:
-// a fresh depot may have to precompile DaemonWorker first.
-const spawn_ceiling_factor = 24;
+const spawn_tick_ms = 1000; // liveness check cadence while waiting for a new worker
 // The worker reads its policy (max clients, TTLs, Revise) from its environment.
 const daemon_env_prefix = "JULIA_DAEMON_";
 
@@ -293,7 +291,10 @@ pub const Worker = struct {
             .direct, .client => blk: {
                 var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
                 defer argv.deinit();
-                try argv.append(if (launch == .client) resolved orelse return error.ExecutableNotFound else cfg.worker_executable);
+                try argv.append(if (launch == .client) resolved orelse {
+                    std.debug.print("Worker {d}: cannot resolve '{s}' on the daemon's PATH to name it to the client's sandbox; set JULIA_DAEMON_WORKER_EXECUTABLE to an absolute path\n", .{ id, cfg.worker_executable });
+                    return error.ExecutableNotFound;
+                } else cfg.worker_executable);
                 if (julia_channel) |ch| try argv.append(ch);
                 const project_arg: ?[]const u8 = if (cfg.worker_project.len > 0)
                     try std.fmt.allocPrint(allocator, "--project={s}", .{cfg.worker_project})
@@ -325,20 +326,30 @@ pub const Worker = struct {
         };
         // Anything reaching the runtime directory can connect first and pose as the
         // worker: take only the process we launched (or its child), or for a client
-        // launch one in the client's namespace. A client that fails to spawn sends
-        // nothing until it has its paths, so its socket turning readable means it is
-        // gone; the deadline is fixed once so dropped connections cannot extend it.
-        const spawn_deadline = platform.timeSeconds(io) + @as(i64, @intCast(cfg.ping_timeout * spawn_ceiling_factor));
+        // launch one in the client's namespace. The deadline is fixed once so dropped
+        // connections cannot extend it. A child of ours that dies first (a failed
+        // precompile, say) is noticed on the next tick; a client that fails to spawn
+        // sends nothing until it has its paths, so its socket turning readable means
+        // it is gone.
+        const spawn_deadline = platform.timeSeconds(io) + @as(i64, @intCast(cfg.spawn_timeout));
         const socket = accepted: while (true) {
-            if (launch == .client) {
-                var pfds = [_]posix.pollfd{
-                    .{ .fd = setup.server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
-                    .{ .fd = launch.client.socket, .events = posix.POLL.IN, .revents = 0 },
+            var pfds = [_]posix.pollfd{
+                .{ .fd = setup.server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = if (launch == .client) launch.client.socket else -1, .events = posix.POLL.IN, .revents = 0 },
+            };
+            const remaining_ms = std.math.clamp((spawn_deadline - platform.timeSeconds(io)) * 1000, 0, spawn_tick_ms);
+            if (try posix.poll(&pfds, @intCast(remaining_ms)) == 0) {
+                if (platform.timeSeconds(io) >= spawn_deadline) {
+                    std.debug.print("Worker {d}: no connection from the new worker within {d}s (JULIA_DAEMON_SPAWN_TIMEOUT)\n", .{ id, cfg.spawn_timeout });
+                    return error.WorkerSpawnTimeout;
+                }
+                if (child.id) |pid| if (platform.waitpidNonBlocking(pid).exited) {
+                    std.debug.print("Worker {d}: process exited before connecting; its output is above\n", .{id});
+                    return error.WorkerExitedEarly;
                 };
-                const remaining_ms: i32 = @intCast(std.math.clamp((spawn_deadline - platform.timeSeconds(io)) * 1000, 0, std.math.maxInt(i32)));
-                if (try posix.poll(&pfds, remaining_ms) == 0) return error.WorkerSpawnTimeout;
-                if (pfds[1].revents != 0) return error.ClientGone;
+                continue;
             }
+            if (pfds[1].revents != 0) return error.ClientGone;
             const conn = try setup.server.accept(io);
             if (isExpectedWorker(conn.socket.handle, launch, child.id)) break :accepted conn.socket.handle;
             std.debug.print("Worker {d}: dropped a setup connection from an unexpected process\n", .{id});
@@ -349,8 +360,14 @@ pub const Worker = struct {
         // pidfd taken now survives pid reuse (waitpid would call it dead at once).
         var pidfd: ?posix.fd_t = null;
         if (launch == .client) {
-            child.id = platform.peerPid(socket) orelse return error.UnknownWorkerPid;
-            pidfd = platform.pidfdOpen(child.id.?) orelse return error.PidfdUnsupported;
+            child.id = platform.peerPid(socket) orelse {
+                std.debug.print("Worker {d}: no peer credentials on the setup connection, so the client-spawned worker cannot be tracked\n", .{id});
+                return error.UnknownWorkerPid;
+            };
+            pidfd = platform.pidfdOpen(child.id.?) orelse {
+                std.debug.print("Worker {d}: pidfd_open failed for pid {d}; client-spawned workers need Linux 5.3+\n", .{ id, child.id.? });
+                return error.PidfdUnsupported;
+            };
         }
         // Set read timeout to avoid blocking conductor if worker becomes unresponsive
         platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
