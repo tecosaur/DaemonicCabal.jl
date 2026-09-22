@@ -77,9 +77,13 @@ pub fn peerForeignMountNs(socket: posix.socket_t) ?u64 {
 /// Forked twice so the parent is init, not the caller: the worker's parent-death
 /// signal then means "die with the sandbox".
 pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !void {
-    // Checked here: a missing executable in the grandchild would die unwatched.
+    // Checked here: a missing executable or /dev/null in the grandchild would die unwatched.
     const exe = argv[0].?;
     if (!canExec(exe)) return error.ExecutableNotFound;
+    const devnull_rc = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    if (linux.errno(devnull_rc) != .SUCCESS) return error.DevNullUnavailable;
+    const devnull: i32 = @intCast(devnull_rc);
+    defer _ = linux.close(devnull);
     const pid = linux.fork();
     if (linux.errno(pid) != .SUCCESS) return error.ForkFailed;
     if (pid != 0) {
@@ -91,11 +95,16 @@ pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*
     const grandchild = linux.fork();
     if (linux.errno(grandchild) != .SUCCESS) linux.exit_group(1);
     if (grandchild != 0) linux.exit_group(0);
-    const devnull: i32 = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0));
     for (0..3) |fd| _ = linux.dup2(devnull, @intCast(fd));
     _ = linux.close_range(3, std.math.maxInt(i32), .{ .UNSHARE = false, .CLOEXEC = false });
     _ = linux.execve(exe, argv, envp);
     linux.exit_group(127);
+}
+
+pub fn mountNsDiffersFromParent() bool {
+    const own = mountNsInode(linux.getpid()) orelse return false;
+    const parent = mountNsInode(linux.getppid()) orelse return false;
+    return own != parent;
 }
 
 // The link reads "mnt:[4026531841]".

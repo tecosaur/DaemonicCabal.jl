@@ -39,26 +39,43 @@ pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
     const ret = impl.rawWaitpid(pid);
     return .{ .pid = ret, .exited = ret != 0 };
 }
+// Peer credentials, mount namespaces, pidfds and the detached spawn exist only on
+// Linux. Elsewhere they report "unavailable", so no client-spawned worker arises
+// and no peer is ever refused.
+const linux_only = if (builtin.os.tag == .linux) impl else struct {
+    pub fn peerPid(_: posix.socket_t) ?posix.pid_t { return null; }
+    pub fn peerForeignMountNs(_: posix.socket_t) ?u64 { return null; }
+    pub fn peerMountNs(_: posix.socket_t) ?u64 { return null; }
+    pub fn parentPid(_: posix.pid_t) ?posix.pid_t { return null; }
+    pub fn pidfdOpen(_: posix.pid_t) ?posix.fd_t { return null; }
+    pub fn pidfdSignal(_: posix.fd_t, _: posix.SIG) usize { return 1; }
+    pub fn spawnDetached(_: [*:null]const ?[*:0]const u8, _: [*:null]const ?[*:0]const u8) !void { return error.SpawnUnsupported; }
+    pub fn mountNsDiffersFromParent() bool { return false; }
+};
 /// Pid of a unix-socket peer as this process sees it; null when unavailable.
-pub const peerPid = impl.peerPid;
+pub const peerPid = linux_only.peerPid;
 /// Inode of the peer's mount namespace when it differs from ours; null when same or unknown.
-pub const peerForeignMountNs = impl.peerForeignMountNs;
+pub const peerForeignMountNs = linux_only.peerForeignMountNs;
 /// Inode of the peer's mount namespace; null when unavailable.
-pub const peerMountNs = impl.peerMountNs;
+pub const peerMountNs = linux_only.peerMountNs;
 /// Parent pid of a process; null when unreadable.
-pub const parentPid = impl.parentPid;
+pub const parentPid = linux_only.parentPid;
 /// Handle on a process that is not our child, immune to pid reuse; null when unsupported.
-pub const pidfdOpen = impl.pidfdOpen;
+pub const pidfdOpen = linux_only.pidfdOpen;
 /// Signal a process through its pidfd; 0 on success, like `kill`.
-pub const pidfdSignal = impl.pidfdSignal;
+pub const pidfdSignal = linux_only.pidfdSignal;
 /// A pidfd turns readable once its process has exited.
 pub fn pidfdExited(fd: posix.fd_t) bool {
     var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
     return (posix.poll(&pfd, 0) catch return true) != 0;
 }
 /// Exec an absolute command as a daemon: own session, stdio on /dev/null, no
-/// inherited fds. Fails before forking when the path is not executable here.
-pub const spawnDetached = impl.spawnDetached;
+/// inherited fds. Fails before forking when the path is not executable here or
+/// /dev/null cannot be opened.
+pub const spawnDetached = linux_only.spawnDetached;
+/// Whether our mount namespace differs from our parent's, as a hardened service
+/// unit's (PrivateTmp, ProtectHome) would: every local client then looks sandboxed.
+pub const mountNsDiffersFromParent = linux_only.mountNsDiffersFromParent;
 
 /// Per-process memory and cumulative CPU time, for status reporting and eviction
 /// sizing. `mem_bytes` is resident set size on Linux, phys_footprint on macOS (the
