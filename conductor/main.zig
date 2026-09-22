@@ -340,10 +340,28 @@ pub const Conductor = struct {
             try self.handleClient(socket, peer);
         } else if (magic == protocol.notification.magic) {
             self.handleNotification(socket);
+        } else if (magic >> 8 == protocol.client.magic_prefix) {
+            try self.rejectClientVersion(socket, peer, @intCast(magic & 0xFF));
         } else {
             std.debug.print("Invalid magic: {x}\n", .{magic});
             return error.InvalidMagic;
         }
+    }
+
+    // A juliaclient of another protocol version. Its request is drained first (the
+    // body has not changed across versions) so the reply is not lost to a reset,
+    // then the reason is served; a client too old to read this framing at least
+    // fails at once, with the daemon log naming the cause.
+    fn rejectClientVersion(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo, theirs: u8) !void {
+        const ours = protocol.client.version;
+        std.debug.print("Client speaks protocol v{d}, this daemon v{d}; rejecting\n", .{ theirs, ours });
+        var request = try self.readClientRequest(socket, peer.isRemote(self.cfg.transport));
+        defer request.deinit(self.allocator);
+        var buf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "This juliaclient speaks protocol v{d} but the daemon speaks v{d}: {s}.\n", .{
+            theirs, ours, if (theirs < ours) "rebuild or reinstall juliaclient to match the daemon" else "restart the daemon so it runs the newly installed version",
+        });
+        try self.serveString(socket, msg, 1);
     }
 
     fn handleNotification(self: *Conductor, socket: posix.socket_t) void {

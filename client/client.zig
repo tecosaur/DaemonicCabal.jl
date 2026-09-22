@@ -21,6 +21,12 @@ const io: Io = Io.Threaded.global_single_threaded.io();
 // Runtime socket paths are short (runtime_dir + hex name + suffix), 256 bytes is ample.
 const max_socket_path = 256;
 
+const restart_hint = switch (builtin.os.tag) {
+    .linux => "systemctl --user restart julia-daemon",
+    .macos => "launchctl kickstart -k gui/$(id -u)/org.julialang.julia-daemon",
+    else => "pkill -f julia-conductor && julia-conductor &",
+};
+
 // --- Types ---
 
 /// Buffered socket writer — flushes automatically when the buffer fills.
@@ -302,11 +308,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
         \\
         \\Or specify a different address with -a <addr>
         \\
-    , .{ addr, switch (builtin.os.tag) {
-        .linux => "systemctl --user restart julia-daemon",
-        .macos => "launchctl kickstart -k gui/$(id -u)/org.julialang.julia-daemon",
-        else => "pkill -f julia-conductor && julia-conductor &",
-    } });
+    , .{ addr, restart_hint });
     exitClient(127);
 }
 
@@ -345,11 +347,11 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     var buf: [1024]u8 = undefined;
     var sr = conductor.reader(io, &buf);
     const reader = &sr.interface;
-    while (true) switch (try reader.takeByte()) {
+    while (true) switch (reader.takeByte() catch |err| replyFailure(err)) {
         protocol.client.env_request => sendFullEnv(w, env, block),
         protocol.client.spawn_request => try spawnWorker(reader, block),
         protocol.client.socket_paths => break,
-        else => return error.BadReply,
+        else => replyFailure(error.BadReply),
     };
     client_id = try reader.takeInt(u32, .little);
     var paths: [4 * (max_socket_path + 1)]u8 = undefined;
@@ -368,6 +370,21 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
     };
     if (transport_mode == .tcp) protocol.setTcpNodelay(result.signals.socket.handle);
     return result;
+}
+
+// The daemon closed without replying, or replied in a framing this client does
+// not know: almost always a daemon of another protocol version. (A daemon that
+// recognises the mismatch says so itself; one older than that cannot.)
+fn replyFailure(err: anyerror) noreturn {
+    std.debug.print(
+        \\The daemon did not reply as expected ({s}).
+        \\It is probably running a different protocol version than this juliaclient:
+        \\restart it after installing, or rebuild juliaclient to match.
+        \\
+        \\  {s}
+        \\
+    , .{ @errorName(err), restart_hint });
+    exitClient(127);
 }
 
 /// Start the worker the conductor describes, detached, in this client's mount
