@@ -40,16 +40,19 @@ const UDATA_SIGNAL: usize = 1;
 const UDATA_PING_TIMER: usize = 2;
 const UDATA_PRESSURE_TIMER: usize = 4;
 const UDATA_LIVE_TIMER: usize = 5;
+const UDATA_TICK_TIMER: usize = 6;
 // Unique idents for periodic timers (won't collide with file descriptors)
 const TIMER_IDENT_PING: usize = 0xFFFF_0001;
 const TIMER_IDENT_PRESSURE: usize = 0xFFFF_0002;
 const TIMER_IDENT_LIVE: usize = 0xFFFF_0003;
+const TIMER_IDENT_TICK: usize = 0xFFFF_0004;
 
 // EventLoop (wraps kqueue fd + configuration)
 pub const EventLoop = struct {
     kq: posix.fd_t,
     ping_interval_ms: isize,
     ping_timeout_ms: isize,
+    tick_armed: bool = false,
 
     pub fn init(_: u13) !EventLoop {
         const kq = c.kqueue();
@@ -84,6 +87,32 @@ pub const EventLoop = struct {
             udata_tagged,
         )};
         _ = keventSubmit(self.kq, &changes);
+    }
+
+    /// Watch `fd` for readability once, reporting `tag` (a pending record's
+    /// pointer with its low bits naming what) to the conductor; watch again to
+    /// keep watching.
+    pub fn watchFd(self: *EventLoop, tag: usize, fd: posix.fd_t) void {
+        var ch = [1]c.Kevent{makeKevent(@intCast(fd), c.EVFILT.READ, c.EV.ADD | c.EV.ONESHOT, 0, 0, tag)};
+        _ = keventSubmit(self.kq, &ch);
+    }
+
+    pub fn unwatchFd(self: *EventLoop, _: usize, fd: posix.fd_t) void {
+        var ch = [1]c.Kevent{makeKevent(@intCast(fd), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
+        _ = keventSubmit(self.kq, &ch);
+    }
+
+    pub fn armTick(self: *EventLoop) void {
+        if (self.tick_armed) return;
+        var tick = [1]c.Kevent{makeKevent(TIMER_IDENT_TICK, c.EVFILT.TIMER, c.EV.ADD, 0, 1000, UDATA_TICK_TIMER)};
+        _ = keventSubmit(self.kq, &tick);
+        self.tick_armed = true;
+    }
+
+    fn stopTick(self: *EventLoop) void {
+        var ch = [1]c.Kevent{makeKevent(TIMER_IDENT_TICK, c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
+        _ = keventSubmit(self.kq, &ch);
+        self.tick_armed = false;
     }
 
     /// Delete kqueue registrations referencing `w`: the health-check timer
@@ -188,9 +217,19 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     pool_changed = true;
                 },
                 UDATA_LIVE_TIMER => conductor.onLiveTimer(),
+                UDATA_TICK_TIMER => {
+                    if (!conductor.tick()) conductor.event_loop.stopTick();
+                    pool_changed = true;
+                },
                 else => {
-                    // Worker event: udata is (worker_ptr | tag); bit 0: 0 = pong
-                    // read/timeout, 1 = health check timeout.
+                    // Tagged pointer: bits 1-2 set is a pending connection or spawn the
+                    // conductor decodes, else a worker (bit 0: 0 = pong read/timeout,
+                    // 1 = health check timeout).
+                    if ((udata & 6) != 0) {
+                        conductor.onReadable(udata);
+                        pool_changed = true;
+                        continue;
+                    }
                     const is_health_check = (udata & 1) != 0;
                     const w: *worker.Worker = @ptrFromInt(udata & ~@as(usize, 1));
                     if (!conductor.isLiveWorker(w)) continue; // stale event for a retired worker
@@ -224,12 +263,9 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
         std.debug.print("Accept error: {}\n", .{err});
         return;
     }
-    defer _ = c.close(client_fd);
     if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
     const peer = main.PeerInfo{ .addr = client_addr, .len = client_addr_len };
-    conductor.handleConnectionFd(client_fd, &peer) catch |err| {
-        std.debug.print("Client handling failed: {}\n", .{err});
-    };
+    conductor.admitConnection(client_fd, &peer);
 }
 
 /// Handle signal pipe read. Returns true if shutdown requested.
