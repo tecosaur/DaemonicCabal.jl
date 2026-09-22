@@ -410,9 +410,19 @@ pub const Conductor = struct {
         const foreign_ns = if (is_remote) null else platform.peerForeignMountNs(socket);
         const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or request.parsed.hasSwitch("--sandbox")))
             .remote
-        else if (foreign_ns) |ns|
-            .{ .client = .{ .socket = socket, .ns = ns } }
-        else if (request.parsed.hasSwitch("--sandbox")) blk: {
+        else if (foreign_ns) |ns| blk: {
+            // Refused rather than downgraded: the worker will run inside the client's
+            // own sandbox, which the daemon can neither see into nor nest another in.
+            if (request.parsed.hasSwitch("--sandbox")) {
+                std.debug.print("Client {d}: --sandbox from inside a sandbox, rejecting\n", .{self.client_counter});
+                try self.serveString(socket,
+                    "--sandbox: this client is already inside a sandbox (its mount namespace differs from the\n" ++
+                        "daemon's), and the daemon cannot nest another in it. Drop --sandbox: the worker runs\n" ++
+                        "inside this sandbox as it is.\n", 1);
+                return;
+            }
+            break :blk .{ .client = .{ .socket = socket, .ns = ns } };
+        } else if (request.parsed.hasSwitch("--sandbox")) blk: {
             // When cwd is inside a non-global project, mount the project rw
             // (subsumes cwd). Otherwise mount just cwd rw.
             const cwd = trimTrailingSlashes(request.cwd);

@@ -61,7 +61,6 @@ pub const spawnDetached = shared.spawnDetached;
 pub const pidfdOpen = shared.pidfdOpen;
 pub const pidfdSignal = shared.pidfdSignal;
 pub const pidfdExited = shared.pidfdExited;
-pub const mountNsDiffersFromParent = shared.mountNsDiffersFromParent;
 pub const ProcessStats = shared.ProcessStats;
 pub const getProcessStats = shared.getProcessStats;
 pub const mem_is_reclaimable = shared.mem_is_reclaimable;

@@ -50,7 +50,6 @@ const linux_only = if (builtin.os.tag == .linux) impl else struct {
     pub fn pidfdOpen(_: posix.pid_t) ?posix.fd_t { return null; }
     pub fn pidfdSignal(_: posix.fd_t, _: posix.SIG) usize { return 1; }
     pub fn spawnDetached(_: [*:null]const ?[*:0]const u8, _: [*:null]const ?[*:0]const u8) !void { return error.SpawnUnsupported; }
-    pub fn mountNsDiffersFromParent() bool { return false; }
 };
 /// Pid of a unix-socket peer as this process sees it; null when unavailable.
 pub const peerPid = linux_only.peerPid;
@@ -73,9 +72,6 @@ pub fn pidfdExited(fd: posix.fd_t) bool {
 /// inherited fds. Fails before forking when the path is not executable here or
 /// /dev/null cannot be opened.
 pub const spawnDetached = linux_only.spawnDetached;
-/// Whether our mount namespace differs from our parent's, as a hardened service
-/// unit's (PrivateTmp, ProtectHome) would: every local client then looks sandboxed.
-pub const mountNsDiffersFromParent = linux_only.mountNsDiffersFromParent;
 
 /// Per-process memory and cumulative CPU time, for status reporting and eviction
 /// sizing. `mem_bytes` is resident set size on Linux, phys_footprint on macOS (the
