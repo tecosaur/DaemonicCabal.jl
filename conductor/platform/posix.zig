@@ -60,6 +60,9 @@ pub fn connectLocalOnce(io: Io, path: []const u8) !posix.socket_t {
     Io.Dir.deleteFileAbsolute(io, path) catch {};
     return fd;
 }
+pub fn connectTcp(io: Io, ip: Io.net.IpAddress) !posix.socket_t {
+    return (try ip.connect(io, .{ .mode = .stream })).socket.handle;
+}
 /// Connect with raw syscalls only, for use inside a signal handler; null on failure.
 pub fn rawConnectLocal(path: []const u8) ?posix.socket_t {
     var addr = std.mem.zeroes(posix.sockaddr.un);
@@ -114,6 +117,26 @@ pub const Listener = struct {
 pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
     return std.process.spawn(io, .{ .argv = argv, .pgid = 0 });
 }
+/// A worker's stderr is inherited, so there is nothing to dump when it dies.
+pub fn dumpChildStderr(_: Io, _: std.mem.Allocator, _: *std.process.Child, _: u32) void {}
+/// Every `KEY=VALUE` of the process environment.
+pub fn collectEnviron(allocator: std.mem.Allocator, environ: std.process.Environ) ![]const []const u8 {
+    const entries = try allocator.alloc([]const u8, environ.block.slice.len);
+    for (environ.block.slice, entries) |entry, *kv| kv.* = std.mem.span(entry.?);
+    return entries;
+}
+/// Ask a conductor to recreate its socket (its SIGUSR1 handler).
+pub fn requestSocketRecreate(pid: u32) void {
+    _ = impl.kill(@intCast(pid), posix.SIG.USR1);
+}
+/// The number a pid prints and travels the wire as.
+pub fn pidNumber(pid: posix.pid_t) u32 {
+    return @intCast(pid);
+}
+/// A socket slot with no connection in it yet.
+pub const no_socket: posix.socket_t = -1;
+/// A worker some other process started for us: no pid to wait on or kill.
+pub const no_child = std.process.Child{ .id = null, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
 pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
     return child.id orelse 0;
 }
@@ -123,39 +146,6 @@ pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
     const ret = impl.rawWaitpid(pid);
     return .{ .pid = ret, .exited = ret != 0 };
 }
-// Peer credentials, mount namespaces, pidfds and the detached spawn exist only on
-// Linux. Elsewhere they report "unavailable", so no client-spawned worker arises
-// and no peer is ever refused.
-const linux_only = if (builtin.os.tag == .linux) impl else struct {
-    pub fn peerPid(_: posix.socket_t) ?posix.pid_t { return null; }
-    pub fn peerForeignMountNs(_: posix.socket_t) ?u64 { return null; }
-    pub fn peerMountNs(_: posix.socket_t) ?u64 { return null; }
-    pub fn parentPid(_: posix.pid_t) ?posix.pid_t { return null; }
-    pub fn pidfdOpen(_: posix.pid_t) ?posix.fd_t { return null; }
-    pub fn pidfdSignal(_: posix.fd_t, _: posix.SIG) usize { return 1; }
-    pub fn spawnDetached(_: [*:null]const ?[*:0]const u8, _: [*:null]const ?[*:0]const u8) !void { return error.SpawnUnsupported; }
-};
-/// Pid of a unix-socket peer as this process sees it; null when unavailable.
-pub const peerPid = linux_only.peerPid;
-/// Inode of the peer's mount namespace when it differs from ours; null when same or unknown.
-pub const peerForeignMountNs = linux_only.peerForeignMountNs;
-/// Inode of the peer's mount namespace; null when unavailable.
-pub const peerMountNs = linux_only.peerMountNs;
-/// Parent pid of a process; null when unreadable.
-pub const parentPid = linux_only.parentPid;
-/// Handle on a process that is not our child, immune to pid reuse; null when unsupported.
-pub const pidfdOpen = linux_only.pidfdOpen;
-/// Signal a process through its pidfd; 0 on success, like `kill`.
-pub const pidfdSignal = linux_only.pidfdSignal;
-/// A pidfd turns readable once its process has exited.
-pub fn pidfdExited(fd: posix.fd_t) bool {
-    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    return (posix.poll(&pfd, 0) catch return true) != 0;
-}
-/// Exec an absolute command as a daemon: own session, stdio on /dev/null, no
-/// inherited fds. Fails before forking when the path is not executable here or
-/// /dev/null cannot be opened.
-pub const spawnDetached = linux_only.spawnDetached;
 
 /// Per-process memory and cumulative CPU time, for status reporting and eviction
 /// sizing. `mem_bytes` is resident set size on Linux, phys_footprint on macOS (the
@@ -163,7 +153,10 @@ pub const spawnDetached = linux_only.spawnDetached;
 /// CPU consumed since the process started (user+system), not a rate.
 pub const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };
 pub const getProcessStats = impl.getProcessStats;
-pub const getParentName = impl.getParentName;
+/// Image base name of a process given its numeric pid, for the status report.
+pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
+    return impl.getParentName(@intCast(pid), buf);
+}
 
 /// True when `getProcessStats().mem_bytes` already reports the reclaimable
 /// (USS-equivalent) figure, so eviction needs no separate `processReclaimable`

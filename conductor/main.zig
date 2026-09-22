@@ -34,76 +34,14 @@ pub const eventLoopImpl = if (builtin.os.tag == .linux)
     @import("eloop/linux.zig")
 else if (builtin.os.tag.isBSD())
     @import("eloop/kqueue.zig")
+else if (builtin.os.tag == .windows)
+    @import("eloop/windows.zig")
 else
     @compileError("unsupported OS");
 
 const readExact = protocol.readExact;
 const EventLocation = protocol.EventLocation;
 
-const VERSION = blk: {
-    const project_toml = @embedFile("Project.toml");
-    const marker = "\nversion = \"";
-    const start = if (std.mem.indexOf(u8, project_toml, marker)) |i| i + marker.len else unreachable;
-    const end = if (std.mem.indexOfPos(u8, project_toml, start, "\"")) |i| i else unreachable;
-    break :blk project_toml[start..end];
-};
-const VERSION_STRING = "juliaclient " ++ VERSION ++ "\n";
-
-const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
-    .linux =>
-        \\Daemon management (systemd):
-        \\
-        \\ systemctl --user {start | stop | restart | status} julia-daemon
-        \\
-    ,
-    .macos =>
-        \\Daemon management (launchd):
-        \\
-        \\ launchctl {start | stop} org.julialang.julia-daemon
-        \\ tail -f ~/Library/Logs/julia-daemon.log
-        \\
-    ,
-    else =>
-        \\Daemon management:
-        \\
-        \\ pgrep -f julia-conductor   (status)
-        \\ pkill -f julia-conductor   (stop)
-        \\
-    ,
-};
-
-const CLIENT_HELP =
-    \\
-    \\    juliaclient [switches] -- [programfile] [args...]
-    \\
-    \\Switches (a '*' marks the default value, if applicable):
-    \\
-    \\ -v, --version              Display version information
-    \\ -h, --help                 Print this message
-    \\ -P, --project[=<dir>|@.]    Set <dir> as the home project/environment
-    \\ -e, --eval <expr>          Evaluate <expr>
-    \\ -E, --print <expr>         Evaluate <expr> and display the result
-    \\ -L, --load <file>          Load <file> immediately on all processors
-    \\ -i                         Interactive mode; REPL runs and `isinteractive()` is true
-    \\ -t, --threads <N|auto>[,<M|auto>]  Launch N threads (and M interactive threads)
-    \\ -q, --quiet                Quiet startup: no banner, suppress REPL warnings
-    \\ --banner={yes|no|auto*}    Enable or disable startup banner
-    \\ --color={yes|no|auto*}     Enable or disable color text
-    \\ --history-file={yes*|no}   Load or save history
-    \\
-    \\Client-specific switches:
-    \\
-    \\ -a, --address <addr>       Connect to conductor at <addr> instead of default
-    \\ --session[=<label>]        Reuse worker state in Main module. With a label,
-    \\                            multiple clients can share the same session.
-    \\ --sync                     Attach to shared REPL (requires --session=<label>)
-    \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
-    \\ --restart                  Kill workers for the project and exit
-    \\ --sandbox                  Run in an isolated sandbox (Linux only)
-    \\ --status[=json]            Show the state of the workers, optionally in json
-    \\
-    \\
-++ DAEMON_MANAGEMENT_HELP;
 
 // --- Constants ---
 
@@ -290,6 +228,7 @@ pub const Conductor = struct {
     }
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
+        if (w.exited()) platform.dumpChildStderr(self.io, self.allocator, &w.process, w.id);
         if (w.launch == .sandboxed) self.removeSandboxDir(w.id);
         w.deinit();
         self.allocator.destroy(w);
@@ -507,11 +446,11 @@ pub const Conductor = struct {
         self.client_counter += 1;
         // Handle special commands
         if (request.parsed.hasSwitch("--help") or request.parsed.hasSwitch("-h")) {
-            try self.serveString(socket, CLIENT_HELP, 0);
+            try self.serveString(socket, protocol.CLIENT_HELP, 0);
             return .done;
         }
         if (request.parsed.hasSwitch("--version") or request.parsed.hasSwitch("-v")) {
-            try self.serveString(socket, VERSION_STRING, 0);
+            try self.serveString(socket, protocol.VERSION_STRING, 0);
             return .done;
         }
         if (request.parsed.hasSwitch("--status")) {
@@ -708,7 +647,7 @@ pub const Conductor = struct {
         return .{
             .flags = flags,
             .pid = pid,
-            .host_pid = if (platform.peerPid(socket)) |p| @intCast(p) else null,
+            .host_pid = if (platform.peerPid(socket)) |p| platform.pidNumber(p) else null,
             .ppid = ppid,
             .cwd = cwd,
             .env = cached.env,
@@ -796,6 +735,7 @@ pub const Conductor = struct {
         const sandbox_env = if (sandbox == .remote) try self.buildSandboxClientEnv(request.env) else null;
         return .{ .port_set = port_set, .sandbox_env = sandbox_env, .info = .{
             .tty = request.flags.tty,
+            .color = request.flags.color,
             .force = is_labeled_session,
             .id = self.client_counter,
             .pid = request.pid,
@@ -960,6 +900,7 @@ pub const Conductor = struct {
         // Remote client's cwd doesn't exist on the host — use host home
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
+            .color = request.flags.color,
             .force = is_labeled_session,
             .id = self.client_counter,
             .pid = request.pid,

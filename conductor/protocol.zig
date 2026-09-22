@@ -2,8 +2,83 @@
 // SPDX-License-Identifier: MPL-2.0
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const platform = @import("platform/main.zig");
+
+// Help and version text, shared so `juliaclient --help` needs no daemon.
+pub const VERSION = blk: {
+    const project_toml = @embedFile("Project.toml");
+    const marker = "\nversion = \"";
+    const start = if (std.mem.indexOf(u8, project_toml, marker)) |i| i + marker.len else unreachable;
+    const end = if (std.mem.indexOfPos(u8, project_toml, start, "\"")) |i| i else unreachable;
+    break :blk project_toml[start..end];
+};
+pub const VERSION_STRING = "juliaclient " ++ VERSION ++ "\n";
+
+pub const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
+    .linux =>
+        \\Daemon management (systemd):
+        \\
+        \\ systemctl --user {start | stop | restart | status} julia-daemon
+        \\
+    ,
+    .macos =>
+        \\Daemon management (launchd):
+        \\
+        \\ launchctl {start | stop} org.julialang.julia-daemon
+        \\ tail -f ~/Library/Logs/julia-daemon.log
+        \\
+    ,
+    .windows =>
+        \\Daemon management (Task Scheduler):
+        \\
+        \\ schtasks /{run | end | query} /tn "Julia\JuliaDaemon"
+        \\ Get-Process julia-conductor   (status, PowerShell)
+        \\
+    ,
+    else =>
+        \\Daemon management:
+        \\
+        \\ pgrep -f julia-conductor   (status)
+        \\ pkill -f julia-conductor   (stop)
+        \\
+    ,
+};
+
+pub const CLIENT_HELP =
+    \\
+    \\    juliaclient [switches] -- [programfile] [args...]
+    \\
+    \\Switches (a '*' marks the default value, if applicable):
+    \\
+    \\ -v, --version              Display version information
+    \\ -h, --help                 Print this message
+    \\ -P, --project[=<dir>|@.]    Set <dir> as the home project/environment
+    \\ -e, --eval <expr>          Evaluate <expr>
+    \\ -E, --print <expr>         Evaluate <expr> and display the result
+    \\ -L, --load <file>          Load <file> immediately on all processors
+    \\ -i                         Interactive mode; REPL runs and `isinteractive()` is true
+    \\ -t, --threads <N|auto>[,<M|auto>]  Launch N threads (and M interactive threads)
+    \\ -q, --quiet                Quiet startup: no banner, suppress REPL warnings
+    \\ --banner={yes|no|auto*}    Enable or disable startup banner
+    \\ --color={yes|no|auto*}     Enable or disable color text
+    \\ --history-file={yes*|no}   Load or save history
+    \\
+    \\Client-specific switches:
+    \\
+    \\ -a, --address <addr>       Connect to conductor at <addr> instead of default
+    \\ --session[=<label>]        Reuse worker state in Main module. With a label,
+    \\                            multiple clients can share the same session.
+    \\ --sync                     Attach to shared REPL (requires --session=<label>)
+    \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
+    \\ --restart                  Kill workers for the project and exit
+    \\ --sandbox                  Run in an isolated sandbox (Linux only)
+    \\ --status[=json]            Show the state of the workers, optionally in json
+    \\
+    \\
+++ DAEMON_MANAGEMENT_HELP;
+
 
 // Client ↔ Conductor Protocol
 //   1. Client sends: magic + flags + pid + ppid + cwd + env_fingerprint + args
@@ -28,7 +103,8 @@ pub const client = struct {
 
     pub const Flags = packed struct(u8) {
         tty: bool,
-        _reserved: u7 = 0,
+        color: bool = false, // the client's terminal renders ANSI colour
+        _reserved: u6 = 0,
     };
 };
 
@@ -65,8 +141,9 @@ pub const worker = struct {
 
     pub const Flags = packed struct(u8) {
         tty: bool,
+        color: bool = false, // the client's terminal renders ANSI colour
         force: bool = false, // Bypass capacity check (for labeled sessions)
-        _reserved: u6 = 0,
+        _reserved: u5 = 0,
     };
 };
 
@@ -271,10 +348,7 @@ fn parseHostPort(addr: []const u8) !Io.net.IpAddress {
 pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !std.posix.socket_t {
     switch (mode) {
         .local => return platform.connectLocal(io_ctx, addr),
-        .tcp => {
-            const ip = try parseHostPort(addr);
-            return (try ip.connect(io_ctx, .{ .mode = .stream })).socket.handle;
-        },
+        .tcp => return platform.connectTcp(io_ctx, try parseHostPort(addr)),
     }
 }
 

@@ -12,6 +12,8 @@ const eloop = if (builtin.os.tag == .linux)
     @import("eloop/linux.zig")
 else if (builtin.os.tag.isBSD())
     @import("eloop/kqueue.zig")
+else if (builtin.os.tag == .windows)
+    @import("eloop/windows.zig")
 else
     @compileError("unsupported OS");
 
@@ -24,6 +26,7 @@ const max_socket_path = 256;
 const restart_hint = switch (builtin.os.tag) {
     .linux => "systemctl --user restart julia-daemon",
     .macos => "launchctl kickstart -k gui/$(id -u)/org.julialang.julia-daemon",
+    .windows => "schtasks /end /tn \"Julia\\JuliaDaemon\" & schtasks /run /tn \"Julia\\JuliaDaemon\"",
     else => "pkill -f julia-conductor && julia-conductor &",
 };
 
@@ -77,7 +80,8 @@ const EnvInfo = struct {
     home: ?[]const u8,
 };
 
-const EnvBlock = std.process.Environ.Block;
+/// argv and the environment as UTF-8 slices, whatever the OS hands over.
+const Inputs = struct { args: []const []const u8, env: []const []const u8 };
 
 // Signal parser with buffering for fragmented reads.
 // Protocol: <id:u8><len:u8><data> (may contain multiple signals)
@@ -208,12 +212,30 @@ fn registerSignalHandlers() void {
 // --- Main pipeline ---
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var env = scanEnv(init.environ.block);
-    const addr_arg = extractAddressArg(init.args.vector);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const inputs = try collectInputs(arena.allocator(), init);
+    var env = scanEnv(inputs.env);
+    const addr_arg = extractAddressArg(inputs.args);
     if (addr_arg.value) |addr| env.server_path = addr;
-    const sync_arg = extractSyncArg(init.args.vector);
-    // Set raw mode for TTY to avoid line buffering
+    const sync_arg = extractSyncArg(inputs.args);
+    // Help and version need no daemon, and must not hang on an absent one.
+    for (inputs.args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            platform.writeFile(platform.getStdoutHandle(), protocol.CLIENT_HELP);
+            return;
+        }
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            platform.writeFile(platform.getStdoutHandle(), protocol.VERSION_STRING);
+            return;
+        }
+    }
+    // Raw mode avoids line buffering; the console must also render the
+    // worker's escapes and UTF-8 where that is not the default.
     const is_tty = platform.isatty(platform.getStdinHandle());
+    const console = if (is_tty) platform.setupConsoleIo(platform.getStdoutHandle(), platform.getStderrHandle()) else null;
+    defer platform.restoreConsoleIo(console);
     if (is_tty) platform.setRawMode(true);
     defer platform.setRawMode(false);
     // Connect to conductor and send client info
@@ -221,16 +243,31 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (transport_mode == .tcp) protocol.setTcpNodelay(conductor);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor };
-    try sendClientInfo(&w, env, is_tty, init.args, addr_arg.skip, sync_arg.skip);
+    // The client decides colour: NO_COLOR is honoured as Julia does, and the
+    // worker's own terminal knows nothing of ours.
+    const color = is_tty and !hasNoColor(inputs.env);
+    try sendClientInfo(&w, env, is_tty, color, inputs.args, addr_arg.skip, sync_arg.skip);
     // Get worker socket paths (conductor may request full env on cache miss)
-    sockets = try connectToWorker(conductor, &w, env, init.environ.block);
+    sockets = try connectToWorker(conductor, &w, env, inputs.env);
     // Forward signals to worker instead of terminating
     registerSignalHandlers();
     signal_parser.sync_mode = sync_arg.sync;
     try runEventLoop(sync_arg.sync);
 }
 
-fn scanEnv(block: EnvBlock) EnvInfo {
+fn collectInputs(a: std.mem.Allocator, init: std.process.Init.Minimal) !Inputs {
+    var it = try std.process.Args.Iterator.initAllocator(init.args, a);
+    var args: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |arg| try args.append(a, arg);
+    return .{ .args = args.items, .env = try platform.collectEnviron(a, init.environ) };
+}
+
+fn hasNoColor(env: []const []const u8) bool {
+    for (env) |kv| if (std.mem.startsWith(u8, kv, "NO_COLOR=") and kv.len > "NO_COLOR=".len) return true;
+    return false;
+}
+
+fn scanEnv(kvs: []const []const u8) EnvInfo {
     var info = EnvInfo{ .fingerprint = 0, .count = 0, .server_path = null, .runtime_dir = null, .xdg_runtime_dir = null, .home = null };
     const env_vars = .{
         .{ "JULIA_DAEMON_SERVER=", "server_path" },
@@ -238,9 +275,7 @@ fn scanEnv(block: EnvBlock) EnvInfo {
         .{ "XDG_RUNTIME_DIR=", "xdg_runtime_dir" },
         .{ "HOME=", "home" },
     };
-    for (block.slice) |entry_opt| {
-        const entry = entry_opt orelse break;
-        const kv = std.mem.span(entry);
+    for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // benchmarking noise
         info.count += 1;
         // XOR hash for order-independent fingerprint
@@ -314,10 +349,10 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     exitClient(127);
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args, addr_skip: [2]usize, sync_skip: usize) !void {
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, args: []const []const u8, addr_skip: [2]usize, sync_skip: usize) !void {
     // Header: magic + flags + reserved + pid + ppid
     w.writeInt(u32, protocol.client.magic);
-    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty }));
+    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color }));
     w.writeSlice(&.{ 0, 0, 0 });
     w.writeInt(u32, @intCast(platform.getpid()));
     w.writeInt(u32, @intCast(platform.getppid()));
@@ -336,30 +371,30 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.pr
     // it because it's not skipped from the args sent on the wire.
     const skip_count = @as(u16, if (addr_skip[0] != sentinel) 1 else 0) +
         @as(u16, if (addr_skip[1] != sentinel) 1 else 0);
-    w.writeInt(u16, @intCast(raw_args.vector.len - skip_count));
-    for (raw_args.vector, 0..) |arg_ptr, i| {
+    w.writeInt(u16, @intCast(args.len - skip_count));
+    for (args, 0..) |arg, i| {
         if (i == addr_skip[0] or i == addr_skip[1]) continue;
         _ = sync_skip; // --sync stays in the forwarded args
-        w.writeLenPrefixed(u16, std.mem.span(arg_ptr));
+        w.writeLenPrefixed(u16, arg);
     }
     w.flush();
 }
 
-fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, block: EnvBlock) !SocketSet {
+fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) !SocketSet {
     const reader = protocol.BufReader{ .fd = conductor };
     while (true) switch (reader.readInt(u8) catch |err| replyFailure(err)) {
-        protocol.client.env_request => sendFullEnv(w, env, block),
-        protocol.client.spawn_request => try spawnWorker(reader, block),
+        protocol.client.env_request => sendFullEnv(w, env, kvs),
+        protocol.client.spawn_request => try spawnWorker(reader, kvs),
         protocol.client.socket_paths => break,
         else => replyFailure(error.BadReply),
     };
     client_id = try reader.readInt(u32);
     var paths: [4 * (max_socket_path + 1)]u8 = undefined;
-    var pos: usize = 0;
-    const stdin_path = try takeString(reader, &paths, &pos);
-    const stdout_path = try takeString(reader, &paths, &pos);
-    const stderr_path = try takeString(reader, &paths, &pos);
-    const signals_path = try takeString(reader, &paths, &pos);
+    var fba = std.heap.FixedBufferAllocator.init(&paths);
+    const stdin_path = try takeString(reader, fba.allocator());
+    const stdout_path = try takeString(reader, fba.allocator());
+    const stderr_path = try takeString(reader, fba.allocator());
+    const signals_path = try takeString(reader, fba.allocator());
     platform.close(conductor);
     const result = SocketSet{
         .stdin = connectToWorkerSocket(stdin_path, "stdin"),
@@ -388,22 +423,22 @@ fn replyFailure(err: anyerror) noreturn {
 
 /// Start the worker the conductor describes, detached, in this client's mount
 /// namespace, which the conductor cannot see into.
-fn spawnWorker(reader: protocol.BufReader, block: EnvBlock) !void {
-    var strings: [8192]u8 = undefined;
-    var argv: [32]?[*:0]const u8 = undefined;
-    var envp: [1024]?[*:0]const u8 = undefined;
-    var pos: usize = 0;
+fn spawnWorker(reader: protocol.BufReader, kvs: []const []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     const argc = try reader.readInt(u16);
-    if (argc == 0 or argc >= argv.len) return error.BadSpawnRequest;
-    for (argv[0..argc]) |*arg| arg.* = (try takeString(reader, &strings, &pos)).ptr;
+    if (argc == 0) return error.BadSpawnRequest;
+    const argv = try a.alloc(?[*:0]const u8, argc + 1);
+    for (argv[0..argc]) |*arg| arg.* = (try takeString(reader, a)).ptr;
     argv[argc] = null;
     // The daemon's own settings go first, so they shadow ours for the worker.
     const envc = try reader.readInt(u16);
-    if (envc + block.slice.len >= envp.len) return error.BadSpawnRequest;
-    for (envp[0..envc]) |*entry| entry.* = (try takeString(reader, &strings, &pos)).ptr;
-    for (block.slice, envp[envc .. envc + block.slice.len]) |ours, *entry| entry.* = ours;
-    envp[envc + block.slice.len] = null;
-    platform.spawnDetached(@ptrCast(&argv), @ptrCast(&envp)) catch |err| {
+    const envp = try a.alloc(?[*:0]const u8, envc + kvs.len + 1);
+    for (envp[0..envc]) |*entry| entry.* = (try takeString(reader, a)).ptr;
+    for (kvs, envp[envc .. envc + kvs.len]) |kv, *entry| entry.* = (try a.dupeZ(u8, kv)).ptr;
+    envp[envc + kvs.len] = null;
+    platform.spawnDetached(@ptrCast(argv.ptr), @ptrCast(envp.ptr)) catch |err| {
         std.debug.print("Cannot start a Julia worker inside this sandbox: {s} ({s}).\n", .{
             std.mem.span(argv[0].?), @errorName(err),
         });
@@ -416,20 +451,16 @@ fn spawnWorker(reader: protocol.BufReader, block: EnvBlock) !void {
     };
 }
 
-fn takeString(reader: protocol.BufReader, strings: []u8, pos: *usize) ![:0]const u8 {
+fn takeString(reader: protocol.BufReader, a: std.mem.Allocator) ![:0]u8 {
     const len = try reader.readInt(u16);
-    const start = pos.*;
-    if (start + len + 1 > strings.len) return error.NameTooLong;
-    try reader.readSlice(strings[start .. start + len]);
-    strings[start + len] = 0;
-    pos.* = start + len + 1;
-    return strings[start .. start + len :0];
+    const s = try a.allocSentinel(u8, len, 0);
+    try reader.readSlice(s);
+    return s;
 }
 
-fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
+fn sendFullEnv(w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) void {
     w.writeInt(u16, env.count);
-    for (block.slice) |entry_opt| {
-        const kv = std.mem.span(entry_opt orelse break);
+    for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue;
         const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
         w.writeLenPrefixed(u16, kv[0..eq]);
@@ -487,9 +518,8 @@ fn readPidAndSignal(pid_path: []const u8) bool {
     var buf: [16]u8 = undefined;
     const content = Io.Dir.readFile(.cwd(), io, pid_path, &buf) catch return false;
     const pid_str = std.mem.trimEnd(u8, content, &.{ '\n', '\r', ' ' });
-    const pid = std.fmt.parseInt(i32, pid_str, 10) catch return false;
-    // Send SIGUSR1
-    _ = platform.kill(pid, platform.SIG.USR1);
+    const pid = std.fmt.parseInt(u32, pid_str, 10) catch return false;
+    platform.requestSocketRecreate(pid);
     return true;
 }
 
@@ -556,10 +586,10 @@ fn getTerminalSize() struct { height: u16, width: u16 } {
     // A degenerate winsize (ioctl succeeds but reports 0 rows/cols — a pty with
     // no size set, or a terminal mid-teardown) is as useless as no tty: the
     // worker's REPL divides by the column count, so a 0 must never go on the wire.
-    if (platform.getTerminalSize(platform.getStdinHandle())) |size| {
-        if (size.rows != 0 and size.cols != 0)
-            return .{ .height = size.rows, .width = size.cols };
-    }
+    // Only an output handle answers on Windows, so stdout is the fallback.
+    const size = platform.getTerminalSize(platform.getStdinHandle()) orelse platform.getTerminalSize(platform.getStdoutHandle());
+    if (size) |sz| if (sz.rows != 0 and sz.cols != 0)
+        return .{ .height = sz.rows, .width = sz.cols };
     return .{ .height = 24, .width = 80 }; // fallback
 }
 
@@ -570,10 +600,8 @@ const SyncArg = struct {
     skip: usize, // index to omit when forwarding; sentinel = unused
 };
 
-fn extractSyncArg(vector: []const ?[*:0]const u8) SyncArg {
-    for (vector, 0..) |entry, i| {
-        if (i == 0) continue;
-        const arg = std.mem.span(entry orelse continue);
+fn extractSyncArg(args: []const []const u8) SyncArg {
+    for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) return .{ .sync = false, .skip = sentinel };
         if (std.mem.eql(u8, arg, "--sync"))
             return .{ .sync = true, .skip = sentinel }; // keep in forwarded args
@@ -586,11 +614,10 @@ const AddressArg = struct {
     skip: [2]usize, // indices to omit when forwarding; sentinel = unused
 };
 
-fn extractAddressArg(vector: []const ?[*:0]const u8) AddressArg {
+fn extractAddressArg(args: []const []const u8) AddressArg {
     const none = AddressArg{ .value = null, .skip = .{ sentinel, sentinel } };
-    for (vector, 0..) |entry, i| {
+    for (args, 0..) |arg, i| {
         if (i == 0) continue;
-        const arg = std.mem.span(entry orelse continue);
         if (std.mem.eql(u8, arg, "--")) return none;
         // --address=<value> or -a<value>
         if (std.mem.startsWith(u8, arg, "--address="))
@@ -599,8 +626,7 @@ fn extractAddressArg(vector: []const ?[*:0]const u8) AddressArg {
             return .{ .value = arg[2..], .skip = .{ i, sentinel } };
         // --address <value> or -a <value>
         if (std.mem.eql(u8, arg, "--address") or std.mem.eql(u8, arg, "-a")) {
-            const next = if (i + 1 < vector.len) vector[i + 1] else null;
-            if (next) |v| return .{ .value = std.mem.span(v), .skip = .{ i, i + 1 } };
+            if (i + 1 < args.len) return .{ .value = args[i + 1], .skip = .{ i, i + 1 } };
             return none;
         }
     }
