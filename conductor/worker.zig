@@ -602,7 +602,7 @@ pub const Worker = struct {
     ) !SocketPaths {
         // Calculate payload size
         const pf_len: usize = if (client_info.programfile) |pf| pf.len + 2 else 0;
-        var payload_size: usize = 1 + 4 + 2 + client_info.cwd.len + 2 + 2 + 1 + pf_len + 2 + 2;
+        var payload_size: usize = 1 + 4 + 4 + 2 + client_info.cwd.len + 2 + 2 + 1 + pf_len + 2 + 2;
         for (client_info.env) |e| payload_size += 4 + e.key.len + e.value.len;
         for (client_info.switches) |sw| payload_size += 4 + sw.name.len + sw.value.len;
         for (client_info.args) |arg| payload_size += 2 + arg.len;
@@ -611,7 +611,11 @@ pub const Worker = struct {
         defer allocator.free(send_buf);
         var w = BufWriter{ .buf = send_buf };
         w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .force = client_info.force }));
-        w.writeInt(u32, client_info.pid);
+        w.writeInt(u32, client_info.id);
+        // The pid the worker will see on the client's stdio connections: a worker
+        // the client launched shares its pid namespace, one of ours shares the
+        // conductor's.
+        w.writeInt(u32, if (self.launch == .client) client_info.pid else (client_info.host_pid orelse client_info.pid));
         w.writeLenPrefixed(u16, client_info.cwd);
         w.writeInt(u16, @intCast(client_info.env.len));
         for (client_info.env) |e| {
@@ -707,7 +711,9 @@ pub const Worker = struct {
 pub const ClientInfo = struct {
     tty: bool,
     force: bool, // Bypass worker capacity check
-    pid: u32,
+    id: u32, // conductor-assigned; names the client in notifications and syncs
+    pid: u32, // as the client reports itself
+    host_pid: ?u32, // as the conductor's kernel reports it; null without peer credentials
     ppid: u32,
     cwd: []const u8,
     env: []const EnvVar,

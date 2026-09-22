@@ -77,10 +77,10 @@ end
 # Kill client tasks the conductor no longer lists. Closing the client's streams
 # makes the task unwind via EOF on its own thread — no cross-thread exception
 # injection (which is fatal when the task runs on another interactive thread).
-function kill_stuck_clients(active_pids::Set{Int})
+function kill_stuck_clients(active_ids::Set{Int})
     stuck = @lock STATE.lock [
-        ct for (pid, ct) in STATE.client_tasks
-        if pid ∉ active_pids && !istaskdone(ct.task)
+        ct for (id, ct) in STATE.client_tasks
+        if id ∉ active_ids && !istaskdone(ct.task)
     ]
     for ct in stuck, io in ct.streams
         try close(io) catch end
@@ -95,9 +95,9 @@ function kill_stuck_clients(active_pids::Set{Int})
     end
 end
 
-# Track a client's task + streams for interrupt/teardown, keyed by client pid.
-function register_client!(pid::Int, task::Task, streams::StreamIO...)
-    @lock STATE.lock STATE.client_tasks[pid] = ClientTask(task, streams)
+# Track a client's task + streams for interrupt/teardown, keyed by client id.
+function register_client!(id::Int, task::Task, streams::StreamIO...)
+    @lock STATE.lock STATE.client_tasks[id] = ClientTask(task, streams)
 end
 
 # Active client's signals socket for the pre-1.11 path, which lacks the
@@ -407,7 +407,7 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
         sync_client_disconnect!(client, client_stdin, client_stdout,
                                 client_stderr, signals, session)
     end
-    register_client!(client.pid, task, client_stdin, client_stdout, client_stderr, signals)
+    register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals)
 end
 
 # Non-interactive (-E / --eval) sync client: run against the session broadcast so
@@ -431,7 +431,7 @@ function spawn_eval_sync_client!(client::ClientInfo, client_stdin::StreamIO,
         write(session.out, "\n")
         restore_repl_prompt(session, has_repl)
     end
-    register_client!(client.pid, task, client_stdin, client_stdout, client_stderr, signals)
+    register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals)
 end
 
 # Clear the in-progress REPL input line so eval output starts on a clean row.
@@ -460,12 +460,12 @@ function unregister_client!(client::ClientInfo)
     exiting = @lock STATE.lock begin
         idx = findfirst(e -> last(e) === client, STATE.clients)
         !isnothing(idx) && deleteat!(STATE.clients, idx)
-        delete!(STATE.client_tasks, client.pid)
+        delete!(STATE.client_tasks, client.id)
         STATE.lastclient[] = time()
         STATE.soft_exit[] && isempty(STATE.clients)
     end
     send_notification(STATE.conductor_socket[], NOTIF_TYPE.client_done,
-                      UInt32(client.pid))
+                      UInt32(client.id))
     exiting && real_exit(0)
     ensure_standby_sockets()
     ensure_standby_module()
@@ -475,9 +475,9 @@ const CLIENT_ACCEPT_TIMEOUT_S = 30.0
 
 # A bare `accept` blocks the message loop indefinitely, so a client that dies
 # after receiving its paths would stall pings and get the whole worker killed.
-# Only the client the conductor named (`pid`, 0 = any) may take the socket:
-# anything else that can reach the runtime directory could connect first and
-# take over the session's terminal.
+# Only the client the conductor named may take the socket (`pid` as our kernel
+# will report it; 0 = any): anything else that can reach the runtime directory
+# could connect first and take over the session's terminal.
 function accept_with_timeout(srv, pid::Integer)
     want = expected_peer(pid)
     deadline = time() + CLIENT_ACCEPT_TIMEOUT_S
@@ -551,7 +551,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         catch
             isopen(client_stdout) && rethrow()
         end
-        register_client!(client.pid, task, client_stdin, client_stdout, client_stderr, signals)
+        register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals)
     else
         spawn_sync_client!(client, client_stdin, client_stdout, client_stderr, signals, label)
     end
@@ -609,22 +609,22 @@ function serve_message(conn::IO, header::MessageHeader)
             end
         end
     elseif header.msg_type == MSG_TYPE.sync_clients
-        pid_count = read(conn, UInt16)
-        active_pids = Set{Int}()
-        for _ in 1:pid_count
-            push!(active_pids, Int(read(conn, UInt32)))
+        id_count = read(conn, UInt16)
+        active_ids = Set{Int}()
+        for _ in 1:id_count
+            push!(active_ids, Int(read(conn, UInt32)))
         end
-        kill_stuck_clients(active_pids)
+        kill_stuck_clients(active_ids)
         remaining = @lock STATE.lock length(STATE.clients)
         write_header(conn, MSG_TYPE.ack, 2)
         write(conn, UInt16(remaining))
         flush(conn)
     elseif header.msg_type == MSG_TYPE.query_clients
-        pids = @lock STATE.lock Int[last(e).pid for e in STATE.clients]
-        write_header(conn, MSG_TYPE.clients, 2 + 4 * length(pids))
-        write(conn, UInt16(length(pids)))
-        for pid in pids
-            write(conn, UInt32(pid))
+        ids = @lock STATE.lock Int[last(e).id for e in STATE.clients]
+        write_header(conn, MSG_TYPE.clients, 2 + 4 * length(ids))
+        write(conn, UInt16(length(ids)))
+        for id in ids
+            write(conn, UInt32(id))
         end
         flush(conn)
     elseif header.msg_type == MSG_TYPE.drop_session

@@ -20,7 +20,9 @@ pub const client = struct {
     // u16 argc, argc × (u16 len + bytes), then u16 n, n × (u16 len + "KEY=VALUE") of
     // daemon settings to place ahead of the client's environment.
     pub const spawn_request: u8 = 0x00;
-    pub const socket_paths: u8 = 0x01; // four len-prefixed paths: stdin, stdout, stderr, signals
+    // u32 client id (the client names itself by it in notifications), then four
+    // len-prefixed paths: stdin, stdout, stderr, signals.
+    pub const socket_paths: u8 = 0x01;
 
     pub const Flags = packed struct(u8) {
         tty: bool,
@@ -30,7 +32,7 @@ pub const client = struct {
 
 // Conductor ↔ Worker Protocol
 pub const worker = struct {
-    pub const magic: u32 = 0x4A445701; // "JDW\x01" little-endian
+    pub const magic: u32 = 0x4A445702; // "JDW\x02" little-endian — v2: client_run carries the client id
 
     pub const MessageType = enum(u8) {
         ping = 0x01,
@@ -72,11 +74,11 @@ pub const notification = struct {
     pub const magic: u32 = 0x4A444E01; // "JDN\x01" little-endian
 
     pub const Type = enum(u8) {
-        client_done = 0x01, // Worker: client disconnected. Payload: pid (u32)
+        client_done = 0x01, // Worker: client disconnected. Payload: client id (u32)
         worker_unresponsive = 0x02, // Client: worker not responding. Payload: pid (u32)
         worker_exit = 0x03, // Worker: exiting (TTL expired). Payload: worker_id (u32)
-        client_exit = 0x04, // Client: exiting. Payload: pid (u32)
-        client_interrupt = 0x05, // Client: interrupt my task. Payload: pid (u32)
+        client_exit = 0x04, // Client: exiting. Payload: client id (u32)
+        client_interrupt = 0x05, // Client: interrupt my task. Payload: client id (u32)
     };
 };
 
