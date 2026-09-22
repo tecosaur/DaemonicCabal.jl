@@ -35,7 +35,7 @@ fn handleUsr1(_: posix.SIG) callconv(.c) void {
 
 /// Create signal pipe and install signal handlers. Call before running event loop.
 pub fn installSignalHandlers() !void {
-    signal_pipe = Io.Threaded.pipe2(.{ .NONBLOCK = true }) catch return error.PipeCreationFailed;
+    signal_pipe = Io.Threaded.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true }) catch return error.PipeCreationFailed;
     const shutdown_sigact = posix.Sigaction{
         .handler = .{ .handler = @ptrCast(&handleShutdown) },
         .mask = std.mem.zeroes(posix.sigset_t),
