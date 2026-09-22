@@ -59,7 +59,7 @@ pub fn peerPid(socket: posix.socket_t) ?posix.pid_t {
     var cred: extern struct { pid: posix.pid_t, uid: posix.uid_t, gid: posix.gid_t } = undefined;
     var len: posix.socklen_t = @sizeOf(@TypeOf(cred));
     if (linux.getsockopt(socket, linux.SOL.SOCKET, linux.SO.PEERCRED, @ptrCast(&cred), &len) != 0) return null;
-    return cred.pid;
+    return if (cred.pid != 0) cred.pid else null; // zeros on a TCP socket
 }
 
 var own_mount_ns: ?u64 = null; // ours never changes; read once

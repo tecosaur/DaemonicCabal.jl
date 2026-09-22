@@ -115,7 +115,9 @@ pub fn setRecvTimeout(socket: posix.fd_t, seconds: u32) void {
 }
 
 pub fn setTcpNodelay(socket: posix.fd_t) void {
-    posix.setsockopt(socket, 6, 1, std.mem.asBytes(&@as(c_int, 1))) catch {}; // IPPROTO_TCP, TCP_NODELAY
+    // Raw call: the socket may already be closed (stdin at EOF), which std's
+    // wrapper treats as unreachable.
+    _ = posix.system.setsockopt(socket, 6, 1, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int)); // IPPROTO_TCP, TCP_NODELAY
 }
 
 // Terminal raw mode

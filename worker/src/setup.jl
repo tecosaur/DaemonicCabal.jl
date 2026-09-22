@@ -536,6 +536,8 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         accept_client_sockets((stdin_srv, stdout_srv, stderr_srv, signals_srv), client.pid)
     catch
         @lock STATE.lock filter!(e -> last(e) !== client, STATE.clients)
+        # Or the conductor keeps counting it, port set and all.
+        send_notification(STATE.conductor_socket[], NOTIF_TYPE.client_done, UInt32(client.id))
         rethrow()
     finally
         foreach(close, (stdin_srv, stdout_srv, stderr_srv, signals_srv))
