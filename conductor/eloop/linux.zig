@@ -6,7 +6,6 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const Io = std.Io;
 
 const main = @import("../main.zig");
 const Conductor = main.Conductor;
@@ -90,12 +89,12 @@ pub const EventLoop = struct {
 };
 
 // Main event loop
-pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
+pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     const ring = &conductor.event_loop.ring;
     var signal_buf: [16]u8 = undefined;
     var client_addr: posix.sockaddr = undefined;
     var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-    var server_fd = server.socket.handle;
+    var server_fd = listener.fd();
     var ping_timer = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_interval), .nsec = 0 };
     var ping_timeout_ts = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_timeout), .nsec = 0 };
     const pressure_active = conductor.pressure_monitor.active();
@@ -188,13 +187,12 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                                 },
                                 SIGNAL_RECREATE => {
                                     std.debug.print("Recreating socket due to SIGUSR1\n", .{});
-                                    server.deinit(conductor.io);
-                                    Io.Dir.deleteFileAbsolute(conductor.io, conductor.cfg.socket_path) catch {};
-                                    server.* = conductor.createServer() catch |err| {
+                                    listener.close(conductor.io);
+                                    listener.* = conductor.createServer() catch |err| {
                                         std.debug.print("Failed to recreate socket: {}\n", .{err});
                                         continue;
                                     };
-                                    server_fd = server.socket.handle;
+                                    server_fd = listener.fd();
                                     need_rearm_accept = true;
                                 },
                                 else => {},

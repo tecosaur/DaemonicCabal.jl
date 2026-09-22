@@ -38,8 +38,6 @@ else
     @compileError("unsupported OS");
 
 const readExact = protocol.readExact;
-const randomSocketPath = protocol.randomSocketPath;
-const createListener = protocol.createListener;
 const EventLocation = protocol.EventLocation;
 
 const VERSION = blk: {
@@ -300,7 +298,7 @@ pub const Conductor = struct {
     fn removeSandboxDir(self: *Conductor, worker_id: u32) void {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const name = std.fmt.bufPrint(&buf, "sandbox-{d}", .{worker_id}) catch return;
-        var dir = Io.Dir.openDirAbsolute(self.io, self.cfg.runtime_dir, .{}) catch return;
+        var dir = Io.Dir.openDirAbsolute(self.io, self.cfg.socket_dir, .{}) catch return;
         defer dir.close(self.io);
         dir.deleteTree(self.io, name) catch {};
     }
@@ -309,25 +307,22 @@ pub const Conductor = struct {
         g_socket_path = try self.allocator.dupeZ(u8, self.cfg.socket_path);
         try eventLoopImpl.installSignalHandlers();
         defer eventLoopImpl.cleanupSignalHandlers();
-        if (self.cfg.transport == .unix) {
+        if (self.cfg.transport == .local) {
             const pid_path = try std.fmt.allocPrint(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir});
             g_pid_path = try self.allocator.dupeZ(u8, pid_path);
             self.allocator.free(pid_path);
             self.writePidFile();
         }
-        defer if (self.cfg.transport == .unix) {
+        defer if (self.cfg.transport == .local) {
             Io.Dir.deleteFileAbsolute(self.io, g_pid_path) catch {};
         };
-        var server = try self.createServer();
-        defer server.deinit(self.io);
-        defer if (self.cfg.transport == .unix) {
-            Io.Dir.deleteFileAbsolute(self.io, self.cfg.socket_path) catch {};
-        };
+        var listener = try self.createServer();
+        defer listener.close(self.io);
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
         if (self.cfg.reserve_worker) self.beginReserveSpawn() catch |err| {
             std.debug.print("Failed to start a reserve worker: {}\n", .{err});
         };
-        eventLoopImpl.run(self, &server);
+        eventLoopImpl.run(self, &listener);
     }
 
     fn cleanupRuntimeDir(self: *Conductor) void {
@@ -1243,7 +1238,7 @@ pub const Conductor = struct {
         const p = try self.allocator.create(PendingSpawn);
         errdefer self.allocator.destroy(p);
         p.* = .{
-            .spawn = try worker.Worker.begin(self.allocator, self.io, &self.cfg, self.next_worker_id, self.cfg.runtime_dir, julia_channel, threads, interactive, launch),
+            .spawn = try worker.Worker.begin(self.allocator, self.io, &self.cfg, self.next_worker_id, julia_channel, threads, interactive, launch),
             .purpose = purpose,
         };
         errdefer p.spawn.abandon(self.io);
@@ -1349,47 +1344,6 @@ pub const Conductor = struct {
             if (findWorkerByLabel(entry.value_ptr, label)) |w| return w;
         }
         return null;
-    }
-
-    fn addSandboxedWorkerToPool(
-        self: *Conductor,
-        list: *WorkerList,
-        project_path: []const u8,
-        julia_channel: ?[]const u8,
-        threads: args.Threads,
-        rw_binds: []const []const u8,
-    ) !*worker.Worker {
-        const proj_copy = if (project_path.len > 0) try self.allocator.dupe(u8, project_path) else null;
-        errdefer if (proj_copy) |p| self.allocator.free(p);
-        const w = try self.allocator.create(worker.Worker);
-        errdefer self.allocator.destroy(w);
-        // When the project dir isn't already covered by an rw bind, mount it ro
-        const proj_ro = if (project_path.len > 0 and !pathCoveredBy(project_path, rw_binds))
-            &[_][]const u8{project_path}
-        else
-            &[_][]const u8{};
-        w.* = try worker.Worker.spawn(
-            self.allocator,
-            self.io,
-            &self.cfg,
-            self.next_worker_id,
-            self.cfg.runtime_dir,
-            julia_channel,
-            threads,
-            false,
-            .{ .sandboxed = .{ .environ = self.environ_map, .ro_binds = proj_ro, .rw_binds = rw_binds } },
-        );
-        std.debug.print("Spawning sandboxed worker {d} (pid {d}){s}{s}\n", .{
-            self.next_worker_id,
-            platform.getChildPid(w.process),
-            if (project_path.len > 0) " for project " else "",
-            if (project_path.len > 0) project_path else "",
-        });
-        self.next_worker_id += 1;
-        self.event_loop.cancelPendingPing(w);
-        if (proj_copy) |p| try w.setProject(p);
-        try list.append(self.allocator, w);
-        return w;
     }
 
     fn trimTrailingSlashes(path: []const u8) []const u8 {
@@ -2028,7 +1982,7 @@ pub const Conductor = struct {
         return @intCast(Io.Clock.now(.awake, self.io).nanoseconds);
     }
 
-    pub fn createServer(self: *Conductor) !Io.net.Server {
+    pub fn createServer(self: *Conductor) !protocol.Listener {
         return protocol.listenAddress(self.io, self.cfg.transport, self.cfg.socket_path);
     }
 
@@ -2054,25 +2008,30 @@ pub const Conductor = struct {
     const ClientStreams = struct {
         c: *Conductor,
         listeners: [4]protocol.Listener,
-        conns: [4]Io.net.Stream,
+        conns: [4]posix.socket_t,
         port_set_idx: u16,
-        // Owned socket paths. createListener returns a slice into a caller's
-        // stack buffer; a held live connection (and the struct's own moves)
-        // outlive it, so store length-bounded copies and never alias.
-        addrs: [4][std.fs.max_path_bytes]u8 = undefined,
-        addr_lens: [4]usize = .{ 0, 0, 0, 0 },
 
         fn fd(self: *const ClientStreams, s: Stream) posix.socket_t {
-            return self.conns[@intFromEnum(s)].socket.handle;
+            return self.conns[@intFromEnum(s)];
+        }
+
+        // Write `content` to stdout, then end the session with `exit_code`.
+        fn finish(self: *const ClientStreams, content: []const u8, exit_code: u8) void {
+            platform.write(self.fd(.stdout), content);
+            self.closeForExit(exit_code);
+        }
+
+        // Shut down stdout/stderr and signal a clean client exit (no content write).
+        fn closeForExit(self: *const ClientStreams, exit_code: u8) void {
+            platform.shutdownWrite(self.fd(.stdout));
+            platform.shutdownWrite(self.fd(.stderr));
+            platform.write(self.fd(.signals), &[_]u8{ protocol.signals.exit, 0x01, exit_code });
+            platform.shutdownWrite(self.fd(.signals));
         }
 
         fn deinit(self: *ClientStreams) void {
-            const io = self.c.io;
-            for (self.conns) |conn| conn.close(io);
-            for (&self.listeners, self.addrs[0..], self.addr_lens) |*l, *addr, len| {
-                if (self.c.cfg.transport == .unix) Io.Dir.deleteFileAbsolute(io, addr[0..len]) catch {};
-                l.server.deinit(io);
-            }
+            for (self.conns) |conn| platform.close(conn);
+            for (&self.listeners) |*l| l.close(self.c.io);
             self.c.releasePortSet(self.port_set_idx);
         }
     };
@@ -2083,7 +2042,6 @@ pub const Conductor = struct {
     fn openClientStreams(self: *Conductor, client_socket: posix.socket_t) !ClientStreams {
         const mode = self.cfg.transport;
         const bind = self.cfg.bind_address;
-        const rdir = self.cfg.runtime_dir;
         var port_set_idx: u16 = protocol.PortPool.none;
         var ports: ?[4]u16 = null;
         if (self.port_pool) |*pool| {
@@ -2094,47 +2052,36 @@ pub const Conductor = struct {
         }
         errdefer self.releasePortSet(port_set_idx);
         const suffixes = [_][]const u8{ "stdin.sock", "stdout.sock", "stderr.sock", "signals.sock" };
-        var bufs: [4][std.fs.max_path_bytes]u8 = undefined;
         var listeners: [4]protocol.Listener = undefined;
         var created: usize = 0;
-        errdefer for (listeners[0..created]) |*l| {
-            if (mode == .unix) Io.Dir.deleteFileAbsolute(self.io, l.addr) catch {};
-            l.server.deinit(self.io);
-        };
+        errdefer for (listeners[0..created]) |*l| l.close(self.io);
         for (0..4) |i| {
             listeners[i] = if (ports) |p|
-                try protocol.listenTcp(self.io, bind, p[i], &bufs[i])
+                try protocol.listenTcp(self.io, bind, p[i])
             else
-                try createListener(self.io, mode, rdir, suffixes[i], bind, &bufs[i]);
+                try protocol.createListener(self.io, mode, self.cfg.socket_dir, suffixes[i], bind);
             created += 1;
         }
         self.sendSocketPaths(client_socket, .{
-            .stdin = listeners[0].addr, .stdout = listeners[1].addr,
-            .stderr = listeners[2].addr, .signals = listeners[3].addr,
+            .stdin = listeners[0].addr(), .stdout = listeners[1].addr(),
+            .stderr = listeners[2].addr(), .signals = listeners[3].addr(),
         });
-        var conns: [4]Io.net.Stream = undefined;
+        var conns: [4]posix.socket_t = undefined;
         var accepted: usize = 0;
-        errdefer for (conns[0..accepted]) |c| c.close(self.io);
+        errdefer for (conns[0..accepted]) |c| platform.close(c);
         for (0..4) |i| {
             // A client that left after asking (a long spawn it gave up on) must not
             // wedge the daemon in a bare accept.
-            var pfd = [_]posix.pollfd{.{ .fd = listeners[i].server.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
-            if (try posix.poll(&pfd, reply_accept_timeout_ms) == 0) return error.ClientGone;
-            conns[i] = try listeners[i].server.accept(self.io);
+            conns[i] = (try listeners[i].acceptTimeout(self.io, reply_accept_timeout_ms)) orelse return error.ClientGone;
             accepted += 1;
         }
-        var streams = ClientStreams{ .c = self, .listeners = listeners, .conns = conns, .port_set_idx = port_set_idx };
-        for (listeners, &streams.addrs, &streams.addr_lens) |l, *addr, *len| {
-            @memcpy(addr[0..l.addr.len], l.addr);
-            len.* = l.addr.len;
-        }
-        return streams;
+        return .{ .c = self, .listeners = listeners, .conns = conns, .port_set_idx = port_set_idx };
     }
 
     fn serveString(self: *Conductor, client_socket: posix.socket_t, content: []const u8, exit_code: u8) !void {
         var streams = try self.openClientStreams(client_socket);
         defer streams.deinit();
-        self.finishStreams(&streams, content, exit_code);
+        streams.finish(content, exit_code);
     }
 
     fn isLiveStatus(format: ?[]const u8) bool {
@@ -2160,7 +2107,7 @@ pub const Conductor = struct {
         }
         const report = self.renderStatus(format, tty, palette) catch |err| {
             std.debug.print("Status: render failed: {}\n", .{err});
-            self.finishStreams(&streams, "Failed to generate status report.\n", 1);
+            streams.finish("Failed to generate status report.\n", 1);
             return;
         };
         defer self.allocator.free(report.bytes);
@@ -2169,7 +2116,7 @@ pub const Conductor = struct {
             try self.subscribeLive(streams, palette, report.lines);
             held = true; // ownership moved into live_clients
         } else {
-            self.closeStreams(&streams, 0);
+            streams.closeForExit(0);
         }
     }
 
@@ -2283,7 +2230,7 @@ pub const Conductor = struct {
         platform.write(fd, "\x1b[?2026l");
         lc.lines_last_printed = report.lines;
         if (!lc.oneshot) return true;
-        self.closeStreams(&lc.streams, 0);
+        lc.streams.closeForExit(0);
         lc.streams.deinit();
         return false;
     }
@@ -2301,21 +2248,6 @@ pub const Conductor = struct {
             return true;
         }
         return false;
-    }
-
-    // Write `content` to stdout, then shut down stdout/stderr and signal a clean
-    // exit. Shared by the report and failure paths.
-    fn finishStreams(self: *Conductor, streams: *ClientStreams, content: []const u8, exit_code: u8) void {
-        platform.write(streams.fd(.stdout), content);
-        self.closeStreams(streams, exit_code);
-    }
-
-    // Shut down stdout/stderr and signal a clean client exit (no content write).
-    fn closeStreams(self: *Conductor, streams: *ClientStreams, exit_code: u8) void {
-        streams.conns[@intFromEnum(Stream.stdout)].shutdown(self.io, .send) catch {};
-        streams.conns[@intFromEnum(Stream.stderr)].shutdown(self.io, .send) catch {};
-        platform.write(streams.fd(.signals), &[_]u8{ protocol.signals.exit, 0x01, exit_code });
-        streams.conns[@intFromEnum(Stream.signals)].shutdown(self.io, .send) catch {};
     }
 
     // Probe the terminal palette: enter raw mode (replies un-echoed), write the

@@ -50,6 +50,18 @@ const shared = if (os != .windows) @import("posix.zig") else impl;
 pub const socketWrite = shared.socketWrite;
 pub const socketRead = shared.socketRead;
 pub const close = shared.close;
+pub const shutdownWrite = shared.shutdownWrite;
+// Local (path-addressed) transport: AF_UNIX on POSIX, named pipes on Windows.
+// Every local address is formed by `localSocketPath` inside the directory
+// `localSocketDir` derives from the runtime dir.
+pub const Listener = shared.Listener;
+pub const localSocketDir = shared.localSocketDir;
+pub const localSocketPath = shared.localSocketPath;
+pub const listenLocal = shared.listenLocal;
+pub const connectLocal = shared.connectLocal;
+pub const connectLocalOnce = shared.connectLocalOnce;
+pub const rawConnectLocal = shared.rawConnectLocal;
+pub const spawnWorker = shared.spawnWorker;
 pub const getChildPid = shared.getChildPid;
 pub const WaitPidResult = shared.WaitPidResult;
 pub const waitpidNonBlocking = shared.waitpidNonBlocking;

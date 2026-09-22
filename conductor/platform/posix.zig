@@ -7,6 +7,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const Io = std.Io;
+const protocol = @import("../protocol.zig");
 const impl = if (builtin.os.tag == .linux) @import("linux.zig") else @import("bsd.zig");
 
 /// Format into either an allocator (returns owned slice) or a `[]u8` buffer (returns sub-slice).
@@ -20,6 +22,10 @@ pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 
 // I/O — on POSIX, sockets are fds.
 pub fn socketWrite(fd: posix.socket_t, buf: []const u8) void { impl.write(fd, buf); }
 pub fn close(fd: posix.fd_t) void { impl.rawClose(fd); }
+/// Half-close the sending side; the peer reads EOF once buffered data drains.
+pub fn shutdownWrite(fd: posix.socket_t) void {
+    _ = posix.system.shutdown(fd, posix.system.SHUT.WR);
+}
 pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     return posix.read(fd, buf) catch |err| {
         @branchHint(.cold);
@@ -29,7 +35,85 @@ pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     };
 }
 
+// Local transport: AF_UNIX sockets, path-addressed within the socket directory.
+// The directory is the runtime dir itself; a path must leave room for sun_path's NUL.
+pub const max_local_addr = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len;
+pub fn localSocketDir(out: anytype, runtime_dir: []const u8) ![]const u8 {
+    return print(out, "{s}", .{runtime_dir});
+}
+pub fn localSocketPath(out: anytype, dir: []const u8, comptime name_fmt: []const u8, name_args: anytype) ![]const u8 {
+    return print(out, "{s}/" ++ name_fmt, .{dir} ++ name_args);
+}
+pub fn listenLocal(io: Io, path: []const u8) !Listener {
+    if (path.len >= max_local_addr) return error.PathTooLong;
+    const ua = try Io.net.UnixAddress.init(path);
+    return Listener.fromServer(try ua.listen(io, .{ .kernel_backlog = 128 }), .local, path);
+}
+pub fn connectLocal(io: Io, path: []const u8) !posix.socket_t {
+    if (path.len >= max_local_addr) return error.PathTooLong;
+    const ua = try Io.net.UnixAddress.init(path);
+    return (try ua.connect(io)).socket.handle;
+}
+/// Connect to a single-use local address and retire it, so nothing else can.
+pub fn connectLocalOnce(io: Io, path: []const u8) !posix.socket_t {
+    const fd = try connectLocal(io, path);
+    Io.Dir.deleteFileAbsolute(io, path) catch {};
+    return fd;
+}
+/// Connect with raw syscalls only, for use inside a signal handler; null on failure.
+pub fn rawConnectLocal(path: []const u8) ?posix.socket_t {
+    var addr = std.mem.zeroes(posix.sockaddr.un);
+    addr.family = posix.AF.UNIX;
+    if (path.len >= addr.path.len) return null;
+    @memcpy(addr.path[0..path.len], path);
+    const fd = impl.rawSocket(posix.AF.UNIX, posix.SOCK.STREAM) orelse return null;
+    if (impl.rawConnect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un))) return fd;
+    impl.rawClose(fd);
+    return null;
+}
+
+/// A listening socket and its address. Accepting yields a plain socket handle;
+/// `close` also unlinks a local socket's path.
+pub const Listener = struct {
+    server: Io.net.Server,
+    mode: protocol.TransportMode,
+    addr_buf: [max_local_addr]u8,
+    addr_len: usize,
+
+    pub fn fromServer(server: Io.net.Server, mode: protocol.TransportMode, address: []const u8) !Listener {
+        var l = Listener{ .server = server, .mode = mode, .addr_buf = undefined, .addr_len = address.len };
+        if (address.len > l.addr_buf.len) return error.PathTooLong;
+        @memcpy(l.addr_buf[0..address.len], address);
+        return l;
+    }
+    pub fn addr(self: *const Listener) []const u8 {
+        return self.addr_buf[0..self.addr_len];
+    }
+    pub fn fd(self: *const Listener) posix.socket_t {
+        return self.server.socket.handle;
+    }
+    /// Accept the connection an event loop reported waiting.
+    pub fn accept(self: *Listener, io: Io) !posix.socket_t {
+        return (try self.server.accept(io)).socket.handle;
+    }
+    /// Accept a connection arriving within `timeout_ms` (0: one already waiting); null when none does.
+    pub fn acceptTimeout(self: *Listener, io: Io, timeout_ms: i32) !?posix.socket_t {
+        var pfd = [_]posix.pollfd{.{ .fd = self.fd(), .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&pfd, timeout_ms) == 0) return null;
+        return try self.accept(io);
+    }
+    pub fn close(self: *Listener, io: Io) void {
+        self.server.deinit(io);
+        if (self.mode == .local) Io.Dir.deleteFileAbsolute(io, self.addr()) catch {};
+    }
+};
+
 // Process helpers
+/// Start a worker in its own process group, so a terminal SIGINT reaches only
+/// the conductor, with stdio inherited (the service manager's fds suit libuv).
+pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
+    return std.process.spawn(io, .{ .argv = argv, .pgid = 0 });
+}
 pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
     return child.id orelse 0;
 }

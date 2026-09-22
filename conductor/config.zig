@@ -10,8 +10,9 @@ pub const Config = struct {
     allocator: std.mem.Allocator,
     socket_path: []const u8,
     runtime_dir: []const u8,
+    socket_dir: []const u8, // where local (path-addressed) sockets are created
     transport: protocol.TransportMode,
-    bind_address: []const u8, // TCP bind address (e.g. "0.0.0.0"); empty in unix mode
+    bind_address: []const u8, // TCP bind address (e.g. "0.0.0.0"); empty in local mode
     worker_executable: []const u8,
     worker_args: []const u8,
     worker_project: []const u8,
@@ -60,10 +61,12 @@ pub const Config = struct {
         else
             try platform.defaultRuntimeDir(allocator, env.get("XDG_RUNTIME_DIR"), env.get("HOME"));
         errdefer allocator.free(runtime_dir);
+        const socket_dir = try platform.localSocketDir(allocator, runtime_dir);
+        errdefer allocator.free(socket_dir);
         const server_env = env.get("JULIA_DAEMON_SERVER");
         const parsed = protocol.parseAddress(server_env orelse
-            try std.fmt.allocPrint(allocator, "{s}/conductor.sock", .{runtime_dir})) catch {
-            std.debug.print("Error: unsupported scheme in JULIA_DAEMON_SERVER={s}\nOnly tcp:// and unix paths are supported.\n", .{server_env.?});
+            try platform.localSocketPath(allocator, socket_dir, "conductor.sock", .{})) catch {
+            std.debug.print("Error: unsupported scheme in JULIA_DAEMON_SERVER={s}\nOnly tcp:// and local socket paths are supported.\n", .{server_env.?});
             return error.UnsupportedScheme;
         };
         const socket_path = if (server_env != null)
@@ -81,6 +84,7 @@ pub const Config = struct {
             .allocator = allocator,
             .socket_path = socket_path,
             .runtime_dir = runtime_dir,
+            .socket_dir = socket_dir,
             .transport = transport,
             .bind_address = bind_address,
             .worker_executable = env.get("JULIA_DAEMON_WORKER_EXECUTABLE") orelse "julia",
@@ -121,6 +125,7 @@ pub const Config = struct {
     pub fn deinit(self: *const Config) void {
         self.allocator.free(self.socket_path);
         self.allocator.free(self.runtime_dir);
+        self.allocator.free(self.socket_dir);
     }
 };
 

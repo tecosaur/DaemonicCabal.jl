@@ -14,8 +14,6 @@ const sandbox = if (builtin.os.tag == .linux) @import("sandbox.zig") else struct
 
 const BufWriter = protocol.BufWriter;
 const readExact = protocol.readExact;
-const randomSocketPath = protocol.randomSocketPath;
-const createListener = protocol.createListener;
 
 const max_recent_ppids = 32;
 // The worker reads its policy (max clients, TTLs, Revise) from its environment.
@@ -201,36 +199,33 @@ pub const Worker = struct {
         io: Io,
         cfg: *const config.Config,
         id: u32,
-        runtime_dir: []const u8,
         julia_channel: ?[]const u8,
         threads: args.Threads,
         interactive: bool,
         launch: Launch,
     ) !Spawn {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         // Sandboxed workers use a per-worker subdirectory so the sandbox
         // can bind-mount it rw without exposing the rest of the runtime dir.
         // The worker derives its RUNTIME_DIR from dirname(setup_socket_path),
         // so placing the setup socket here makes the worker create its
         // stdio sockets in the same isolated subdirectory.
         var subdir_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const effective_runtime_dir = if (launch == .sandboxed) blk: {
-            const subdir = std.fmt.bufPrint(&subdir_buf, "{s}/sandbox-{d}", .{ runtime_dir, id }) catch
+        const socket_dir = if (launch == .sandboxed) blk: {
+            const subdir = std.fmt.bufPrint(&subdir_buf, "{s}/sandbox-{d}", .{ cfg.socket_dir, id }) catch
                 return error.PathTooLong;
             Io.Dir.createDirAbsolute(io, subdir, .default_dir) catch {};
             break :blk subdir;
-        } else runtime_dir;
+        } else cfg.socket_dir;
         // Conductor and worker are always on the same machine, so use a
-        // Unix socket regardless of the client-facing transport mode.
-        var setup = try createListener(io, .unix, effective_runtime_dir, "wsetup.sock", "", &path_buf);
-        errdefer setup.server.deinit(io);
-        errdefer Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
+        // local socket regardless of the client-facing transport mode.
+        var setup = try protocol.createListener(io, .local, socket_dir, "wsetup.sock", "");
+        errdefer setup.close(io);
         const channel_copy: ?[]const u8 = if (julia_channel) |ch| try allocator.dupe(u8, ch) else null;
         errdefer if (channel_copy) |ch| allocator.free(ch);
         const eval_expr = try std.fmt.allocPrint(
             allocator,
-            "using DaemonWorker; DaemonWorker.runworker(\"{s}\", {d}, \"{s}\")",
-            .{ setup.addr, id, cfg.socket_path },
+            "using DaemonWorker; DaemonWorker.runworker({f}, {d}, {f})",
+            .{ juliaString(setup.addr()), id, juliaString(cfg.socket_path) },
         );
         defer allocator.free(eval_expr);
         // Rendered once for both spawn paths. Passed after worker_args so a
@@ -275,7 +270,7 @@ pub const Worker = struct {
                     .worker_args = cfg.worker_args,
                     .eval_expr = eval_expr,
                     .host_environ = s.environ,
-                    .setup_socket_path = setup.addr,
+                    .setup_socket_path = setup.addr(),
                     .worker_id = id,
                     .host_home = cfg.host_home,
                     .depot_env = s.environ.get("JULIA_DEPOT_PATH"),
@@ -319,16 +314,12 @@ pub const Worker = struct {
                         try sendSpawnRequest(c.socket, argv.items, c.environ);
                         break :handed .{ .id = null, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
                     },
-                    else => try std.process.spawn(io, .{
-                        .argv = argv.items,
-                        // Separate process group so terminal SIGINT only goes to conductor
-                        .pgid = if (builtin.os.tag == .windows) null else 0,
-                    }),
+                    else => try platform.spawnWorker(io, argv.items),
                 };
             },
         };
         const now = Io.Clock.now(.awake, io).toSeconds();
-        var pending = Spawn{
+        const pending = Spawn{
             .worker = .{
                 .allocator = allocator,
                 .id = id,
@@ -346,13 +337,24 @@ pub const Worker = struct {
                 .interactive = interactive,
             },
             .client_ns = if (launch == .client) launch.client.ns else null,
-            .server = setup.server,
-            .addr_buf = undefined,
-            .addr_len = setup.addr.len,
+            .listener = setup,
             .deadline = now + @as(i64, @intCast(cfg.spawn_timeout)),
         };
-        @memcpy(pending.addr_buf[0..setup.addr.len], setup.addr);
         return pending;
+    }
+
+    /// Format bytes as a Julia string literal, so a path with `"`, `\` or `$`
+    /// survives being embedded in the worker's `--eval` source.
+    fn juliaString(bytes: []const u8) std.fmt.Alt([]const u8, formatJuliaString) {
+        return .{ .data = bytes };
+    }
+    fn formatJuliaString(bytes: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeByte('"');
+        for (bytes) |b| {
+            if (b == '"' or b == '\\' or b == '$') try w.writeByte('\\');
+            try w.writeByte(b);
+        }
+        try w.writeByte('"');
     }
 
     /// A worker process launched but not yet connected. The conductor watches
@@ -362,13 +364,11 @@ pub const Worker = struct {
     pub const Spawn = struct {
         worker: Worker, // socket, pidfd and (for a client launch) pid arrive with the connection
         client_ns: ?u64, // the launching client's mount namespace, for a .client launch
-        server: Io.net.Server,
-        addr_buf: [std.fs.max_path_bytes]u8,
-        addr_len: usize,
+        listener: protocol.Listener,
         deadline: i64,
 
         pub fn listenerFd(self: *const Spawn) posix.socket_t {
-            return self.server.socket.handle;
+            return self.listener.fd();
         }
 
         /// Take the connection waiting on the listener. Null when nothing was
@@ -378,10 +378,7 @@ pub const Worker = struct {
         /// launch one in the client's namespace, is accepted. On success the
         /// listener is released and the returned worker is connected.
         pub fn accept(self: *Spawn, io: Io, cfg: *const config.Config) !?Worker {
-            var pfd = [_]posix.pollfd{.{ .fd = self.listenerFd(), .events = posix.POLL.IN, .revents = 0 }};
-            if ((posix.poll(&pfd, 0) catch 0) == 0) return null;
-            const conn = try self.server.accept(io);
-            const socket = conn.socket.handle;
+            const socket = (try self.listener.acceptTimeout(io, 0)) orelse return null;
             var w = self.worker;
             if (!isExpectedWorker(socket, w.launch, self.client_ns, w.process.id)) {
                 std.debug.print("Worker {d}: dropped a setup connection from an unexpected process\n", .{w.id});
@@ -406,7 +403,7 @@ pub const Worker = struct {
             var magic_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
             platform.write(socket, &magic_buf);
-            self.releaseListener(io);
+            self.listener.close(io);
             self.worker.julia_channel = null; // now the returned worker's
             w.socket = socket;
             w.created_at = Io.Clock.now(.awake, io).toSeconds();
@@ -436,13 +433,8 @@ pub const Worker = struct {
                 _ = platform.kill(pid, platform.SIG.KILL);
                 _ = platform.waitpidNonBlocking(pid);
             };
-            self.releaseListener(io);
+            self.listener.close(io);
             if (self.worker.julia_channel) |ch| self.worker.allocator.free(ch);
-        }
-
-        fn releaseListener(self: *Spawn, io: Io) void {
-            self.server.deinit(io);
-            Io.Dir.deleteFileAbsolute(io, self.addr_buf[0..self.addr_len]) catch {};
         }
     };
 
