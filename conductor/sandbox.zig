@@ -239,18 +239,35 @@ pub fn execInSandbox(
     // First fork: parent gets child PID back
     const pid1 = callFork() orelse return SandboxError.ForkFailed;
     if (pid1 != 0) return pid1;
-    // Child 1: create new user/mount/PID namespaces
+    // Child 1: hold the signals it will relay until there is a worker to relay
+    // them to, then create new user/mount/PID namespaces.
+    var relayed = posix.sigemptyset();
+    posix.sigaddset(&relayed, .INT);
+    posix.sigaddset(&relayed, .TERM);
+    posix.sigprocmask(posix.SIG.BLOCK, &relayed, null);
     setupNamespaces(orig_uid, orig_gid) catch |err|
         fatalChild("namespace setup", err);
     // Second fork: enter the PID namespace (child becomes PID 1 inside)
     const pid2 = callFork() orelse
         fatalChild("inner fork", SandboxError.ForkFailed);
     if (pid2 != 0) {
+        relay_target = pid2;
+        const relay = posix.Sigaction{ .handler = .{ .handler = relaySignal }, .mask = std.mem.zeroes(posix.sigset_t), .flags = 0 };
+        posix.sigaction(.INT, &relay, null);
+        posix.sigaction(.TERM, &relay, null);
+        // Inherited from the conductor, whose signal pipe it writes into.
+        const ignore = posix.Sigaction{ .handler = .{ .handler = posix.SIG.IGN }, .mask = std.mem.zeroes(posix.sigset_t), .flags = 0 };
+        posix.sigaction(.USR1, &ignore, null);
+        posix.sigprocmask(posix.SIG.UNBLOCK, &relayed, null);
         var status: u32 = 0;
-        _ = linux.waitpid(@intCast(pid2), &status, 0);
+        while (errnoFromRc(linux.waitpid(@intCast(pid2), &status, 0))) |e| {
+            if (e != .INTR) break;
+        }
         linux.exit_group(@intCast(status >> 8));
     }
-    // Child 2 (PID 1 inside): build filesystem and exec
+    // Child 2 (PID 1 inside): the signal mask survives exec, so clear it before
+    // building the filesystem and exec'ing.
+    posix.sigprocmask(posix.SIG.UNBLOCK, &relayed, null);
     setupFilesystem(config) catch |err|
         fatalChild("filesystem setup", err);
     if (config.max_memory != null or config.max_cpu != null)
@@ -261,6 +278,14 @@ pub fn execInSandbox(
     if (errnoFromRc(rc)) |e|
         std.debug.print("Sandbox: execve failed: {s}\n", .{@tagName(e)});
     linux.exit_group(127);
+}
+
+// Signals aimed at a sandbox land on child 1, the waiter outside the pid
+// namespace. It relays them to the worker rather than dying on them, which would
+// take the worker down through its parent-death signal.
+var relay_target: posix.pid_t = 0;
+fn relaySignal(sig: posix.SIG) callconv(.c) void {
+    _ = linux.kill(relay_target, sig);
 }
 
 /// Test whether an environment variable key passes the sandbox allowlist.
