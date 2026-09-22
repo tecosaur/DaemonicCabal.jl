@@ -101,12 +101,6 @@ pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*
     linux.exit_group(127);
 }
 
-pub fn mountNsDiffersFromParent() bool {
-    const own = mountNsInode(linux.getpid()) orelse return false;
-    const parent = mountNsInode(linux.getppid()) orelse return false;
-    return own != parent;
-}
-
 // The link reads "mnt:[4026531841]".
 fn mountNsInode(pid: posix.pid_t) ?u64 {
     var path_buf: [64]u8 = undefined;
