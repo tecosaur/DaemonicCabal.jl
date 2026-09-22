@@ -137,10 +137,11 @@ DaemonWorker project the daemon was installed with, and the Julia depot
 precompile there). A Julia the sandbox cannot run is reported by the client at
 once; a Julia that starts but cannot load its worker package shows up as a
 timeout after =JULIA_DAEMON_SPAWN_TIMEOUT=, with the details in the daemon log.
-The daemon itself must share the host's mount namespace for the comparison to
-mean anything: a service hardened with =PrivateTmp= or =ProtectHome= would see
-every client as sandboxed, and the daemon warns at startup when its mount
-namespace differs from its parent's.
+Such a client is refused =--sandbox=, since the sandbox it is in is the one that
+counts and the daemon cannot nest another inside it. The daemon itself must
+share the host's mount namespace for the comparison to mean anything: a service
+hardened with =PrivateTmp= or =ProtectHome= would see every client as
+sandboxed.
 
 ** Remote sandboxing
 
