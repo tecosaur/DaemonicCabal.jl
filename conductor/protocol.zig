@@ -179,22 +179,12 @@ pub const BufReader = struct {
     }
 };
 
-/// Length of `sun_path` for this platform (104 on macOS, 108 on Linux/Windows).
-/// A bound socket path must fit here including a NUL terminator, so the usable
-/// path length is one less than this.
-const sun_path_len = @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len;
-
-/// Generate a random socket path in the given runtime directory
-pub fn randomSocketPath(io: Io, runtime_dir: []const u8, suffix: []const u8, buf: []u8) ![]const u8 {
+/// Generate a random local socket address in `socket_dir`, ending in `suffix`.
+pub fn randomSocketPath(io: Io, socket_dir: []const u8, suffix: []const u8, buf: []u8) ![]const u8 {
     var rand_buf: [8]u8 = undefined;
     io.random(&rand_buf);
     const hex = std.fmt.bytesToHex(rand_buf, .lower);
-    const path = std.fmt.bufPrint(buf, "{s}/{s}-{s}", .{ runtime_dir, &hex, suffix }) catch
-        return error.PathTooLong;
-    // Surface an over-long runtime dir as a clear error rather than letting the
-    // bind overflow sun_path and panic deep inside std.
-    if (path.len >= sun_path_len) return error.PathTooLong;
-    return path;
+    return platform.localSocketPath(buf, socket_dir, "{s}-{s}", .{ &hex, suffix });
 }
 
 // --- Port pool for managed TCP port ranges ---
@@ -234,9 +224,12 @@ pub const PortPool = struct {
     }
 };
 
-// --- Dual transport (Unix sockets / TCP) ---
+// --- Dual transport ---
+// `local` is path-addressed and same-host: AF_UNIX on POSIX, named pipes on
+// Windows. `tcp` is host:port. The platform owns the local implementation.
 
-pub const TransportMode = enum { unix, tcp };
+pub const TransportMode = enum { local, tcp };
+pub const Listener = platform.Listener;
 
 pub const Address = struct {
     mode: TransportMode,
@@ -249,17 +242,18 @@ pub fn setTcpNodelay(fd: std.posix.socket_t) void {
 }
 
 /// Detect transport mode from address string, stripping any `tcp://` scheme prefix.
-/// `tcp://host[:port]` or bare `host[:port]` → tcp; paths (containing `/` or starting with `.`) → unix.
+/// `tcp://host[:port]` or bare `host[:port]` → tcp; paths (containing a
+/// separator or starting with `.`) → local.
 pub fn parseAddress(raw: []const u8) error{UnsupportedScheme}!Address {
     if (std.mem.indexOf(u8, raw, "://")) |sep| {
         if (std.mem.eql(u8, raw[0..sep], "tcp"))
             return .{ .mode = .tcp, .addr = raw[sep + 3 ..] };
         return error.UnsupportedScheme;
     }
-    if (raw.len > 0 and raw[0] != '/' and raw[0] != '.' and
-        std.mem.indexOfScalar(u8, raw, '/') == null)
+    if (raw.len > 0 and raw[0] != '/' and raw[0] != '\\' and raw[0] != '.' and
+        std.mem.indexOfAny(u8, raw, "/\\") == null)
         return .{ .mode = .tcp, .addr = raw };
-    return .{ .mode = .unix, .addr = raw };
+    return .{ .mode = .local, .addr = raw };
 }
 
 pub const default_tcp_port: u16 = 9345;
@@ -274,63 +268,49 @@ fn parseHostPort(addr: []const u8) !Io.net.IpAddress {
     return Io.net.IpAddress.parse(host, port) catch return error.InvalidAddress;
 }
 
-pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net.Stream {
+pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !std.posix.socket_t {
     switch (mode) {
-        .unix => {
-            const ua = try Io.net.UnixAddress.init(addr);
-            return ua.connect(io_ctx);
-        },
+        .local => return platform.connectLocal(io_ctx, addr),
         .tcp => {
             const ip = try parseHostPort(addr);
-            return ip.connect(io_ctx, .{ .mode = .stream });
+            return (try ip.connect(io_ctx, .{ .mode = .stream })).socket.handle;
         },
     }
 }
 
-pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net.Server {
+pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Listener {
     switch (mode) {
-        .unix => {
-            const ua = try Io.net.UnixAddress.init(addr);
-            return ua.listen(io_ctx, .{ .kernel_backlog = 128 });
-        },
+        .local => return platform.listenLocal(io_ctx, addr),
         .tcp => {
             const ip = try parseHostPort(addr);
-            return ip.listen(io_ctx, .{ .kernel_backlog = 128, .reuse_address = true });
+            var server = try ip.listen(io_ctx, .{ .kernel_backlog = 128, .reuse_address = true });
+            errdefer server.deinit(io_ctx);
+            return Listener.fromServer(server, .tcp, addr);
         },
     }
 }
 
-pub const Listener = struct { server: Io.net.Server, addr: []const u8 };
-
-pub fn createListener(
-    io_ctx: Io,
-    mode: TransportMode,
-    runtime_dir: []const u8,
-    suffix: []const u8,
-    bind_addr: []const u8,
-    buf: []u8,
-) !Listener {
+/// Listen on a fresh random local address in `socket_dir`, or an ephemeral TCP port.
+pub fn createListener(io_ctx: Io, mode: TransportMode, socket_dir: []const u8, suffix: []const u8, bind_addr: []const u8) !Listener {
     switch (mode) {
-        .unix => {
-            const path = try randomSocketPath(io_ctx, runtime_dir, suffix, buf);
-            const unix_addr = try Io.net.UnixAddress.init(path);
-            return .{ .server = try unix_addr.listen(io_ctx, .{}), .addr = path };
+        .local => {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            return platform.listenLocal(io_ctx, try randomSocketPath(io_ctx, socket_dir, suffix, &buf));
         },
-        .tcp => return listenTcp(io_ctx, bind_addr, 0, buf),
+        .tcp => return listenTcp(io_ctx, bind_addr, 0),
     }
 }
 
 /// Port 0 = ephemeral (OS-assigned).
-pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16, buf: []u8) !Listener {
+pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16) !Listener {
     const ip = Io.net.IpAddress.parse(bind_addr, port) catch return error.InvalidAddress;
     var server = try ip.listen(io_ctx, .{ .reuse_address = true });
+    errdefer server.deinit(io_ctx);
     const actual_port = switch (server.socket.address) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
     };
-    const addr_str = std.fmt.bufPrint(buf, "{s}:{d}", .{ bind_addr, actual_port }) catch {
-        server.deinit(io_ctx);
-        return error.NameTooLong;
-    };
-    return .{ .server = server, .addr = addr_str };
+    var buf: [64]u8 = undefined;
+    const addr_str = std.fmt.bufPrint(&buf, "{s}:{d}", .{ bind_addr, actual_port }) catch return error.NameTooLong;
+    return Listener.fromServer(server, .tcp, addr_str);
 }

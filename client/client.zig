@@ -62,10 +62,10 @@ const SocketWriter = struct {
 };
 
 const SocketSet = struct {
-    stdin: Io.net.Stream,
-    stdout: Io.net.Stream,
-    stderr: Io.net.Stream,
-    signals: Io.net.Stream,
+    stdin: posix.socket_t,
+    stdout: posix.socket_t,
+    stderr: posix.socket_t,
+    signals: posix.socket_t,
 };
 
 const EnvInfo = struct {
@@ -160,7 +160,7 @@ const SignalParser = struct {
                 break :blk .none;
             },
             protocol.signals.nodelay => blk: {
-                protocol.setTcpNodelay(sockets.stdin.socket.handle);
+                protocol.setTcpNodelay(sockets.stdin);
                 protocol.setTcpNodelay(fd); // signals socket
                 break :blk .none;
             },
@@ -176,7 +176,7 @@ var sockets: SocketSet = undefined;
 // Conductor address for exit notification (global buffer so it outlives connectToConductor)
 var conductor_path_buf: [max_socket_path]u8 = undefined;
 var conductor_path: []const u8 = &.{};
-var transport_mode: protocol.TransportMode = .unix;
+var transport_mode: protocol.TransportMode = .local;
 var signal_parser = SignalParser{};
 var client_id: u32 = 0; // conductor-assigned with the socket paths; names us in notifications
 
@@ -184,7 +184,7 @@ var client_id: u32 = 0; // conductor-assigned with the socket paths; names us in
 
 fn signalWriteStdin(ptr: *anyopaque, data: []const u8) void {
     const sock_set: *SocketSet = @ptrCast(@alignCast(ptr));
-    platform.socketWrite(sock_set.stdin.socket.handle, data);
+    platform.socketWrite(sock_set.stdin, data);
 }
 
 fn signalNotifyExit() void {
@@ -218,9 +218,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer platform.setRawMode(false);
     // Connect to conductor and send client info
     const conductor = try connectToConductor(env);
-    if (transport_mode == .tcp) protocol.setTcpNodelay(conductor.socket.handle);
+    if (transport_mode == .tcp) protocol.setTcpNodelay(conductor);
     defer notifyExit();
-    var w = SocketWriter{ .handle = conductor.socket.handle };
+    var w = SocketWriter{ .handle = conductor };
     try sendClientInfo(&w, env, is_tty, init.args, addr_arg.skip, sync_arg.skip);
     // Get worker socket paths (conductor may request full env on cache miss)
     sockets = try connectToWorker(conductor, &w, env, init.environ.block);
@@ -257,14 +257,16 @@ fn scanEnv(block: EnvBlock) EnvInfo {
     return info;
 }
 
-fn connectToConductor(env: EnvInfo) !Io.net.Stream {
+fn connectToConductor(env: EnvInfo) !posix.socket_t {
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
     const runtime_dir = env.runtime_dir orelse
         try platform.defaultRuntimeDir(&runtime_dir_buf, env.xdg_runtime_dir, env.home);
+    var socket_dir_buf: [max_socket_path]u8 = undefined;
+    const socket_dir = try platform.localSocketDir(&socket_dir_buf, runtime_dir);
     const raw_path = env.server_path orelse
-        std.fmt.bufPrint(&conductor_path_buf, "{s}/conductor.sock", .{runtime_dir}) catch return error.NameTooLong;
+        try platform.localSocketPath(&conductor_path_buf, socket_dir, "conductor.sock", .{});
     const parsed = protocol.parseAddress(raw_path) catch {
-        std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and unix paths are supported.\n", .{raw_path});
+        std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and local socket paths are supported.\n", .{raw_path});
         exitClient(1);
     };
     transport_mode = parsed.mode;
@@ -280,16 +282,16 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
             if (protocol.connectAddress(io, transport_mode, addr)) |stream| return stream else |_| {}
         }
     } else {
-        // Unix mode: try to signal conductor to recreate socket
+        // Local mode: try to signal conductor to recreate socket
         var pid_buf: [max_socket_path]u8 = undefined;
         const pid_path = std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong;
         if (readPidAndSignal(pid_path)) {
             var attempts: u32 = 0;
             while (attempts < 20) : (attempts += 1) {
                 Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
-                if (connectUnix(addr)) |stream| return stream else |_| {}
+                if (platform.connectLocal(io, addr)) |stream| return stream else |_| {}
             }
-            // Unix socket still missing but conductor is alive — try default TCP port
+            // Local socket still missing but conductor is alive — try default TCP port
             const tcp_addr = std.fmt.bufPrint(&conductor_path_buf, "localhost:{d}", .{protocol.default_tcp_port}) catch unreachable;
             if (protocol.connectAddress(io, .tcp, tcp_addr)) |stream| {
                 transport_mode = .tcp;
@@ -343,32 +345,29 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.pr
     w.flush();
 }
 
-fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, block: EnvBlock) !SocketSet {
-    var buf: [1024]u8 = undefined;
-    var sr = conductor.reader(io, &buf);
-    const reader = &sr.interface;
-    while (true) switch (reader.takeByte() catch |err| replyFailure(err)) {
+fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, block: EnvBlock) !SocketSet {
+    const reader = protocol.BufReader{ .fd = conductor };
+    while (true) switch (reader.readInt(u8) catch |err| replyFailure(err)) {
         protocol.client.env_request => sendFullEnv(w, env, block),
         protocol.client.spawn_request => try spawnWorker(reader, block),
         protocol.client.socket_paths => break,
         else => replyFailure(error.BadReply),
     };
-    client_id = try reader.takeInt(u32, .little);
+    client_id = try reader.readInt(u32);
     var paths: [4 * (max_socket_path + 1)]u8 = undefined;
     var pos: usize = 0;
     const stdin_path = try takeString(reader, &paths, &pos);
     const stdout_path = try takeString(reader, &paths, &pos);
     const stderr_path = try takeString(reader, &paths, &pos);
     const signals_path = try takeString(reader, &paths, &pos);
-    conductor.close(io);
-    // Connect to worker sockets (and clean up socket files in unix mode)
+    platform.close(conductor);
     const result = SocketSet{
         .stdin = connectToWorkerSocket(stdin_path, "stdin"),
         .stdout = connectToWorkerSocket(stdout_path, "stdout"),
         .stderr = connectToWorkerSocket(stderr_path, "stderr"),
         .signals = connectToWorkerSocket(signals_path, "signals"),
     };
-    if (transport_mode == .tcp) protocol.setTcpNodelay(result.signals.socket.handle);
+    if (transport_mode == .tcp) protocol.setTcpNodelay(result.signals);
     return result;
 }
 
@@ -389,17 +388,17 @@ fn replyFailure(err: anyerror) noreturn {
 
 /// Start the worker the conductor describes, detached, in this client's mount
 /// namespace, which the conductor cannot see into.
-fn spawnWorker(reader: *Io.Reader, block: EnvBlock) !void {
+fn spawnWorker(reader: protocol.BufReader, block: EnvBlock) !void {
     var strings: [8192]u8 = undefined;
     var argv: [32]?[*:0]const u8 = undefined;
     var envp: [1024]?[*:0]const u8 = undefined;
     var pos: usize = 0;
-    const argc = try reader.takeInt(u16, .little);
+    const argc = try reader.readInt(u16);
     if (argc == 0 or argc >= argv.len) return error.BadSpawnRequest;
     for (argv[0..argc]) |*arg| arg.* = (try takeString(reader, &strings, &pos)).ptr;
     argv[argc] = null;
     // The daemon's own settings go first, so they shadow ours for the worker.
-    const envc = try reader.takeInt(u16, .little);
+    const envc = try reader.readInt(u16);
     if (envc + block.slice.len >= envp.len) return error.BadSpawnRequest;
     for (envp[0..envc]) |*entry| entry.* = (try takeString(reader, &strings, &pos)).ptr;
     for (block.slice, envp[envc .. envc + block.slice.len]) |ours, *entry| entry.* = ours;
@@ -417,11 +416,11 @@ fn spawnWorker(reader: *Io.Reader, block: EnvBlock) !void {
     };
 }
 
-fn takeString(reader: *Io.Reader, strings: []u8, pos: *usize) ![:0]const u8 {
-    const len = try reader.takeInt(u16, .little);
+fn takeString(reader: protocol.BufReader, strings: []u8, pos: *usize) ![:0]const u8 {
+    const len = try reader.readInt(u16);
     const start = pos.*;
     if (start + len + 1 > strings.len) return error.NameTooLong;
-    try reader.readSliceAll(strings[start .. start + len]);
+    try reader.readSlice(strings[start .. start + len]);
     strings[start + len] = 0;
     pos.* = start + len + 1;
     return strings[start .. start + len :0];
@@ -440,14 +439,7 @@ fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
 }
 
 fn runEventLoop(sync_mode: bool) !void {
-    const exit_code = try eloop.run(
-        sockets.stdin.socket.handle,
-        sockets.stdout.socket.handle,
-        sockets.stderr.socket.handle,
-        sockets.signals.socket.handle,
-        &signal_parser,
-        sync_mode,
-    );
+    const exit_code = try eloop.run(sockets.stdin, sockets.stdout, sockets.stderr, sockets.signals, &signal_parser, sync_mode);
     notifyExit();
     exitClient(exit_code);
 }
@@ -461,11 +453,7 @@ fn exitClient(code: u8) noreturn {
     std.process.exit(code);
 }
 
-fn connectUnix(path: []const u8) !Io.net.Stream {
-    return (try Io.net.UnixAddress.init(path)).connect(io);
-}
-
-fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Stream {
+fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.socket_t {
     // In TCP mode the conductor sends just `:port` — prepend the conductor host
     var addr_buf: [max_socket_path]u8 = undefined;
     const addr = if (raw.len > 0 and raw[0] == ':') blk: {
@@ -478,13 +466,15 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) Io.net.Str
         @memcpy(addr_buf[host.len..][0..raw.len], raw);
         break :blk addr_buf[0 .. host.len + raw.len];
     } else raw;
-    const mode = (protocol.parseAddress(addr) catch unreachable).mode;
-    const stream = protocol.connectAddress(io, mode, addr) catch |e| {
+    // Each address is single-use, so a local one is retired once connected.
+    const connected = switch ((protocol.parseAddress(addr) catch unreachable).mode) {
+        .local => platform.connectLocalOnce(io, addr),
+        .tcp => protocol.connectAddress(io, .tcp, addr),
+    };
+    return connected catch |e| {
         std.debug.print("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ addr, e });
         exitClient(127);
     };
-    if (mode == .unix) Io.Dir.deleteFileAbsolute(io, raw) catch {};
-    return stream;
 }
 
 fn conductorHost() []const u8 {
@@ -504,13 +494,13 @@ fn readPidAndSignal(pid_path: []const u8) bool {
 }
 
 fn notifyExit() void {
-    const stream = protocol.connectAddress(io, transport_mode, conductor_path) catch return;
-    defer stream.close(io);
+    const fd = protocol.connectAddress(io, transport_mode, conductor_path) catch return;
+    defer platform.close(fd);
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
     buf[4] = @intFromEnum(protocol.notification.Type.client_exit);
     std.mem.writeInt(u32, buf[5..9], client_id, .little);
-    platform.socketWrite(stream.socket.handle, &buf);
+    platform.socketWrite(fd, &buf);
 }
 
 /// Signal-handler-safe interrupt notification using raw POSIX syscalls.
@@ -523,16 +513,10 @@ fn notifyInterruptRaw() void {
     buf[4] = @intFromEnum(protocol.notification.Type.client_interrupt);
     std.mem.writeInt(u32, buf[5..9], client_id, .little);
     switch (transport_mode) {
-        .unix => {
-            const fd = platform.rawSocket(posix.AF.UNIX, posix.SOCK.STREAM) orelse return;
+        .local => {
+            const fd = platform.rawConnectLocal(conductor_path) orelse return;
             defer platform.rawClose(fd);
-            var addr = std.mem.zeroes(posix.sockaddr.un);
-            addr.family = posix.AF.UNIX;
-            if (conductor_path.len > addr.path.len) return;
-            @memcpy(addr.path[0..conductor_path.len], conductor_path);
-            if (platform.rawConnect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un))) {
-                platform.socketWrite(fd, &buf);
-            }
+            platform.socketWrite(fd, &buf);
         },
         .tcp => {
             // Parse host:port from conductor_path

@@ -15,7 +15,6 @@
 const std = @import("std");
 const c = std.c;
 const posix = std.posix;
-const Io = std.Io;
 
 const main = @import("../main.zig");
 const Conductor = main.Conductor;
@@ -136,9 +135,9 @@ pub const EventLoop = struct {
 };
 
 // Main event loop
-pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
+pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     const kq = conductor.event_loop.kq;
-    var server_fd: posix.fd_t = server.socket.handle;
+    var server_fd: posix.fd_t = listener.fd();
     // Store timeout configuration
     conductor.event_loop.ping_interval_ms = @intCast(conductor.cfg.ping_interval * 1000);
     conductor.event_loop.ping_timeout_ms = @intCast(conductor.cfg.ping_timeout * 1000);
@@ -202,7 +201,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     pool_changed = true;
                 },
                 UDATA_SIGNAL => {
-                    if (handleSignal(conductor, server, &server_fd, kq, &signal_buf)) return;
+                    if (handleSignal(conductor, listener, &server_fd, kq, &signal_buf)) return;
                     pool_changed = true;
                 },
                 UDATA_PING_TIMER => {
@@ -271,7 +270,7 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
 /// Handle signal pipe read. Returns true if shutdown requested.
 fn handleSignal(
     conductor: *Conductor,
-    server: *Io.net.Server,
+    listener: *protocol.Listener,
     server_fd: *posix.fd_t,
     kq: posix.fd_t,
     signal_buf: *[16]u8,
@@ -292,13 +291,12 @@ fn handleSignal(
                 // Remove old server fd from kqueue
                 var del_changes = [1]c.Kevent{makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
                 _ = keventSubmit(kq, &del_changes);
-                server.deinit(conductor.io);
-                Io.Dir.deleteFileAbsolute(conductor.io, conductor.cfg.socket_path) catch {};
-                server.* = conductor.createServer() catch |err| {
+                listener.close(conductor.io);
+                listener.* = conductor.createServer() catch |err| {
                     std.debug.print("Failed to recreate socket: {}\n", .{err});
                     continue;
                 };
-                server_fd.* = server.socket.handle;
+                server_fd.* = listener.fd();
                 // Register new server fd
                 var add_changes = [1]c.Kevent{makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT)};
                 _ = keventSubmit(kq, &add_changes);
