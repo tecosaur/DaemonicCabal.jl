@@ -190,8 +190,8 @@ pub const Worker = struct {
             ro_binds: []const []const u8,
             rw_binds: []const []const u8,
         },
-        /// Started by the client, inside a mount namespace we cannot see into.
-        client: struct { socket: posix.socket_t, environ: *const std.process.Environ.Map },
+        /// Started by the client, inside a mount namespace (`ns`) we cannot see into.
+        client: struct { socket: posix.socket_t, environ: *const std.process.Environ.Map, ns: u64 },
     };
     pub const LaunchKind = std.meta.Tag(Launch);
 
@@ -424,7 +424,7 @@ pub const Worker = struct {
         const peer = platform.peerPid(socket) orelse return true; // no peer credentials on this platform
         return switch (launch) {
             .direct, .sandboxed => peer == child_pid or platform.parentPid(peer) == child_pid,
-            .client => |c| if (platform.peerMountNs(socket)) |ns| ns == platform.peerMountNs(c.socket) else false,
+            .client => |c| platform.peerMountNs(socket) == c.ns,
         };
     }
 
@@ -434,6 +434,13 @@ pub const Worker = struct {
         if (self.pidfd) |fd| return platform.pidfdExited(fd);
         const pid = self.process.id orelse return true;
         return platform.waitpidNonBlocking(pid).exited;
+    }
+
+    /// The pid to read process stats for: null once a pidfd-backed worker has
+    /// exited, since its pid may already belong to another process.
+    pub fn livePid(self: *const Worker) ?posix.pid_t {
+        if (self.pidfd) |fd| if (platform.pidfdExited(fd)) return null;
+        return self.process.id;
     }
 
     /// Signal the worker; through the pidfd where we hold one, since a worker
