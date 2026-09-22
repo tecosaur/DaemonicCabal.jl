@@ -172,6 +172,7 @@ var conductor_path_buf: [max_socket_path]u8 = undefined;
 var conductor_path: []const u8 = &.{};
 var transport_mode: protocol.TransportMode = .unix;
 var signal_parser = SignalParser{};
+var client_id: u32 = 0; // conductor-assigned with the socket paths; names us in notifications
 
 // --- Signal handler wiring ---
 
@@ -350,6 +351,7 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
         protocol.client.socket_paths => break,
         else => return error.BadReply,
     };
+    client_id = try reader.takeInt(u32, .little);
     var paths: [4 * (max_socket_path + 1)]u8 = undefined;
     var pos: usize = 0;
     const stdin_path = try takeString(reader, &paths, &pos);
@@ -480,7 +482,7 @@ fn notifyExit() void {
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
     buf[4] = @intFromEnum(protocol.notification.Type.client_exit);
-    std.mem.writeInt(u32, buf[5..9], @intCast(platform.getpid()), .little);
+    std.mem.writeInt(u32, buf[5..9], client_id, .little);
     platform.socketWrite(stream.socket.handle, &buf);
 }
 
@@ -492,7 +494,7 @@ fn notifyInterruptRaw() void {
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
     buf[4] = @intFromEnum(protocol.notification.Type.client_interrupt);
-    std.mem.writeInt(u32, buf[5..9], @intCast(platform.getpid()), .little);
+    std.mem.writeInt(u32, buf[5..9], client_id, .little);
     switch (transport_mode) {
         .unix => {
             const fd = platform.rawSocket(posix.AF.UNIX, posix.SOCK.STREAM) orelse return;

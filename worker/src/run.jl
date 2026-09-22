@@ -64,7 +64,7 @@ function warm_repl_path()
             derr = errormonitor(@async try read(cerr.out) catch end)
             feeder = errormonitor(@async try write(cin.in, "1+1\n"); close(cin.in) catch end)
             histfile = tempname()
-            client = ClientInfo(true, false, 0, pwd(),
+            client = ClientInfo(true, false, 0, 0, pwd(),
                                 ["TERM" => "xterm-256color", "JULIA_HISTORY" => histfile,
                                  "JULIA_DAEMON_REVISE" => "no"],
                                 Tuple{String, String}[],

@@ -143,7 +143,8 @@ pub const WorkerList = std.array_list.Aligned(*worker.Worker, null);
 
 pub const ActiveClientInfo = struct {
     worker: *worker.Worker,
-    client_num: u32,
+    pid: u32, // host-view where peer credentials exist, else self-reported; for display
+
     start_time_us: i64,
     port_set: u16, // PortPool index, or PortPool.none when unmanaged
 };
@@ -203,7 +204,7 @@ pub const Conductor = struct {
     const LiveClient = struct {
         streams: ClientStreams, // held open across repaints
         palette: ?pal.Palette, // probed once at subscribe
-        pid: u32, // matched for teardown on exit/interrupt
+        id: u32, // matched for teardown on exit/interrupt
         lines_last_printed: usize, // for the cursor-up redraw
         oneshot: bool, // draw one CPU-resolved frame, then disconnect
     };
@@ -351,15 +352,15 @@ pub const Conductor = struct {
             std.debug.print("Notification read error: {}\n", .{err});
             return;
         };
-        const pid = std.mem.readInt(u32, buf[1..5], .little);
+        const subject = std.mem.readInt(u32, buf[1..5], .little); // client id, or worker pid/id
         const ntype = @as(protocol.notification.Type, @enumFromInt(buf[0]));
         // A live-status subscriber leaves on ^D (exit) or ^C (interrupt); it was
         // never assigned to a worker, so dropping it is all that's needed.
-        if ((ntype == .client_exit or ntype == .client_interrupt) and self.dropLiveClient(pid)) return;
+        if ((ntype == .client_exit or ntype == .client_interrupt) and self.dropLiveClient(subject)) return;
         switch (ntype) {
-            .client_done => _ = self.clientDone(pid),
+            .client_done => _ = self.clientDone(subject),
             .client_exit => {
-                if (self.clientDone(pid)) |w| {
+                if (self.clientDone(subject)) |w| {
                     if (!w.ping_pending) self.event_loop.scheduleHealthCheck(w);
                 }
             },
@@ -367,15 +368,15 @@ pub const Conductor = struct {
                 // SIGINT the worker process: Julia's runtime throws InterruptException
                 // into the running client task (force-throwing a tight loop after rapid
                 // Ctrl-C). Untargeted, but the common worker serves one client.
-                if (self.active_clients.get(pid)) |info| info.worker.signal(platform.SIG.INT);
+                if (self.active_clients.get(subject)) |info| info.worker.signal(platform.SIG.INT);
             },
-            .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{pid}),
+            .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{subject}),
             .worker_exit => {
-                if (self.findWorkerByPid(pid)) |w| {
+                if (self.findWorkerByPid(subject)) |w| {
                     std.debug.print("Worker {d} exiting (TTL expired)\n", .{w.id});
                     self.retireWorker(w);
                 } else {
-                    std.debug.print("Worker (pid {d}) exiting (TTL expired)\n", .{pid});
+                    std.debug.print("Worker (pid {d}) exiting (TTL expired)\n", .{subject});
                 }
             },
         }
@@ -396,7 +397,7 @@ pub const Conductor = struct {
             return;
         }
         if (request.parsed.hasSwitch("--status")) {
-            try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty, request.pid);
+            try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty);
             return;
         }
         const project_path = request.project orelse "";
@@ -491,7 +492,8 @@ pub const Conductor = struct {
 
     const ClientRequest = struct {
         flags: protocol.client.Flags,
-        pid: u32,
+        pid: u32, // self-reported, meaningful only in the client's pid namespace
+        host_pid: ?u32, // from peer credentials; null on TCP
         ppid: u32,
         cwd: []const u8,
         env: []const worker.EnvVar,
@@ -547,6 +549,7 @@ pub const Conductor = struct {
         return .{
             .flags = flags,
             .pid = pid,
+            .host_pid = if (platform.peerPid(socket)) |p| @intCast(p) else null,
             .ppid = ppid,
             .cwd = cwd,
             .env = cached.env,
@@ -623,7 +626,9 @@ pub const Conductor = struct {
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
             .force = is_labeled_session,
+            .id = self.client_counter,
             .pid = request.pid,
+            .host_pid = request.host_pid,
             .ppid = request.ppid,
             .cwd = if (sandbox == .remote) "/home/sandbox" else request.cwd,
             .env = sandbox_env orelse request.env,
@@ -641,7 +646,7 @@ pub const Conductor = struct {
         defer self.allocator.free(assignment.paths.signals);
         assignment.w.last_pinged = now;
         assignment.w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        try self.registerClient(request.pid, self.client_counter, assignment.w, port_set);
+        try self.registerClient(self.client_counter, request.host_pid orelse request.pid, assignment.w, port_set);
         self.bumpCrf(worker_key, now); // count the summons only once the client is tracked
         std.debug.print("Client {d}: sending socket paths to client\n", .{self.client_counter});
         self.sendSocketPaths(socket, assignment.paths);
@@ -669,7 +674,9 @@ pub const Conductor = struct {
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
             .force = is_labeled_session,
+            .id = self.client_counter,
             .pid = request.pid,
+            .host_pid = request.host_pid,
             .ppid = request.ppid,
             .cwd = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/",
             .env = request.env,
@@ -691,7 +698,7 @@ pub const Conductor = struct {
         const now = self.currentTime();
         w.last_pinged = now;
         w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        try self.registerClient(request.pid, self.client_counter, w, port_set);
+        try self.registerClient(self.client_counter, request.host_pid orelse request.pid, w, port_set);
         self.sendSocketPaths(socket, paths);
         return true;
     }
@@ -1355,8 +1362,8 @@ pub const Conductor = struct {
                     if (remove_count >= to_remove.len) break;
                 }
             }
-            for (to_remove[0..remove_count]) |pid| {
-                _ = self.active_clients.remove(pid);
+            for (to_remove[0..remove_count]) |id| {
+                _ = self.active_clients.remove(id);
             }
             if (remove_count < to_remove.len) break;
         }
@@ -1446,15 +1453,15 @@ pub const Conductor = struct {
 
     // --- Client tracking ---
 
-    fn registerClient(self: *Conductor, pid: u32, client_num: u32, w: *worker.Worker, port_set: u16) !void {
+    fn registerClient(self: *Conductor, id: u32, pid: u32, w: *worker.Worker, port_set: u16) !void {
         const now_us = @divTrunc(self.nowNs(), 1000);
         const now_s = @divTrunc(now_us, 1_000_000);
         if (!w.occupancy.fast.busy) w.occupancy.attach(now_s, self.activityHalfLife(), self.budgetOccHalfLife());
-        try self.active_clients.put(pid, .{ .worker = w, .client_num = client_num, .start_time_us = now_us, .port_set = port_set });
+        try self.active_clients.put(id, .{ .worker = w, .pid = pid, .start_time_us = now_us, .port_set = port_set });
     }
 
-    fn clientDone(self: *Conductor, pid: u32) ?*worker.Worker {
-        if (self.active_clients.fetchRemove(pid)) |entry| {
+    fn clientDone(self: *Conductor, id: u32) ?*worker.Worker {
+        if (self.active_clients.fetchRemove(id)) |entry| {
             const info = entry.value;
             self.releasePortSet(info.port_set);
             if (info.worker.active_clients > 0) {
@@ -1475,7 +1482,7 @@ pub const Conductor = struct {
             const duration_s: u64 = @intCast(@divTrunc(duration_us, 1_000_000));
             const duration_ms: u64 = @intCast(@divTrunc(@mod(duration_us, 1_000_000), 1_000));
             std.debug.print("Client {d} disconnected; worker: {d}, duration: {d}.{d:0>3}s\n", .{
-                info.client_num,
+                entry.key,
                 info.worker.id,
                 duration_s,
                 duration_ms,
@@ -1486,16 +1493,16 @@ pub const Conductor = struct {
     }
 
     pub fn syncWorkerClients(self: *Conductor, w: *worker.Worker) void {
-        var pids: [32]u32 = undefined;
+        var ids: [32]u32 = undefined;
         var count: u16 = 0;
         var it = self.active_clients.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.worker == w and count < 32) {
-                pids[count] = entry.key_ptr.*;
+                ids[count] = entry.key_ptr.*;
                 count += 1;
             }
         }
-        _ = w.syncClients(pids[0..count]) catch |err| {
+        _ = w.syncClients(ids[0..count]) catch |err| {
             std.debug.print("Worker {d}: sync_clients failed: {}\n", .{ w.id, err });
             self.retireWorker(w);
             return;
@@ -1546,8 +1553,8 @@ pub const Conductor = struct {
                 n += 1;
             }
         }
-        for (stale[0..n]) |pid| {
-            if (self.active_clients.fetchRemove(pid)) |e| self.releasePortSet(e.value.port_set);
+        for (stale[0..n]) |id| {
+            if (self.active_clients.fetchRemove(id)) |e| self.releasePortSet(e.value.port_set);
         }
     }
 
@@ -1727,7 +1734,7 @@ pub const Conductor = struct {
     // gradients track its palette; a non-answering terminal degrades to the flat
     // report. `--status=live` holds the connection for in-place repaints rather
     // than finishing after one frame.
-    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool, pid: u32) !void {
+    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool) !void {
         var streams = try self.openClientStreams(client_socket);
         var held = false;
         defer if (!held) streams.deinit();
@@ -1736,7 +1743,7 @@ pub const Conductor = struct {
         // A styled TTY one-shot is deferred so its CPU meter resolves over a beat;
         // live holds for repaints; everything else renders once and closes.
         if (tty and format == null) {
-            try self.subscribeOneshot(streams, palette, pid);
+            try self.subscribeOneshot(streams, palette);
             held = true;
             return;
         }
@@ -1748,7 +1755,7 @@ pub const Conductor = struct {
         defer self.allocator.free(report.bytes);
         platform.write(streams.fd(.stdout), report.bytes);
         if (live) {
-            try self.subscribeLive(streams, palette, pid, report.lines);
+            try self.subscribeLive(streams, palette, report.lines);
             held = true; // ownership moved into live_clients
         } else {
             self.closeStreams(&streams);
@@ -1780,11 +1787,11 @@ pub const Conductor = struct {
 
     // First frame was sent by serveStatus; hide the cursor for the live view and
     // start the heartbeat (dirty stays false, so no redundant immediate repaint).
-    fn subscribeLive(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, pid: u32, lines: usize) !void {
+    fn subscribeLive(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, lines: usize) !void {
         try self.live_clients.append(self.allocator, .{
             .streams = streams,
             .palette = palette,
-            .pid = pid,
+            .id = self.client_counter,
             .lines_last_printed = lines,
             .oneshot = false,
         });
@@ -1801,12 +1808,12 @@ pub const Conductor = struct {
     // and fire a single frame after a beat. fireLive's refreshStats takes the second
     // reading, so util lands at the busy-cores rate over the window. No frame is
     // drawn yet and the cursor is left alone, so the delayed frame is a static report.
-    fn subscribeOneshot(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, pid: u32) !void {
+    fn subscribeOneshot(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette) !void {
         self.refreshStats(null); // first reading; the deferred fire takes the second
         try self.live_clients.append(self.allocator, .{
             .streams = streams,
             .palette = palette,
-            .pid = pid,
+            .id = self.client_counter,
             .lines_last_printed = 0,
             .oneshot = true,
         });
@@ -1870,11 +1877,11 @@ pub const Conductor = struct {
         return false;
     }
 
-    // Remove the live client with `pid` (if any), restoring its cursor. Returns
+    // Remove the live client with `id` (if any), restoring its cursor. Returns
     // whether one was found.
-    fn dropLiveClient(self: *Conductor, pid: u32) bool {
+    fn dropLiveClient(self: *Conductor, id: u32) bool {
         for (self.live_clients.items, 0..) |*lc, i| {
-            if (lc.pid != pid) continue;
+            if (lc.id != id) continue;
             var removed = self.live_clients.swapRemove(i);
             // Newline below the final frame, then restore the cursor, so the
             // shell prompt lands cleanly under the frozen snapshot.
@@ -1930,6 +1937,7 @@ pub const Conductor = struct {
         var buf: [1024]u8 = undefined;
         var w = protocol.BufWriter{ .buf = &buf };
         w.writeInt(u8, protocol.client.socket_paths);
+        w.writeInt(u32, self.client_counter);
         // In TCP mode, send just the port — the client uses the conductor host
         const all = [_][]const u8{ paths.stdin, paths.stdout, paths.stderr, paths.signals };
         for (all) |path| {

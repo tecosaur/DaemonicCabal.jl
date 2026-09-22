@@ -3,7 +3,7 @@
 
 # Binary protocol for Conductor ↔ Worker communication
 
-const PROTOCOL_MAGIC = 0x4A445701  # "JDW\x01" little-endian
+const PROTOCOL_MAGIC = 0x4A445702  # "JDW\x02" little-endian
 const NOTIFICATION_MAGIC = 0x4A444E01  # "JDN\x01" little-endian
 
 # Notification types (sent via main conductor socket)
@@ -149,7 +149,8 @@ end
 struct ClientInfo
     tty::Bool
     force::Bool  # Bypass capacity check (for labeled sessions)
-    pid::Int
+    id::Int      # Conductor-assigned; names the client in notifications and syncs
+    pid::Int     # As our kernel reports it on the client's stdio connections (0 = unchecked)
     cwd::String
     env::Vector{Pair{String, String}}
     switches::Vector{Tuple{String, String}}
@@ -163,6 +164,7 @@ function read_client_run(conn::IO)
     flags = read(conn, UInt8)
     tty = (flags & 0x01) != 0
     force = (flags & 0x02) != 0  # Bypass capacity check
+    id = Int(read(conn, UInt32))
     pid = Int(read(conn, UInt32))
     cwd = read_string(conn)
     # Env
@@ -195,6 +197,6 @@ function read_client_run(conn::IO)
         args[i] = read_string(conn)
     end
     port_set = Int(read(conn, UInt16))
-    ClientInfo(tty, force, pid, cwd, env, switches, programfile, args, port_set)
+    ClientInfo(tty, force, id, pid, cwd, env, switches, programfile, args, port_set)
 end
 

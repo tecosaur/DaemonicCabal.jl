@@ -22,6 +22,7 @@ let
     # client_run (type=0x20): build payload separately to compute length
     cr = IOBuffer()
     write(cr, UInt8(0x00))                        # flags: tty=false, force=false
+    write(cr, UInt32(7))                          # client id
     write(cr, UInt32(12345))                      # pid
     _ws(cr, "/tmp")                               # cwd
     write(cr, UInt16(2))                          # env_count
