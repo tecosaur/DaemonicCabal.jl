@@ -626,6 +626,7 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style, now: i64) !void {
     try w.writeAll(indent);
     try w.print("{d} workers", .{active_workers});
     if (has_reserve) try w.writeAll(" · 1 reserve");
+    if (c.pending_spawns.items.len > 0) try w.print(" · {d} starting", .{c.pending_spawns.items.len});
     try w.print(" · {d} clients", .{total_clients});
     if (total_mem > 0) {
         try w.writeAll(" · ");
@@ -731,8 +732,8 @@ fn renderJson(c: *Conductor, w: Writer, now: i64) !void {
     } else {
         try w.writeAll("null");
     }
-    try w.print(",\"totals\":{{\"workers\":{d},\"reserve\":{d},\"clients\":{d},\"mem_bytes\":{d}}}", .{
-        worker_count, @as(u8, if (c.reserve != null) 1 else 0), total_clients, total_mem,
+    try w.print(",\"totals\":{{\"workers\":{d},\"reserve\":{d},\"starting\":{d},\"clients\":{d},\"mem_bytes\":{d}}}", .{
+        worker_count, @as(u8, if (c.reserve != null) 1 else 0), c.pending_spawns.items.len, total_clients, total_mem,
     });
     try w.print(",\"max_ttl\":{d},\"min_ttl\":{d},\"label_ttl\":{d},\"worker_args\":", .{ c.cfg.max_ttl, c.cfg.min_ttl, c.cfg.label_ttl });
     try writeJsonString(w, c.cfg.worker_args);

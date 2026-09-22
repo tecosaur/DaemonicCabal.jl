@@ -95,8 +95,10 @@ pub const signals = struct {
 };
 
 // Event user_data encoding for io_uring:
-// - Low values (0-5): fixed events (accept, signal, ping_timer, ignored, pressure_timer, live_timer)
-// - High values (>= 0x1000): worker pointer | tag (bit 0: 0=pong, 1=health check timeout)
+// - Low values (0-6): fixed events (accept, signal, ping_timer, ignored, pressure_timer, live_timer, tick_timer)
+// - High values (>= 0x1000): a pointer with tag bits. Bit 2 set: pending connection
+//   (readable). Else bit 1 set: pending spawn (bit 0: 0=setup listener readable,
+//   1=waiting client's socket readable). Else worker (bit 0: 0=pong, 1=health check timeout)
 pub const EventLocation = enum(u64) {
     accept = 0,
     signal = 1,
@@ -104,6 +106,7 @@ pub const EventLocation = enum(u64) {
     ignored = 3, // For link_timeout completions we don't need to handle
     pressure_timer = 4,
     live_timer = 5, // --status=live repaint (debounce + heartbeat unified)
+    tick_timer = 6, // 1s tick while anything is pending: spawn deadlines, early exits, silent connections
     _,
 };
 

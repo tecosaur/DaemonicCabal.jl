@@ -18,7 +18,6 @@ const randomSocketPath = protocol.randomSocketPath;
 const createListener = protocol.createListener;
 
 const max_recent_ppids = 32;
-const spawn_tick_ms = 1000; // liveness check cadence while waiting for a new worker
 // The worker reads its policy (max clients, TTLs, Revise) from its environment.
 const daemon_env_prefix = "JULIA_DAEMON_";
 
@@ -195,7 +194,9 @@ pub const Worker = struct {
     };
     pub const LaunchKind = std.meta.Tag(Launch);
 
-    pub fn spawn(
+    /// Launch a worker process and return the pending `Spawn` for the conductor
+    /// to complete once the process connects to its setup socket.
+    pub fn begin(
         allocator: Allocator,
         io: Io,
         cfg: *const config.Config,
@@ -205,7 +206,7 @@ pub const Worker = struct {
         threads: args.Threads,
         interactive: bool,
         launch: Launch,
-    ) !Worker {
+    ) !Spawn {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         // Sandboxed workers use a per-worker subdirectory so the sandbox
         // can bind-mount it rw without exposing the rest of the runtime dir.
@@ -222,8 +223,10 @@ pub const Worker = struct {
         // Conductor and worker are always on the same machine, so use a
         // Unix socket regardless of the client-facing transport mode.
         var setup = try createListener(io, .unix, effective_runtime_dir, "wsetup.sock", "", &path_buf);
-        defer setup.server.deinit(io);
-        defer Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
+        errdefer setup.server.deinit(io);
+        errdefer Io.Dir.deleteFileAbsolute(io, setup.addr) catch {};
+        const channel_copy: ?[]const u8 = if (julia_channel) |ch| try allocator.dupe(u8, ch) else null;
+        errdefer if (channel_copy) |ch| allocator.free(ch);
         const eval_expr = try std.fmt.allocPrint(
             allocator,
             "using DaemonWorker; DaemonWorker.runworker(\"{s}\", {d}, \"{s}\")",
@@ -248,7 +251,7 @@ pub const Worker = struct {
             (if (env.get("PATH")) |p| resolveInPath(io, cfg.worker_executable, p) else null)
         else
             null;
-        var child: std.process.Child = switch (launch) {
+        const child: std.process.Child = switch (launch) {
             .sandboxed => |s| if (comptime builtin.os.tag != .linux) return error.SandboxUnsupported else blk: {
                 const exe_path = resolved orelse cfg.worker_executable;
                 // Merge caller-provided ro binds with the worker project dir
@@ -324,75 +327,124 @@ pub const Worker = struct {
                 };
             },
         };
-        // Anything reaching the runtime directory can connect first and pose as the
-        // worker: take only the process we launched (or its child), or for a client
-        // launch one in the client's namespace. The deadline is fixed once so dropped
-        // connections cannot extend it. A child of ours that dies first (a failed
-        // precompile, say) is noticed on the next tick; a client that fails to spawn
-        // sends nothing until it has its paths, so its socket turning readable means
-        // it is gone.
-        const spawn_deadline = platform.timeSeconds(io) + @as(i64, @intCast(cfg.spawn_timeout));
-        const socket = accepted: while (true) {
-            var pfds = [_]posix.pollfd{
-                .{ .fd = setup.server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
-                .{ .fd = if (launch == .client) launch.client.socket else -1, .events = posix.POLL.IN, .revents = 0 },
-            };
-            const remaining_ms = std.math.clamp((spawn_deadline - platform.timeSeconds(io)) * 1000, 0, spawn_tick_ms);
-            if (try posix.poll(&pfds, @intCast(remaining_ms)) == 0) {
-                if (platform.timeSeconds(io) >= spawn_deadline) {
-                    std.debug.print("Worker {d}: no connection from the new worker within {d}s (JULIA_DAEMON_SPAWN_TIMEOUT)\n", .{ id, cfg.spawn_timeout });
-                    return error.WorkerSpawnTimeout;
-                }
-                if (child.id) |pid| if (platform.waitpidNonBlocking(pid).exited) {
-                    std.debug.print("Worker {d}: process exited before connecting; its output is above\n", .{id});
-                    return error.WorkerExitedEarly;
-                };
-                continue;
-            }
-            if (pfds[1].revents != 0) return error.ClientGone;
-            const conn = try setup.server.accept(io);
-            if (isExpectedWorker(conn.socket.handle, launch, child.id)) break :accepted conn.socket.handle;
-            std.debug.print("Worker {d}: dropped a setup connection from an unexpected process\n", .{id});
-            platform.close(conn.socket.handle);
+        const now = Io.Clock.now(.awake, io).toSeconds();
+        var pending = Spawn{
+            .worker = .{
+                .allocator = allocator,
+                .id = id,
+                .process = child,
+                .socket = -1,
+                .project = null,
+                .julia_channel = channel_copy,
+                .threads = threads,
+                .session_label = null,
+                .created_at = now,
+                .last_active = now,
+                .last_pinged = now,
+                .active_clients = 0,
+                .launch = launch,
+                .interactive = interactive,
+            },
+            .client_ns = if (launch == .client) launch.client.ns else null,
+            .server = setup.server,
+            .addr_buf = undefined,
+            .addr_len = setup.addr.len,
+            .deadline = now + @as(i64, @intCast(cfg.spawn_timeout)),
         };
-        errdefer platform.close(socket);
-        // Not our child: the pid comes from the connection it just made, and only a
-        // pidfd taken now survives pid reuse (waitpid would call it dead at once).
-        var pidfd: ?posix.fd_t = null;
-        if (launch == .client) {
-            child.id = platform.peerPid(socket) orelse {
-                std.debug.print("Worker {d}: no peer credentials on the setup connection, so the client-spawned worker cannot be tracked\n", .{id});
-                return error.UnknownWorkerPid;
-            };
-            pidfd = platform.pidfdOpen(child.id.?) orelse {
-                std.debug.print("Worker {d}: pidfd_open failed for pid {d}; client-spawned workers need Linux 5.3+\n", .{ id, child.id.? });
-                return error.PidfdUnsupported;
+        @memcpy(pending.addr_buf[0..setup.addr.len], setup.addr);
+        return pending;
+    }
+
+    /// A worker process launched but not yet connected. The conductor watches
+    /// `listenerFd` through its event loop: `accept` when it turns readable,
+    /// `check` on a tick, `abandon` to give up. The deadline is fixed at launch
+    /// so dropped connections cannot extend it.
+    pub const Spawn = struct {
+        worker: Worker, // socket, pidfd and (for a client launch) pid arrive with the connection
+        client_ns: ?u64, // the launching client's mount namespace, for a .client launch
+        server: Io.net.Server,
+        addr_buf: [std.fs.max_path_bytes]u8,
+        addr_len: usize,
+        deadline: i64,
+
+        pub fn listenerFd(self: *const Spawn) posix.socket_t {
+            return self.server.socket.handle;
+        }
+
+        /// Take the connection waiting on the listener. Null when nothing was
+        /// waiting or it came from an unexpected process (dropped): anything
+        /// reaching the runtime directory can connect first and pose as the
+        /// worker, so only the process we launched (or its child), or for a client
+        /// launch one in the client's namespace, is accepted. On success the
+        /// listener is released and the returned worker is connected.
+        pub fn accept(self: *Spawn, io: Io, cfg: *const config.Config) !?Worker {
+            var pfd = [_]posix.pollfd{.{ .fd = self.listenerFd(), .events = posix.POLL.IN, .revents = 0 }};
+            if ((posix.poll(&pfd, 0) catch 0) == 0) return null;
+            const conn = try self.server.accept(io);
+            const socket = conn.socket.handle;
+            var w = self.worker;
+            if (!isExpectedWorker(socket, w.launch, self.client_ns, w.process.id)) {
+                std.debug.print("Worker {d}: dropped a setup connection from an unexpected process\n", .{w.id});
+                platform.close(socket);
+                return null;
+            }
+            errdefer platform.close(socket);
+            // Not our child: the pid comes from the connection it just made, and only a
+            // pidfd taken now survives pid reuse (waitpid would call it dead at once).
+            if (w.launch == .client) {
+                w.process.id = platform.peerPid(socket) orelse {
+                    std.debug.print("Worker {d}: no peer credentials on the setup connection, so the client-spawned worker cannot be tracked\n", .{w.id});
+                    return error.UnknownWorkerPid;
+                };
+                w.pidfd = platform.pidfdOpen(w.process.id.?) orelse {
+                    std.debug.print("Worker {d}: pidfd_open failed for pid {d}; client-spawned workers need Linux 5.3+\n", .{ w.id, w.process.id.? });
+                    return error.PidfdUnsupported;
+                };
+            }
+            // Set read timeout to avoid blocking conductor if worker becomes unresponsive
+            platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
+            var magic_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
+            platform.write(socket, &magic_buf);
+            self.releaseListener(io);
+            self.worker.julia_channel = null; // now the returned worker's
+            w.socket = socket;
+            w.created_at = Io.Clock.now(.awake, io).toSeconds();
+            w.last_active = w.created_at;
+            w.last_pinged = w.created_at;
+            return w;
+        }
+
+        /// Fail once the deadline has passed or a child of ours has already exited
+        /// (a failed precompile, say). A client-launched worker is not our child;
+        /// the client's socket turning readable is its failure signal instead.
+        pub fn check(self: *Spawn, io: Io, cfg: *const config.Config) !void {
+            if (platform.timeSeconds(io) >= self.deadline) {
+                std.debug.print("Worker {d}: no connection from the new worker within {d}s (JULIA_DAEMON_SPAWN_TIMEOUT)\n", .{ self.worker.id, cfg.spawn_timeout });
+                return error.WorkerSpawnTimeout;
+            }
+            if (self.worker.process.id) |pid| if (platform.waitpidNonBlocking(pid).exited) {
+                self.worker.process.id = null; // reaped; the pid may be reused
+                std.debug.print("Worker {d}: process exited before connecting; its output is above\n", .{self.worker.id});
+                return error.WorkerExitedEarly;
             };
         }
-        // Set read timeout to avoid blocking conductor if worker becomes unresponsive
-        platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
-        var magic_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
-        platform.write(socket, &magic_buf);
-        const now = Io.Clock.now(.awake, io).toSeconds();
-        return .{
-            .allocator = allocator,
-            .id = id,
-            .process = child,
-            .socket = socket,
-            .project = null,
-            .julia_channel = julia_channel,
-            .threads = threads,
-            .session_label = null,
-            .created_at = now,
-            .last_active = now,
-            .last_pinged = now,
-            .active_clients = 0,
-            .launch = launch,
-            .interactive = interactive,
-            .pidfd = pidfd,
-        };
-    }
+
+        /// Give up: end a child of ours and release the listener.
+        pub fn abandon(self: *Spawn, io: Io) void {
+            if (self.worker.launch != .client) if (self.worker.process.id) |pid| {
+                _ = platform.kill(pid, platform.SIG.KILL);
+                _ = platform.waitpidNonBlocking(pid);
+            };
+            self.releaseListener(io);
+            if (self.worker.julia_channel) |ch| self.worker.allocator.free(ch);
+        }
+
+        fn releaseListener(self: *Spawn, io: Io) void {
+            self.server.deinit(io);
+            Io.Dir.deleteFileAbsolute(io, self.addr_buf[0..self.addr_len]) catch {};
+        }
+    };
 
     fn sendSpawnRequest(client_socket: posix.socket_t, argv: []const []const u8, environ: *const std.process.Environ.Map) !void {
         var buf: [4096]u8 = undefined;
@@ -420,11 +472,11 @@ pub const Worker = struct {
         platform.write(client_socket, w.written());
     }
 
-    fn isExpectedWorker(socket: posix.socket_t, launch: Launch, child_pid: ?posix.pid_t) bool {
+    fn isExpectedWorker(socket: posix.socket_t, kind: LaunchKind, client_ns: ?u64, child_pid: ?posix.pid_t) bool {
         const peer = platform.peerPid(socket) orelse return true; // no peer credentials on this platform
-        return switch (launch) {
+        return switch (kind) {
             .direct, .sandboxed => peer == child_pid or platform.parentPid(peer) == child_pid,
-            .client => |c| platform.peerMountNs(socket) == c.ns,
+            .client => platform.peerMountNs(socket) == client_ns,
         };
     }
 
@@ -462,6 +514,7 @@ pub const Worker = struct {
 
     pub fn deinit(self: *Worker) void {
         if (self.project) |p| self.allocator.free(p);
+        if (self.julia_channel) |ch| self.allocator.free(ch);
         if (self.session_label) |l| self.allocator.free(l);
         if (self.pidfd) |fd| platform.close(fd);
         platform.close(self.socket);

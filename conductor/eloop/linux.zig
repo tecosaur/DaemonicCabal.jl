@@ -28,6 +28,8 @@ pub const EventLoop = struct {
     ring: linux.IoUring,
     health_check_ts: linux.kernel_timespec,
     live_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+    tick_ts: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
+    tick_armed: bool = false,
 
     pub fn init(entries: u13) !EventLoop {
         return .{
@@ -49,6 +51,24 @@ pub const EventLoop = struct {
     /// Schedule a health check for a worker after a short delay.
     pub fn scheduleHealthCheck(self: *EventLoop, w: *worker.Worker) void {
         _ = self.ring.timeout(@intFromPtr(w) | 1, &self.health_check_ts, 0, 0) catch {};
+    }
+
+    /// Watch `fd` for readability once, reporting `tag` (a pending record's
+    /// pointer with its low bits naming what) to the conductor; watch again to
+    /// keep watching.
+    pub fn watchFd(self: *EventLoop, tag: usize, fd: posix.fd_t) void {
+        _ = self.ring.poll_add(tag, fd, posix.POLL.IN) catch {};
+    }
+
+    /// A completion that still arrives is negative (cancelled) and ignored.
+    pub fn unwatchFd(self: *EventLoop, tag: usize, _: posix.fd_t) void {
+        _ = self.ring.cancel(@intFromEnum(EventLocation.ignored), tag, 0) catch {};
+    }
+
+    pub fn armTick(self: *EventLoop) void {
+        if (self.tick_armed) return;
+        _ = self.ring.timeout(@intFromEnum(EventLocation.tick_timer), &self.tick_ts, 0, 0) catch return;
+        self.tick_armed = true;
     }
 
     /// Cancel in-flight ops referencing `w`: the health-check timeout (`ptr|1`,
@@ -117,7 +137,14 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                 return;
             };
             const user_data = cqe.user_data;
-            // Worker events (user_data >= 0x1000, bit 0: 0=pong, 1=health check timeout)
+            // Tagged pointers (user_data >= 0x1000): bits 1-2 set is a pending
+            // connection or spawn the conductor decodes, else a worker (bit 0:
+            // 0=pong, 1=health check timeout).
+            if (user_data >= 0x1000 and (user_data & 6) != 0) {
+                if (cqe.res >= 0) conductor.onReadable(@intCast(user_data)); // else cancelled
+                pool_changed = true;
+                continue;
+            }
             if (user_data >= 0x1000) {
                 const w: *worker.Worker = @ptrFromInt(user_data & ~@as(u64, 1));
                 if (!conductor.isLiveWorker(w)) continue; // stale completion for a retired worker
@@ -139,10 +166,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                         const client_fd: posix.fd_t = @intCast(cqe.res);
                         if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
                         const peer = main.PeerInfo{ .addr = client_addr, .len = client_addr_len };
-                        conductor.handleConnectionFd(client_fd, &peer) catch |err| {
-                            std.debug.print("Client handling failed: {}\n", .{err});
-                        };
-                        platform.close(client_fd);
+                        conductor.admitConnection(client_fd, &peer);
                     } else {
                         const err_code: u32 = @intCast(-cqe.res);
                         if (err_code != @intFromEnum(posix.E.BADF)) {
@@ -196,6 +220,11 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     pool_changed = true;
                 },
                 .live_timer => conductor.onLiveTimer(),
+                .tick_timer => {
+                    conductor.event_loop.tick_armed = false;
+                    if (conductor.tick()) conductor.event_loop.armTick();
+                    pool_changed = true;
+                },
                 .ignored, _ => {},
             }
         }
