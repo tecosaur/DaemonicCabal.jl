@@ -5,6 +5,7 @@ module DaemonWorker
 
 using Base.Threads
 using InteractiveUtils
+using Logging
 using REPL
 using Sockets
 
@@ -49,6 +50,8 @@ function __init__()
         setglobal!(Base, :stdin, ScopedStdin())
         setglobal!(Base, :stdout, ScopedStdout())
         setglobal!(Base, :stderr, ScopedStderr())
+        # The default logger still holds the stderr object whose handle moved.
+        global_logger(ConsoleLogger(Base.stderr))
     end
 end
 
