@@ -276,7 +276,7 @@ pub const Conductor = struct {
     }
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
-        if (w.confinement == .remote) self.removeSandboxDir(w.id);
+        if (w.launch == .sandboxed) self.removeSandboxDir(w.id);
         w.deinit();
         self.allocator.destroy(w);
     }
@@ -944,8 +944,9 @@ pub const Conductor = struct {
     fn findWorkerByLabelGlobal(self: *Conductor, label: []const u8) ?*worker.Worker {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
-            // Sandboxed pools (`__…__` keys) never serve a caller outside their sandbox.
-            if (std.mem.startsWith(u8, entry.key_ptr.*, "__")) continue;
+            // A sandboxed pool never serves a caller outside its sandbox.
+            const pool = entry.value_ptr.items;
+            if (pool.len > 0 and pool[0].launch != .direct) continue;
             if (findWorkerByLabel(entry.value_ptr, label)) |w| return w;
         }
         return null;
