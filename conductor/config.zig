@@ -21,6 +21,7 @@ pub const Config = struct {
     label_ttl: u64, // seconds - how long to keep session labels after last client disconnects
     ping_interval: u64, // seconds
     ping_timeout: u64, // seconds
+    spawn_timeout: u64, // seconds a new worker may take to connect (a fresh depot precompiles first)
     memory_pressure: bool, // master switch for pressure-reactive eviction
     psi_threshold: f64, // PSI some-avg10 % for moderate pressure (when PSI is the active source)
     memfree_low: MemThreshold, // free-memory enter threshold (when level path is active)
@@ -93,6 +94,7 @@ pub const Config = struct {
             .label_ttl = parseUint(u64, env.get("JULIA_DAEMON_LABEL_TTL"), 90),
             .ping_interval = parseUint(u64, env.get("JULIA_DAEMON_PING_INTERVAL"), 30),
             .ping_timeout = parseUint(u64, env.get("JULIA_DAEMON_PING_TIMEOUT"), 5),
+            .spawn_timeout = try parseUintStrict(u64, env.get("JULIA_DAEMON_SPAWN_TIMEOUT"), 600),
             // On by default; set JULIA_DAEMON_MEMORY_PRESSURE=0 to opt out.
             .memory_pressure = !std.mem.eql(u8, env.get("JULIA_DAEMON_MEMORY_PRESSURE") orelse "1", "0"),
             .psi_threshold = try parseFloatStrict(env.get("JULIA_DAEMON_PSI_THRESHOLD"), 10.0),

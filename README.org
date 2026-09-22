@@ -127,12 +127,20 @@ the client to start its worker itself, inside that sandbox, so Julia sees exactl
 what the client sees and writes land where the sandbox says they should. Such
 workers are pooled per sandbox and never serve the host or another sandbox, and
 they die with the sandbox when it has a pid namespace of its own (bubblewrap's
-=--unshare-pid=); without one they linger until their idle TTL. The sandbox only
-needs the daemon's runtime directory bound in at its host path
-(=/run/user/$UID/julia-daemon=); =--sandbox= adds nothing there. The daemon itself
-must share the host's mount namespace for the comparison to mean anything: a
-service hardened with =PrivateTmp= or =ProtectHome= would see every client as
-sandboxed.
+=--unshare-pid=); without one they linger until their idle TTL.
+
+Since the worker runs inside the sandbox, the sandbox must see everything it
+needs: the daemon's runtime directory at its host path
+(=/run/user/$UID/julia-daemon=, for the sockets), the Julia install, the
+DaemonWorker project the daemon was installed with, and the Julia depot
+(=~/.julia= or =JULIA_DEPOT_PATH=; writable if DaemonWorker still has to
+precompile there). A Julia the sandbox cannot run is reported by the client at
+once; a Julia that starts but cannot load its worker package shows up as a
+timeout after =JULIA_DAEMON_SPAWN_TIMEOUT=, with the details in the daemon log.
+The daemon itself must share the host's mount namespace for the comparison to
+mean anything: a service hardened with =PrivateTmp= or =ProtectHome= would see
+every client as sandboxed, and the daemon warns at startup when its mount
+namespace differs from its parent's.
 
 ** Remote sandboxing
 
@@ -164,6 +172,7 @@ Environment variables read at daemon startup:
 | =JULIA_DAEMON_LABEL_TTL=         | =90=                           | Session label retention after last client disconnects (seconds)                                                                  |
 | =JULIA_DAEMON_PING_INTERVAL=     | =30=                           | Health check interval (seconds)                                                                                                  |
 | =JULIA_DAEMON_PING_TIMEOUT=      | =5=                            | Ping timeout before killing unresponsive worker (seconds)                                                                        |
+| =JULIA_DAEMON_SPAWN_TIMEOUT=     | =600=                          | Seconds a new worker may take to connect (a fresh depot precompiles DaemonWorker first)                                          |
 | =JULIA_DAEMON_REVISE=            | =no=                           | Enable Revise.jl by default (also settable with =--revise=)                                                                        |
 
 Memory-pressure eviction:

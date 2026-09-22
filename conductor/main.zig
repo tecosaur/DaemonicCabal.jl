@@ -389,11 +389,11 @@ pub const Conductor = struct {
         self.client_counter += 1;
         // Handle special commands
         if (request.parsed.hasSwitch("--help") or request.parsed.hasSwitch("-h")) {
-            try self.serveString(socket, CLIENT_HELP);
+            try self.serveString(socket, CLIENT_HELP, 0);
             return;
         }
         if (request.parsed.hasSwitch("--version") or request.parsed.hasSwitch("-v")) {
-            try self.serveString(socket, VERSION_STRING);
+            try self.serveString(socket, VERSION_STRING, 0);
             return;
         }
         if (request.parsed.hasSwitch("--status")) {
@@ -430,7 +430,7 @@ pub const Conductor = struct {
                 else
                     "--sandbox requires Linux (user namespaces).\n";
                 std.debug.print("Client {d}: sandbox rejected (Linux only)\n", .{self.client_counter});
-                try self.serveString(socket, msg);
+                try self.serveString(socket, msg, 1);
                 return;
             }
             std.debug.print("Client {d}: {s} sandbox\n", .{
@@ -467,7 +467,7 @@ pub const Conductor = struct {
             const session = request.parsed.getSwitch("--session");
             if (session == null or session.?.len == 0) {
                 std.debug.print("Client {d}: --sync without --session label, rejecting\n", .{self.client_counter});
-                try self.serveString(socket, "--sync requires --session=<label>\n");
+                try self.serveString(socket, "--sync requires --session=<label>\n", 1);
                 return;
             }
             std.debug.print("Client {d}: sync mode, session='{s}'\n", .{ self.client_counter, session.? });
@@ -483,11 +483,37 @@ pub const Conductor = struct {
             });
             const msg = try std.fmt.allocPrint(self.allocator, "Reset: killed {d} worker(s) for project\n", .{nkilled});
             defer self.allocator.free(msg);
-            try self.serveString(socket, msg);
+            try self.serveString(socket, msg, 0);
             return;
         }
         // Assign client to worker
-        try self.assignClientToWorker(socket, &request, worker_key, threads, sandbox);
+        self.assignClientToWorker(socket, &request, worker_key, threads, sandbox) catch |err| {
+            std.debug.print("Client {d}: no worker: {}\n", .{ self.client_counter, err });
+            if (err == error.ClientGone) return;
+            var msg_buf: [1024]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Could not run a Julia worker for this session ({s}).\n{s}", .{
+                @errorName(err), self.spawnFailureHint(err, sandbox),
+            }) catch return err;
+            try self.serveString(socket, msg, 1);
+        };
+    }
+
+    fn spawnFailureHint(self: *Conductor, err: anyerror, sandbox: SandboxKind) []const u8 {
+        return switch (err) {
+            error.WorkerSpawnTimeout => if (sandbox == .client)
+                "The worker started inside your sandbox never connected to the daemon. Julia, the DaemonWorker project\n" ++
+                    "and the Julia depot must all be visible inside the sandbox; a fresh depot precompiles first, which\n" ++
+                    "JULIA_DAEMON_SPAWN_TIMEOUT bounds.\n"
+            else
+                "The worker never connected to the daemon within JULIA_DAEMON_SPAWN_TIMEOUT.\n",
+            error.WorkerExitedEarly => "The worker exited while starting up; its output is in the daemon log.\n",
+            error.ExecutableNotFound => if (self.cfg.worker_executable.len > 0)
+                "The daemon cannot resolve its worker executable to an absolute path to hand to your sandbox;\n" ++
+                    "set JULIA_DAEMON_WORKER_EXECUTABLE to one.\n"
+            else
+                "",
+            else => "See the daemon log for details.\n",
+        };
     }
 
     const ClientRequest = struct {
@@ -1644,6 +1670,8 @@ pub const Conductor = struct {
     // The four stdio streams of a session, owning their listeners and port-set
     // reservation; `deinit` closes everything.
     const Stream = enum(usize) { stdin, stdout, stderr, signals };
+    const reply_accept_timeout_ms = 5000;
+
     const ClientStreams = struct {
         c: *Conductor,
         listeners: [4]protocol.Listener,
@@ -1709,6 +1737,10 @@ pub const Conductor = struct {
         var accepted: usize = 0;
         errdefer for (conns[0..accepted]) |c| c.close(self.io);
         for (0..4) |i| {
+            // A client that left after asking (a long spawn it gave up on) must not
+            // wedge the daemon in a bare accept.
+            var pfd = [_]posix.pollfd{.{ .fd = listeners[i].server.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
+            if (try posix.poll(&pfd, reply_accept_timeout_ms) == 0) return error.ClientGone;
             conns[i] = try listeners[i].server.accept(self.io);
             accepted += 1;
         }
@@ -1720,10 +1752,10 @@ pub const Conductor = struct {
         return streams;
     }
 
-    fn serveString(self: *Conductor, client_socket: posix.socket_t, content: []const u8) !void {
+    fn serveString(self: *Conductor, client_socket: posix.socket_t, content: []const u8, exit_code: u8) !void {
         var streams = try self.openClientStreams(client_socket);
         defer streams.deinit();
-        self.finishStreams(&streams, content);
+        self.finishStreams(&streams, content, exit_code);
     }
 
     fn isLiveStatus(format: ?[]const u8) bool {
@@ -1749,7 +1781,7 @@ pub const Conductor = struct {
         }
         const report = self.renderStatus(format, tty, palette) catch |err| {
             std.debug.print("Status: render failed: {}\n", .{err});
-            self.finishStreams(&streams, "Failed to generate status report.\n");
+            self.finishStreams(&streams, "Failed to generate status report.\n", 1);
             return;
         };
         defer self.allocator.free(report.bytes);
@@ -1758,7 +1790,7 @@ pub const Conductor = struct {
             try self.subscribeLive(streams, palette, report.lines);
             held = true; // ownership moved into live_clients
         } else {
-            self.closeStreams(&streams);
+            self.closeStreams(&streams, 0);
         }
     }
 
@@ -1872,7 +1904,7 @@ pub const Conductor = struct {
         platform.write(fd, "\x1b[?2026l");
         lc.lines_last_printed = report.lines;
         if (!lc.oneshot) return true;
-        self.closeStreams(&lc.streams);
+        self.closeStreams(&lc.streams, 0);
         lc.streams.deinit();
         return false;
     }
@@ -1894,16 +1926,16 @@ pub const Conductor = struct {
 
     // Write `content` to stdout, then shut down stdout/stderr and signal a clean
     // exit. Shared by the report and failure paths.
-    fn finishStreams(self: *Conductor, streams: *ClientStreams, content: []const u8) void {
+    fn finishStreams(self: *Conductor, streams: *ClientStreams, content: []const u8, exit_code: u8) void {
         platform.write(streams.fd(.stdout), content);
-        self.closeStreams(streams);
+        self.closeStreams(streams, exit_code);
     }
 
     // Shut down stdout/stderr and signal a clean client exit (no content write).
-    fn closeStreams(self: *Conductor, streams: *ClientStreams) void {
+    fn closeStreams(self: *Conductor, streams: *ClientStreams, exit_code: u8) void {
         streams.conns[@intFromEnum(Stream.stdout)].shutdown(self.io, .send) catch {};
         streams.conns[@intFromEnum(Stream.stderr)].shutdown(self.io, .send) catch {};
-        platform.write(streams.fd(.signals), &[_]u8{ protocol.signals.exit, 0x01, 0x00 });
+        platform.write(streams.fd(.signals), &[_]u8{ protocol.signals.exit, 0x01, exit_code });
         streams.conns[@intFromEnum(Stream.signals)].shutdown(self.io, .send) catch {};
     }
 
