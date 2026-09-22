@@ -34,6 +34,7 @@ function unsafe_pipe!(pipe::Base.PipeEndpoint, tty::Base.TTY)
     pipe.sendbuf = tty.sendbuf
     pipe.lock = tty.lock
     pipe.throttle = tty.throttle
+    tty.handle = C_NULL # or its finalizer frees the handle under us
     Base.associate_julia_struct(pipe.handle, pipe)
     pipe
 end
@@ -52,6 +53,7 @@ function unsafe_pipe!(pipe::Base.PipeEndpoint, pipe2::Base.PipeEndpoint)
     pipe.sendbuf = pipe2.sendbuf
     pipe.lock = pipe2.lock
     pipe.throttle = pipe2.throttle
+    pipe2.handle = C_NULL # or its finalizer frees the handle under us
     Base.associate_julia_struct(pipe.handle, pipe)
     pipe
 end
@@ -138,6 +140,7 @@ function Base.displaysize(::Union{ScopedStdout, ScopedStderr})
             (min_h, min_w)
         end
     else
+        term === WORKER_TERM && return DEFAULT_DISPLAYSIZE # no client to ask
         isopen(term.signals) || return DEFAULT_DISPLAYSIZE
         query_displaysize(term.signals)
     end
