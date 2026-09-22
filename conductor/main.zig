@@ -424,7 +424,6 @@ pub const Conductor = struct {
         const threads = resolveThreads(&request);
         // A client in another mount namespace is sandboxed by something we cannot
         // see into, so it spawns its own worker there.
-        var rw_binds: [1][]const u8 = undefined;
         const foreign_ns = if (is_remote) null else platform.peerForeignMountNs(socket);
         const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or request.parsed.hasSwitch("--sandbox")))
             .remote
@@ -446,8 +445,7 @@ pub const Conductor = struct {
             const cwd = trimTrailingSlashes(request.cwd);
             const proj = trimTrailingSlashes(project_path);
             const has_local_project = proj.len > 0 and proj[0] != '@';
-            rw_binds = .{if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd};
-            break :blk .{ .local = &rw_binds };
+            break :blk .{ .local = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd };
         } else .none;
         // Platform check: sandboxing requires Linux
         if (sandbox != .none) {
@@ -487,7 +485,7 @@ pub const Conductor = struct {
             .client => |c| try std.fmt.allocPrint(self.allocator, "__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
             // Key encodes rw mount + project so workers only share when their
             // mount configuration matches.
-            .local => |binds| try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ binds[0], trimTrailingSlashes(project_path), ch, tkey }),
+            .local => |rw| try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw, trimTrailingSlashes(project_path), ch, tkey }),
         };
         defer self.allocator.free(worker_key);
         // Validate --sync requires --session=<label>
@@ -648,7 +646,7 @@ pub const Conductor = struct {
     const SandboxKind = union(enum) {
         none,
         remote,
-        local: []const []const u8, // rw bind mounts
+        local: []const u8, // the one rw bind mount: the project, or just cwd
         client: struct { socket: posix.socket_t, ns: u64 }, // the client spawns the worker inside its own sandbox
     };
 
@@ -809,9 +807,9 @@ pub const Conductor = struct {
         // 4. Spawn new worker
         const w = switch (sandbox) {
             .none => try self.addWorkerToPool(list, project_path, julia_channel, threads, want_interactive, .direct),
-            .client => |c| try self.addWorkerToPool(list, project_path, julia_channel, threads, want_interactive, .{ .client = .{ .socket = c.socket, .environ = self.environ_map } }),
+            .client => |c| try self.addWorkerToPool(list, project_path, julia_channel, threads, want_interactive, .{ .client = .{ .socket = c.socket, .environ = self.environ_map, .ns = c.ns } }),
             .remote => try self.addSandboxedWorkerToPool(list, project_path, julia_channel, threads, &.{}),
-            .local => |rw_binds| try self.addSandboxedWorkerToPool(list, project_path, julia_channel, threads, rw_binds),
+            .local => |rw| try self.addSandboxedWorkerToPool(list, project_path, julia_channel, threads, &.{rw}),
         };
         if (is_labeled_session and w.session_label == null) {
             std.debug.print("Worker {d}: assigning label '{s}'\n", .{ w.id, session_label.? });
@@ -1177,7 +1175,7 @@ pub const Conductor = struct {
     }
 
     fn refreshOne(w: *worker.Worker, now_ns: i64, half_life_s: ?f64) void {
-        const pid = w.process.id orelse return;
+        const pid = w.livePid() orelse return;
         const s = platform.getProcessStats(pid) orelse return;
         w.mem = s.mem_bytes;
         w.mem_at = @divTrunc(now_ns, 1_000_000_000);
@@ -1273,7 +1271,7 @@ pub const Conductor = struct {
         const band = @min(2 * max_evict_per_episode, cands.len);
         if (!platform.mem_is_reclaimable) {
             for (cands[0..band]) |*c| {
-                if (c.w.process.id) |pid| {
+                if (c.w.livePid()) |pid| {
                     if (platform.processReclaimable(pid)) |uss| c.size = uss;
                 }
                 c.value = self.workerValue(c.w, c.key, now, c.size);
