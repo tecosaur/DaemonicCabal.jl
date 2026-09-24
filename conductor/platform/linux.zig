@@ -42,6 +42,11 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
 // Raw syscall primitives used by posix.zig shared implementations
 pub const kill = linux.kill;
 
+/// A pidfd turns readable once its process has exited.
+pub fn pidfdExited(fd: posix.fd_t) bool {
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    return (posix.poll(&pfd, 0) catch return true) != 0;
+}
 pub fn pidfdOpen(pid: posix.pid_t) ?posix.fd_t {
     const rc = linux.pidfd_open(pid, 0);
     return if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
