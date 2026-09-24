@@ -40,71 +40,6 @@ else
 const readExact = protocol.readExact;
 const EventLocation = protocol.EventLocation;
 
-const VERSION = blk: {
-    const project_toml = @embedFile("Project.toml");
-    const marker = "\nversion = \"";
-    const start = if (std.mem.indexOf(u8, project_toml, marker)) |i| i + marker.len else unreachable;
-    const end = if (std.mem.indexOfPos(u8, project_toml, start, "\"")) |i| i else unreachable;
-    break :blk project_toml[start..end];
-};
-const VERSION_STRING = "juliaclient " ++ VERSION ++ "\n";
-
-const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
-    .linux =>
-        \\Daemon management (systemd):
-        \\
-        \\ systemctl --user {start | stop | restart | status} julia-daemon
-        \\
-    ,
-    .macos =>
-        \\Daemon management (launchd):
-        \\
-        \\ launchctl {start | stop} org.julialang.julia-daemon
-        \\ tail -f ~/Library/Logs/julia-daemon.log
-        \\
-    ,
-    else =>
-        \\Daemon management:
-        \\
-        \\ pgrep -f julia-conductor   (status)
-        \\ pkill -f julia-conductor   (stop)
-        \\
-    ,
-};
-
-const CLIENT_HELP =
-    \\
-    \\    juliaclient [switches] -- [programfile] [args...]
-    \\
-    \\Switches (a '*' marks the default value, if applicable):
-    \\
-    \\ -v, --version              Display version information
-    \\ -h, --help                 Print this message
-    \\ -P, --project[=<dir>|@.]    Set <dir> as the home project/environment
-    \\ -e, --eval <expr>          Evaluate <expr>
-    \\ -E, --print <expr>         Evaluate <expr> and display the result
-    \\ -L, --load <file>          Load <file> immediately on all processors
-    \\ -i                         Interactive mode; REPL runs and `isinteractive()` is true
-    \\ -t, --threads <N|auto>[,<M|auto>]  Launch N threads (and M interactive threads)
-    \\ -q, --quiet                Quiet startup: no banner, suppress REPL warnings
-    \\ --banner={yes|no|auto*}    Enable or disable startup banner
-    \\ --color={yes|no|auto*}     Enable or disable color text
-    \\ --history-file={yes*|no}   Load or save history
-    \\
-    \\Client-specific switches:
-    \\
-    \\ -a, --address <addr>       Connect to conductor at <addr> instead of default
-    \\ --session[=<label>]        Reuse worker state in Main module. With a label,
-    \\                            multiple clients can share the same session.
-    \\ --sync                     Attach to shared REPL (requires --session=<label>)
-    \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
-    \\ --restart                  Kill workers for the project and exit
-    \\ --sandbox                  Run in an isolated sandbox (Linux only)
-    \\ --status[=json]            Show the state of the workers, optionally in json
-    \\
-    \\
-++ DAEMON_MANAGEMENT_HELP;
-
 // --- Constants ---
 
 /// Grace per retirement stage; SIGTERM/SIGKILL fire only for a wedged worker.
@@ -429,7 +364,10 @@ pub const Conductor = struct {
         // is bounded here, one that never sends is dropped by tickConnections.
         platform.setRecvTimeout(socket, request_timeout_s);
         var magic_buf: [4]u8 = undefined;
-        readExact(socket, &magic_buf) catch |err| {
+        // Closing without a word is `juliaclient --version` checking we are up.
+        const first = platform.socketRead(socket, &magic_buf);
+        if (first == 0) return .done;
+        readExact(socket, magic_buf[first..]) catch |err| {
             std.debug.print("Connection sent no request within {d}s ({})\n", .{ request_timeout_s, err });
             return err;
         };
@@ -507,11 +445,11 @@ pub const Conductor = struct {
         self.client_counter += 1;
         // Handle special commands
         if (request.parsed.hasSwitch("--help") or request.parsed.hasSwitch("-h")) {
-            try self.serveString(socket, CLIENT_HELP, 0);
+            try self.serveString(socket, protocol.CLIENT_HELP, 0);
             return .done;
         }
         if (request.parsed.hasSwitch("--version") or request.parsed.hasSwitch("-v")) {
-            try self.serveString(socket, VERSION_STRING, 0);
+            try self.serveString(socket, protocol.VERSION_STRING, 0);
             return .done;
         }
         if (request.parsed.hasSwitch("--status")) {
