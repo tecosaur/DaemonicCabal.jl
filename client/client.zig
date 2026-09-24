@@ -213,7 +213,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var env = scanEnv(inputs.env);
     const addr_arg = extractAddressArg(inputs.args);
     if (addr_arg.value) |addr| env.server_path = addr;
-    const sync_arg = extractSyncArg(inputs.args);
+    const sync = hasSyncArg(inputs.args);
     for (inputs.args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -236,11 +236,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var w = SocketWriter{ .handle = conductor };
     // The worker's own terminal knows nothing of ours.
     const color = is_tty and !hasNoColor(inputs.env);
-    try sendClientInfo(&w, env, is_tty, color, inputs.args, addr_arg.skip, sync_arg.skip);
+    try sendClientInfo(&w, env, is_tty, color, inputs.args, addr_arg.skip);
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers();
-    signal_parser.sync_mode = sync_arg.sync;
-    try runEventLoop(sync_arg.sync);
+    signal_parser.sync_mode = sync;
+    try runEventLoop(sync);
 }
 
 fn collectInputs(a: std.mem.Allocator, init: std.process.Init.Minimal) !Inputs {
@@ -362,7 +362,7 @@ fn keepConductor(connection: protocol.Connection) posix.socket_t {
     return connection.socket;
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, args: []const []const u8, addr_skip: [2]usize, sync_skip: usize) !void {
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, args: []const []const u8, addr_skip: [2]usize) !void {
     w.writeInt(u32, protocol.client.magic);
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color }));
     w.writeSlice(&.{ 0, 0, 0 });
@@ -382,7 +382,6 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, arg
     w.writeInt(u16, @intCast(args.len - skip_count));
     for (args, 0..) |arg, i| {
         if (i == addr_skip[0] or i == addr_skip[1]) continue;
-        _ = sync_skip; // --sync stays in the forwarded args
         w.writeLenPrefixed(u16, arg);
     }
     w.flush();
@@ -557,18 +556,12 @@ fn getTerminalSize() struct { height: u16, width: u16 } {
 
 const sentinel = std.math.maxInt(usize);
 
-const SyncArg = struct {
-    sync: bool,
-    skip: usize, // index to omit when forwarding
-};
-
-fn extractSyncArg(args: []const []const u8) SyncArg {
+fn hasSyncArg(args: []const []const u8) bool {
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--")) return .{ .sync = false, .skip = sentinel };
-        if (std.mem.eql(u8, arg, "--sync"))
-            return .{ .sync = true, .skip = sentinel }; // the worker needs it too
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (std.mem.eql(u8, arg, "--sync")) return true;
     }
-    return .{ .sync = false, .skip = sentinel };
+    return false;
 }
 
 const AddressArg = struct {
