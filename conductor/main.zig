@@ -1733,6 +1733,7 @@ pub const Conductor = struct {
     fn buildSandboxClientEnv(self: *Conductor, env: []const worker.EnvVar) ![]const worker.EnvVar {
         // Upper bound: original env + identity overrides
         const result = try self.allocator.alloc(worker.EnvVar, env.len + sandbox_identity_vars.len);
+        errdefer self.allocator.free(result);
         var n: usize = 0;
         for (env) |e| {
             var is_identity = false;
@@ -1741,7 +1742,8 @@ pub const Conductor = struct {
             if (!is_identity) { result[n] = e; n += 1; }
         }
         for (sandbox_identity_vars) |e| { result[n] = e; n += 1; }
-        return result[0..n];
+        // Callers free what we return, so it must be the whole allocation.
+        return self.allocator.realloc(result, n);
     }
 
     // --- Port pool ---
