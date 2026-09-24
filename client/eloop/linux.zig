@@ -74,7 +74,9 @@ pub fn run(
                 },
                 @intFromEnum(Location.local_stdin) => {
                     if (cqe.res <= 0) {
-                        platform.close(stdin_fd);
+                        // Half-close: the worker sees EOF, and the handle stays
+                        // valid for a late Ctrl-C write rather than being reused.
+                        platform.shutdownWrite(stdin_fd);
                         continue;
                     }
                     if (exit_code != null) continue;
