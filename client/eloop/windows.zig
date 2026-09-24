@@ -23,29 +23,17 @@ const buf_size = 1024;
 // std.Thread is unavailable under -fsingle-threaded.
 extern "kernel32" fn CreateThread(lpThreadAttributes: ?*anyopaque, dwStackSize: usize, lpStartAddress: *const fn (?*anyopaque) callconv(.winapi) win32.DWORD, lpParameter: ?*anyopaque, dwCreationFlags: win32.DWORD, lpThreadId: ?*win32.DWORD) ?win32.HANDLE;
 
-const StdinArgs = struct {
-    src: posix.fd_t,
-    dst: posix.fd_t,
-    sync_mode: bool,
-    wants_raw: *bool, // written by the loop thread
-};
+const StdinArgs = struct { src: posix.fd_t, fwd: cooked.StdinForwarder };
 
 fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
     const args: *StdinArgs = @ptrCast(@alignCast(param orelse return 1));
-    var cooked_state = cooked.CookedState{};
     var buf: [buf_size]u8 = undefined;
     while (true) {
         var got: win32.DWORD = 0;
         if (!platform.ReadFile(args.src, &buf, buf.len, &got, null).toBool() or got == 0) break;
-        if (args.sync_mode and !@atomicLoad(bool, args.wants_raw, .acquire)) {
-            for (buf[0..got]) |byte| {
-                cooked_state.process(byte, args.dst);
-            }
-        } else {
-            platform.write(args.dst, buf[0..got]);
-        }
+        args.fwd.forward(buf[0..got]);
     }
-    platform.sendEof(args.dst);
+    platform.sendEof(args.fwd.dst);
     return 0;
 }
 
@@ -65,9 +53,7 @@ pub fn run(
     const args = try std.heap.page_allocator.create(StdinArgs);
     args.* = .{
         .src = platform.getStdinHandle(),
-        .dst = stdin_fd,
-        .sync_mode = sync_mode,
-        .wants_raw = &signal_parser.worker_wants_raw,
+        .fwd = .{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw },
     };
     _ = CreateThread(null, 0, &stdinProc, args, 0, null) orelse
         return error.StdinThreadFailed;
