@@ -625,41 +625,15 @@ pub fn rawConnect(fd: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t)
     return true;
 }
 
-/// Connect to an IP address. The platform primitives report why a connect
-/// failed, where std's collapse the reasons into error.Unexpected.
-pub fn connectTcp(io: Io, ip: Io.net.IpAddress) !HANDLE {
-    _ = io;
-    return dialIp(ip, null);
-}
-
-/// Whether something accepts TCP connections at `ip` within `timeout_ms`.
-pub fn probeTcp(ip: Io.net.IpAddress, timeout_ms: u32) bool {
-    close(dialIp(ip, timeout_ms) catch return false);
-    return true;
-}
-
-fn dialIp(ip: Io.net.IpAddress, timeout_ms: ?u32) !HANDLE {
-    const fd = switch (ip) {
-        .ip4 => rawSocket(posix.AF.INET, posix.SOCK.STREAM),
-        .ip6 => rawSocket(posix.AF.INET6, posix.SOCK.STREAM),
-    } orelse return error.SocketCreateFailed;
+/// Connect to `ip`, giving up after `timeout_ms`. The platform primitives
+/// report why a connect failed, where std's collapse the reasons into
+/// error.Unexpected.
+pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !HANDLE {
+    var storage: Io.Threaded.PosixAddress = undefined;
+    const len = Io.Threaded.addressToPosix(&ip, &storage);
+    const fd = rawSocket(storage.any.family, posix.SOCK.STREAM) orelse return error.SocketCreateFailed;
     errdefer close(fd);
-    switch (ip) {
-        .ip4 => |a| {
-            var sa: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
-            sa.family = posix.AF.INET;
-            sa.port = std.mem.nativeToBig(u16, a.port);
-            sa.addr = @bitCast(a.bytes);
-            try connectAfd(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in), timeout_ms);
-        },
-        .ip6 => |a| {
-            var sa: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
-            sa.family = posix.AF.INET6;
-            sa.port = std.mem.nativeToBig(u16, a.port);
-            sa.addr = a.bytes;
-            try connectAfd(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in6), timeout_ms);
-        },
-    }
+    try connectAfd(fd, &storage.any, len, timeout_ms);
     return fd;
 }
 
@@ -865,23 +839,22 @@ pub fn listenLocal(io: Io, path: []const u8) !Listener {
 
 pub const local_transport_name = "named pipe";
 
-pub fn connectLocal(io: Io, path: []const u8) !HANDLE {
+/// A missing name means no server; a busy one is retried within `timeout_ms`.
+pub fn connectLocal(io: Io, path: []const u8, timeout_ms: u32) !HANDLE {
+    _ = io;
+    return connectPipe(path, timeout_ms, false);
+}
+
+/// A single-use address its server may still be creating, so a missing name
+/// is waited for. A pipe name vanishes with its last instance: nothing to retire.
+pub fn connectLocalOnce(io: Io, path: []const u8) !HANDLE {
     _ = io;
     return connectPipe(path, 10_000, true);
 }
 
-/// A missing name means no server; a busy one is retried within `timeout_ms`.
-pub fn probeLocal(path: []const u8, timeout_ms: u32) bool {
-    close(connectPipe(path, timeout_ms, false) catch return false);
-    return true;
-}
-
-/// A pipe name vanishes with its last instance, so there is nothing to retire.
-pub const connectLocalOnce = connectLocal;
-
 /// Usable off the main thread (the console-control handler); null on failure.
 pub fn rawConnectLocal(path: []const u8) ?HANDLE {
-    return connectPipe(path, 10_000, true) catch null;
+    return connectPipe(path, 1000, false) catch null;
 }
 
 const closeHandle = close; // unambiguous inside Listener, which has its own `close`
@@ -912,7 +885,7 @@ pub const Listener = struct {
         };
     }
     /// Accept the connection an event loop reported waiting.
-    pub fn accept(self: *Listener, io: Io) !protocol.Accepted {
+    pub fn accept(self: *Listener, io: Io) !protocol.Connection {
         return switch (self.backing) {
             .pipe => .{ .socket = try self.takePipeConnection(), .peer = null },
             .socket => |*s| blk: {
@@ -1188,7 +1161,9 @@ pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
 }
 
 /// The POSIX SIGUSR1 socket-recreate nudge has no counterpart here.
-pub fn requestSocketRecreate(_: u32) void {}
+pub fn requestSocketRecreate(_: u32) bool {
+    return false;
+}
 
 /// %LOCALAPPDATA%\julia-daemon: persistent, so startup cleanup still matters.
 pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const u8 {

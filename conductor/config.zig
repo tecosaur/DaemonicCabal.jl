@@ -76,10 +76,13 @@ pub const Config = struct {
         const transport = parsed.mode;
         const bind_address: []const u8 = if (env.get("JULIA_DAEMON_BIND")) |b|
             b
-        else if (transport == .tcp) blk: {
-            const colon = std.mem.lastIndexOfScalar(u8, socket_path, ':') orelse break :blk "0.0.0.0";
-            break :blk socket_path[0..colon];
-        } else "";
+        else if (transport == .tcp)
+            (protocol.splitHostPort(socket_path) catch {
+                std.debug.print("Error: JULIA_DAEMON_SERVER={s} is not a valid host[:port]\n", .{socket_path});
+                return error.InvalidAddress;
+            }).host
+        else
+            "";
         const cfg: Config = .{
             .allocator = allocator,
             .socket_path = socket_path,
