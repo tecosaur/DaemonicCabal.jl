@@ -18,6 +18,7 @@ pub const Timeval = linux.timeval;
 // Process info
 pub const getpid = linux.getpid;
 pub const getppid = linux.getppid;
+pub const geteuid = linux.geteuid;
 
 // I/O
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
@@ -39,6 +40,12 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
 
 // Raw primitives
 pub const kill = linux.kill;
+
+pub fn fileOwner(fd: posix.fd_t) ?struct { uid: posix.uid_t, mode: u32 } {
+    var stx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true, .UID = true }, &stx)) != .SUCCESS) return null;
+    return .{ .uid = stx.uid, .mode = stx.mode };
+}
 
 /// A pidfd turns readable once its process has exited.
 pub fn pidfdExited(fd: posix.fd_t) bool {
