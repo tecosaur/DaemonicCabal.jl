@@ -45,8 +45,7 @@ fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
             platform.write(args.dst, buf[0..got]);
         }
     }
-    // Half-close keeps the handle valid for a late Ctrl-C write.
-    if (platform.handleKind(args.dst) == .afd) platform.shutdownWrite(args.dst) else platform.close(args.dst);
+    platform.sendEof(args.dst);
     return 0;
 }
 

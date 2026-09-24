@@ -128,9 +128,8 @@ pub fn run(
                         }
                         remaining -= n;
                     }
-                    // Half-close keeps the handle valid for a late Ctrl-C write.
                     if ((ev.flags & EV_EOF) != 0) {
-                        platform.shutdownWrite(stdin_fd);
+                        platform.sendEof(stdin_fd);
                         stdin_closed = true;
                     }
                 },
@@ -160,7 +159,7 @@ pub fn run(
         if (!stdin_polled and !stdin_closed and exit_code == null) {
             const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch 0;
             if (n == 0) {
-                platform.shutdownWrite(stdin_fd);
+                platform.sendEof(stdin_fd);
                 stdin_closed = true;
             } else if (sync_mode and !signal_parser.worker_wants_raw) {
                 for (stdin_buf[0..n]) |byte| cooked_state.process(byte, stdin_fd);

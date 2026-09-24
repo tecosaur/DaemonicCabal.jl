@@ -378,6 +378,11 @@ pub fn socketWrite(fd: HANDLE, buf: []const u8) void {
     }
 }
 
+/// Half-closes a socket, keeping the handle valid; a pipe, which cannot, is closed.
+pub fn sendEof(fd: HANDLE) void {
+    if (handleKind(fd) == .afd) shutdownWrite(fd) else close(fd);
+}
+
 /// 0 on timeout, EOF or error.
 pub fn socketRead(fd: HANDLE, buf: []u8) usize {
     lockRegistry();
@@ -455,7 +460,7 @@ pub fn setRecvTimeout(fd: HANDLE, seconds: u32) void {
     }
 }
 
-/// A pipe cannot half-close.
+/// A pipe cannot half-close; see `sendEof`.
 pub fn shutdownWrite(fd: HANDLE) void {
     if (handleKind(fd) != .afd) return;
     const info = win32.AFD.PARTIAL_DISCONNECT_INFO{ .DisconnectMode = .{ .SEND = true, .RECEIVE = false }, .Timeout = -1 };
