@@ -303,33 +303,30 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     conductor_path = located.address.addr;
     const addr = conductor_path;
     const timeout = protocol.connect_timeout_ms;
-    if (protocol.connectAddress(io, transport_mode, addr, timeout)) |c| return keepConductor(c) else |err| switch (transport_mode) {
-        // A refusal may be a conductor restarting; a timeout is not worth repeating.
-        .tcp => if (err == error.ConnectionRefused) {
-            var attempts: u32 = 0;
-            while (attempts < 20) : (attempts += 1) {
-                Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
-                if (protocol.connectAddress(io, .tcp, addr, timeout)) |c| return keepConductor(c) else |_| {}
-            }
-        },
-        .local => {
+    const first_err = if (protocol.connectAddress(io, transport_mode, addr, timeout)) |c| return keepConductor(c) else |err| err;
+    // A refusal may be a conductor restarting, and a live conductor can be asked
+    // to recreate a missing socket; a timeout is not worth repeating.
+    const worth_retrying = switch (transport_mode) {
+        .tcp => first_err == error.ConnectionRefused,
+        .local => blk: {
             var pid_buf: [max_socket_path]u8 = undefined;
-            const pid_path = std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong;
-            if (readPidAndSignal(pid_path)) {
-                var attempts: u32 = 0;
-                while (attempts < 20) : (attempts += 1) {
-                    Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
-                    if (protocol.connectAddress(io, .local, addr, timeout)) |c| return keepConductor(c) else |_| {}
-                }
-                // The conductor is alive but its socket is still missing.
-                const tcp_addr = std.fmt.bufPrint(&conductor_path_buf, "localhost:{d}", .{protocol.default_tcp_port}) catch unreachable;
-                if (protocol.connectAddress(io, .tcp, tcp_addr, timeout)) |c| {
-                    transport_mode = .tcp;
-                    conductor_path = tcp_addr;
-                    return keepConductor(c);
-                } else |_| {}
-            }
+            break :blk readPidAndSignal(std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong);
         },
+    };
+    if (worth_retrying) {
+        for (0..20) |_| {
+            Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
+            if (protocol.connectAddress(io, transport_mode, addr, timeout)) |c| return keepConductor(c) else |_| {}
+        }
+        // Alive with no local socket: it may be listening on TCP.
+        if (transport_mode == .local) {
+            const tcp_addr = std.fmt.comptimePrint("localhost:{d}", .{protocol.default_tcp_port});
+            if (protocol.connectAddress(io, .tcp, tcp_addr, timeout)) |c| {
+                transport_mode = .tcp;
+                conductor_path = tcp_addr;
+                return keepConductor(c);
+            } else |_| {}
+        }
     }
     std.debug.print(
         \\Failed to connect to {s}
