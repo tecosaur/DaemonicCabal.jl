@@ -191,12 +191,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
         if err isa DaemonClientExit
             exit_code = err.code
         elseif isopen(client_stdout)
-            # TODO trim the stacktrace
-            Base.invokelatest(
-                Base.display_error,
-                stderrx,
-                Base.scrub_repl_backtrace(
-                    current_exceptions()))
+            Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
             exit_code = 1
         end
     finally
@@ -207,6 +202,18 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                             signals, owned_streams, exit_code)
         end
     end
+end
+
+# Stock julia's trace ends where it entered user code; ours would run on
+# through the worker, from the inner `runclient` (its kwarg body) outward.
+function scrub_backtrace(stack::Base.ExceptionStack)
+    function scrub(bt)
+        bt isa Vector{Base.StackTraces.StackFrame} || return bt
+        entry = findfirst(f -> parentmodule(f) === @__MODULE__() && occursin("runclient", String(f.func)), bt)
+        if isnothing(entry) bt else bt[1:entry-1] end
+    end
+    Base.ExceptionStack(Any[(; x.exception, backtrace = scrub(x.backtrace))
+                            for x in Base.scrub_repl_backtrace(stack)])
 end
 
 # A sync REPL task owns no streams; its clients are cleaned up by stdin_copy_loop.
@@ -259,10 +266,7 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
             # `exit(n)` is not a failure; `include` wraps it on the way out.
             thrown = if err isa LoadError err.error else err end
             thrown isa DaemonClientExit && throw(thrown)
-            Base.invokelatest(
-                Base.display_error,
-                Base.scrub_repl_backtrace(
-                    current_exceptions()))
+            Base.invokelatest(Base.display_error, scrub_backtrace(current_exceptions()))
             runrepl || throw(DaemonClientExit(1))
         end
     end
