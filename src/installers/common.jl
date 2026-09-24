@@ -3,12 +3,29 @@
 
 const SOURCE_WORKER_PROJECT = joinpath(dirname(dirname(@__DIR__)), "worker")
 
-install_dir() = BaseDirs.User.data(BaseDirs.App("julia-daemon"), create=false)
-installed_worker_project() = joinpath(install_dir(), "worker")
-installed_conductor() = joinpath(install_dir(), "julia-conductor")
-installed_client() = joinpath(install_dir(), "juliaclient")
-client_symlink_path() = BaseDirs.User.bin(CLIENT_NAME)
+install_dir() = Sys.iswindows() ?
+        # Local app data is the usual USER installation folder
+        # for example, VS Code user installation is installed in
+        # %LOCALAPPDATA%/Programs/Microsoft VS Code/
+       joinpath(ENV["LOCALAPPDATA"], "Programs", "julia-daemon") :
+       BaseDirs.User.data(BaseDirs.App("julia-daemon"), create=false)
 
+installed_worker_project() = joinpath(install_dir(), "worker")
+installed_conductor() = joinpath(install_dir(), "julia-conductor$EXE")
+installed_client() = joinpath(install_dir(), CLIENT_NAME)
+client_symlink_path() = begin
+    @static if Sys.iswindows()
+        # Here we pick "Microsoft/WindowsApps" because this path should be
+        # in the PATH by default. so we don't have to inject PATHs anywhere.
+        # It's a bit tongue in cheek and a shortcut, but it somewhat customary
+        # and the blast radius is non existent.
+        joinpath(ENV["LOCALAPPDATA"],
+            "Microsoft", "WindowsApps", CLIENT_NAME
+        )
+    else
+        BaseDirs.User.bin(CLIENT_NAME)
+    end
+end
 worker_executable() = something(
     get(ENV, "JULIA_DAEMON_WORKER_EXECUTABLE", nothing),
     Sys.which("julia"),
@@ -54,8 +71,13 @@ end
 function install_files()
     dest = install_dir()
     if isdir(dest)
-        for (root, _, _) in walkdir(dest; topdown=true)
-            chmod(root, 0o755)
+        # Windows: Julia's chmod rewrites the DACL (stripping delete rights the
+        # owner needs for non-Julia tools to clean up) rather than setting a
+        # read-only bit, so skip the permission dance entirely.
+        if !Sys.iswindows()
+            for (root, _, _) in walkdir(dest; topdown=true)
+                chmod(root, 0o755)
+            end
         end
         rm(dest; recursive=true, force=true)
     end
@@ -63,8 +85,8 @@ function install_files()
     mkpath(dest)
     cp(SOURCE_WORKER_PROJECT, installed_worker_project())
     make_tree_readonly(installed_worker_project())
-    hardlink(joinpath(artifact"execbundle", "julia-conductor"), installed_conductor())
-    hardlink(joinpath(artifact"execbundle", "juliaclient"), installed_client())
+    hardlink(joinpath(artifact"execbundle", "julia-conductor$EXE"), installed_conductor())
+    hardlink(joinpath(artifact"execbundle", "juliaclient$EXE"), installed_client())
 end
 
 function uninstall_files()
@@ -76,9 +98,16 @@ end
 
 function install_client_symlink()
     binpath = client_symlink_path()
-    @info "Symlinking client to $binpath"
     rm(binpath; force=true)
-    symlink(installed_client(), binpath)
+    @static if Sys.iswindows()
+        # symlinking on windows is a pain.
+        # we install in %LOCALAPPDATA% so always same drive
+        @info "Hardlinking client to $binpath"
+        hardlink(installed_client(), binpath)
+    else
+        @info "Symlinking client to $binpath"
+        symlink(installed_client(), binpath)
+    end
 end
 
 function uninstall_client_symlink()
@@ -89,6 +118,7 @@ function uninstall_client_symlink()
 end
 
 function make_tree_readonly(path::AbstractString)
+    Sys.iswindows() && return  # chmod → DACL trap, see install_files
     for (root, dirs, files) in walkdir(path)
         for f in files
             chmod(joinpath(root, f), 0o444)
