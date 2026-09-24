@@ -8,6 +8,22 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const platform = @import("platform/main.zig");
 
+/// Local stdin on its way to the worker: line-edited here while a `--sync`
+/// worker wants cooked input, passed straight through otherwise.
+pub const StdinForwarder = struct {
+    dst: posix.socket_t,
+    sync_mode: bool,
+    /// The signal parser's; on Windows another thread writes it.
+    wants_raw: *const bool,
+    cooked: CookedState = .{},
+
+    pub fn forward(self: *StdinForwarder, bytes: []const u8) void {
+        if (self.sync_mode and !@atomicLoad(bool, self.wants_raw, .acquire)) {
+            for (bytes) |byte| self.cooked.process(byte, self.dst);
+        } else platform.write(self.dst, bytes);
+    }
+};
+
 pub const CookedState = struct {
     line_buf: [4096]u8 = undefined,
     line_len: usize = 0,
