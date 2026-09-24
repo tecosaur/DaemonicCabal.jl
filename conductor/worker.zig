@@ -195,8 +195,8 @@ pub const Worker = struct {
         errdefer if (channel_copy) |ch| allocator.free(ch);
         const eval_expr = try std.fmt.allocPrint(
             allocator,
-            "using DaemonWorker; DaemonWorker.runworker({f}, {d}, {f})",
-            .{ juliaString(setup.addr()), id, juliaString(cfg.socket_path) },
+            "using DaemonWorker; DaemonWorker.runworker({f}, {f})",
+            .{ juliaString(setup.addr()), juliaString(cfg.socket_path) },
         );
         defer allocator.free(eval_expr);
         // Passed after worker_args so a client's request wins.

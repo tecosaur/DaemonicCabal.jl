@@ -7,16 +7,12 @@ struct ClientTask
 end
 
 const STATE = (
-    ctime = time(),
-    worker_number = Ref(-1),
-    clients = Vector{Tuple{Float64, ClientInfo}}(),
+    clients = Vector{ClientInfo}(),
     client_tasks = Dict{Int, ClientTask}(),
-    project = Ref(""),
     lastclient = Ref(time()),
     last_contact = Ref(time()),
     lock = SpinLock(),
     soft_exit = Ref(false),
-    conductor_conn = Ref{Union{IO, Nothing}}(nothing),
     conductor_socket = Ref(""),
     standby_sockets = Ref{Union{Nothing, NTuple{4, Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}}}}(nothing),
     standby_module = Ref{Union{Nothing, Module}}(nothing),
@@ -27,6 +23,9 @@ RUNTIME_DIR::String = ""
 MAX_CLIENTS::Int = 1
 PORT_BASE::Int = 0
 ORPHAN_FAILSAFE::Int = 0  # seconds; 0 = off
+
+# A switch or variable given with no value counts as yes.
+isyes(value::AbstractString) = value ∈ ("yes", "true", "1", "")
 
 # Exiting
 
@@ -40,11 +39,9 @@ const REVISE_PKG =
     Base.PkgId(Base.UUID("295af30f-e4ad-537b-8983-00126c2a3abe"), "Revise")
 
 function try_load_revise()
-    get(ENV, "JULIA_DAEMON_REVISE", "no") ∈ ("yes", "true", "1", "") || return
+    isyes(get(ENV, "JULIA_DAEMON_REVISE", "no")) || return
     isdefined(Main, :Revise) && return
-    if !isdefined(Main, :Revise) && !isnothing(Base.locate_package(REVISE_PKG))
-        Core.eval(Main, :(using Revise))
-    end
+    isnothing(Base.locate_package(REVISE_PKG)) || Core.eval(Main, :(using Revise))
 end
 
 # Orphan failsafe, for a conductor death pdeathsig misses (non-Linux, unclean crash).
@@ -170,35 +167,25 @@ function create_socket(port::Integer=0)::Pair{Union{Sockets.PipeServer, Sockets.
     end
 end
 
-function ports_for_index(port_set::Int)::NTuple{4, Int}
-    start = PORT_BASE + port_set * 4
-    (start, start + 1, start + 2, start + 3)
-end
-
 const PORT_SET_NONE = 0xFFFF
 
 function get_client_sockets(port_set::Int)::NTuple{4, Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}}
     if port_set != PORT_SET_NONE
-        p1, p2, p3, p4 = ports_for_index(port_set)
-        return (create_socket(p1), create_socket(p2), create_socket(p3), create_socket(p4))
+        return ntuple(i -> create_socket(PORT_BASE + 4port_set + i - 1), 4)
     end
     sockets = @lock STATE.lock begin
         s = STATE.standby_sockets[]
         STATE.standby_sockets[] = nothing
         s
     end
-    if isnothing(sockets)
-        (create_socket(), create_socket(), create_socket(), create_socket())
-    else
-        sockets
-    end
+    if isnothing(sockets) ntuple(_ -> create_socket(), 4) else sockets end
 end
 # None with a managed port range: the port set is unknown until `client_run`.
 function ensure_standby_sockets()
     PORT_BASE > 0 && return
     @lock STATE.lock begin
         if isnothing(STATE.standby_sockets[])
-            STATE.standby_sockets[] = (create_socket(), create_socket(), create_socket(), create_socket())
+            STATE.standby_sockets[] = ntuple(_ -> create_socket(), 4)
         end
     end
 end
@@ -344,7 +331,7 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
     if isassigned(session.repl)
         # Reposition the cursor so the REPL's refresh lands right on a fresh terminal.
         height = first(query_displaysize(signals))
-        maxlines = 3 * if iszero(height) 24 else height end
+        maxlines = 3 * height
         replay_history(client_stdout, session.history; maxlines)
         send_signal(signals, SIGNAL_RAW_MODE, UInt8[true])
         read(signals, 2)
@@ -412,7 +399,7 @@ end
 
 function unregister_client!(client::ClientInfo)
     exiting = @lock STATE.lock begin
-        idx = findfirst(e -> last(e) === client, STATE.clients)
+        idx = findfirst(c -> c === client, STATE.clients)
         !isnothing(idx) && deleteat!(STATE.clients, idx)
         delete!(STATE.client_tasks, client.id)
         STATE.lastclient[] = time()
@@ -475,7 +462,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
     (stdin_srv, stdin_path), (stdout_srv, stdout_path),
         (stderr_srv, stderr_path), (signals_srv, signals_path) = get_client_sockets(client.port_set)
     active_count = @lock STATE.lock begin
-        push!(STATE.clients, (time(), client))
+        push!(STATE.clients, client)
         length(STATE.clients)
     end
     send_sockets(conn, stdin_path, stdout_path, stderr_path, signals_path, active_count)
@@ -485,7 +472,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
     client_stdin, client_stdout, client_stderr, signals = try
         accept_client_sockets((stdin_srv, stdout_srv, stderr_srv, signals_srv), client.pid)
     catch
-        @lock STATE.lock filter!(e -> last(e) !== client, STATE.clients)
+        @lock STATE.lock filter!(c -> c !== client, STATE.clients)
         # Or the conductor keeps counting it, port set and all.
         send_notification(STATE.conductor_socket[], NOTIF_TYPE.client_done, UInt32(client.id))
         rethrow()
@@ -524,7 +511,6 @@ function serve_message(conn::IO, header::MessageHeader)
         project = read_string(conn)
         try
             set_project(project)
-            STATE.project[] = project
             write_header(conn, MSG_TYPE.project_ok, 0)
             flush(conn)
         catch err
@@ -579,7 +565,7 @@ function serve_message(conn::IO, header::MessageHeader)
         write(conn, UInt16(remaining))
         flush(conn)
     elseif header.msg_type == MSG_TYPE.query_clients
-        ids = @lock STATE.lock Int[last(e).id for e in STATE.clients]
+        ids = @lock STATE.lock Int[c.id for c in STATE.clients]
         write_header(conn, MSG_TYPE.clients, 2 + 4 * length(ids))
         write(conn, UInt16(length(ids)))
         for id in ids
@@ -595,16 +581,10 @@ function serve_message(conn::IO, header::MessageHeader)
     end
 end
 
-function runworker(socketpath::String, worker_number::Int=-1, conductor_address::String="")
+function runworker(socketpath::String, conductor_address::String)
     Base.exit_on_sigint(false)
     conn = connect_to(socketpath)
-    STATE.conductor_conn[] = conn
-    STATE.worker_number[] = worker_number
-    STATE.conductor_socket[] = if !isempty(conductor_address)
-        conductor_address
-    else
-        joinpath(dirname(socketpath), "conductor.sock")
-    end
+    STATE.conductor_socket[] = conductor_address
     global RUNTIME_DIR = if is_tcp_address(STATE.conductor_socket[]) "" else dirname(socketpath) end
     global MAX_CLIENTS = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS", "1"))
     max_ttl = parse(Int, get(ENV, "JULIA_DAEMON_MAX_TTL",
