@@ -230,6 +230,7 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
         std.debug.print("Accept error: {}\n", .{err});
         return;
     }
+    _ = c.fcntl(client_fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
     const peer = main.PeerInfo.fromSockaddr(&client_addr);
     conductor.admitConnection(client_fd, &peer);
 }
