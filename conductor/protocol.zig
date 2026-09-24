@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const platform = @import("platform/main.zig");
 
-// Help and version text, shared so `juliaclient --help` needs no daemon.
+// Help and version text
 pub const VERSION = blk: {
     const project_toml = @embedFile("Project.toml");
     const marker = "\nversion = \"";
@@ -80,37 +80,29 @@ pub const CLIENT_HELP =
 ++ DAEMON_MANAGEMENT_HELP;
 
 
-// Client ↔ Conductor Protocol
-//   1. Client sends: magic + flags + pid + ppid + cwd + env_fingerprint + args
-//   2. Conductor replies with a sequence of frames, each introduced by a kind byte:
-//      env_request if the fingerprint is not cached (the client then sends its
-//      full env), spawn_request if the client must start its own worker, and
-//      finally socket_paths
-//   3. Client connects to worker sockets for stdio and signals
+// Client ↔ Conductor: magic + flags + pid + ppid + cwd + env_fingerprint + args,
+// answered by kind-byte frames ending in socket_paths.
 pub const client = struct {
-    pub const magic_prefix: u32 = 0x4A4443; // "JDC"; the low byte is the protocol version
-    pub const version: u8 = 2; // v2: framed replies carrying the client id
-    pub const magic: u32 = magic_prefix << 8 | version; // "JDC\x02" little-endian
-    // Reply frame kinds:
-    pub const env_request: u8 = 0x3F; // '?' - send the full environment (fingerprint cache miss)
-    // Spawn your own worker (you are in a mount namespace the conductor cannot see):
-    // u16 argc, argc × (u16 len + bytes), then u16 n, n × (u16 len + "KEY=VALUE") of
-    // daemon settings to place ahead of the client's environment.
+    pub const magic_prefix: u32 = 0x4A4443; // "JDC", then the version byte
+    pub const version: u8 = 2;
+    pub const magic: u32 = magic_prefix << 8 | version;
+    pub const env_request: u8 = 0x3F; // fingerprint cache miss: send the full env
+    // The client spawns its own worker: u16 argc, argc × (u16 len + bytes), then
+    // u16 n, n × (u16 len + "KEY=VALUE") placed ahead of the client's env.
     pub const spawn_request: u8 = 0x00;
-    // u32 client id (the client names itself by it in notifications), then four
-    // len-prefixed paths: stdin, stdout, stderr, signals.
+    // u32 client id, then len-prefixed stdin, stdout, stderr, signals paths.
     pub const socket_paths: u8 = 0x01;
 
     pub const Flags = packed struct(u8) {
         tty: bool,
-        color: bool = false, // the client's terminal renders ANSI colour
+        color: bool = false,
         _reserved: u6 = 0,
     };
 };
 
 // Conductor ↔ Worker Protocol
 pub const worker = struct {
-    pub const magic: u32 = 0x4A445702; // "JDW\x02" little-endian — v2: client_run carries the client id
+    pub const magic: u32 = 0x4A445702; // "JDW\x02"
 
     pub const MessageType = enum(u8) {
         ping = 0x01,
@@ -125,8 +117,8 @@ pub const worker = struct {
         clients = 0x33,
         soft_exit = 0x40,
         ack = 0x41,
-        sync_clients = 0x50, // Conductor sends list of active PIDs; worker kills any not in list
-        drop_session = 0x51, // Conductor: session label expired; tear down its REPL. Payload: label (u16-len + bytes)
+        sync_clients = 0x50, // the worker kills any client not listed
+        drop_session = 0x51, // payload: label (u16-len + bytes)
         err = 0xFF,
     };
 
@@ -141,53 +133,49 @@ pub const worker = struct {
 
     pub const Flags = packed struct(u8) {
         tty: bool,
-        color: bool = false, // the client's terminal renders ANSI colour
-        force: bool = false, // Bypass capacity check (for labeled sessions)
+        color: bool = false,
+        force: bool = false, // bypass the capacity check, for labelled sessions
         _reserved: u5 = 0,
     };
 };
 
-// Notification Protocol (Worker/Client → Conductor via main socket)
-// Flow: connect to conductor socket, send magic + type + payload, close
+// Notifications → Conductor: connect, send magic + type + payload, close.
+// Payloads are a u32: the client id, except as noted.
 pub const notification = struct {
-    pub const magic: u32 = 0x4A444E01; // "JDN\x01" little-endian
+    pub const magic: u32 = 0x4A444E01; // "JDN\x01"
 
     pub const Type = enum(u8) {
-        client_done = 0x01, // Worker: client disconnected. Payload: client id (u32)
-        worker_unresponsive = 0x02, // Client: worker not responding. Payload: pid (u32)
-        worker_exit = 0x03, // Worker: exiting (TTL expired). Payload: worker_id (u32)
-        client_exit = 0x04, // Client: exiting. Payload: client id (u32)
-        client_interrupt = 0x05, // Client: interrupt my task. Payload: client id (u32)
+        client_done = 0x01,
+        worker_unresponsive = 0x02, // pid
+        worker_exit = 0x03, // worker id
+        client_exit = 0x04,
+        client_interrupt = 0x05,
     };
 };
 
-// Signal Protocol (Worker → Client via signals socket)
-// Format: id:u8 + len:u8 + data
+// Signals (Worker → Client): id:u8 + len:u8 + data
 pub const signals = struct {
     pub const exit: u8 = 0x01;
     pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw
     pub const query_size: u8 = 0x03; // response: height(u16) + width(u16)
-    pub const nodelay: u8 = 0x04;    // disable Nagle on stdin+signals (low-latency connection)
+    pub const nodelay: u8 = 0x04;
     pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating
 };
 
-// Event user_data encoding for io_uring:
-// - Low values (0-6): fixed events (accept, signal, ping_timer, ignored, pressure_timer, live_timer, tick_timer)
-// - High values (>= 0x1000): a pointer with tag bits. Bit 2 set: pending connection
-//   (readable). Else bit 1 set: pending spawn (bit 0: 0=setup listener readable,
-//   1=waiting client's socket readable). Else worker (bit 0: 0=pong, 1=health check timeout)
+// Event keys >= 0x1000 are pointers with tag bits. Bit 2: pending connection.
+// Else bit 1: pending spawn (bit 0: waiting client, not setup listener). Else a
+// worker (bit 0: health check, not pong).
 pub const EventLocation = enum(u64) {
     accept = 0,
     signal = 1,
     ping_timer = 2,
-    ignored = 3, // For link_timeout completions we don't need to handle
+    ignored = 3, // link_timeout completions
     pressure_timer = 4,
-    live_timer = 5, // --status=live repaint (debounce + heartbeat unified)
-    tick_timer = 6, // 1s tick while anything is pending: spawn deadlines, early exits, silent connections
+    live_timer = 5, // --status=live repaint
+    tick_timer = 6, // 1s, while anything is pending
     _,
 };
 
-/// Read exactly buf.len bytes from socket, returning error on EOF.
 pub fn readExact(fd: std.posix.socket_t, buf: []u8) !void {
     var total: usize = 0;
     while (total < buf.len) {
@@ -197,7 +185,6 @@ pub fn readExact(fd: std.posix.socket_t, buf: []u8) !void {
     }
 }
 
-/// Helper for building binary protocol messages into a fixed buffer
 pub const BufWriter = struct {
     buf: []u8,
     pos: usize = 0,
@@ -222,7 +209,6 @@ pub const BufWriter = struct {
     }
 };
 
-/// Helper for reading binary protocol messages from a socket
 pub const BufReader = struct {
     fd: std.posix.socket_t,
 
@@ -236,7 +222,6 @@ pub const BufReader = struct {
         try readExact(self.fd, buf);
     }
 
-    /// Read a length-prefixed byte slice, allocating with the given allocator.
     pub fn readLenPrefixed(self: BufReader, comptime T: type, allocator: std.mem.Allocator) ![]u8 {
         const len = try self.readInt(T);
         const buf = try allocator.alloc(u8, len);
@@ -256,7 +241,6 @@ pub const BufReader = struct {
     }
 };
 
-/// Generate a random local socket address in `socket_dir`, ending in `suffix`.
 pub fn randomSocketPath(io: Io, socket_dir: []const u8, suffix: []const u8, buf: []u8) ![]const u8 {
     var rand_buf: [8]u8 = undefined;
     io.random(&rand_buf);
@@ -266,16 +250,14 @@ pub fn randomSocketPath(io: Io, socket_dir: []const u8, suffix: []const u8, buf:
 
 // --- Port pool for managed TCP port ranges ---
 
-/// Manages a pool of port sets (4 consecutive ports each) for TCP mode.
-/// Port set `i` maps to ports `base + i*4` through `base + i*4 + 3`
-/// (stdin, stdout, stderr, signals).
+/// Sets of 4 consecutive ports: stdin, stdout, stderr, signals.
 pub const PortPool = struct {
     base: u16,
     count: u16,
     free: std.StaticBitSet(max_port_sets),
 
     pub const max_port_sets = 2048;
-    pub const none: u16 = 0xFFFF; // sentinel: no managed port set
+    pub const none: u16 = 0xFFFF;
 
     pub fn init(base: u16, count: u16) PortPool {
         std.debug.assert(count <= max_port_sets);
@@ -302,12 +284,10 @@ pub const PortPool = struct {
 };
 
 // --- Dual transport ---
-// `local` is path-addressed and same-host: AF_UNIX on POSIX, named pipes on
-// Windows. `tcp` is host:port. The platform owns the local implementation.
 
 pub const TransportMode = enum { local, tcp };
 pub const Listener = platform.Listener;
-/// A connected or accepted socket and, over TCP, the address at the other end.
+/// `peer` is set over TCP only.
 pub const Connection = struct { socket: std.posix.socket_t, peer: ?Io.net.IpAddress };
 
 pub const Address = struct {
@@ -315,14 +295,12 @@ pub const Address = struct {
     addr: []const u8,
 };
 
-/// Disable Nagle's algorithm on a TCP socket.
 pub fn setTcpNodelay(fd: std.posix.socket_t) void {
-    platform.setTcpNodelay(fd); // IPPROTO_TCP=6, TCP_NODELAY=1
+    platform.setTcpNodelay(fd);
 }
 
-/// Detect transport mode from address string, stripping any `tcp://` scheme prefix.
-/// `tcp://host[:port]` or bare `host[:port]` → tcp; paths (containing a
-/// separator or starting with `.`) → local.
+/// Paths (containing a separator or starting with `.`) are local; the rest,
+/// with any `tcp://` stripped, are TCP.
 pub fn parseAddress(raw: []const u8) error{UnsupportedScheme}!Address {
     if (std.mem.indexOf(u8, raw, "://")) |sep| {
         if (std.mem.eql(u8, raw[0..sep], "tcp"))
@@ -337,11 +315,10 @@ pub fn parseAddress(raw: []const u8) error{UnsupportedScheme}!Address {
 
 pub const default_tcp_port: u16 = 9345;
 
-/// How long connecting to one address may take before it counts as unreachable.
+/// Per address tried.
 pub const connect_timeout_ms: u32 = 5000;
 
-/// Split `host[:port]`, the host optionally bracketed (as an IPv6 address with
-/// a port must be) and the port defaulting to `default_tcp_port`.
+/// Split `host[:port]`, where an IPv6 host with a port must be bracketed.
 pub fn splitHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
     var host = addr;
     var port_text: ?[]const u8 = null;
@@ -361,8 +338,7 @@ pub fn splitHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host, .port = port };
 }
 
-/// The addresses `host` names, in resolver order, into `buf`: a numeric host
-/// as it stands, a name by lookup, narrowed to `family` when one is given.
+/// In resolver order, narrowed to `family` when one is given.
 pub fn resolveHost(io_ctx: Io, host: []const u8, port: u16, family: ?Io.net.IpAddress.Family, buf: []Io.net.IpAddress) ![]Io.net.IpAddress {
     if (Io.net.IpAddress.parse(host, port)) |ip| {
         buf[0] = ip;
@@ -384,8 +360,7 @@ pub fn resolveHost(io_ctx: Io, host: []const u8, port: u16, family: ?Io.net.IpAd
     return if (n == 0) error.UnknownHostName else buf[0..n];
 }
 
-/// Connect to `addr`, giving each address a TCP host resolves to `timeout_ms`
-/// in turn; the connection records the one it reached.
+/// Tries each address a TCP host resolves to in turn.
 pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8, timeout_ms: u32) !Connection {
     switch (mode) {
         .local => return .{ .socket = try platform.connectLocal(io_ctx, addr, timeout_ms), .peer = null },
@@ -405,16 +380,13 @@ pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8, timeout
     }
 }
 
-/// Whether something accepts connections at `addr` within `timeout_ms` per
-/// address. The connection is closed unused.
 pub fn probeAddress(io_ctx: Io, mode: TransportMode, addr: []const u8, timeout_ms: u32) bool {
     const connection = connectAddress(io_ctx, mode, addr, timeout_ms) catch return false;
     platform.close(connection.socket);
     return true;
 }
 
-/// The address to listen on for `host`: its IPv4 address where it has one, as
-/// a name like `localhost` is most commonly reached that way.
+/// Prefers IPv4, as a name like `localhost` is most commonly reached that way.
 fn resolveListen(io_ctx: Io, host: []const u8, port: u16) !Io.net.IpAddress {
     var buf: [1]Io.net.IpAddress = undefined;
     const found = resolveHost(io_ctx, host, port, .ip4, &buf) catch try resolveHost(io_ctx, host, port, null, &buf);
@@ -434,7 +406,6 @@ pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Listene
     }
 }
 
-/// Listen on a fresh random local address in `socket_dir`, or an ephemeral TCP port.
 pub fn createListener(io_ctx: Io, mode: TransportMode, socket_dir: []const u8, suffix: []const u8, bind_addr: []const u8) !Listener {
     switch (mode) {
         .local => {
@@ -445,7 +416,7 @@ pub fn createListener(io_ctx: Io, mode: TransportMode, socket_dir: []const u8, s
     }
 }
 
-/// Port 0 = ephemeral (OS-assigned).
+/// Port 0 is ephemeral.
 pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16) !Listener {
     const ip = try resolveListen(io_ctx, bind_addr, port);
     var server = try ip.listen(io_ctx, .{ .reuse_address = true });

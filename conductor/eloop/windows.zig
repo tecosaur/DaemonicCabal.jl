@@ -1,17 +1,9 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Windows IOCP-based event loop for the conductor.
-//
-// Structurally the kqueue loop: one-shot readiness watches, timers, and the
-// console-control handler all surface as completion packets on one port. Each
-// watch owns a heap context whose iosb is the packet's lpOverlapped, so a
-// packet names its watch and the loop never dispatches a completion it did not
-// arm. A cancelled watch stays registered until its packet arrives, since the
-// kernel writes into the context until then.
-//
-// Synchronous operations on handles the loop has associated leave tokens the
-// loop reaps (`platform.reapSyncOp`) before anything else.
+// Windows IOCP-based event loop for the conductor, structured like kqueue.zig.
+// A cancelled watch stays registered until its packet arrives: the kernel
+// writes into it until then.
 
 const std = @import("std");
 const win32 = std.os.windows;
@@ -37,17 +29,14 @@ extern "kernel32" fn CreateThread(lpThreadAttributes: ?*anyopaque, dwStackSize: 
 extern "kernel32" fn Sleep(dwMilliseconds: DWORD) void;
 extern "kernel32" fn GetCurrentProcess() HANDLE;
 
-// Fixed completion keys are EventLocation values; worker keys are pointers
-// (>= 0x1000, bit 0 set for a health check), as in the POSIX loops.
+// Worker keys are pointers (>= 0x1000, bit 0 set for a health check).
 const tag_accept: usize = @intFromEnum(EventLocation.accept);
 
-// --- Signals: the console-control handler posts a shutdown ------------------
+// --- Signals ----------------------------------------------------------------
 
 var g_console_iocp: ?HANDLE = null;
 
-// Runs on a console-spawned thread. TRUE keeps the default handler from
-// terminating the process before the graceful shutdown runs; the watchdog
-// covers a loop parked in an unalertable call.
+// The watchdog covers a loop parked in an unalertable call.
 fn consoleCtrlHandler(_: DWORD) callconv(.winapi) BOOL {
     if (g_console_iocp) |iocp| _ = win.PostQueuedCompletionStatus(iocp, 0, @intFromEnum(EventLocation.signal), null);
     _ = CreateThread(null, 0, &watchdogProc, null, 0, null);
@@ -69,10 +58,9 @@ pub fn cleanupSignalHandlers() void {
     _ = win.SetConsoleCtrlHandler(&consoleCtrlHandler, .FALSE);
 }
 
-// --- Timers: a timer-queue callback posts the key to the port --------------
-// A pong timeout must be cancellable when the pong wins, so it posts its own
-// context as the packet's lpOverlapped and the loop owns it in `ping_timers`
-// until then; a fire-and-forget timer just frees itself in the callback.
+// --- Timers -----------------------------------------------------------------
+// An owned timer (a pong timeout) posts its context as lpOverlapped so the loop
+// can tell a cancelled one; the rest free themselves in the callback.
 
 const TimerCtx = struct { iocp: HANDLE, key: usize, timer: HANDLE, owned: bool };
 
@@ -103,8 +91,7 @@ fn scheduleTimer(iocp: HANDLE, key: usize, delay_ms: u64) void {
 
 // --- Watches ----------------------------------------------------------------
 
-/// One armed readiness notification. `op` is first, so the packet's
-/// lpOverlapped (the op's iosb) casts back to the watch.
+/// `op` is first, so the packet's lpOverlapped casts back to the watch.
 const Watch = extern struct {
     op: win.ReadinessOp,
     tag: usize,
@@ -137,8 +124,6 @@ pub const EventLoop = struct {
         g_console_iocp = null;
     }
 
-    /// Watch `fd` for readability once, reporting `tag` to the conductor;
-    /// watch again to keep watching.
     pub fn watchFd(self: *EventLoop, tag: usize, fd: posix.fd_t) void {
         const w = std.heap.page_allocator.create(Watch) catch return;
         w.* = .{ .op = undefined, .tag = tag, .fd = fd, .cancelled = false };
@@ -146,7 +131,6 @@ pub const EventLoop = struct {
             std.heap.page_allocator.destroy(w);
             return;
         };
-        // A condition that already holds yields no packet; post one ourselves.
         if (win.issueReadiness(self.poll_device, self.iocp, fd, &w.op))
             _ = win.PostQueuedCompletionStatus(self.iocp, 0, 0, @ptrCast(w));
     }
@@ -173,8 +157,6 @@ pub const EventLoop = struct {
         scheduleTimer(self.iocp, @intFromPtr(w) | 1, 1000);
     }
 
-    /// Stop waiting on a worker's pong and drain it, so the socket is not
-    /// left with a stale pending read.
     pub fn cancelPendingPing(self: *EventLoop, w: *worker.Worker) void {
         if (!w.ping_pending) return;
         self.unwatchFd(@intFromPtr(w), w.socket);
@@ -193,15 +175,13 @@ pub const EventLoop = struct {
         };
     }
 
-    // Waits out a callback that is mid-post; its packet then names a context
-    // no longer in the map and is ignored by pointer comparison alone.
+    // Waits out a mid-post callback, whose packet then fails `takePingTimer`.
     fn cancelPingTimer(self: *EventLoop, w: *worker.Worker) void {
         const kv = self.ping_timers.fetchRemove(w) orelse return;
         _ = DeleteTimerQueueTimer(null, kv.value.timer, win32.INVALID_HANDLE_VALUE);
         std.heap.page_allocator.destroy(kv.value);
     }
 
-    /// Whether `ovl` is the live timeout of `w`'s current ping; consumed if so.
     fn takePingTimer(self: *EventLoop, w: *worker.Worker, ovl: *win.OVERLAPPED) bool {
         const ctx = self.ping_timers.get(w) orelse return false;
         if (@intFromPtr(ctx) != @intFromPtr(ovl)) return false;
@@ -211,8 +191,6 @@ pub const EventLoop = struct {
         return true;
     }
 
-    /// The watch a packet belongs to, removed from the registry; null for a
-    /// packet the loop did not arm or has already cancelled.
     fn takeWatch(self: *EventLoop, ovl: *win.OVERLAPPED) ?*Watch {
         const kv = self.watches.fetchRemove(@intFromPtr(ovl)) orelse return null;
         if (!kv.value.cancelled) return kv.value;
@@ -263,9 +241,9 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 }
             } else if (key >= 0x1000 and (key & 1) == 0) {
                 const wk: *worker.Worker = @ptrFromInt(key);
-                if (!loop.takePingTimer(wk, o)) continue; // a timeout the pong already won
+                if (!loop.takePingTimer(wk, o)) continue;
                 if (conductor.isLiveWorker(wk)) handlePongTimeout(conductor, wk);
-            } else continue; // a stray: a token already consumed, or an op we never armed
+            } else continue;
         } else if (key >= 0x1000) {
             const wk: *worker.Worker = @ptrFromInt(key & ~@as(usize, 1));
             if (conductor.isLiveWorker(wk)) handleHealthCheck(conductor, wk);
@@ -300,7 +278,6 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     }
 }
 
-/// False when the listener can no longer accept (a pipe name it failed to re-create).
 fn handleAccept(conductor: *Conductor, listener: *protocol.Listener) bool {
     const accepted = listener.accept(conductor.io) catch |err| {
         std.debug.print("Accept error: {}\n", .{err});
@@ -312,7 +289,7 @@ fn handleAccept(conductor: *Conductor, listener: *protocol.Listener) bool {
     return true;
 }
 
-// --- Health checking, as in kqueue.zig --------------------------------------
+// --- Health checking --------------------------------------------------------
 
 fn queueWorkerPings(conductor: *Conductor, timeout_ms: u64) void {
     const now = conductor.currentTime();
@@ -327,8 +304,6 @@ fn maybeQueuePing(conductor: *Conductor, w: *worker.Worker, timeout_ms: u64, now
     queuePing(conductor, w, timeout_ms);
 }
 
-// Send the ping, then watch for the pong under the worker's pointer with a
-// timeout timer under the same key; whichever packet lands first decides.
 fn queuePing(conductor: *Conductor, w: *worker.Worker, timeout_ms: u64) void {
     w.sendPing();
     conductor.event_loop.watchFd(@intFromPtr(w), w.socket);
@@ -343,7 +318,7 @@ fn handleHealthCheck(conductor: *Conductor, w: *worker.Worker) void {
 }
 
 fn handlePongReady(conductor: *Conductor, w: *worker.Worker) void {
-    if (!w.ping_pending) return; // the timeout already settled this ping
+    if (!w.ping_pending) return;
     w.ping_pending = false;
     conductor.event_loop.cancelPingTimer(w);
     const n = platform.socketRead(w.socket, &w.pong_buf);
@@ -361,7 +336,7 @@ fn handlePongReady(conductor: *Conductor, w: *worker.Worker) void {
 }
 
 fn handlePongTimeout(conductor: *Conductor, w: *worker.Worker) void {
-    if (!w.ping_pending) return; // the pong beat the timer
+    if (!w.ping_pending) return;
     conductor.event_loop.unwatchFd(@intFromPtr(w), w.socket);
     w.ping_pending = false;
     if (w.active_clients > 0) {

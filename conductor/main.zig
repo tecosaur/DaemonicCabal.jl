@@ -18,13 +18,10 @@ const pal = @import("palette.zig");
 const pressure = @import("pressure.zig");
 pub const worker = @import("worker.zig");
 
-/// Who is on the other end of an accepted connection.
 pub const PeerInfo = struct {
-    /// The peer's IP address; null for a local peer, or a TCP peer whose
-    /// address is unknown, which counts as remote.
+    /// Null for a local peer, or a TCP peer of unknown address (remote).
     address: ?Io.net.IpAddress = null,
 
-    /// The peer an accept reported, from its socket address.
     pub fn fromSockaddr(storage: *const Io.Threaded.PosixAddress) PeerInfo {
         // std maps any other family to loopback, which must not pass as local.
         return .{ .address = switch (storage.any.family) {
@@ -33,13 +30,11 @@ pub const PeerInfo = struct {
         } };
     }
 
-    /// True for a TCP peer that is not provably on a loopback address.
     pub fn isRemote(self: *const PeerInfo, transport: protocol.TransportMode) bool {
         if (transport != .tcp) return false;
         return !isLoopback(self.address orelse return true);
     }
 
-    /// 127.0.0.0/8, ::1, or 127.0.0.0/8 mapped into IPv6.
     fn isLoopback(address: Io.net.IpAddress) bool {
         const v4_mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
         return switch (address) {
@@ -68,21 +63,16 @@ const EventLocation = protocol.EventLocation;
 /// Grace per retirement stage; SIGTERM/SIGKILL fire only for a wedged worker.
 const retire_grace_s: i64 = 5;
 
-/// Max workers retired per eviction episode (bounds runaway culling under
-/// sustained exogenous pressure; see WORKER_CACHE.md §Bounding).
+/// Bounds runaway culling under sustained pressure (WORKER_CACHE.md §Bounding).
 const max_evict_per_episode: usize = 4;
 
-/// Upper bound on discretionary workers ranked per episode. Episodes that would
-/// exceed this rank only the first `episode_capacity` (logged), never silently.
+/// Episodes beyond this rank only the first `episode_capacity`, logged.
 const episode_capacity: usize = 256;
 
-/// Maps the occupancy budget term's [0,1] busy-fraction onto the min→max span: a
-/// bias flattening the early climb (smaller → steeper near 0; ~0.25 is gentle) and
-/// its normalizer so busy-fraction 1 → the full span. See idleBudget.
+/// Flattens the occupancy term's early climb (smaller → steeper near 0). See idleBudget.
 const idle_budget_bias: f64 = 0.25;
 const idle_budget_log_span: f64 = @log2((1 + idle_budget_bias) / idle_budget_bias);
-/// Divisor in the cadence multiplier f(crf)=1+log2(1+(crf-1)/k): smaller → frequency
-/// earns longevity faster. See idleBudget.
+/// k in the cadence multiplier 1+log2(1+(crf-1)/k): smaller → frequency earns longevity faster.
 const cadence_mult_divisor: f64 = 2;
 
 /// Per-worker client PIDs a single reconciliation pass can hold.
@@ -109,7 +99,7 @@ pub const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
 pub const PendingSpawnList = std.array_list.Aligned(*Conductor.PendingSpawn, null);
 pub const PendingConnectionList = std.array_list.Aligned(*Conductor.PendingConnection, null);
 
-/// A retiring worker awaiting reap; owns the `Worker` until then.
+/// Owns the `Worker` until reaped.
 pub const PendingKill = struct {
     w: *worker.Worker,
     stage: enum { soft, term },
@@ -145,21 +135,15 @@ pub const Conductor = struct {
     reserve: ?*worker.Worker,
     next_worker_id: u32,
     client_counter: u32,
-    /// Workers starting up, each with whoever is waiting on it. Driven by the event loop.
     pending_spawns: PendingSpawnList,
-    /// Accepted connections not yet read: a peer that sends nothing costs nobody anything.
+    /// Read only once readable, so a silent peer costs nothing.
     pending_connections: PendingConnectionList,
-    /// Workers asked to exit, awaiting reap or escalation. Swept on the timer.
     pending_kills: PendingKillList,
-    /// Per-pool-key combined recency+frequency (LRFU). Keyed like `workers`;
-    /// outlives every worker death except a max-TTL cull (see dropColdKey).
+    /// LRFU, keyed like `workers`; survives every death but a max-TTL cull.
     crf: std.StringHashMap(worker.Crf),
-    /// Host memory-pressure monitor (inert unless JULIA_DAEMON_MEMORY_PRESSURE).
     pressure_monitor: pressure.Monitor,
     event_loop: eventLoopImpl.EventLoop,
-    /// `--status=live` subscribers, repainted in place until they disconnect.
     live_clients: std.ArrayList(LiveClient),
-    /// Live-repaint timer state; see noteLiveChange.
     live_armed: bool,
     dirty: bool,
 
@@ -235,9 +219,7 @@ pub const Conductor = struct {
         self.cfg.deinit();
     }
 
-    // Whether `w` is still in the pool/reserve. retireWorker removes a worker
-    // before it can be freed, so the event loops use this to drop stale
-    // completions rather than dereference freed (or recycled) memory.
+    // Event loops drop completions for workers retired (and maybe freed) since.
     pub fn isLiveWorker(self: *Conductor, w: *const worker.Worker) bool {
         if (self.reserve == w) return true;
         var it = self.workers.iterator();
@@ -301,11 +283,9 @@ pub const Conductor = struct {
 
     // --- Connection handling ---
 
-    /// Whether the connection's socket is still ours after handling: a client
-    /// held while its worker starts keeps it open, everything else is done.
+    /// `held`: the socket stays open for a client waiting on a starting worker.
     pub const Outcome = enum { done, held };
 
-    /// An accepted connection whose request has not arrived yet.
     pub const PendingConnection = struct { socket: posix.socket_t, peer: PeerInfo, deadline: i64 };
 
     // Event tags: a pending record's pointer, its low bits naming what turned readable.
@@ -313,8 +293,7 @@ pub const Conductor = struct {
     const tag_spawn_client: usize = 3;
     const tag_connection: usize = 4;
 
-    /// Take a freshly accepted connection; it is read once the event loop
-    /// reports it readable, or dropped after `request_timeout_s`.
+    /// Read once readable, or dropped after `request_timeout_s`.
     pub fn admitConnection(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) void {
         const pc = self.allocator.create(PendingConnection) catch return platform.close(socket);
         pc.* = .{ .socket = socket, .peer = peer.*, .deadline = self.currentTime() + request_timeout_s };
@@ -325,8 +304,7 @@ pub const Conductor = struct {
         self.event_loop.watchFd(@intFromPtr(pc) | tag_connection, socket);
     }
 
-    /// A watched fd turned readable; `tag` is what watchFd was given. A tag whose
-    /// record is no longer pending is stale and ignored.
+    /// A tag whose record is no longer pending is stale.
     pub fn onReadable(self: *Conductor, tag: usize) void {
         if (tag & tag_connection != 0) {
             const pc: *PendingConnection = @ptrFromInt(tag & ~@as(usize, 7));
@@ -344,9 +322,7 @@ pub const Conductor = struct {
         }
     }
 
-    /// Once-a-second tick while anything is pending: connections that never sent
-    /// a request, spawn deadlines, children that died before connecting. Returns
-    /// whether anything is still pending.
+    /// Runs each second while anything is pending; returns whether anything still is.
     pub fn tick(self: *Conductor) bool {
         const now = self.currentTime();
         var i: usize = 0;
@@ -384,11 +360,10 @@ pub const Conductor = struct {
     }
 
     pub fn handleConnectionFd(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) !Outcome {
-        // Readable, so the request has started arriving; a peer that stalls midway
-        // is bounded here, one that never sends is dropped by tickConnections.
+        // Bounds a peer stalling midway; one that never sends is dropped by tickConnections.
         platform.setRecvTimeout(socket, request_timeout_s);
         var magic_buf: [4]u8 = undefined;
-        // Closing without a word is `juliaclient --version` checking we are up.
+        // A silent close is `juliaclient --version` probing.
         const first = platform.socketRead(socket, &magic_buf);
         if (first == 0) return .done;
         readExact(socket, magic_buf[first..]) catch |err| {
@@ -409,10 +384,8 @@ pub const Conductor = struct {
         return .done;
     }
 
-    // A juliaclient of another protocol version. Its request is drained first (the
-    // body has not changed across versions) so the reply is not lost to a reset,
-    // then the reason is served; a client too old to read this framing at least
-    // fails at once, with the daemon log naming the cause.
+    // The body is drained first so the reply isn't lost to a reset; a client too
+    // old for this framing still fails at once.
     fn rejectClientVersion(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo, theirs: u8) !void {
         const ours = protocol.client.version;
         std.debug.print("Client speaks protocol v{d}, this daemon v{d}; rejecting\n", .{ theirs, ours });
@@ -433,8 +406,7 @@ pub const Conductor = struct {
         };
         const subject = std.mem.readInt(u32, buf[1..5], .little); // client id, or worker pid/id
         const ntype = @as(protocol.notification.Type, @enumFromInt(buf[0]));
-        // A live-status subscriber leaves on ^D (exit) or ^C (interrupt); it was
-        // never assigned to a worker, so dropping it is all that's needed.
+        // A live-status subscriber was never assigned a worker.
         if ((ntype == .client_exit or ntype == .client_interrupt) and self.dropLiveClient(subject)) return;
         switch (ntype) {
             .client_done => _ = self.clientDone(subject),
@@ -444,9 +416,7 @@ pub const Conductor = struct {
                 }
             },
             .client_interrupt => {
-                // SIGINT the worker process: Julia's runtime throws InterruptException
-                // into the running client task (force-throwing a tight loop after rapid
-                // Ctrl-C). Untargeted, but the common worker serves one client.
+                // Untargeted, but the common worker serves one client.
                 if (self.active_clients.get(subject)) |info| info.worker.signal(platform.SIG.INT);
             },
             .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{subject}),
@@ -467,7 +437,6 @@ pub const Conductor = struct {
         var request_held = false; // moved into a HeldClient while its worker starts
         defer if (!request_held) request.deinit(self.allocator);
         self.client_counter += 1;
-        // Handle special commands
         if (request.parsed.hasSwitch("--help") or request.parsed.hasSwitch("-h")) {
             try self.serveString(socket, protocol.CLIENT_HELP, 0);
             return .done;
@@ -490,8 +459,7 @@ pub const Conductor = struct {
         const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or request.parsed.hasSwitch("--sandbox")))
             .remote
         else if (foreign_ns) |ns| blk: {
-            // Refused rather than downgraded: the worker will run inside the client's
-            // own sandbox, which the daemon can neither see into nor nest another in.
+            // Refused, not downgraded: we can neither see into nor nest in the client's sandbox.
             if (request.parsed.hasSwitch("--sandbox")) {
                 std.debug.print("Client {d}: --sandbox from inside a sandbox, rejecting\n", .{self.client_counter});
                 try self.serveString(socket,
@@ -502,14 +470,11 @@ pub const Conductor = struct {
             }
             break :blk .{ .client = .{ .socket = socket, .ns = ns } };
         } else if (request.parsed.hasSwitch("--sandbox")) blk: {
-            // When cwd is inside a non-global project, mount the project rw
-            // (subsumes cwd). Otherwise mount just cwd rw.
             const cwd = trimTrailingSlashes(request.cwd);
             const proj = trimTrailingSlashes(project_path);
             const has_local_project = proj.len > 0 and proj[0] != '@';
             break :blk .{ .local = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd };
         } else .none;
-        // Platform check: sandboxing requires Linux
         if (sandbox != .none) {
             if (comptime builtin.os.tag != .linux) {
                 const msg = if (sandbox == .remote)
@@ -525,7 +490,7 @@ pub const Conductor = struct {
                 self.client_counter, @tagName(sandbox),
             });
         }
-        // Session bypass: allow remote --session=<name> to join existing local workers
+        // Session bypass
         if (sandbox == .remote) {
             const session_label = request.parsed.getSwitch("--session");
             if (session_label != null and session_label.?.len > 0 and self.cfg.sandbox_session_bypass) {
@@ -537,7 +502,6 @@ pub const Conductor = struct {
                 }
             }
         }
-        // Compute the worker key
         const tkey = args.packThreads(threads);
         const ch = julia_channel orelse "";
         const worker_key = switch (sandbox) {
@@ -545,12 +509,10 @@ pub const Conductor = struct {
             .remote => try std.fmt.allocPrint(self.allocator, "__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
             // Keyed by mount namespace: a worker never serves another sandbox or the host.
             .client => |c| try std.fmt.allocPrint(self.allocator, "__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
-            // Key encodes rw mount + project so workers only share when their
-            // mount configuration matches.
+            // Workers share only when their mounts match.
             .local => |rw| try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw, trimTrailingSlashes(project_path), ch, tkey }),
         };
         defer self.allocator.free(worker_key);
-        // Validate --sync requires --session=<label>
         if (request.parsed.hasSwitch("--sync")) {
             const session = request.parsed.getSwitch("--session");
             if (session == null or session.?.len == 0) {
@@ -560,7 +522,6 @@ pub const Conductor = struct {
             }
             std.debug.print("Client {d}: sync mode, session='{s}'\n", .{ self.client_counter, session.? });
         }
-        // Handle --restart: kill matching workers and report
         if (request.parsed.hasSwitch("--restart")) {
             const nkilled = self.killWorkersForProject(worker_key);
             std.debug.print("Restart: killed {d} worker(s) for {s}{s}{s}\n", .{
@@ -574,7 +535,6 @@ pub const Conductor = struct {
             try self.serveString(socket, msg, 0);
             return .done;
         }
-        // Assign the client a worker, or hold it while one starts
         const outcome = self.assignClientToWorker(socket, &request, worker_key, sandbox, null, null) catch |err| {
             self.reportNoWorker(socket, err, sandbox);
             return .done;
@@ -643,14 +603,12 @@ pub const Conductor = struct {
         errdefer self.allocator.free(cwd);
         const fingerprint = try r.readInt(u64);
         const client_args = try self.readClientArgs(&r);
-        // NOTE: client_args ownership transfers to parsed.
-        // The Switch structs in parsed.switches contain slices into these strings,
-        // so we must NOT free them here. They are freed via request.deinit().
+        // Switches slice into client_args; request.deinit() frees them.
         errdefer {
             for (client_args) |a| self.allocator.free(a);
             self.allocator.free(client_args);
         }
-        // Remote clients: always request full env (fingerprint cache is per-machine)
+        // The fingerprint cache is per-machine.
         const cached = if (is_remote) blk: {
             platform.write(socket, &[_]u8{protocol.client.env_request});
             const full_env = try self.readFullEnv(&r);
@@ -662,7 +620,7 @@ pub const Conductor = struct {
         });
         var parsed = try args.parse(self.allocator, client_args);
         errdefer parsed.deinit();
-        // Remote clients: skip project resolution (filesystem doesn't match)
+        // A remote client's filesystem isn't ours.
         const proj = if (is_remote) null else blk: {
             const home_dir = self.environ_map.get("HOME") orelse "";
             break :blk try project.resolve(self.allocator, self.io, &parsed, cached.julia_project, home_dir, cwd);
@@ -719,7 +677,6 @@ pub const Conductor = struct {
         client: struct { socket: posix.socket_t, ns: u64 }, // the client spawns the worker inside its own sandbox
     };
 
-    /// A client kept waiting, request and all, while the worker it needs starts.
     pub const HeldClient = struct {
         socket: posix.socket_t,
         request: ClientRequest, // its env is an owned copy: the cache entry may be evicted meanwhile
@@ -728,15 +685,13 @@ pub const Conductor = struct {
         id: u32,
     };
 
-    /// A worker starting up, and what it is for. Clients arriving for the same
-    /// pool key queue as waiters and are re-selected once it is up.
+    /// Clients for the same pool key queue as waiters, re-selected once it is up.
     pub const PendingSpawn = struct {
         spawn: worker.Worker.Spawn,
         purpose: union(enum) { reserve, client: *HeldClient },
         waiters: std.array_list.Aligned(*HeldClient, null) = .empty,
     };
 
-    /// A client's port set, sandbox-adjusted environment and worker-facing info.
     const PreparedClient = struct {
         port_set: u16,
         sandbox_env: ?[]const worker.EnvVar,
@@ -753,8 +708,7 @@ pub const Conductor = struct {
             };
         } else protocol.PortPool.none;
         errdefer self.releasePortSet(port_set);
-        // Remote sandboxed workers: override identity env vars so the
-        // worker's withenv(client.env...) doesn't leak the remote HOME etc.
+        // So withenv(client.env...) doesn't leak the remote HOME etc.
         const sandbox_env = if (sandbox == .remote) try self.buildSandboxClientEnv(request.env) else null;
         return .{ .port_set = port_set, .sandbox_env = sandbox_env, .info = .{
             .tty = request.flags.tty,
@@ -773,8 +727,7 @@ pub const Conductor = struct {
         } };
     }
 
-    /// Give the client a worker now (`direct`, the one started for it, else by
-    /// selection), or hold it (`existing_hold`, or a new one) until one has started.
+    /// `direct` is the worker started for the client; `existing_hold` resumes a hold.
     fn assignClientToWorker(self: *Conductor, socket: posix.socket_t, request: *ClientRequest, worker_key: []const u8, sandbox: SandboxKind, existing_hold: ?*HeldClient, direct: ?*worker.Worker) !Outcome {
         const list = try self.getWorkerList(worker_key);
         const session_label = request.parsed.getSwitch("--session");
@@ -788,8 +741,7 @@ pub const Conductor = struct {
             request.project orelse "(default)",
             if (sandbox != .none) " [sandboxed]" else "",
         });
-        // A worker for this key is already starting: queue behind it rather than
-        // start another, so a labelled session cannot end up with two.
+        // Queue behind a starting worker so a labelled session can't end up with two.
         if (direct == null) if (self.findPendingSpawn(worker_key)) |p| {
             const hold = existing_hold orelse try self.holdClient(socket, request, worker_key, sandbox);
             errdefer if (existing_hold == null) self.unholdClient(hold);
@@ -809,7 +761,6 @@ pub const Conductor = struct {
             self.finishAssignment(socket, request, worker_key, a, prepared.port_set);
             return .done;
         }
-        // No worker to be had: start one and hold the client until it connects.
         self.releasePortSet(prepared.port_set);
         port_set_held = false;
         const hold = existing_hold orelse try self.holdClient(socket, request, worker_key, sandbox);
@@ -823,7 +774,6 @@ pub const Conductor = struct {
         return if (label.len > 0) label else null;
     }
 
-    /// Seat the client on its assigned worker and hand it the socket paths.
     fn finishAssignment(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, assignment: WorkerAssignment, port_set: u16) void {
         std.debug.print("Assigned client {d} to worker {d}: {s}\n", .{ self.client_counter, assignment.w.id, @tagName(assignment.reason) });
         defer self.allocator.free(assignment.paths.stdin);
@@ -881,7 +831,6 @@ pub const Conductor = struct {
         self.allocator.destroy(hold);
     }
 
-    // The client is served or refused: close its socket and free everything.
     fn discardHold(self: *Conductor, hold: *HeldClient) void {
         platform.close(hold.socket);
         hold.request.deinit(self.allocator);
@@ -890,8 +839,6 @@ pub const Conductor = struct {
 
     const Resumption = union(enum) { select, on: *worker.Worker, refuse: anyerror };
 
-    // Serve a held client: on the worker started for it, by selection again
-    // (which may hold it once more), or refuse it.
     fn resumeHeld(self: *Conductor, hold: *HeldClient, how: Resumption) void {
         self.client_counter = hold.id;
         const attempt: anyerror!Outcome = switch (how) {
@@ -906,10 +853,7 @@ pub const Conductor = struct {
         if (outcome == .done) self.discardHold(hold);
     }
 
-    /// Assign a remote client to an existing (already-selected) worker.
-    /// Used for session bypass where the worker was found via global label search.
-    /// Returns false if the worker had already died and was retired, in which
-    /// case the caller should fall through to normal worker selection.
+    /// False when the worker already died; the caller falls back to selection.
     fn assignClientToExistingWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, w: *worker.Worker) !bool {
         const port_set = if (self.port_pool) |*pool| blk: {
             break :blk pool.allocate() orelse {
@@ -920,7 +864,7 @@ pub const Conductor = struct {
         errdefer self.releasePortSet(port_set);
         const session_label = request.parsed.getSwitch("--session");
         const is_labeled_session = session_label != null and session_label.?.len > 0;
-        // Remote client's cwd doesn't exist on the host — use host home
+        // The remote cwd doesn't exist here.
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
             .color = request.flags.color,
@@ -1049,8 +993,7 @@ pub const Conductor = struct {
         return null;
     }
 
-    // A free worker a new labeled session can take over: no clients, no live label,
-    // matching interactivity. Prefers the warmest (most recently active); null → spawn.
+    // Warmest first; null → spawn.
     fn findClaimableWorker(self: *Conductor, list: *WorkerList, interactive: bool, now: i64) ?*worker.Worker {
         var best: ?*worker.Worker = null;
         for (list.items) |w| {
@@ -1062,8 +1005,7 @@ pub const Conductor = struct {
         return best;
     }
 
-    // Spare the most-recently-active worker for its ppid owner; among the rest pick
-    // the lightest, so heavy workers stay idle and age out. Recency breaks ties.
+    // Spare the most recent for its ppid owner; the lightest goes, so heavy workers age out.
     fn tryExistingWorkers(self: *Conductor, list: *WorkerList, client_info: *const worker.ClientInfo, interactive: bool, now: i64) ?WorkerAssignment {
         var newest: ?*worker.Worker = null;
         for (list.items) |w| {
@@ -1076,8 +1018,7 @@ pub const Conductor = struct {
         var pick_mem: u64 = 0;
         for (list.items) |w| {
             if (w == newest.? or !self.isWorkerAvailable(w, interactive, now)) continue;
-            // Unmeasured (mem==0) ranks as heaviest so it's never the lightest pick;
-            // candidates are idle, so mem is current (clientDone + idle-ping refresh).
+            // Unmeasured ranks heaviest; an idle candidate's mem is current.
             const mem = if (w.mem > 0) w.mem else std.math.maxInt(u64);
             if (pick == null or mem < pick_mem or (mem == pick_mem and w.last_active > pick.?.last_active)) {
                 pick = w;
@@ -1107,14 +1048,10 @@ pub const Conductor = struct {
 
     // --- Worker pool management ---
 
-    /// Start the spare worker the next new project will claim, unless one
-    /// exists or is already starting.
     pub fn beginReserveSpawn(self: *Conductor) !void {
         if (self.reserve != null) return;
         for (self.pending_spawns.items) |p| if (p.purpose == .reserve) return;
-        // Match the host's JULIA_NUM_THREADS so clients (which usually inherit it)
-        // can reuse the reserve — thread count is fixed at Julia startup, and the
-        // reuse gate requires an exact match.
+        // Clients usually inherit JULIA_NUM_THREADS, and reuse needs an exact match.
         const reserve_threads = if (self.environ_map.get("JULIA_NUM_THREADS")) |v|
             args.parseThreads(v)
         else
@@ -1123,8 +1060,7 @@ pub const Conductor = struct {
         std.debug.print("Spawning reserve worker {d} (pid {d})\n", .{ p.spawn.worker.id, platform.getChildPid(p.spawn.worker.process) });
     }
 
-    // Take the reserve for `proj` when its threads and channel match; seated in
-    // `list` (and labelled) on return.
+    // Seated in `list` (and labelled) on return.
     fn claimReserve(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, threads: args.Threads, label: ?[]const u8) !?*worker.Worker {
         const r = self.reserve orelse return null;
         if (!std.meta.eql(threads, r.threads)) return null;
@@ -1143,7 +1079,7 @@ pub const Conductor = struct {
         return r;
     }
 
-    // Put a detached worker in the pool under `proj`; killed if that fails, else it orphans.
+    // Killed if seating fails, else it would orphan.
     fn seatWorker(self: *Conductor, list: *WorkerList, w: *worker.Worker, proj: []const u8, label: ?[]const u8) !void {
         self.event_loop.cancelPendingPing(w);
         errdefer self.enqueueKill(w);
@@ -1209,14 +1145,13 @@ pub const Conductor = struct {
         try self.pending_spawns.append(self.allocator, p);
         self.next_worker_id += 1;
         self.event_loop.watchFd(@intFromPtr(p) | tag_spawn_listener, p.spawn.listenerFd());
-        // The waiting client's socket turning readable means it hung up: it sends
-        // nothing else until it has its paths.
+        // It sends nothing until it has its paths, so readable means it hung up.
         if (p.purpose == .client) self.event_loop.watchFd(@intFromPtr(p) | tag_spawn_client, p.purpose.client.socket);
         self.event_loop.armTick();
         return p;
     }
 
-    // --- Pending spawns (driven by the event loop) ---
+    // --- Pending spawns ---
 
     fn findPendingSpawn(self: *Conductor, key: []const u8) ?*PendingSpawn {
         for (self.pending_spawns.items) |p| switch (p.purpose) {
@@ -1232,8 +1167,7 @@ pub const Conductor = struct {
         if (connected) |w| self.completeSpawn(p, w) else self.event_loop.watchFd(@intFromPtr(p) | tag_spawn_listener, p.spawn.listenerFd());
     }
 
-    // The waiting client hung up. Its waiters, if any, select again (and may
-    // start their own spawn); the worker underway is not worth keeping.
+    // Waiters select again; the worker underway is not worth keeping.
     fn onSpawnClientGone(self: *Conductor, p: *PendingSpawn) void {
         std.debug.print("Client {d}: left while worker {d} was starting\n", .{ p.purpose.client.id, p.spawn.worker.id });
         self.failSpawn(p, error.ClientGone);
@@ -1278,7 +1212,6 @@ pub const Conductor = struct {
         self.settleSpawn(p, .select);
     }
 
-    // Resume the spawn's own client as `how`, re-select every waiter, free the record.
     fn settleSpawn(self: *Conductor, p: *PendingSpawn, how: Resumption) void {
         if (p.purpose == .client) self.resumeHeld(p.purpose.client, how);
         for (p.waiters.items) |hold| self.resumeHeld(hold, .select);
@@ -1286,7 +1219,6 @@ pub const Conductor = struct {
         self.allocator.destroy(p);
     }
 
-    // Kill every starting worker and refuse everyone waiting on one (shutdown).
     fn abandonSpawns(self: *Conductor) void {
         while (self.pending_spawns.pop()) |p| {
             self.detachSpawn(p);
@@ -1297,8 +1229,6 @@ pub const Conductor = struct {
         }
     }
 
-    /// Search ALL worker lists for a worker with matching session label.
-    /// Used for session bypass (remote client joining local worker by label).
     fn findWorkerByLabelGlobal(self: *Conductor, label: []const u8) ?*worker.Worker {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
@@ -1316,7 +1246,6 @@ pub const Conductor = struct {
         return path[0..end];
     }
 
-    /// Test whether `path` is equal to or a subdirectory of any entry in `dirs`.
     fn pathCoveredBy(path: []const u8, dirs: []const []const u8) bool {
         const p = trimTrailingSlashes(path);
         for (dirs) |raw_d| {
@@ -1394,8 +1323,7 @@ pub const Conductor = struct {
         return self.cfg.min_ttl;
     }
 
-    // Slow half-lives for the budget signals: occupancy over half the budget span,
-    // crf over a quarter (it feeds a compounding multiplier, so it accrues slower).
+    // Slow half-lives: occupancy over half the budget span, crf a quarter (it compounds).
     fn budgetOccHalfLife(self: *const Conductor) u64 {
         return (self.cfg.max_ttl - self.cfg.min_ttl) / 2;
     }
@@ -1415,25 +1343,19 @@ pub const Conductor = struct {
         return e.read(now, self.crfHalfLife());
     }
 
-    // crf as [0,1) warmth, discounting the first summon: a key touched once is cold
-    // (a single use shouldn't read as activity or earn budget); only reuse counts.
+    // Discounts the first summon: only reuse counts as warmth.
     fn crfWarmth(self: *Conductor, key: ?[]const u8, now: i64) f64 {
         const k = key orelse return 0;
         return worker.Crf.normalize(@max(0, self.readCrf(k, now) - 1));
     }
 
-    // Eviction warmth of an idle worker: max(crf, occupancy) in [0,1).
-    // Pure, so safe to call from the status renderer.
+    // Pure, so safe from the status renderer.
     pub fn workerActivity(self: *Conductor, w: *const worker.Worker, key: ?[]const u8, now: i64) f64 {
         return @max(self.crfWarmth(key, now), w.occupancy.fast.read(now, self.activityHalfLife()));
     }
 
-    // Read process stats and fold the CPU figure into the worker's meter, timed
-    // with the ns clock. `half_life_s` blends into the EWMA (live view); null sets
-    // util to the raw rate (one-shot, where two reads a beat apart bracket it).
-    // Stat every worker, caching mem and folding cpu into the meter, so the status
-    // render reads both off the worker (no re-statting) and stays clock-free.
-    // Half-life null sets util to the raw rate (one-shot); a value blends the EWMA.
+    // Caches mem and folds cpu into the meter, so the status render stays clock-free.
+    // Null `half_life_s` sets util to the raw rate (one-shot); a value blends the EWMA.
     pub fn refreshStats(self: *Conductor, half_life_s: ?f64) void {
         const now_ns = self.nowNs();
         var it = self.workers.iterator();
@@ -1451,23 +1373,18 @@ pub const Conductor = struct {
         w.cpu.update(now_ns, s.cpu_seconds, half_life_s);
     }
 
-    // Re-sample an idle worker's footprint once per ping interval (called from the
-    // ping gate) so eviction sizing tracks post-idle drift without an extra wakeup.
+    // Once per ping interval, so sizing tracks idle drift without an extra wakeup.
     pub fn refreshIdleMemIfStale(self: *Conductor, w: *worker.Worker, now_s: i64) void {
         if (w.active_clients != 0) return;
         if (now_s - w.mem_at < @as(i64, @intCast(self.cfg.ping_interval))) return;
         refreshOne(w, self.nowNs(), null);
     }
 
-    // Drop crf history. Only ever called for a TTL-culled key (gone cold); a
-    // crash/pressure death keeps the key for re-warming, and cleanupWorker — the
-    // shared death funnel — has no handle to the crf map, enforcing this.
+    // Only for a TTL-culled key; cleanupWorker has no handle on the crf map, enforcing this.
     fn dropColdKey(self: *Conductor, key: []const u8) void {
         if (self.crf.fetchRemove(key)) |kv| self.allocator.free(kv.key);
     }
 
-    // The conductor-owned idle policy: cull workers past max_ttl regardless of
-    // pressure, dropping the crf history of any key left cold.
     pub fn enforceMaxTtl(self: *Conductor) void {
         if (self.cfg.max_ttl == 0) return;
         const now = self.currentTime();
@@ -1475,8 +1392,7 @@ pub const Conductor = struct {
         while (self.findExpired(now)) |hit| {
             std.debug.print("Worker {d}: idle {d}s past activity-scaled budget (max TTL {d}s), retiring\n", .{ hit.w.id, now - hit.w.last_active, self.cfg.max_ttl });
             self.retireWorker(hit.w);
-            // Order matters: both calls read hit.key, which dropPoolEntry frees,
-            // so dropColdKey (a content lookup) must run first.
+            // dropColdKey reads hit.key, which dropPoolEntry frees.
             if (self.workers.getPtr(hit.key)) |list| {
                 if (list.items.len == 0) {
                     self.dropColdKey(hit.key);
@@ -1486,8 +1402,7 @@ pub const Conductor = struct {
         }
     }
 
-    // Free a pool entry's list backing and map key (callers own any workers in
-    // it first; `key` dangles afterward).
+    // Callers own the list's workers first; `key` dangles afterward.
     fn dropPoolEntry(self: *Conductor, key: []const u8) void {
         if (self.workers.fetchRemove(key)) |kv| {
             var list = kv.value;
@@ -1498,10 +1413,8 @@ pub const Conductor = struct {
 
     const Expired = struct { w: *worker.Worker, key: []const u8 };
 
-    // One at a time, so the caller can retire (mutating the pool) between calls.
-    // The reserve is exempt: it is meant to sit idle ready for the next client, so
-    // idle TTL never culls it (memory pressure still can — see collectDiscretionary
-    // — after which the next client assignment recreates it).
+    // One at a time: the caller mutates the pool between calls. The reserve is
+    // exempt from TTL, though not from pressure.
     fn findExpired(self: *Conductor, now: i64) ?Expired {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
@@ -1524,8 +1437,7 @@ pub const Conductor = struct {
         var buf: [episode_capacity]Candidate = undefined;
         const cands = self.collectDiscretionary(&buf, now);
         if (cands.len == 0) return;
-        // Selection pass: read current RSS and rank ascending by value(). An
-        // unreadable footprint (size 0) ranks by activity alone — see workerValue.
+        // An unreadable footprint (size 0) ranks by activity alone.
         const now_ns = self.nowNs();
         const half_life: f64 = @floatFromInt(self.cfg.ping_interval);
         for (cands) |*c| {
@@ -1534,9 +1446,7 @@ pub const Conductor = struct {
             c.value = self.workerValue(c.w, c.key, now, c.size);
         }
         std.sort.pdq(Candidate, cands, {}, lessByValue);
-        // Validation pass: where the selection figure was RSS (Linux), refine the
-        // bottom 2*cap band with true USS and re-rank. Skipped where getProcessStats
-        // already reports the reclaimable footprint cheaply (macOS).
+        // Where selection used RSS, refine the bottom 2*cap band with true USS.
         const band = @min(2 * max_evict_per_episode, cands.len);
         if (!platform.mem_is_reclaimable) {
             for (cands[0..band]) |*c| {
@@ -1547,8 +1457,7 @@ pub const Conductor = struct {
             }
             std.sort.pdq(Candidate, cands[0..band], {}, lessByValue);
         }
-        // Retire the true bottom, re-checking each is still a valid victim (the
-        // rank snapshot may predate an assignment from a prior CQE).
+        // Re-check each: the ranking may predate an assignment.
         var evicted: usize = 0;
         for (cands[0..band]) |c| {
             if (evicted >= max_evict_per_episode) break;
@@ -1562,7 +1471,6 @@ pub const Conductor = struct {
         }
     }
 
-    // Idle in-band workers (+ the reserve), capped at episode_capacity.
     fn collectDiscretionary(self: *Conductor, buf: []Candidate, now: i64) []Candidate {
         var n: usize = 0;
         var it = self.workers.iterator();
@@ -1588,14 +1496,12 @@ pub const Conductor = struct {
         return buf[0..n];
     }
 
-    // Idle age of a cullable worker, or null if it has clients or a live label.
     fn cullableAge(self: *Conductor, w: *worker.Worker, now: i64) ?u64 {
         if (w.active_clients > 0) return null;
         if (w.session_label != null and !self.isLabelExpired(w, now)) return null;
         return @intCast(@max(0, now - w.last_active));
     }
-    // Discretionary: past the floor but not yet past its budget — cullable only under
-    // pressure. (Past budget is expired: enforceMaxTtl culls it regardless of pressure.)
+    // Past budget is expired instead: enforceMaxTtl culls it regardless.
     fn inPressureBand(self: *Conductor, w: *worker.Worker, key: []const u8, now: i64) bool {
         const age = self.cullableAge(w, now) orelse return false;
         return age >= self.cfg.min_ttl and age < self.idleBudget(w, key);
@@ -1606,8 +1512,7 @@ pub const Conductor = struct {
     //  • occupancy: sustained busy-time, so a long single session earns budget too.
     pub fn idleBudget(self: *Conductor, w: *const worker.Worker, key: []const u8) u64 {
         const max_ttl: f64 = @floatFromInt(self.cfg.max_ttl);
-        // Session workers raise the budget floor to the geomean of min/max_ttl, so
-        // a labelled REPL persists far longer when idle than an ad-hoc worker.
+        // A session worker's floor is the geomean of min/max_ttl.
         const min_ttl: f64 = if (w.session_label != null)
             @sqrt(@as(f64, @floatFromInt(self.cfg.min_ttl)) * max_ttl)
         else
@@ -1626,11 +1531,8 @@ pub const Conductor = struct {
         return age >= self.idleBudget(w, key);
     }
 
-    // value(w) = activity / size_MiB, evicted lowest-first. An unmeasured
-    // footprint (size 0: no /proc, or a platform without per-process stats)
-    // falls back to activity alone, so it ranks well above any measured worker
-    // and is spared rather than evicted on a fabricated size — and on a
-    // footprint-less platform all workers compare by activity uniformly.
+    // value = activity / size_MiB, lowest evicted first. An unmeasured footprint
+    // (size 0) ranks by activity alone, spared rather than evicted on a made-up size.
     fn workerValue(self: *Conductor, w: *worker.Worker, key: []const u8, now: i64, size_bytes: u64) f64 {
         const activity_val = self.workerActivity(w, key, now);
         if (size_bytes == 0) return activity_val;
@@ -1669,8 +1571,7 @@ pub const Conductor = struct {
     }
 
     fn removeActiveClientsForWorker(self: *Conductor, w: *worker.Worker) void {
-        // Collect-then-remove loop: repeat until no more matches, since
-        // the fixed buffer may not hold all entries in one pass.
+        // Repeat: the fixed buffer may not hold every match in one pass.
         var to_remove: [64]u32 = undefined;
         while (true) {
             var remove_count: usize = 0;
@@ -1747,11 +1648,8 @@ pub const Conductor = struct {
         .{ .key = "LOGNAME", .value = "sandbox" },
     };
 
-    /// Build a client env slice with identity vars overridden for sandbox.
-    /// Caller must free the returned slice (but not the individual EnvVars,
-    /// which point into the original env or static strings).
+    /// Free only the slice: its EnvVars point into `env` or static strings.
     fn buildSandboxClientEnv(self: *Conductor, env: []const worker.EnvVar) ![]const worker.EnvVar {
-        // Upper bound: original env + identity overrides
         const result = try self.allocator.alloc(worker.EnvVar, env.len + sandbox_identity_vars.len);
         errdefer self.allocator.free(result);
         var n: usize = 0;
@@ -1762,7 +1660,7 @@ pub const Conductor = struct {
             if (!is_identity) { result[n] = e; n += 1; }
         }
         for (sandbox_identity_vars) |e| { result[n] = e; n += 1; }
-        // Callers free what we return, so it must be the whole allocation.
+        // Callers free the whole allocation.
         return self.allocator.realloc(result, n);
     }
 
@@ -1798,7 +1696,6 @@ pub const Conductor = struct {
             info.worker.last_active = now_s;
             if (info.worker.active_clients == 0) {
                 info.worker.occupancy.detach(now_s, self.activityHalfLife(), self.budgetOccHalfLife());
-                // Sample the post-run footprint now for eviction sizing.
                 refreshOne(info.worker, now_ns, null);
             }
             const duration_us = now_us - info.start_time_us;
@@ -1831,14 +1728,10 @@ pub const Conductor = struct {
             return;
         };
         self.reconcileClientMap(w);
-        // The conductor's map is authoritative for client liveness — it is driven by
-        // the client's own client_exit, which arrives even when the worker's task is
-        // still stuck on a dead socket and thus over-counts. Derive the counter from
-        // the reconciled map, not the worker's self-report, or a stuck task leaks a
-        // phantom active client that no later sync can clear.
+        // Count from our map, not the worker's report: a task stuck on a dead socket
+        // over-counts, leaking a phantom client no later sync clears.
         const remaining = self.countMapClients(w);
         w.active_clients = remaining;
-        // Keep occupancy's busy/idle state consistent with the synced count.
         const now = self.currentTime();
         if (remaining == 0 and w.occupancy.fast.busy) {
             w.occupancy.detach(now, self.activityHalfLife(), self.budgetOccHalfLife());
@@ -1857,8 +1750,7 @@ pub const Conductor = struct {
         return count;
     }
 
-    // Prune active_clients entries for `w` the worker no longer reports (a lost
-    // client_done the count-only sync can't repair).
+    // Repairs a lost client_done, which the count-only sync can't.
     fn reconcileClientMap(self: *Conductor, w: *worker.Worker) void {
         var live_buf: [max_tracked_clients]u32 = undefined;
         const live = w.queryClients(&live_buf) catch |err| {
@@ -1965,8 +1857,6 @@ pub const Conductor = struct {
         };
     }
 
-    // The four stdio streams of a session, owning their listeners and port-set
-    // reservation; `deinit` closes everything.
     const Stream = enum(usize) { stdin, stdout, stderr, signals };
     const reply_accept_timeout_ms = 5000;
     const request_timeout_s = 10; // a client sends its whole request at once
@@ -1981,13 +1871,11 @@ pub const Conductor = struct {
             return self.conns[@intFromEnum(s)];
         }
 
-        // Write `content` to stdout, then end the session with `exit_code`.
         fn finish(self: *const ClientStreams, content: []const u8, exit_code: u8) void {
             platform.write(self.fd(.stdout), content);
             self.closeForExit(exit_code);
         }
 
-        // Shut down stdout/stderr and signal a clean client exit (no content write).
         fn closeForExit(self: *const ClientStreams, exit_code: u8) void {
             platform.shutdownWrite(self.fd(.stdout));
             platform.shutdownWrite(self.fd(.stderr));
@@ -2002,9 +1890,7 @@ pub const Conductor = struct {
         }
     };
 
-    // Create the four response listeners, hand their addresses to the client,
-    // and accept the connections it opens back. Caller owns the result and must
-    // `deinit` it; on any failure all partial resources are released first.
+    // On failure everything partial is released first.
     fn openClientStreams(self: *Conductor, client_socket: posix.socket_t) !ClientStreams {
         const mode = self.cfg.transport;
         const bind = self.cfg.bind_address;
@@ -2036,8 +1922,7 @@ pub const Conductor = struct {
         var accepted: usize = 0;
         errdefer for (conns[0..accepted]) |c| platform.close(c);
         for (0..4) |i| {
-            // A client that left after asking (a long spawn it gave up on) must not
-            // wedge the daemon in a bare accept.
+            // A client that gave up waiting must not wedge us in a bare accept.
             conns[i] = (try listeners[i].acceptTimeout(self.io, reply_accept_timeout_ms)) orelse return error.ClientGone;
             accepted += 1;
         }
@@ -2054,18 +1939,14 @@ pub const Conductor = struct {
         return format != null and std.mem.eql(u8, format.?, "live");
     }
 
-    // Serve the `--status` report. A TTY client is colour-probed first so stat
-    // gradients track its palette; a non-answering terminal degrades to the flat
-    // report. `--status=live` holds the connection for in-place repaints rather
-    // than finishing after one frame.
+    // A TTY client is colour-probed first; a non-answering terminal gets the flat report.
     fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool) !void {
         var streams = try self.openClientStreams(client_socket);
         var held = false;
         defer if (!held) streams.deinit();
         const live = tty and isLiveStatus(format);
         const palette: ?pal.Palette = if (tty and (format == null or live)) probePalette(&streams) else null;
-        // A styled TTY one-shot is deferred so its CPU meter resolves over a beat;
-        // live holds for repaints; everything else renders once and closes.
+        // A styled TTY one-shot waits a beat so its CPU meter resolves.
         if (tty and format == null) {
             try self.subscribeOneshot(streams, palette);
             held = true;
@@ -2096,21 +1977,17 @@ pub const Conductor = struct {
 
     // --- Live repaint scheduling ---
     //
-    // One self-perpetuating timer drives live `--status` repaints. A change with
-    // no timer armed repaints immediately (leading edge); further changes only
-    // set `dirty`, coalescing a burst. Each fire repaints, then re-arms fast if
-    // more changes arrived, else at the slow heartbeat to refresh stat numbers,
-    // and stops once no clients remain.
+    // A change with no timer armed repaints at once; a burst only sets `dirty`.
+    // Each fire re-arms fast if dirty, else at the heartbeat, until no clients remain.
     const live_debounce_ms = 100;
     const live_heartbeat_ms = 1000;
     const live_cursor_hide = "\x1b[?25l";
     const live_cursor_show = "\x1b[?25h";
-    // Live meter half-life: ~1.4s fades prior activity tracking the 1s heartbeat.
+    // ~1.4s tracks the 1s heartbeat.
     const live_cpu_half_life: f64 = 1.4;
     const palette_probe_timeout_s = 2;
 
-    // First frame was sent by serveStatus; hide the cursor for the live view and
-    // start the heartbeat (dirty stays false, so no redundant immediate repaint).
+    // serveStatus sent the first frame, so `dirty` stays false.
     fn subscribeLive(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, lines: usize) !void {
         try self.live_clients.append(self.allocator, .{
             .streams = streams,
@@ -2128,10 +2005,8 @@ pub const Conductor = struct {
         }
     }
 
-    // One-shot CPU-resolved status: prime every meter now, hold the connection,
-    // and fire a single frame after a beat. fireLive's refreshStats takes the second
-    // reading, so util lands at the busy-cores rate over the window. No frame is
-    // drawn yet and the cursor is left alone, so the delayed frame is a static report.
+    // fireLive's refreshStats takes the second reading, so util is the busy-cores
+    // rate over the beat. The cursor is left alone: the frame is a static report.
     fn subscribeOneshot(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette) !void {
         self.refreshStats(null); // first reading; the deferred fire takes the second
         try self.live_clients.append(self.allocator, .{
@@ -2156,9 +2031,7 @@ pub const Conductor = struct {
         self.fireLive();
     }
 
-    // A disconnected live client is reaped via its exit/interrupt notification; a
-    // one-shot disconnects itself in repaintOne after its single frame, so an
-    // all-one-shot fire leaves no clients and the timer stops.
+    // A one-shot disconnects itself after its frame, so an all-one-shot fire stops the timer.
     fn fireLive(self: *Conductor) void {
         if (self.live_clients.items.len == 0) return;
         const had_change = self.dirty;
@@ -2177,15 +2050,13 @@ pub const Conductor = struct {
         self.live_armed = true;
     }
 
-    // Paint one frame; returns whether the client stays subscribed. A one-shot
-    // gets its single CPU-resolved frame, then is closed and reaped (false).
+    // Returns whether the client stays subscribed.
     fn repaintOne(self: *Conductor, lc: *LiveClient) bool {
         const report = self.renderStatus("live", true, lc.palette) catch return !lc.oneshot;
         defer self.allocator.free(report.bytes);
         const fd = lc.streams.fd(.stdout);
-        // Wrap in a synchronized update (DEC 2026) so the terminal applies the
-        // whole frame atomically — no tearing. ESC[<n>F moves up to column 0 of
-        // the prior frame; ESC[0J clears down so a shorter frame leaves no tail.
+        // DEC 2026 synchronized update, so no tearing; ESC[<n>F returns to the frame's
+        // top and ESC[0J clears any tail.
         var hdr: [32]u8 = undefined;
         const prefix = if (lc.lines_last_printed > 0)
             std.fmt.bufPrint(&hdr, "\x1b[?2026h\x1b[{d}F\x1b[0J", .{lc.lines_last_printed}) catch unreachable
@@ -2201,14 +2072,11 @@ pub const Conductor = struct {
         return false;
     }
 
-    // Remove the live client with `id` (if any), restoring its cursor. Returns
-    // whether one was found.
     fn dropLiveClient(self: *Conductor, id: u32) bool {
         for (self.live_clients.items, 0..) |*lc, i| {
             if (lc.id != id) continue;
             var removed = self.live_clients.swapRemove(i);
-            // Newline below the final frame, then restore the cursor, so the
-            // shell prompt lands cleanly under the frozen snapshot.
+            // So the shell prompt lands under the frozen snapshot.
             platform.write(removed.streams.fd(.stdout), "\r\n" ++ live_cursor_show);
             removed.streams.deinit();
             return true;
@@ -2216,17 +2084,15 @@ pub const Conductor = struct {
         return false;
     }
 
-    // Probe the terminal palette: enter raw mode (replies un-echoed), write the
-    // queries, read stdin until the CSI 5n sentinel or a byte cap. Cooked mode is
-    // left for the client's exitClient to restore. Null if no colour reply parsed.
+    // Read raw until the CSI 5n sentinel or a byte cap; the client's exit restores
+    // cooked mode.
     fn probePalette(streams: *ClientStreams) ?pal.Palette {
         const stdin = streams.fd(.stdin);
         const signals = streams.fd(.signals);
         platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
         var qbuf: [pal.query_buf_len]u8 = undefined;
         platform.write(streams.fd(.stdout), pal.writeQueries(&qbuf));
-        // This read blocks the event loop; a client that never replies would
-        // otherwise wedge the conductor.
+        // This read blocks the event loop.
         platform.setRecvTimeout(stdin, palette_probe_timeout_s);
         defer platform.setRecvTimeout(stdin, 0);
         var buf: [4096]u8 = undefined;
@@ -2247,7 +2113,7 @@ pub const Conductor = struct {
         var w = protocol.BufWriter{ .buf = &buf };
         w.writeInt(u8, protocol.client.socket_paths);
         w.writeInt(u32, self.client_counter);
-        // In TCP mode, send just the port — the client uses the conductor host
+        // TCP: the client pairs the port with the conductor's host.
         const all = [_][]const u8{ paths.stdin, paths.stdout, paths.stderr, paths.signals };
         for (all) |path| {
             if (self.cfg.transport == .tcp) {
@@ -2288,8 +2154,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(" - Sandbox remote clients: disabled\n", .{});
     if (cfg.sandbox_session_bypass)
         std.debug.print(" - Sandbox session bypass: enabled\n", .{});
-    // The runtime dir is needed even in TCP mode: the conductor↔worker setup
-    // socket (wsetup.sock) is always a unix socket created there (see worker.zig).
+    // Needed even in TCP mode: the worker setup socket is always local.
     try Io.Dir.cwd().createDirPath(io, cfg.runtime_dir);
     conductor.cleanupRuntimeDir();
     try conductor.run();

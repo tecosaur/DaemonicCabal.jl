@@ -42,9 +42,8 @@
             end
             display(exit)
         else
-            # `print_response` leaves interrupts on here to let a long trace be cut
-            # short; relayed Ctrl-Cs keep landing after the loop breaks, so without
-            # this the render is lost to the interrupt that prompted it.
+            # Relayed Ctrl-Cs keep landing after the loop breaks, and would cut
+            # short the render of the interrupt that prompted them.
             Base.disable_sigint() do
                 printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
                 Base.show_exception_stack(IOContext(io, :limit => true), stack)
@@ -54,9 +53,6 @@
     end
 end
 
-# Override active_module to use the per-client scoped module for REPL
-# evaluation, and install an atreplinit hook that records the REPL
-# object into the client's scoped ref.
 @static if VERSION >= v"1.11"
     @eval function Base.active_module((; mistate)::REPL.LineEditREPL)
         if mistate !== nothing && mistate.active_module !== Main
@@ -65,9 +61,7 @@ end
             CLIENT_MODULE[]
         end
     end
-    # Override contextual_prompt so the module prefix is suppressed when
-    # the active module is the client's own Main (the standard version
-    # checks `mod == Main` by identity, which fails for our per-client module).
+    # Base checks `mod == Main`, which fails for the per-client Main.
     @eval function REPL.contextual_prompt(repl::REPL.LineEditREPL, prompt::Union{String,Function})
         function ()
             mod = Base.active_module(repl)
@@ -75,9 +69,7 @@ end
             prefix * (prompt isa String ? prompt : prompt())
         end
     end
-    # Override print_fullname so the client's per-session Main module
-    # prints as just "Main" rather than "Main.Main", and submodules
-    # defined within it print relative to it (e.g. "Main.Foo").
+    # The per-client Main prints as "Main", not "Main.Main".
     @eval function Base.print_fullname(io::IO, m::Module)
         mp = parentmodule(m)
         if m === Main || m === Base || m === Core || mp === m || m === CLIENT_MODULE[]
@@ -88,8 +80,7 @@ end
             Base.show_sym(io, nameof(m))
         end
     end
-    # Runs at the banner→prompt seam. Banner + replay go to the client's private
-    # stdout (not session.out) so they aren't recaptured into history.
+    # Replay goes to the client's own stdout, so history doesn't recapture it.
     pushfirst!(Base.repl_hooks, function (repl)
         CLIENT_REPL[][] = repl
         target = REPLAY_TARGET[]
@@ -101,8 +92,6 @@ end
     end)
 end
 
-# Tell the client to flip its terminal between raw (REPL reading input) and cooked
-# (code executing) via the signals socket.
 @static if VERSION >= v"1.11"
     @eval function REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool)
         term = ACTIVE_TERM[]
@@ -133,9 +122,7 @@ else
     end
 end
 
-# A near-copy of `REPL.repl_backend_loop`, modified to catch InterruptException from `take!` and retry.
-# A real TTY would stop emitting SIGINT as soon as the prompt goes raw, but it's entirely possible
-# for the client to have more interrupts in-flight.
+# `REPL.repl_backend_loop`, retrying a `take!` interrupted by a Ctrl-C still in flight.
 @eval REPL function repl_backend_loop(backend::REPLBackend, get_module::Function)
     while true
         tls = task_local_storage()
@@ -175,9 +162,7 @@ end
 
 @eval Base.exit(n) = throw(DaemonClientExit(n))
 
-# Base spawns children on fds 0/1/2, which belong to the conductor, not the
-# client. Interactive sessions leave stdin closed, and a closed handle would
-# fail the spawn with EINVAL.
+# Fds 0/1/2 are the conductor's; a closed stdin would fail a spawn with EINVAL.
 function spawn_stdin()
     reader = Base.pipe_reader(Base.stdin)
     if reader isa Base.PipeEndpoint && reader.status == Base.StatusClosed
@@ -193,9 +178,8 @@ end
     extra::Base.Redirectable...,
 ) = Base.Redirectable[in, out, err, extra...]
 
-# Base's `redirect_std*` dups onto fds 0/1/2, which belong to the conductor, so a
-# client redirect must stay within Julia. Every signature Base defines needs an
-# override, or its more specific method wins and reaches the fd.
+# `redirect_std*` must not dup onto the conductor's fds 0/1/2. Every Base
+# signature needs an override, or its more specific method wins.
 @static if VERSION >= v"1.11"
     for T in (:IO, :(Union{Base.LibuvStream, IOStream}), :(Base.AbstractPipe), :(Base.DevNull))
         @eval (f::Base.RedirectStdStream)(io::$T) = set_redirect!(f, io)

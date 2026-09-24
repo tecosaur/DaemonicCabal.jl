@@ -1,12 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Windows IOCP event loop for the client.
-// Multiplexes worker stdout, worker stderr, and the signals socket on the
-// port; local console stdin is NOT overlapped-capable, so a helper thread
-// owns it entirely: blocking ReadFile → (cooked) → worker stdin socket.
-// The worker stdin socket is never port-associated (the client only writes
-// it), so every packet on this port is one of ours — no stray-packet guards.
+// Windows IOCP event loop for the client. Console stdin cannot join a port,
+// so a helper thread forwards it to the worker.
 
 const std = @import("std");
 const win32 = std.os.windows;
@@ -24,17 +20,14 @@ const Location = enum(u64) {
 
 const buf_size = 1024;
 
-// --- stdin helper thread -------------------------------------------------
-// Console/pipe stdin can't join the IOCP, so this thread blocks in ReadFile
-// and forwards to the worker stdin socket directly. Created via raw
-// CreateThread: the binaries build -fsingle-threaded, so std.Thread is out.
+// std.Thread is unavailable under -fsingle-threaded.
 extern "kernel32" fn CreateThread(lpThreadAttributes: ?*anyopaque, dwStackSize: usize, lpStartAddress: *const fn (?*anyopaque) callconv(.winapi) win32.DWORD, lpParameter: ?*anyopaque, dwCreationFlags: win32.DWORD, lpThreadId: ?*win32.DWORD) ?win32.HANDLE;
 
 const StdinArgs = struct {
-    src: posix.fd_t, // local console/pipe handle
-    dst: posix.fd_t, // worker stdin socket
+    src: posix.fd_t,
+    dst: posix.fd_t,
     sync_mode: bool,
-    wants_raw: *bool, // shared with the loop thread — read atomically
+    wants_raw: *bool, // written by the loop thread
 };
 
 fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
@@ -44,9 +37,6 @@ fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
     while (true) {
         var got: win32.DWORD = 0;
         if (!platform.ReadFile(args.src, &buf, buf.len, &got, null).toBool() or got == 0) break;
-        // In sync mode with the worker asking for cooked input, emulate line
-        // editing locally (linux.zig parity). wants_raw is mutated by the
-        // loop thread — atomic load, plain bool field.
         if (args.sync_mode and !@atomicLoad(bool, args.wants_raw, .acquire)) {
             for (buf[0..got]) |byte| {
                 cooked_state.process(byte, args.dst);
@@ -55,13 +45,12 @@ fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
             platform.write(args.dst, buf[0..got]);
         }
     }
-    // stdin EOF: pass it on. A socket half-closes, keeping its handle valid for
-    // a late Ctrl-C write; a pipe has no half-close, so it must be closed.
+    // Half-close keeps the handle valid for a late Ctrl-C write.
     if (platform.handleKind(args.dst) == .afd) platform.shutdownWrite(args.dst) else platform.close(args.dst);
     return 0;
 }
 
-/// Run the client I/O loop on the IOCP, returning the worker's exit code.
+/// Returns the worker's exit code.
 pub fn run(
     stdin_fd: posix.fd_t,
     stdout_fd: posix.fd_t,
@@ -74,7 +63,6 @@ pub fn run(
         return error.IocpCreateFailed;
     defer win32.CloseHandle(port);
 
-    // Start the stdin helper before anything can block the loop.
     const args = try std.heap.page_allocator.create(StdinArgs);
     args.* = .{
         .src = platform.getStdinHandle(),
@@ -85,7 +73,6 @@ pub fn run(
     _ = CreateThread(null, 0, &stdinProc, args, 0, null) orelse
         return error.StdinThreadFailed;
 
-    // Associate the three read streams and queue their first receives.
     const stream_fds = [3]posix.fd_t{ stdout_fd, stderr_fd, signals_fd };
     var bufs: [3][buf_size]u8 = undefined;
     var ctxs: [3]?*platform.RecvCtx = .{ null, null, null };
@@ -97,9 +84,7 @@ pub fn run(
         ctxs[i] = platform.issueRecv(fd, &bufs[i]) orelse return error.StreamDead;
     }
 
-    // Wait for: stdout+stderr EOF (guarantees output flushed) and exit code
-    // (from the signals socket). Signals EOF without an exit code means the
-    // worker crashed — exit 1 (linux.zig parity).
+    // Signals EOF without an exit code means the worker crashed.
     var exit_code: ?u8 = null;
     var eof = [3]bool{ false, false, false };
     while (true) {
@@ -110,9 +95,6 @@ pub fn run(
             std.debug.print("Fatal: GetQueuedCompletionStatus failed\n", .{});
             return error.IocpWaitFailed;
         }
-        // Defensive: a non-enum key would be a stray packet whose ovl belongs
-        // to the issuer's frame; never touch it. reapSyncOp below makes this
-        // unreachable in practice.
         if (key >= 3) {
             std.debug.print("event loop: stray completion (key={d}) — ignoring\n", .{key});
             continue;
@@ -136,12 +118,9 @@ pub fn run(
                     else
                         platform.getStderrHandle();
                     platform.writeFile(dst, bufs[idx][0..@intCast(bytes)]);
-                    // Re-issue; a failure here (PIPE_BROKEN et al) means the
-                    // conductor closed the stream — same as EOF.
                     ctxs[idx] = platform.issueRecv(stream_fds[idx], &bufs[idx]);
                     if (ctxs[idx] == null) eof[idx] = true;
                 } else {
-                    // EOF (graceful close, 0 bytes, or stream error).
                     eof[idx] = true;
                 }
             },
@@ -161,7 +140,6 @@ pub fn run(
                 }
             },
         }
-        // Exit only once we have the exit code AND both output streams drained.
         if (exit_code != null and eof[0] and eof[1]) {
             return exit_code.?;
         }

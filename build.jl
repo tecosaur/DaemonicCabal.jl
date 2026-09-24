@@ -41,7 +41,6 @@ if staged && !isnothing(rev)
     exit(1)
 end
 
-# The vendored zig, or the one on PATH when none was fetched here.
 const ZIG = let vendored = joinpath(@__DIR__, "zig", "zig" * (Sys.iswindows() ? ".exe" : ""))
     isfile(vendored) ? vendored : something(Sys.which("zig"), vendored)
 end
@@ -81,7 +80,6 @@ function with_srcdir(f)
     end
 end
 
-# `exe` is the target's executable suffix, which the installer expects.
 function build_binaries(srcdir; outdir=".", flags, exe=Sys.iswindows() ? ".exe" : "", runner=run)
     map(BINARIES) do (name, src)
         runner(`$ZIG build-exe $flags -femit-bin=$outdir/$name$exe --name $name $srcdir/$src`)
@@ -97,8 +95,7 @@ end
 
 function start_service_with_worker(srcdir)
     manage_service || return
-    # If building from a worktree, copy the worker dir to a stable location
-    # since the worktree will be cleaned up after with_srcdir returns
+    # A build worktree is removed once with_srcdir returns.
     worker_project = joinpath(srcdir, "worker")
     if srcdir != @__DIR__
         id = bytes2hex(rand(UInt8, 4))
@@ -107,7 +104,6 @@ function start_service_with_worker(srcdir)
         worker_project = dest
         @info "Copied worker to $dest"
     end
-    # Update the worker project path in the service file
     content = read(SERVICE_FILE, String)
     content = replace(content,
         r"Environment=\"JULIA_DAEMON_WORKER_PROJECT=.*\"" =>
@@ -148,8 +144,7 @@ function build()
             ("windows", "x86_64",  String[]),
             ("windows", "aarch64", String[]),
         ]
-        # Cross-compile, package, and collect artifact metadata. Each target
-        # builds alone, so nothing another emits can reach its bundle.
+        # A directory per target, so no target's output reaches another's bundle.
         artifacts = map(BUILD_SPECS) do (os, arch, extra)
             @info "$os-$arch"
             mktempdir() do workdir

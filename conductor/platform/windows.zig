@@ -1,14 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Windows platform module: the whole `platform` surface, since nothing in
-// posix.zig applies. Every socket is an AFD endpoint handle and every local
-// socket a named-pipe instance, both plain overlapped HANDLEs driven through
-// ntdll, dispatched on a per-handle kind. There is no ws2_32 layer.
-//
-// A handle the loop has associated with its port rejects APC-routed I/O, so a
-// synchronous operation on one is issued with an Event and a heap token that
-// the loop reaps when the matching completion packet surfaces (`reapSyncOp`).
+// Windows platform module. Sockets are AFD endpoints and local sockets named
+// pipes, both overlapped HANDLEs driven through ntdll; there is no ws2_32.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,8 +21,7 @@ const HANDLE = win32.HANDLE;
 const FILETIME = win32.FILETIME;
 
 // =============================================================================
-// Win32 bindings absent from std.os.windows. kernel32/psapi/advapi32 link
-// without -l flags. Everything the event loops need is pub.
+// Win32 bindings absent from std.os.windows
 // =============================================================================
 
 pub const STD_INPUT_HANDLE: DWORD = @bitCast(@as(i32, -10));
@@ -131,12 +124,9 @@ extern "advapi32" fn GetUserNameW(lpBuffer: [*]u16, pcbBuffer: *DWORD) BOOL;
 extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(StringSecurityDescriptor: [*:0]const u16, StringSDRevision: DWORD, SecurityDescriptor: *?*anyopaque, SecurityDescriptorSize: ?*ULONG) BOOL;
 
 // =============================================================================
-// Handle registry. A handle is opaque, so its recorded kind decides which
-// syscalls move its bytes, and its port association decides how a synchronous
-// operation on it must be issued. Locked: touched from several threads.
+// Handle registry, shared with the client's helper threads
 // =============================================================================
 
-/// A pipe_listener turning readable means a client connected to it.
 pub const HandleKind = enum { afd, pipe, pipe_listener };
 
 const IoStatusToken = struct { iosb: win32.IO_STATUS_BLOCK };
@@ -172,7 +162,6 @@ pub fn isAssociated(fd: HANDLE) bool {
     return associated.contains(@intFromPtr(fd));
 }
 
-/// Idempotent: a handle joins a port once for its lifetime.
 pub fn associate(port: HANDLE, fd: HANDLE) !void {
     if (isAssociated(fd)) return;
     if (CreateIoCompletionPort(fd, port, 0, 0) == null) return error.IocpAssociateFailed;
@@ -181,7 +170,6 @@ pub fn associate(port: HANDLE, fd: HANDLE) !void {
     associated.put(std.heap.page_allocator, @intFromPtr(fd), {}) catch {};
 }
 
-/// Record a handle the caller associated itself.
 pub fn markAssociated(fd: HANDLE) void {
     lockRegistry();
     defer unlockRegistry();
@@ -196,8 +184,7 @@ fn forgetHandle(fd: HANDLE) void {
     _ = read_timeouts_ms.remove(@intFromPtr(fd));
 }
 
-/// Remove one completed sync-op token. True when `ovl` belonged to a
-/// synchronous operation, whose result was already consumed via its Event.
+/// True when `ovl` was a synchronous operation's, already consumed.
 pub fn reapSyncOp(ovl: *OVERLAPPED) bool {
     lockRegistry();
     const kv = sync_tokens.fetchRemove(@intFromPtr(ovl));
@@ -207,9 +194,7 @@ pub fn reapSyncOp(ovl: *OVERLAPPED) bool {
     return true;
 }
 
-// One auto-reset event per synchronous operation: the binaries are built
-// -fsingle-threaded, so a threadlocal event would be shared with the helper
-// threads and let them wake each other.
+// Per operation: under -fsingle-threaded a threadlocal is shared with helper threads.
 fn ensureEvent() !HANDLE {
     return CreateEventW(null, 0, 0, null) orelse error.EventCreateFailed;
 }
@@ -228,7 +213,6 @@ fn waitForApcOrAlert() void {
     _ = ntdll.NtDelayExecution(.TRUE, &forever);
 }
 
-/// Map an AFD connect status to an error callers can branch on.
 pub fn mapAfdStatus(status: win32.NTSTATUS) anyerror {
     return switch (status) {
         .IO_TIMEOUT, .TIMEOUT => error.ConnectionTimedOut,
@@ -253,8 +237,8 @@ pub fn syncAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: []u8
     };
 }
 
-/// Synchronous completion on a port-associated handle: issue with an Event,
-/// wait on it, and leave the token for the loop to reap with the packet.
+/// A port-associated handle rejects APC completion: wait on an Event and leave
+/// the token for the loop to reap with the packet.
 fn syncViaPort(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out_len: usize) !usize {
     const tok = try std.heap.page_allocator.create(IoStatusToken);
     tok.* = .{ .iosb = undefined };
@@ -274,7 +258,7 @@ fn syncViaPort(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8, out
     switch (issued) {
         .SUCCESS, .PENDING => {},
         else => |status| {
-            // No IRP in flight, so no packet will come: the token is ours again.
+            // No IRP, so no packet: the token is ours again.
             lockRegistry();
             _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
             unlockRegistry();
@@ -300,7 +284,6 @@ fn dataTransferAfd(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: ?[*]u8,
     }
     return switch (iosb.u.Status) {
         .SUCCESS => iosb.Information,
-        // A closed or reset peer reads as EOF, as on POSIX.
         .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => 0,
         else => |status| win32.unexpectedStatus(status),
     };
@@ -328,8 +311,6 @@ fn afdRecv(h: HANDLE, buf: []u8) !usize {
     return dataTransferAfd(h, win32.IOCTL.AFD.RECEIVE, std.mem.asBytes(&info), if (buf.len > 0) buf.ptr else null, buf.len);
 }
 
-// A pipe read or write: Event + token when the handle is on the loop's port
-// (the loop reaps the token), a private token otherwise.
 fn pipeSyncOp(h: HANDLE, read: bool, buf: []const u8) !usize {
     const tok = try std.heap.page_allocator.create(IoStatusToken);
     tok.* = .{ .iosb = undefined };
@@ -360,7 +341,6 @@ fn pipeSyncOp(h: HANDLE, read: bool, buf: []const u8) !usize {
         ntdll.NtWriteFile(h, ev, null, @ptrCast(&tok.iosb), &tok.iosb, @ptrCast(buf.ptr), @intCast(buf.len), null, null);
     switch (stat) {
         .SUCCESS, .PENDING => {},
-        // Synchronous disconnect: no IRP, no packet, EOF.
         .PIPE_BROKEN, .PIPE_DISCONNECTED, .PIPE_CLOSING, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => {
             disown(tok);
             return 0;
@@ -382,7 +362,6 @@ fn pipeSyncOp(h: HANDLE, read: bool, buf: []const u8) !usize {
             return win32.unexpectedStatus(tok.iosb.u.Status);
         },
     };
-    // An associated token stays registered for the loop; a private one is done.
     if (!is_assoc) std.heap.page_allocator.destroy(tok);
     return result;
 }
@@ -399,8 +378,7 @@ pub fn socketWrite(fd: HANDLE, buf: []const u8) void {
     }
 }
 
-/// Read once, honouring any `setRecvTimeout` deadline on the handle; 0 on
-/// timeout, EOF or error, as on POSIX.
+/// 0 on timeout, EOF or error.
 pub fn socketRead(fd: HANDLE, buf: []u8) usize {
     lockRegistry();
     const timeout_ms = read_timeouts_ms.get(@intFromPtr(fd));
@@ -440,9 +418,7 @@ fn issueReadEvent(fd: HANDLE, buf: []u8, ev: HANDLE, iosb: *win32.IO_STATUS_BLOC
     }
 }
 
-/// A read bounded by `timeout_ms`: issued against a private Event, cancelled
-/// and waited out on expiry (the IRP writes into this frame's iosb and `buf`).
-/// Neither pipes nor raw AFD handles accept a per-handle receive timeout.
+/// Neither pipes nor AFD handles take a receive timeout, so cancel on expiry.
 pub fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = ensureEvent() catch return 0;
@@ -468,7 +444,7 @@ pub fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
     };
 }
 
-/// Bound every following `socketRead` on `fd` (0 lifts the bound).
+/// 0 lifts the bound.
 pub fn setRecvTimeout(fd: HANDLE, seconds: u32) void {
     lockRegistry();
     defer unlockRegistry();
@@ -479,14 +455,13 @@ pub fn setRecvTimeout(fd: HANDLE, seconds: u32) void {
     }
 }
 
-/// Half-close the sending side. A pipe cannot; its peer reads EOF at close.
+/// A pipe cannot half-close.
 pub fn shutdownWrite(fd: HANDLE) void {
     if (handleKind(fd) != .afd) return;
     const info = win32.AFD.PARTIAL_DISCONNECT_INFO{ .DisconnectMode = .{ .SEND = true, .RECEIVE = false }, .Timeout = -1 };
     _ = syncAfdControl(fd, win32.IOCTL.AFD.PARTIAL_DISCONNECT, std.mem.asBytes(&info), &.{}) catch {};
 }
 
-/// CloseHandle, forgetting whatever the registry knew about the value.
 pub fn close(fd: HANDLE) void {
     forgetHandle(fd);
     win32.CloseHandle(fd);
@@ -497,7 +472,7 @@ pub fn write(fd: HANDLE, buf: []const u8) void {
     socketWrite(fd, buf);
 }
 
-/// WriteFile, for console, pipe and file handles that are not sockets.
+/// For handles that are not sockets.
 pub fn writeFile(fd: HANDLE, buf: []const u8) void {
     var off: usize = 0;
     while (off < buf.len) {
@@ -512,7 +487,6 @@ pub fn writeFile(fd: HANDLE, buf: []const u8) void {
 // AFD sockets
 // =============================================================================
 
-/// Create a stream-mode AFD endpoint (the object behind every socket).
 pub fn openAfdEndpoint(family: posix.sa_family_t) !HANDLE {
     const mode_protocol = try Io.Threaded.posixSocketModeProtocol(family, .stream, null);
     var handle: HANDLE = undefined;
@@ -564,8 +538,6 @@ fn afdBind(h: HANDLE, mode: win32.AFD.BIND_INFO.MODE, addr_bytes: []const u8) !v
     _ = try syncAfdControl(h, win32.IOCTL.AFD.BIND, @as([]const u8, @ptrCast(&storage))[0 .. @offsetOf(Storage, "addr") + addr_bytes.len], @as([]u8, @ptrCast(&storage.addr)));
 }
 
-/// Connect an AFD endpoint to an IP address, reporting the failure reason.
-/// Connect, abandoning the attempt after `timeout_ms` when one is given.
 fn connectAfd(fd: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t, timeout_ms: ?u32) !void {
     switch (addr.family) {
         posix.AF.INET, posix.AF.INET6 => {},
@@ -586,8 +558,6 @@ fn connectAfd(fd: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t, tim
     _ = try syncAfdControl(fd, win32.IOCTL.AFD.CONNECT, request, &.{});
 }
 
-/// An AFD IOCTL on an unassociated handle, cancelled and waited out if it has
-/// not completed within `timeout_ms` (the IRP writes into this frame's iosb).
 fn boundedAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, timeout_ms: u32) !void {
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = try ensureEvent();
@@ -625,9 +595,7 @@ pub fn rawConnect(fd: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t)
     return true;
 }
 
-/// Connect to `ip`, giving up after `timeout_ms`. The platform primitives
-/// report why a connect failed, where std's collapse the reasons into
-/// error.Unexpected.
+/// std's connect collapses the failure reason into error.Unexpected.
 pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !HANDLE {
     var storage: Io.Threaded.PosixAddress = undefined;
     const len = Io.Threaded.addressToPosix(&ip, &storage);
@@ -643,9 +611,8 @@ pub fn setTcpNodelay(fd: HANDLE) void {
 }
 
 // =============================================================================
-// Named pipes: the local transport. Each instance carries a DACL admitting
-// only its owner, and the first instance claims the name with
-// FIRST_PIPE_INSTANCE, so no other local user can squat or join it.
+// Named pipes. An owner-only DACL and FIRST_PIPE_INSTANCE keep other local
+// users from joining or squatting the name.
 // =============================================================================
 
 pub const max_local_addr = 256;
@@ -664,7 +631,6 @@ fn comptimeWide(comptime name: []const u8) [name.len:0]u16 {
     return out;
 }
 
-/// The per-user pipe namespace, standing in for the runtime directory.
 pub fn localSocketDir(out: anytype, _: []const u8) ![]const u8 {
     var wide: [257]u16 = undefined;
     var len: DWORD = wide.len;
@@ -678,7 +644,6 @@ pub fn localSocketPath(out: anytype, dir: []const u8, comptime name_fmt: []const
     return print(out, "{s}\\" ++ name_fmt, .{dir} ++ name_args);
 }
 
-/// The Win32 pipe path for `name`, tolerating `/` and the `\\?\pipe\` spelling.
 fn pipeWin32Name(buf: *[max_local_addr + 1]u16, name: []const u8) ![:0]const u16 {
     const prefixes = [_][]const u8{ "\\\\.\\pipe\\", "\\\\?\\pipe\\", "\\??\\pipe\\", "//./pipe/", "//?/pipe/" };
     var rel = name;
@@ -696,7 +661,6 @@ fn pipeWin32Name(buf: *[max_local_addr + 1]u16, name: []const u8) ![:0]const u16
 
 var pipe_security: ?win32.SECURITY_ATTRIBUTES = null;
 
-// A DACL granting everything to the object's owner and nothing to anyone else.
 fn pipeSecurityAttributes() !*win32.SECURITY_ATTRIBUTES {
     if (pipe_security == null) {
         const sddl = comptimeWide("D:P(A;;GA;;;OW)");
@@ -708,8 +672,7 @@ fn pipeSecurityAttributes() !*win32.SECURITY_ATTRIBUTES {
     return &pipe_security.?;
 }
 
-/// A byte-stream, duplex, overlapped instance of `name`: what libuv (and so
-/// Julia's Sockets) speaks. `first` claims the name.
+/// Byte-stream, duplex and overlapped: what libuv speaks.
 fn createPipeInstance(name: []const u8, first: bool) !HANDLE {
     var wide: [max_local_addr + 1]u16 = undefined;
     const path = try pipeWin32Name(&wide, name);
@@ -720,13 +683,10 @@ fn createPipeInstance(name: []const u8, first: bool) !HANDLE {
     return handle;
 }
 
-/// Pend the accept (FSCTL PIPE LISTEN) on an instance. The status left in
-/// `iosb` tells whether it is pending or the instance is already connected.
 pub fn issuePipeListen(h: HANDLE, iosb: *win32.IO_STATUS_BLOCK) !void {
     switch (ntdll.NtFsControlFile(h, null, null, @ptrCast(iosb), iosb, win32.CTL_CODE.PIPE.LISTEN, null, 0, null, 0)) {
         .SUCCESS, .PENDING, .PIPE_CONNECTED => |status| iosb.u.Status = status,
-        // A peer that connected and left before we listened is readiness, not
-        // an error: the readable dispatch reads it and sees EOF.
+        // A peer that came and went is readiness; the read sees EOF.
         .PIPE_CLOSING, .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE => |status| iosb.u.Status = status,
         else => |status| return win32.unexpectedStatus(status),
     }
@@ -751,7 +711,6 @@ fn pipeConnected(h: HANDLE) bool {
     return info.NamedPipeState == 3; // FILE_PIPE_CONNECTED_STATE
 }
 
-/// Wait up to `timeout_ms` for a client on an unwatched instance.
 fn awaitPipeClient(h: HANDLE, timeout_ms: u32) !bool {
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = try ensureEvent();
@@ -777,13 +736,11 @@ fn awaitPipeClient(h: HANDLE, timeout_ms: u32) !bool {
     };
 }
 
-/// Open the client end of a pipe, retrying for up to `wait_ms` while the server
-/// is between instances (it re-creates one after each accept). A missing name
-/// is waited for too when `name_may_appear`: a worker's socket may not exist yet.
+/// Retries while the server is between instances, and on a missing name too
+/// when `name_may_appear`.
 fn connectPipe(name: []const u8, wait_ms: u32, name_may_appear: bool) !HANDLE {
     var wide: [max_local_addr + 1]u16 = undefined;
     const path = try pipeWin32Name(&wide, name);
-    // NtCreateFile wants the NT spelling of the same name.
     const nt_prefix = comptimeWide("\\??\\pipe\\");
     var nt_buf: [max_local_addr + 1]u16 = undefined;
     const rel = path[comptimeWide("\\\\.\\pipe\\").len..];
@@ -839,27 +796,24 @@ pub fn listenLocal(io: Io, path: []const u8) !Listener {
 
 pub const local_transport_name = "named pipe";
 
-/// A missing name means no server; a busy one is retried within `timeout_ms`.
 pub fn connectLocal(io: Io, path: []const u8, timeout_ms: u32) !HANDLE {
     _ = io;
     return connectPipe(path, timeout_ms, false);
 }
 
-/// A single-use address its server may still be creating, so a missing name
-/// is waited for. A pipe name vanishes with its last instance: nothing to retire.
+/// A pipe name vanishes with its last instance, so there is nothing to retire.
 pub fn connectLocalOnce(io: Io, path: []const u8) !HANDLE {
     _ = io;
     return connectPipe(path, 10_000, true);
 }
 
-/// Usable off the main thread (the console-control handler); null on failure.
+/// Usable off the main thread.
 pub fn rawConnectLocal(path: []const u8) ?HANDLE {
     return connectPipe(path, 1000, false) catch null;
 }
 
 const closeHandle = close; // unambiguous inside Listener, which has its own `close`
 
-/// A listening pipe instance or AFD socket with its address.
 pub const Listener = struct {
     backing: union(enum) { pipe: HANDLE, socket: Io.net.Server },
     addr_buf: [max_local_addr]u8,
@@ -884,7 +838,6 @@ pub const Listener = struct {
             .socket => |s| s.socket.handle,
         };
     }
-    /// Accept the connection an event loop reported waiting.
     pub fn accept(self: *Listener, io: Io) !protocol.Connection {
         return switch (self.backing) {
             .pipe => .{ .socket = try self.takePipeConnection(), .peer = null },
@@ -894,7 +847,7 @@ pub const Listener = struct {
             },
         };
     }
-    /// Accept a connection arriving within `timeout_ms` (0: one already waiting); null when none does.
+    /// 0 takes only a connection already waiting.
     pub fn acceptTimeout(self: *Listener, io: Io, timeout_ms: i32) !?HANDLE {
         switch (self.backing) {
             .pipe => |instance| {
@@ -916,9 +869,8 @@ pub const Listener = struct {
             .socket => |*s| s.deinit(io),
         }
     }
-    // The connected instance becomes the connection; a fresh instance takes over
-    // listening. The old handle must be closed before the name is re-created,
-    // or the create fails with ACCESS_DENIED, so the connection lives on a dup.
+    // Re-creating the name fails with ACCESS_DENIED while the old handle is
+    // open, so the connection lives on a dup.
     fn takePipeConnection(self: *Listener) !HANDLE {
         const instance = self.backing.pipe;
         const conn = try dupHandle(instance);
@@ -931,9 +883,8 @@ pub const Listener = struct {
 };
 
 // =============================================================================
-// Readiness, for the conductor's event loop. The AFD poll is issued on a
-// dedicated handle so sockets themselves never join the port, keeping the
-// cheap APC path for their synchronous reads.
+// Readiness. AFD polls go through a dedicated handle so sockets stay off the
+// port and keep the APC path for synchronous reads.
 // =============================================================================
 
 const PollHandleInfo = extern struct { Handle: HANDLE, Events: ULONG, Status: win32.NTSTATUS };
@@ -950,7 +901,7 @@ fn pollInfo(fd: HANDLE, timeout_ms: i32) PollInfo {
     };
 }
 
-/// Whether a socket turns readable within `timeout_ms` (negative: forever).
+/// Negative `timeout_ms` waits forever.
 fn pollReadable(fd: HANDLE, timeout_ms: i32) !bool {
     var info = pollInfo(fd, timeout_ms);
     _ = syncAfdControl(fd, win32.IOCTL.AFD.POLL, std.mem.asBytes(&info), std.mem.asBytes(&info)) catch |err| switch (err) {
@@ -960,19 +911,15 @@ fn pollReadable(fd: HANDLE, timeout_ms: i32) !bool {
     return info.NumberOfHandles > 0;
 }
 
-/// The AFD handle the loop issues socket polls on; associate it with the port.
 pub fn openPollDevice() !HANDLE {
     return openAfdEndpoint(posix.AF.INET);
 }
 
-/// Storage for one pending readiness notification; `iosb` is the packet's
-/// lpOverlapped, so the owner is recovered by casting it back.
+/// `iosb` comes back as the packet's lpOverlapped.
 pub const ReadinessOp = extern struct { iosb: win32.IO_STATUS_BLOCK, poll: PollInfo };
 var zero_read_buf: [1]u8 = undefined; // a zero-length read still wants a buffer address
 
-/// Arm a one-shot readiness notification for `fd` into `op`, routed to `port`.
-/// Returns true when the condition already holds and no completion packet will
-/// follow, in which case the caller posts one itself.
+/// True when no packet will follow, so the caller posts one itself.
 pub fn issueReadiness(poll_device: HANDLE, port: HANDLE, fd: HANDLE, op: *ReadinessOp) bool {
     switch (handleKind(fd)) {
         .afd => {
@@ -983,8 +930,6 @@ pub fn issueReadiness(poll_device: HANDLE, port: HANDLE, fd: HANDLE, op: *Readin
         .pipe_listener => {
             associate(port, fd) catch return true;
             issuePipeListen(fd, &op.iosb) catch return true;
-            // An instance a client reached first (and may have left already,
-            // its bytes still buffered) completes inline without a packet.
             return op.iosb.u.Status != .PENDING;
         },
         .pipe => {
@@ -995,16 +940,15 @@ pub fn issueReadiness(poll_device: HANDLE, port: HANDLE, fd: HANDLE, op: *Readin
     }
 }
 
-/// Abandon a pending readiness notification; its packet still arrives, cancelled.
+/// Its packet still arrives, cancelled.
 pub fn cancelReadiness(poll_device: HANDLE, fd: HANDLE, op: *ReadinessOp) void {
     var scratch: win32.IO_STATUS_BLOCK = undefined;
     const issued_on = if (handleKind(fd) == .afd) poll_device else fd;
     _ = ntdll.NtCancelIoFileEx(issued_on, &op.iosb, &scratch);
 }
 
-/// One in-flight overlapped read into a caller's buffer (the client loop's
-/// stream reads); `iosb` is the packet's lpOverlapped. Null when the stream is
-/// already dead, which callers treat as EOF.
+/// `iosb` comes back as the packet's lpOverlapped; `issueRecv` gives null on a
+/// dead stream.
 pub const RecvCtx = extern struct {
     iosb: win32.IO_STATUS_BLOCK,
     iovec: [1]win32.AFD.WSABUF(.@"var"),
@@ -1037,13 +981,10 @@ pub fn issueRecv(h: HANDLE, buf: []u8) ?*RecvCtx {
 }
 
 // =============================================================================
-// Processes. A child's `pid` is its process handle (std's Child.Id), used
-// directly for waits, termination and statistics.
+// Processes. A `pid` here is a process handle (std's Child.Id).
 // =============================================================================
 
-/// The signals shared code sends. TERM and KILL both terminate; INT would
-/// need a shared console, which spawned workers have none of; USR1 is a
-/// POSIX-only nudge.
+/// TERM and KILL both terminate; USR1 is a no-op.
 pub const SIG = enum { INT, TERM, KILL, USR1 };
 
 pub fn getpid() DWORD {
@@ -1060,10 +1001,8 @@ pub fn kill(pid: posix.pid_t, sig: SIG) usize {
     return if (TerminateProcess(pid, 1).toBool()) 0 else 1;
 }
 
-/// Start a worker on pipes: a headless conductor's inherited stdio is
-/// file-backed, which libuv rejects at worker start. Its stdin is at EOF and
-/// its stdout closed, so a stray raw write fails rather than filling a pipe
-/// nobody drains; stderr is kept for `dumpChildStderr`.
+/// libuv rejects the file-backed stdio a headless conductor would pass on.
+/// stdout is closed so a stray write fails rather than fills an undrained pipe.
 pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
     var child = try std.process.spawn(io, .{ .argv = argv, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe });
     if (child.stdin) |f| f.close(io);
@@ -1073,8 +1012,7 @@ pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
     return child;
 }
 
-/// Print what a dead worker wrote to its stderr pipe, then close it. The
-/// process must have exited: the read runs to EOF.
+/// The worker must have exited: the read runs to EOF.
 pub fn dumpChildStderr(io: Io, allocator: Allocator, child: *std.process.Child, id: u32) void {
     var f = child.stderr orelse return;
     child.stderr = null;
@@ -1086,13 +1024,10 @@ pub fn dumpChildStderr(io: Io, allocator: Allocator, child: *std.process.Child, 
     if (data.len > 0) std.debug.print("Worker {d} stderr:\n{s}\n", .{ id, data });
 }
 
-/// The number a pid prints and travels the wire as (a pid here is a process handle).
 pub fn pidNumber(pid: posix.pid_t) u32 {
     return GetProcessId(pid);
 }
-/// A socket slot with no connection in it yet.
 pub const no_socket: posix.socket_t = win32.INVALID_HANDLE_VALUE;
-/// A worker some other process started for us: no handle to wait on or kill.
 pub const no_child = std.process.Child{ .id = null, .thread_handle = undefined, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
 
 pub fn getChildPid(child: anytype) DWORD {
@@ -1124,8 +1059,7 @@ pub fn getProcessStats(pid: posix.pid_t) ?ProcessStats {
     return .{ .mem_bytes = pmc.WorkingSetSize, .cpu_seconds = cpu_100ns / 10_000_000.0 };
 }
 
-// WorkingSetSize is resident, not private, and no cheap private-page figure
-// exists here, so eviction sizes workers by their resident set.
+// No cheap private-page figure exists, so workers are sized by working set.
 pub const mem_is_reclaimable = false;
 pub fn processReclaimable(_: posix.pid_t) ?u64 {
     return null;
@@ -1144,7 +1078,6 @@ pub fn readMemInfo() ?MemInfo {
     return .{ .available = ms.ullAvailPhys, .total = ms.ullTotalPhys };
 }
 
-/// Image base name of a process given its numeric pid, for the status report.
 pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
     const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
     const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, .FALSE, pid) orelse return null;
@@ -1160,12 +1093,10 @@ pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// The POSIX SIGUSR1 socket-recreate nudge has no counterpart here.
 pub fn requestSocketRecreate(_: u32) bool {
     return false;
 }
 
-/// %LOCALAPPDATA%\julia-daemon: persistent, so startup cleanup still matters.
 pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const u8 {
     const env: std.process.Environ = .{ .block = .global };
     const appdata = try env.getAlloc(std.heap.page_allocator, "LOCALAPPDATA");
@@ -1173,8 +1104,6 @@ pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const 
     return print(out, "{s}\\julia-daemon", .{appdata});
 }
 
-/// Every `KEY=VALUE` of the process environment, as UTF-8. The block lives in
-/// the PEB as one double-NUL-terminated wide string, walked under its lock.
 pub fn collectEnviron(allocator: Allocator, environ: std.process.Environ) ![]const []const u8 {
     _ = environ;
     const peb = win32.peb();
@@ -1192,7 +1121,7 @@ pub fn collectEnviron(allocator: Allocator, environ: std.process.Environ) ![]con
     return kvs.items;
 }
 
-/// Format into either an allocator (owned slice) or a `[]u8` buffer (sub-slice).
+/// Into an allocator (owned slice) or a `[]u8` buffer (sub-slice).
 pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
     if (@TypeOf(out) == std.mem.Allocator)
         return std.fmt.allocPrint(out, fmt, args)
@@ -1219,9 +1148,7 @@ const ENABLE_ECHO_INPUT: DWORD = 0x0004;
 const ENABLE_VIRTUAL_TERMINAL_INPUT: DWORD = 0x0200;
 var saved_mode: ?DWORD = null;
 
-// Raw: no line buffering or echo, and VT input so arrow and home/end keys
-// arrive as the sequences LineEdit parses. Processed input stays on so Ctrl-C
-// still reaches the console-control handler.
+// Processed input stays on so Ctrl-C still reaches the ctrl handler.
 pub fn setRawMode(stdin: HANDLE, raw: bool) void {
     if (raw) {
         var mode: DWORD = undefined;
@@ -1239,9 +1166,7 @@ pub fn setRawModeStdin(raw: bool) void {
 
 const ConsoleSaved = struct { stdout: HANDLE, stderr: HANDLE, out_mode: DWORD, err_mode: DWORD, out_cp: DWORD, in_cp: DWORD };
 
-/// Switch the console to VT processing and UTF-8 code pages, so the worker's
-/// escapes and text render; null when stdout is not a console. Restore with
-/// `restoreConsoleIo`.
+/// Null when stdout is not a console.
 pub fn setupConsoleIo(stdout: HANDLE, stderr: HANDLE) ?*anyopaque {
     var out_mode: DWORD = undefined;
     if (!GetConsoleMode(stdout, &out_mode).toBool()) return null;
@@ -1303,9 +1228,7 @@ pub fn setWorkerExecuting(executing: bool) void {
 }
 var g_signal_handler: ?SignalHandler = null;
 
-// Runs on a console-spawned thread. Ctrl-C at a raw prompt is a \x03 for
-// LineEdit, otherwise an interrupt notification; the console going away is an
-// exit. TRUE keeps the default handler from terminating the process first.
+// Runs on a console-spawned thread. TRUE stops the default handler killing us.
 fn clientCtrlHandler(dwCtrlType: DWORD) callconv(.winapi) BOOL {
     const handler = g_signal_handler orelse return .FALSE;
     switch (dwCtrlType) {

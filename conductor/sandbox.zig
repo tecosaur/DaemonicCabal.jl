@@ -1,19 +1,9 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Linux sandbox for untrusted Julia worker processes.
-//
-// Uses unprivileged user namespaces (no root required) to isolate a
-// child process with its own uid mapping, PID namespace, and filesystem.
-// The child sees a minimal root built from read-only bind mounts of host
-// system directories plus an overlayfs on ~/.julia (so writes are
-// ephemeral). The host home directory is not accessible.
-//
-// Public API:
-//   spawnSandboxed  — build argv/envp from config, fork+exec in sandbox
-//   execInSandbox   — fork+exec pre-built argv/envp in sandbox
-//   envAllowed      — test whether an env var passes the sandbox allowlist
-//   cleanupCgroup   — remove a sandbox's cgroup directory by worker ID
+// Linux sandbox for untrusted Julia workers, built on unprivileged user
+// namespaces: read-only host system dirs, an ephemeral overlay on the depot,
+// and no access to the host home.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -40,7 +30,6 @@ const CLONE_NEWUSER: usize = 0x10000000;
 // --- Public types ---
 
 pub const SandboxConfig = struct {
-    // Process execution
     julia_executable: []const u8,
     julia_channel: ?[]const u8,
     threads_arg: ?[]const u8,
@@ -48,30 +37,26 @@ pub const SandboxConfig = struct {
     worker_args: []const u8,
     eval_expr: []const u8,
     host_environ: *const std.process.Environ.Map,
-    setup_socket_path: []const u8, // host path to wsetup-*.sock (parent dir bind-mounted rw)
-    worker_id: u32, // conductor-assigned worker ID (unique, used for cgroup naming)
-    // Isolation
+    setup_socket_path: []const u8, // its parent dir is bound rw
+    worker_id: u32,
     host_home: []const u8,
-    depot_env: ?[]const u8 = null, // host JULIA_DEPOT_PATH, verbatim (null = unset)
+    depot_env: ?[]const u8 = null, // host JULIA_DEPOT_PATH, null when unset
     extra_ro_binds: []const []const u8 = &.{},
     extra_rw_binds: []const []const u8 = &.{},
     max_memory: ?[]const u8,
     max_cpu: ?u32,
 };
 
-/// Maximum depot entries mounted; further entries are ignored with a warning.
 pub const max_depots: usize = 8;
 
 pub const DepotMount = struct {
     path: []const u8,
-    /// Overlaid rather than bound read-only. Set for the depot Julia writes to
-    /// and for any depot containing it, since a read-only ancestor would place
-    /// that overlay beneath a read-only mount.
+    /// Also set on any ancestor of the written depot, which a read-only mount
+    /// would otherwise cover.
     writable: bool,
 };
 
-/// Depot directories to mount, deduplicated and ordered shallowest-first so a
-/// nested depot lands on top of its ancestors rather than under them.
+/// Ordered shallowest-first, so a nested depot mounts over its ancestors.
 pub const DepotTargets = struct {
     entries: [max_depots]DepotMount = undefined,
     len: usize = 0,
@@ -85,8 +70,7 @@ pub const DepotTargets = struct {
         return if (self.len == 0) "" else self.entries[self.writable_at].path;
     }
 
-    /// The first occurrence wins, so a later duplicate cannot displace the
-    /// writable depot.
+    /// First occurrence wins, so a duplicate cannot displace the writable depot.
     fn push(self: *DepotTargets, path: []const u8) void {
         if (path.len == 0) return;
         for (self.entries[0..self.len]) |e|
@@ -99,8 +83,7 @@ pub const DepotTargets = struct {
         self.len += 1;
     }
 
-    /// Apply the ancestor rule and mount ordering. Required before mounting: a
-    /// mount over an ancestor shadows everything already mounted beneath it.
+    /// Required before mounting: a mount over an ancestor shadows its descendants.
     fn arrange(self: *DepotTargets) void {
         if (self.len == 0) return;
         const writable = self.entries[0].path;
@@ -118,21 +101,14 @@ pub const DepotTargets = struct {
     }
 };
 
-/// Resolve `JULIA_DEPOT_PATH` to the directories the sandbox must mount, in
-/// mount order and tagged with their access mode.
-///
-/// Follows the Julia manual's empty-entry rules: an empty entry expands to the
-/// defaults, *including* the user depot unless an explicit entry already
-/// supplies one; an entirely empty variable yields no depots. Bundled system
-/// depots are not returned — they live under the Julia install root, which is
-/// mounted separately.
+/// Follows the Julia manual's empty-entry rules. Bundled depots are left out:
+/// they live under the install root, mounted separately.
 pub fn resolveDepots(depot_env: ?[]const u8, host_home: []const u8) DepotTargets {
     var out: DepotTargets = .{};
     // An empty string is a zero-element list, not a one-element empty list.
     const env = depot_env orelse "";
     if (depot_env != null and env.len == 0) return out;
-    // A leading empty entry puts the user depot first; so does the absence of
-    // any explicit entry, which is why ":" is equivalent to leaving env unset.
+    // ":" is equivalent to unset: both put the user depot first.
     const explicit = std.mem.indexOfNone(u8, env, ":") != null;
     if (!explicit or env[0] == ':') out.push(homeDepotPath(host_home));
     var it = std.mem.splitScalar(u8, env, ':');
@@ -143,17 +119,14 @@ pub fn resolveDepots(depot_env: ?[]const u8, host_home: []const u8) DepotTargets
     return out;
 }
 
-/// Where the Julia executable's supporting files live.
 pub const InstallRoot = union(enum) {
-    /// Directory containing `share/julia/base` — a complete Julia install.
+    /// Contains `share/julia/base`.
     install_root: []const u8,
-    /// Directory containing `juliaup.json` — a juliaup home holding every channel.
+    /// Contains `juliaup.json`, with every channel.
     launcher_home: []const u8,
-    /// No marker found; nothing safe to bind.
     unrecognised,
 };
 
-/// Directories never bound as an install root, whatever markers they contain.
 fn isDangerousRoot(path: []const u8, host_home: []const u8) bool {
     if (path.len == 0) return true;
     if (std.mem.eql(u8, path, "/")) return true;
@@ -162,23 +135,15 @@ fn isDangerousRoot(path: []const u8, host_home: []const u8) bool {
     return host_home.len > 0 and std.mem.eql(u8, path, host_home);
 }
 
-/// True if `path` exists, via a raw syscall (no allocator, no `Io` — this runs
-/// in the post-fork sandbox child as well as from the parent).
+/// Raw syscall: also runs in the post-fork sandbox child.
 fn pathExists(path: [*:0]const u8) bool {
     return errnoFromRc(linux.access(path, 0)) == null;
 }
 
-/// Classify the Julia executable's install directory, walking up at most two
-/// levels and recognising the root by content: a Julia install always carries
-/// `share/julia/base`, a juliaup home `juliaup.json`. Recognition by shape is
-/// unsafe — `dirname(dirname("/home/user/julia"))` is `/home`.
-///
-/// `exe_path` must NOT be canonicalised: juliaup's per-channel symlinks resolve
-/// to one versioned install, but the launcher may exec any channel, so only the
-/// unresolved path describes the mount actually needed.
-///
-/// `prefix` is prepended when probing, but not to the result — the sandbox
-/// child runs after `pivot_root`, where the host is under `/oldroot`.
+/// Recognises the root by content within two levels, never by shape:
+/// `dirname(dirname("/home/user/julia"))` is `/home`. `exe_path` must not be
+/// canonicalised, as the juliaup launcher may exec any channel. `prefix` is
+/// used only for probing (the host sits under `/oldroot` after pivot_root).
 pub fn classifyInstallPrefixed(exe_path: []const u8, host_home: []const u8, prefix: []const u8) InstallRoot {
     if (exe_path.len == 0 or exe_path[0] != '/') return .unrecognised;
     var dir = std.fs.path.dirname(exe_path) orelse return .unrecognised;
@@ -195,7 +160,6 @@ pub fn classifyInstallPrefixed(exe_path: []const u8, host_home: []const u8, pref
     return .unrecognised;
 }
 
-/// Classify against the live filesystem, for callers outside the sandbox child.
 pub fn classifyInstall(exe_path: []const u8, host_home: []const u8) InstallRoot {
     return classifyInstallPrefixed(exe_path, host_home, "");
 }
@@ -217,8 +181,6 @@ pub const SandboxError = error{
 
 // --- Public API ---
 
-/// Build argv/envp from config, then fork+exec inside a sandboxed namespace.
-/// Returns the child PID on success.
 pub fn spawnSandboxed(allocator: Allocator, config: *const SandboxConfig) SandboxError!posix.pid_t {
     const argv = buildArgv(allocator, config) catch return SandboxError.ExecFailed;
     defer freeNullTermList(allocator, argv);
@@ -227,8 +189,6 @@ pub fn spawnSandboxed(allocator: Allocator, config: *const SandboxConfig) Sandbo
     return execInSandbox(argv, envp, config);
 }
 
-/// Fork+exec pre-built argv/envp inside a sandboxed namespace.
-/// Returns the child PID on success.
 pub fn execInSandbox(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
@@ -236,18 +196,15 @@ pub fn execInSandbox(
 ) SandboxError!posix.pid_t {
     const orig_uid = linux.getuid();
     const orig_gid = linux.getgid();
-    // First fork: parent gets child PID back
     const pid1 = callFork() orelse return SandboxError.ForkFailed;
     if (pid1 != 0) return pid1;
-    // Child 1: hold the signals it will relay until there is a worker to relay
-    // them to, then create new user/mount/PID namespaces.
+    // Child 1 holds the signals it relays until there is a worker to take them.
     var relayed = posix.sigemptyset();
     posix.sigaddset(&relayed, .INT);
     posix.sigaddset(&relayed, .TERM);
     posix.sigprocmask(posix.SIG.BLOCK, &relayed, null);
     setupNamespaces(orig_uid, orig_gid) catch |err|
         fatalChild("namespace setup", err);
-    // Second fork: enter the PID namespace (child becomes PID 1 inside)
     const pid2 = callFork() orelse
         fatalChild("inner fork", SandboxError.ForkFailed);
     if (pid2 != 0) {
@@ -265,8 +222,7 @@ pub fn execInSandbox(
         }
         linux.exit_group(@intCast(status >> 8));
     }
-    // Child 2 (PID 1 inside): the signal mask survives exec, so clear it before
-    // building the filesystem and exec'ing.
+    // Child 2, PID 1 inside: the signal mask survives exec.
     posix.sigprocmask(posix.SIG.UNBLOCK, &relayed, null);
     setupFilesystem(config) catch |err|
         fatalChild("filesystem setup", err);
@@ -280,15 +236,13 @@ pub fn execInSandbox(
     linux.exit_group(127);
 }
 
-// Signals aimed at a sandbox land on child 1, the waiter outside the pid
-// namespace. It relays them to the worker rather than dying on them, which would
-// take the worker down through its parent-death signal.
+// Child 1 relays rather than dies, which would kill the worker through its
+// parent-death signal.
 var relay_target: posix.pid_t = 0;
 fn relaySignal(sig: posix.SIG) callconv(.c) void {
     _ = linux.kill(relay_target, sig);
 }
 
-/// Test whether an environment variable key passes the sandbox allowlist.
 pub fn envAllowed(key: []const u8) bool {
     if (std.mem.startsWith(u8, key, "JULIA_")) return true;
     for (env_allowlist) |allowed|
@@ -296,7 +250,6 @@ pub fn envAllowed(key: []const u8) bool {
     return false;
 }
 
-/// Remove a sandbox's cgroup directory after the worker exits. Best-effort.
 pub fn cleanupCgroup(worker_id: u32) void {
     var buf: [128]u8 = undefined;
     const path = fmtPath(&buf, "/sys/fs/cgroup/julia-sandbox-{d}", .{worker_id}) orelse return;
@@ -310,7 +263,7 @@ fn setupNamespaces(orig_uid: linux.uid_t, orig_gid: linux.gid_t) SandboxError!vo
         logErrno("unshare", e);
         return SandboxError.UnshareFailed;
     }
-    // Deny setgroups, then map uid/gid: 0 inside → real uid/gid outside
+    // setgroups must be denied before an unprivileged gid_map write.
     writeFile("/proc/self/setgroups", "deny") catch return SandboxError.SetgroupsFailed;
     var uid_buf: [64]u8 = undefined;
     const uid_map = std.fmt.bufPrint(&uid_buf, "0 {d} 1\n", .{orig_uid}) catch
@@ -323,14 +276,6 @@ fn setupNamespaces(orig_uid: linux.uid_t, orig_gid: linux.gid_t) SandboxError!vo
 }
 
 // --- Filesystem construction ---
-//
-// Build a new root from scratch:
-//   1. mountStaging    — tmpfs staging area, overlay dirs, first pivot_root
-//   2. mountSystemDirs — /dev, /proc, /tmp, system ro-binds
-//   3. mountHome       — /home tmpfs, juliaup config, depot overlay, sandbox symlink
-//   4. extra binds     — caller-specified ro and rw paths (e.g. worker project, client cwd)
-//   5. socket dir      — per-worker runtime subdirectory (rw, for stdio sockets)
-//   6. final pivot     — pivot_root into /newroot, detach staging
 
 fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
     const home = config.host_home;
@@ -338,7 +283,6 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
     try mountSystemDirs();
     try mountHome(config, home);
     try mountJuliaInstall(config.julia_executable, home);
-    // Extra read-only bind mounts
     for (config.extra_ro_binds) |path| {
         if (path.len == 0) continue;
         var src_buf: [512]u8 = undefined;
@@ -348,7 +292,6 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
         mkdirp(dst);
         robindOptional(src, dst);
     }
-    // Extra read-write bind mounts (e.g. client cwd/project for --sandbox)
     for (config.extra_rw_binds) |path| {
         if (path.len == 0) continue;
         var src_buf: [512]u8 = undefined;
@@ -358,9 +301,7 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
         mkdirp(dst);
         try mountBind(src, dst);
     }
-    // Per-worker socket directory: bind-mount rw so the worker can
-    // create stdio sockets visible to the host. Only the per-worker
-    // subdirectory (e.g. sandbox-1/) is exposed, not the main runtime dir.
+    // Only the per-worker socket subdirectory is exposed, not the runtime dir.
     if (config.setup_socket_path.len > 0) {
         if (std.mem.lastIndexOfScalar(u8, config.setup_socket_path, '/')) |sep| {
             const runtime_dir = config.setup_socket_path[0..sep];
@@ -374,7 +315,6 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
             }
         }
     }
-    // Final pivot: enter /newroot, detach staging
     mountFlags("oldroot", MS_REC | MS_PRIVATE) catch {};
     if (errnoFromRc(linux.chdir("/newroot"))) |_| return SandboxError.ChdirFailed;
     if (errnoFromRc(linux.pivot_root(".", "."))) |e| {
@@ -386,20 +326,16 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
     _ = linux.chdir("/home/sandbox");
 }
 
-/// Create tmpfs staging area, prepare overlay dirs, pivot_root into staging.
 fn mountStaging() SandboxError!void {
-    // Prevent mount propagation back to host
+    // No mount propagation back to the host.
     mountFlags("/", MS_SLAVE | MS_REC) catch return SandboxError.MountFailed;
     mountTmpfs("/tmp", MS_NOSUID | MS_NODEV, null) catch return SandboxError.MountFailed;
     if (errnoFromRc(linux.chdir("/tmp"))) |_| return SandboxError.ChdirFailed;
-    // Staging layout
     try mkdirE("newroot");
     mountBind("newroot", "newroot") catch return SandboxError.MountFailed;
     try mkdirE("oldroot");
-    // Overlay upper/work on the staging tmpfs — ephemeral, per-sandbox
     try mkdirE("ovl-upper");
     try mkdirE("ovl-work");
-    // Pivot into staging
     if (errnoFromRc(linux.pivot_root("/tmp", "oldroot"))) |e| {
         logErrno("pivot_root staging", e);
         return SandboxError.PivotRootFailed;
@@ -407,9 +343,7 @@ fn mountStaging() SandboxError!void {
     if (errnoFromRc(linux.chdir("/"))) |_| return SandboxError.ChdirFailed;
 }
 
-/// Mount /dev, /proc, /tmp, and read-only system directories into /newroot.
 fn mountSystemDirs() SandboxError!void {
-    // /dev — tmpfs with bind-mounted device nodes and devpts
     try mkdirE("/newroot/dev");
     mountTmpfs("/newroot/dev", MS_NOSUID | MS_NODEV, "mode=0755") catch
         return SandboxError.MountFailed;
@@ -430,42 +364,30 @@ fn mountSystemDirs() SandboxError!void {
     try mkdirE("/newroot/dev/pts");
     mountOrFail("devpts", "/newroot/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=620") catch {};
     _ = linux.symlink("pts/ptmx", "/newroot/dev/ptmx");
-    // /proc — fresh procfs scoped to PID namespace
     try mkdirE("/newroot/proc");
     mountOrFail("proc", "/newroot/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, "") catch
         return SandboxError.MountFailed;
-    // /tmp — private tmpfs
     try mkdirE("/newroot/tmp");
     mountTmpfs("/newroot/tmp", MS_NOSUID | MS_NODEV, "mode=1777") catch
         return SandboxError.MountFailed;
-    // System directories — read-only from host
     try robind("/oldroot/usr", "/newroot/usr");
     try robind("/oldroot/etc", "/newroot/etc");
-    // Override identity files: the host /etc/passwd maps uid 0 → root,
-    // and nss-systemd can leak the real host user through the namespace
-    // uid mapping. Write synthetic files and bind-mount them over the
-    // host originals so getpwuid(0) returns "sandbox".
+    // nss-systemd can leak the host user through the uid mapping.
     overrideEtcFile("/newroot/etc/passwd",
         "root:x:0:0:root:/root:/bin/sh\nsandbox:x:0:0:sandbox:/home/sandbox:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n");
     overrideEtcFile("/newroot/etc/group",
         "root:x:0:\nsandbox:x:0:\nnogroup:x:65534:\n");
     overrideEtcFile("/newroot/etc/nsswitch.conf",
         "passwd: files\ngroup:  files\nshadow: files\nhosts:  files dns\nnetworks: files\nprotocols: files\nservices: files\n");
-    // /lib, /lib64, /bin are often symlinks to /usr/* — bind resolved paths
+    // /lib, /lib64 and /bin are often symlinks into /usr.
     robindOptional("/oldroot/usr/lib", "/newroot/lib");
     robindOptional("/oldroot/usr/lib64", "/newroot/lib64");
     robindOptional("/oldroot/usr/bin", "/newroot/bin");
     robindOptional("/oldroot/opt", "/newroot/opt");
 }
 
-/// Bind the Julia install root, so the binary can reach its sibling
-/// `share/julia` and `lib/julia`. Roots under `/usr` or `/opt` are skipped —
-/// `mountSystemDirs` has bound those already.
-///
-/// A juliaup launcher additionally needs its home at `$HOME/.julia/juliaup`:
-/// that is where it looks, and `HOME` is `/home/sandbox` here, so the host-path
-/// bind alone is never consulted. `juliaup.json`'s relative `Path` entries
-/// bring the versioned installs along with it.
+/// A juliaup launcher looks for its home under `$HOME`, which is
+/// `/home/sandbox` here, so it is bound there too.
 fn mountJuliaInstall(exe_path: []const u8, home: []const u8) SandboxError!void {
     const install = classifyInstallPrefixed(exe_path, home, "/oldroot");
     const root = switch (install) {
@@ -490,16 +412,13 @@ fn mountJuliaInstall(exe_path: []const u8, home: []const u8) SandboxError!void {
     }
 }
 
-/// `$HOME/.julia` — the default depot location — or empty if there is no home.
-/// Returned in a static buffer: the sandbox child is single-threaded, and
-/// callers consume the slice before resolving again.
+/// Static buffer: callers consume the slice before resolving again.
 var home_depot_buf: [384]u8 = undefined;
 fn homeDepotPath(home: []const u8) []const u8 {
     if (home.len == 0) return "";
     return std.fmt.bufPrint(&home_depot_buf, "{s}/.julia", .{home}) catch "";
 }
 
-/// Mount /home tmpfs, the resolved depots, and the sandbox home symlink.
 fn mountHome(config: *const SandboxConfig, home: []const u8) SandboxError!void {
     try mkdirE("/newroot/home");
     mountTmpfs("/newroot/home", MS_NOSUID | MS_NODEV, "mode=0755") catch
@@ -523,13 +442,9 @@ fn mountHome(config: *const SandboxConfig, home: []const u8) SandboxError!void {
     try linkSandboxDepot(depots.writablePath(), home);
 }
 
-/// Point `/home/sandbox/.julia` at the writable depot, for tools that resolve
-/// the depot relative to `HOME`.
-///
-/// A symlink suffices only when nothing else need live under it; the juliaup
-/// bind does, so a relocated depot gets a real directory with the depot bound
-/// inside. That bind sources from `/newroot` to keep writes on the overlay, so
-/// it must run after every depot mount.
+/// A relocated depot is bound rather than linked, as the juliaup bind lives
+/// under it. It sources from `/newroot` to keep writes on the overlay, so it
+/// must run after every depot mount.
 fn linkSandboxDepot(depot: []const u8, home: []const u8) SandboxError!void {
     mkdirE("/newroot/home/sandbox") catch {};
     var buf: [384]u8 = undefined;
@@ -543,29 +458,23 @@ fn linkSandboxDepot(depot: []const u8, home: []const u8) SandboxError!void {
     }
 }
 
-/// Number of path components, for ordering nested mounts ancestor-first.
 fn pathDepth(path: []const u8) usize {
     return std.mem.count(u8, path, "/");
 }
 
-/// True if `path` is `dir` or lies within it (component-wise, so `/usrlocal`
-/// is not within `/usr`).
+/// Component-wise: `/usrlocal` is not within `/usr`.
 pub fn isWithin(path: []const u8, dir: []const u8) bool {
     return std.mem.eql(u8, path, dir) or isStrictAncestor(dir, path);
 }
 
-/// True if `ancestor` strictly contains `descendant` (component-wise, so
-/// `/foo` does not contain `/foobar`).
 pub fn isStrictAncestor(ancestor: []const u8, descendant: []const u8) bool {
     if (ancestor.len >= descendant.len) return false;
     if (!std.mem.startsWith(u8, descendant, ancestor)) return false;
     return descendant[ancestor.len] == '/';
 }
 
-/// Mount overlayfs on `depot_dst`, with the host path `depot_src` as the
-/// read-only lower layer; fall back to a read-only bind if overlay fails.
-/// `<depot>/environments` is then bound read-only over the overlay, so named
-/// environments (`@v1.x`, `@debug`) resolve but no manifest can change.
+/// `environments` is bound read-only over the overlay, so named environments
+/// resolve but no manifest can change.
 fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) void {
     var opts_buf: [512]u8 = undefined;
     const opts = fmtPath(&opts_buf,
@@ -576,7 +485,7 @@ fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) void {
         var src_buf: [384]u8 = undefined;
         if (fmtPath(&src_buf, "/oldroot{s}", .{depot_src})) |src|
             robindOptional(src, depot_dst);
-        return; // the whole depot is already read-only
+        return;
     };
     var src_buf: [384]u8 = undefined;
     var dst_buf: [384]u8 = undefined;
@@ -587,9 +496,7 @@ fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) void {
 
 // --- Cgroup v2 resource limits ---
 
-/// Set up cgroup v2 resource limits. Uses worker_id (not PID) for the
-/// cgroup name, since the in-namespace PID is always 1 after double-fork
-/// and would collide across sandbox instances.
+/// Named by worker id: the in-namespace pid is always 1.
 fn setupCgroup(config: *const SandboxConfig) !void {
     var cg_buf: [128]u8 = undefined;
     const cg = fmtPath(&cg_buf, "/sys/fs/cgroup/julia-sandbox-{d}", .{config.worker_id}) orelse
@@ -608,7 +515,6 @@ fn setupCgroup(config: *const SandboxConfig) !void {
             return SandboxError.CgroupSetupFailed;
         writeFile(path, val) catch return SandboxError.CgroupSetupFailed;
     }
-    // Move self into the cgroup
     var procs_buf: [192]u8 = undefined;
     const procs = fmtPath(&procs_buf, "{s}/cgroup.procs", .{cg}) orelse return SandboxError.CgroupSetupFailed;
     writeFile(procs, "0") catch return SandboxError.CgroupSetupFailed;
@@ -625,7 +531,7 @@ fn buildArgv(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]c
         try list.append(try allocator.dupeZ(u8, ch));
     if (config.worker_project.len > 0)
         try list.append(try std.fmt.allocPrintSentinel(allocator, "--project={s}", .{config.worker_project}, 0));
-    // Split on spaces; individual args containing spaces are not supported.
+    // Args containing spaces are not supported.
     var it = std.mem.tokenizeScalar(u8, config.worker_args, ' ');
     while (it.next()) |arg|
         try list.append(try allocator.dupeZ(u8, arg));
@@ -638,7 +544,7 @@ fn buildArgv(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]c
     return argv;
 }
 
-/// Environment variables allowed through from the host (in addition to JULIA_*).
+/// Besides JULIA_*.
 const env_allowlist = [_][]const u8{
     "LANG",  "LC_CTYPE",  "LC_ALL",
     "TERM",  "COLORTERM",
@@ -647,9 +553,7 @@ const env_allowlist = [_][]const u8{
     "CUDA_CACHE_PATH",
 };
 
-/// Keys always overridden rather than passed through from the host.
-/// `JULIA_DEPOT_PATH` is deliberately absent: it passes through verbatim so
-/// Julia's own expansion resolves to the paths the sandbox mounted.
+/// `JULIA_DEPOT_PATH` passes through, so Julia's expansion matches the mounts.
 const env_managed = [_][]const u8{
     "HOME", "USER", "LOGNAME", "PATH",
 };
@@ -658,7 +562,6 @@ fn buildEnvp(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]c
     var list = std.array_list.AlignedManaged([*:0]const u8, null).init(allocator);
     defer list.deinit();
     errdefer for (list.items) |s| allocator.free(std.mem.span(s));
-    // Pass through allowlisted host vars, skipping managed keys
     const env = config.host_environ;
     for (env.array_hash_map.keys(), env.array_hash_map.values()) |key, value| {
         var managed = false;
@@ -666,11 +569,9 @@ fn buildEnvp(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]c
         if (!managed and envAllowed(key))
             try list.append(try std.fmt.allocPrintSentinel(allocator, "{s}={s}", .{ key, value }, 0));
     }
-    // Sandbox identity and paths
     try list.append(try allocator.dupeZ(u8, "HOME=/home/sandbox"));
     try list.append(try allocator.dupeZ(u8, "USER=sandbox"));
     try list.append(try allocator.dupeZ(u8, "LOGNAME=sandbox"));
-    // PATH leads with the directory holding the Julia binary actually invoked.
     if (std.fs.path.dirname(config.julia_executable)) |bindir| {
         try list.append(try std.fmt.allocPrintSentinel(allocator,
             "PATH={s}:/usr/local/bin:/usr/bin:/bin", .{bindir}, 0));
@@ -717,8 +618,6 @@ fn mountTmpfs(target: [*:0]const u8, flags: u32, opts: ?[*:0]const u8) SandboxEr
     }
 }
 
-/// Write content to a staging tmpfs file and bind-mount it over target.
-/// Used to override individual files inside a read-only /etc bind mount.
 var etc_override_counter: u8 = 0;
 fn overrideEtcFile(target: [*:0]const u8, content: []const u8) void {
     var src_buf: [64]u8 = undefined;
@@ -729,7 +628,6 @@ fn overrideEtcFile(target: [*:0]const u8, content: []const u8) void {
     remountReadonly(target);
 }
 
-/// Bind-mount source to target read-only, remounting all submounts rdonly.
 fn robind(source: [*:0]const u8, target: [*:0]const u8) SandboxError!void {
     try mkdirE(target);
     mountBind(source, target) catch return SandboxError.MountFailed;
@@ -737,7 +635,6 @@ fn robind(source: [*:0]const u8, target: [*:0]const u8) SandboxError!void {
     remountSubmountsReadonly(target);
 }
 
-/// Like robind but silently skips if source doesn't exist.
 fn robindOptional(source: [*:0]const u8, target: [*:0]const u8) void {
     mkdirE(target) catch return;
     mountBind(source, target) catch return;
@@ -749,9 +646,7 @@ fn remountReadonly(target: [*:0]const u8) void {
     _ = linux.mount("none", target, null, MS_RDONLY | MS_NOSUID | MS_NODEV | MS_REMOUNT | MS_BIND | MS_SILENT, 0);
 }
 
-/// Read /proc/self/mountinfo and remount any mounts strictly under target as rdonly.
-/// Aborts the sandbox if mountinfo is truncated or a mount path overflows,
-/// since silently skipping mounts would leave them writable.
+/// Aborts rather than skip a mount, which would leave it writable.
 fn remountSubmountsReadonly(target: [*:0]const u8) void {
     const prefix = std.mem.span(target);
     var info_buf: [16384]u8 = undefined;
@@ -774,7 +669,7 @@ fn remountSubmountsReadonly(target: [*:0]const u8) void {
     }
 }
 
-/// Extract mount point (field 5) from a /proc/self/mountinfo line.
+/// Field 5 of a mountinfo line.
 fn parseMountPoint(line: []const u8) ?[]const u8 {
     var pos: usize = 0;
     var field: u8 = 0;
@@ -790,7 +685,6 @@ fn parseMountPoint(line: []const u8) ?[]const u8 {
 
 // --- Low-level helpers ---
 
-/// Format a null-terminated path into a stack buffer. Returns null on overflow.
 fn fmtPath(buf: []u8, comptime fmt: []const u8, args: anytype) ?[:0]const u8 {
     const result = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args) catch return null;
     buf[result.len] = 0;
@@ -813,7 +707,6 @@ fn mkdirE(path: [*:0]const u8) SandboxError!void {
         if (e != .EXIST) return SandboxError.MkdirFailed;
 }
 
-/// Create all directories along a path (like mkdir -p). Best-effort.
 fn mkdirp(path: [*:0]const u8) void {
     const span = std.mem.span(path);
     if (span.len == 0) return;

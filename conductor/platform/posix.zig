@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Shared POSIX platform code used by both linux.zig and bsd.zig.
-// Platform-specific raw syscall wrappers are imported from the active impl.
+// Shared POSIX platform code, over linux.zig or bsd.zig primitives.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,7 +10,7 @@ const Io = std.Io;
 const protocol = @import("../protocol.zig");
 const impl = if (builtin.os.tag == .linux) @import("linux.zig") else @import("bsd.zig");
 
-/// Format into either an allocator (returns owned slice) or a `[]u8` buffer (returns sub-slice).
+/// Into an allocator (owned slice) or a `[]u8` buffer (sub-slice).
 pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
     if (@TypeOf(out) == std.mem.Allocator)
         return std.fmt.allocPrint(out, fmt, args)
@@ -19,10 +18,9 @@ pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 
         return std.fmt.bufPrint(out, fmt, args) catch error.NameTooLong;
 }
 
-// I/O — on POSIX, sockets are fds.
+// I/O
 pub fn socketWrite(fd: posix.socket_t, buf: []const u8) void { impl.write(fd, buf); }
 pub fn close(fd: posix.fd_t) void { impl.rawClose(fd); }
-/// Half-close the sending side; the peer reads EOF once buffered data drains.
 pub fn shutdownWrite(fd: posix.socket_t) void {
     _ = posix.system.shutdown(fd, posix.system.SHUT.WR);
 }
@@ -35,8 +33,7 @@ pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     };
 }
 
-// Local transport: AF_UNIX sockets, path-addressed within the socket directory.
-// The directory is the runtime dir itself; a path must leave room for sun_path's NUL.
+// Local transport: AF_UNIX sockets in the runtime dir.
 pub const max_local_addr = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len;
 pub fn localSocketDir(out: anytype, runtime_dir: []const u8) ![]const u8 {
     return print(out, "{s}", .{runtime_dir});
@@ -49,21 +46,19 @@ pub fn listenLocal(io: Io, path: []const u8) !Listener {
     const ua = try Io.net.UnixAddress.init(path);
     return Listener.fromServer(try ua.listen(io, .{ .kernel_backlog = 128 }), .local, path);
 }
-/// A local connect succeeds or fails at once, so there is no wait to bound.
 pub fn connectLocal(io: Io, path: []const u8, _: u32) !posix.socket_t {
     if (path.len >= max_local_addr) return error.PathTooLong;
     const ua = try Io.net.UnixAddress.init(path);
     return (try ua.connect(io)).socket.handle;
 }
-/// Connect to a single-use local address and retire it, so nothing else can.
+/// Retire the single-use address, so nothing else can connect.
 pub fn connectLocalOnce(io: Io, path: []const u8) !posix.socket_t {
     const fd = try connectLocal(io, path, 0);
     Io.Dir.deleteFileAbsolute(io, path) catch {};
     return fd;
 }
 pub const local_transport_name = "unix socket";
-/// Connect to `ip`, giving up after `timeout_ms` rather than the kernel's
-/// minutes of SYN retries. The socket comes back blocking and close-on-exec.
+/// Bounded, unlike the kernel's minutes of SYN retries.
 pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !posix.socket_t {
     var storage: Io.Threaded.PosixAddress = undefined;
     const len = Io.Threaded.addressToPosix(&ip, &storage);
@@ -103,7 +98,7 @@ fn fcntl(fd: posix.fd_t, cmd: anytype, arg: usize) !usize {
     if (posix.errno(rc) != .SUCCESS) return error.Unexpected;
     return @intCast(rc);
 }
-/// Connect with raw syscalls only, for use inside a signal handler; null on failure.
+/// Raw syscalls only, for use inside a signal handler.
 pub fn rawConnectLocal(path: []const u8) ?posix.socket_t {
     var addr = std.mem.zeroes(posix.sockaddr.un);
     addr.family = posix.AF.UNIX;
@@ -115,8 +110,6 @@ pub fn rawConnectLocal(path: []const u8) ?posix.socket_t {
     return null;
 }
 
-/// A listening socket and its address. Accepting yields a plain socket handle;
-/// `close` also unlinks a local socket's path.
 pub const Listener = struct {
     server: Io.net.Server,
     mode: protocol.TransportMode,
@@ -135,12 +128,11 @@ pub const Listener = struct {
     pub fn fd(self: *const Listener) posix.socket_t {
         return self.server.socket.handle;
     }
-    /// Accept the connection an event loop reported waiting.
     pub fn accept(self: *Listener, io: Io) !protocol.Connection {
         const stream = try self.server.accept(io);
         return .{ .socket = stream.socket.handle, .peer = if (self.mode == .tcp) stream.socket.address else null };
     }
-    /// Accept a connection arriving within `timeout_ms` (0: one already waiting); null when none does.
+    /// 0 takes only a connection already waiting.
     pub fn acceptTimeout(self: *Listener, io: Io, timeout_ms: i32) !?posix.socket_t {
         var pfd = [_]posix.pollfd{.{ .fd = self.fd(), .events = posix.POLL.IN, .revents = 0 }};
         if (try posix.poll(&pfd, timeout_ms) == 0) return null;
@@ -153,68 +145,47 @@ pub const Listener = struct {
 };
 
 // Process helpers
-/// Start a worker in its own process group, so a terminal SIGINT reaches only
-/// the conductor, with stdio inherited (the service manager's fds suit libuv).
+/// Own process group, so a terminal SIGINT reaches only the conductor.
 pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
     return std.process.spawn(io, .{ .argv = argv, .pgid = 0 });
 }
-/// A worker's stderr is inherited, so there is nothing to dump when it dies.
 pub fn dumpChildStderr(_: Io, _: std.mem.Allocator, _: *std.process.Child, _: u32) void {}
-/// Every `KEY=VALUE` of the process environment.
 pub fn collectEnviron(allocator: std.mem.Allocator, environ: std.process.Environ) ![]const []const u8 {
     const entries = try allocator.alloc([]const u8, environ.block.slice.len);
     for (environ.block.slice, entries) |entry, *kv| kv.* = std.mem.span(entry.?);
     return entries;
 }
-/// Ask a conductor to recreate its socket (its SIGUSR1 handler).
-/// Ask the conductor at `pid` to recreate its socket; false when it could not be asked.
 pub fn requestSocketRecreate(pid: u32) bool {
     return impl.kill(@intCast(pid), posix.SIG.USR1) == 0;
 }
-/// The number a pid prints and travels the wire as.
 pub fn pidNumber(pid: posix.pid_t) u32 {
     return @intCast(pid);
 }
-/// A socket slot with no connection in it yet.
 pub const no_socket: posix.socket_t = -1;
-/// A worker some other process started for us: no pid to wait on or kill.
 pub const no_child = std.process.Child{ .id = null, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
 pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
     return child.id orelse 0;
 }
 pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };
 pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
-    // ret > 0: reaped now; ret < 0: ECHILD (already gone); ret == 0: still alive.
+    // < 0 is ECHILD: already gone.
     const ret = impl.rawWaitpid(pid);
     return .{ .pid = ret, .exited = ret != 0 };
 }
 
-/// Per-process memory and cumulative CPU time, for status reporting and eviction
-/// sizing. `mem_bytes` is resident set size on Linux, phys_footprint on macOS (the
-/// reclaimable private memory — see `mem_is_reclaimable`). `cpu_seconds` is total
-/// CPU consumed since the process started (user+system), not a rate.
+/// `cpu_seconds` is cumulative, not a rate.
 pub const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };
 pub const getProcessStats = impl.getProcessStats;
-/// Image base name of a process given its numeric pid, for the status report.
 pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
     return impl.getParentName(@intCast(pid), buf);
 }
 
-/// True when `getProcessStats().mem_bytes` already reports the reclaimable
-/// (USS-equivalent) figure, so eviction needs no separate `processReclaimable`
-/// pass. macOS (phys_footprint); false on Linux (RSS, USS needs an smaps walk).
+/// Whether `getProcessStats().mem_bytes` is already the reclaimable figure.
 pub const mem_is_reclaimable = impl.mem_is_reclaimable;
 
-/// Reclaimable (private) memory of a process in bytes — what killing it returns
-/// to the OS (USS). Null where the OS exposes no private-page accounting, in
-/// which case the caller falls back to RSS. Read on demand, never smoothed.
-/// Only consulted where `mem_is_reclaimable` is false (Linux).
+/// USS in bytes; null where the OS has no private-page accounting.
 pub const processReclaimable = impl.processReclaimable;
 
-/// Host memory-pressure sources, resolved per-OS. `readPsiSomeAvg10` is the
-/// preferred stall signal (null where PSI is unavailable); `readMemInfo` is the
-/// always-available free-memory level. No PSI on macOS/BSD (the level path is used);
-/// the level path works on Linux/macOS/FreeBSD, null (inert) on OpenBSD/Windows.
 pub const MemInfo = impl.MemInfo;
 pub const readPsiSomeAvg10 = impl.readPsiSomeAvg10;
 pub const readMemInfo = impl.readMemInfo;
@@ -234,8 +205,7 @@ pub fn setRecvTimeout(socket: posix.fd_t, seconds: u32) void {
 }
 
 pub fn setTcpNodelay(socket: posix.fd_t) void {
-    // Raw call: the socket may already be closed (stdin at EOF), which std's
-    // wrapper treats as unreachable.
+    // Raw: std's wrapper treats an already-closed socket as unreachable.
     _ = posix.system.setsockopt(socket, 6, 1, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int)); // IPPROTO_TCP, TCP_NODELAY
 }
 
@@ -256,10 +226,6 @@ pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
 }
 
 // Signal handling
-//
-// Worker state tracking, reported over the signals socket: whether the client's
-// terminal is raw (REPL reading input) or cooked, and whether user code is
-// evaluating. The SIGINT handler routes on the latter.
 var worker_raw: bool = false;
 pub fn setWorkerRawMode(raw: bool) void { worker_raw = raw; }
 var worker_executing: bool = false;
@@ -284,16 +250,13 @@ fn signalAction(sig: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callc
     const handler = g_signal_handler orelse return;
     switch (sig) {
         .INT => {
-            // \x03 only reaches LineEdit at the prompt; while code runs nothing is
-            // reading stdin. Never coalesce: Julia's force-throw for tight loops
-            // needs the repeated presses to accumulate.
+            // Nothing reads stdin while code runs. Never coalesce: Julia's
+            // force-throw for tight loops needs the repeated presses.
             if (worker_raw and !worker_executing)
                 handler.writeStdio("\x03")
             else
                 handler.notifyInterrupt();
         },
-        // SIGHUP (terminal closed) and SIGTERM both mean "leave now": tell the
-        // conductor so it frees the worker, restore the terminal, then exit.
         .TERM, .HUP => {
             handler.notifyExit();
             std.process.exit(128 +% @as(u8, @intCast(@intFromEnum(sig))));
@@ -310,12 +273,11 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     const sigact = posix.Sigaction{
         .handler = .{ .sigaction = signalAction },
         .mask = mask,
-        .flags = 0, // No SA_RESTART: let io_uring submit_and_wait return EINTR promptly
+        .flags = 0, // no SA_RESTART, so io_uring_enter returns EINTR promptly
     };
     posix.sigaction(posix.SIG.INT, &sigact, null);
     posix.sigaction(posix.SIG.TERM, &sigact, null);
     posix.sigaction(posix.SIG.HUP, &sigact, null);
-    // Ignore SIGPIPE so writes to broken sockets return EPIPE instead of killing the process
     const pipe_act = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = std.mem.zeroes(posix.sigset_t),

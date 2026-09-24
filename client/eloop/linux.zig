@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MPL-2.0
 //
 // Linux io_uring-based event loop for the client.
-// Multiplexes local stdin, worker stdout, worker stderr, and signals socket.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -19,8 +18,7 @@ const Location = enum(u64) {
     signals,
 };
 
-/// Run the client I/O loop using io_uring.
-/// Returns exit code when complete.
+/// Returns the worker's exit code.
 pub fn run(
     stdin_fd: posix.fd_t,
     stdout_fd: posix.fd_t,
@@ -37,19 +35,17 @@ pub fn run(
     var worker_stderr_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
     var cooked_state = cooked.CookedState{};
-    // Queue initial reads
     _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, 0);
     _ = try ring.read(@intFromEnum(Location.worker_stdout), stdout_fd, .{ .buffer = &worker_stdout_buf }, 0);
     _ = try ring.read(@intFromEnum(Location.worker_stderr), stderr_fd, .{ .buffer = &worker_stderr_buf }, 0);
     _ = try ring.read(@intFromEnum(Location.signals), signals_fd, .{ .buffer = &signals_buf }, 0);
-    // Wait for: stdout+stderr EOF (guarantees output flushed) and exit code (from signals socket).
-    // If signals EOF arrives without exit code, worker crashed - use exit code 1.
+    // Signals EOF without an exit code means the worker crashed.
     var exit_code: ?u8 = null;
     var stdout_eof = false;
     var stderr_eof = false;
     while (true) {
         _ = ring.submit_and_wait(1) catch |err| switch (err) {
-            error.SignalInterrupt => continue, // SIGINT handled by signal handler, restart
+            error.SignalInterrupt => continue,
             else => return err,
         };
         while (ring.cq_ready() > 0) {
@@ -74,13 +70,11 @@ pub fn run(
                 },
                 @intFromEnum(Location.local_stdin) => {
                     if (cqe.res <= 0) {
-                        // Half-close: the worker sees EOF, and the handle stays
-                        // valid for a late Ctrl-C write rather than being reused.
+                        // Half-close keeps the handle valid for a late Ctrl-C write.
                         platform.shutdownWrite(stdin_fd);
                         continue;
                     }
                     if (exit_code != null) continue;
-                    // In sync mode with worker requesting cooked: emulate line editing
                     if (sync_mode and !signal_parser.worker_wants_raw) {
                         for (local_stdin_buf[0..len]) |byte| {
                             cooked_state.process(byte, stdin_fd);
@@ -105,7 +99,6 @@ pub fn run(
                 else => {},
             }
         }
-        // Exit only when we have exit code AND both output streams are drained
         if (exit_code != null and stdout_eof and stderr_eof) {
             return exit_code.?;
         }

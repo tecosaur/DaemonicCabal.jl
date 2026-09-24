@@ -1,13 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Platform abstraction layer for OS-specific functionality.
-// On POSIX: platform-specific primitives from linux.zig/bsd.zig,
-//           shared implementations from posix.zig.
-// On Windows: everything from windows.zig.
-//
-// Everything here is selected at comptime; shared code pays nothing for the
-// choice and holds no OS conditionals of its own.
+// Platform abstraction layer, selected at comptime: linux.zig/bsd.zig plus
+// the shared posix.zig, or windows.zig alone.
 
 const std = @import("std");
 const Io = std.Io;
@@ -21,20 +16,17 @@ else if (os == .windows)
 else
     @import("bsd.zig");
 
-// Platform-specific (different implementation per OS)
 pub const SIG = impl.SIG;
 pub const getpid = impl.getpid;
 pub const getppid = impl.getppid;
 pub const write = impl.write;
-/// Write to a console, pipe or file handle: WriteFile on Windows, `write` on
-/// POSIX where every descriptor is alike.
+/// For console, pipe and file handles.
 pub const writeFile = if (os != .windows) impl.write else impl.writeFile;
 pub const kill = impl.kill;
 pub const rawSocket = impl.rawSocket;
 pub const rawConnect = impl.rawConnect;
 pub const rawClose = impl.rawClose;
 pub const defaultRuntimeDir = impl.defaultRuntimeDir;
-// Standard handles — POSIX constants vs Win32 GetStdHandle
 pub fn getStdinHandle() std.posix.fd_t {
     if (os == .windows) return impl.getStdinHandle();
     return impl.STDIN_HANDLE;
@@ -48,15 +40,12 @@ pub fn getStderrHandle() std.posix.fd_t {
     return impl.STDERR_HANDLE;
 }
 
-// Shared POSIX / Windows-specific
 const shared = if (os != .windows) @import("posix.zig") else impl;
 pub const socketWrite = shared.socketWrite;
 pub const socketRead = shared.socketRead;
 pub const close = shared.close;
 pub const shutdownWrite = shared.shutdownWrite;
-// Local (path-addressed) transport: AF_UNIX on POSIX, named pipes on Windows.
-// Every local address is formed by `localSocketPath` inside the directory
-// `localSocketDir` derives from the runtime dir.
+// Local transport: AF_UNIX on POSIX, named pipes on Windows.
 pub const Listener = shared.Listener;
 pub const localSocketDir = shared.localSocketDir;
 pub const localSocketPath = shared.localSocketPath;
@@ -76,9 +65,7 @@ pub const requestSocketRecreate = shared.requestSocketRecreate;
 pub const getChildPid = shared.getChildPid;
 pub const WaitPidResult = shared.WaitPidResult;
 pub const waitpidNonBlocking = shared.waitpidNonBlocking;
-// Peer credentials, mount namespaces, pidfds and the detached spawn exist only
-// on Linux. Elsewhere they report "unavailable", so no client-spawned worker
-// arises and no peer is ever refused.
+// Linux-only; elsewhere "unavailable", so no peer is ever refused.
 const linux_only = if (os == .linux) impl else struct {
     pub fn peerPid(_: std.posix.socket_t) ?std.posix.pid_t { return null; }
     pub fn peerForeignMountNs(_: std.posix.socket_t) ?u64 { return null; }
@@ -89,23 +76,18 @@ const linux_only = if (os == .linux) impl else struct {
     pub fn pidfdExited(_: std.posix.fd_t) bool { return true; }
     pub fn spawnDetached(_: [*:null]const ?[*:0]const u8, _: [*:null]const ?[*:0]const u8) !void { return error.SpawnUnsupported; }
 };
-/// Pid of a unix-socket peer as this process sees it; null when unavailable.
+/// As this process's pid namespace sees it.
 pub const peerPid = linux_only.peerPid;
-/// Inode of the peer's mount namespace when it differs from ours; null when same or unknown.
+/// Null when the same as ours, or unknown.
 pub const peerForeignMountNs = linux_only.peerForeignMountNs;
-/// Inode of the peer's mount namespace; null when unavailable.
 pub const peerMountNs = linux_only.peerMountNs;
-/// Parent pid of a process; null when unreadable.
 pub const parentPid = linux_only.parentPid;
-/// Handle on a process that is not our child, immune to pid reuse; null when unsupported.
+/// Immune to pid reuse.
 pub const pidfdOpen = linux_only.pidfdOpen;
-/// Signal a process through its pidfd; 0 on success, like `kill`.
+/// 0 on success, like `kill`.
 pub const pidfdSignal = linux_only.pidfdSignal;
-/// A pidfd turns readable once its process has exited.
 pub const pidfdExited = linux_only.pidfdExited;
-/// Exec an absolute command as a daemon: own session, stdio on /dev/null, no
-/// inherited fds. Fails before forking when the path is not executable here or
-/// /dev/null cannot be opened.
+/// Own session, stdio on /dev/null, no inherited fds; fails before forking.
 pub const spawnDetached = linux_only.spawnDetached;
 pub const ProcessStats = shared.ProcessStats;
 pub const getProcessStats = shared.getProcessStats;
@@ -124,8 +106,6 @@ pub const registerSignalHandlers = shared.registerSignalHandlers;
 pub const setRawMode = shared.setRawModeStdin;
 pub const setWorkerRawMode = shared.setWorkerRawMode;
 pub const setWorkerExecuting = shared.setWorkerExecuting;
-// Console configuration (VT processing, UTF-8 code pages) that POSIX
-// terminals need none of.
 pub const setupConsoleIo = if (os == .windows) impl.setupConsoleIo else struct {
     fn f(_: std.posix.fd_t, _: std.posix.fd_t) ?*anyopaque { return null; }
 }.f;
@@ -133,7 +113,6 @@ pub const restoreConsoleIo = if (os == .windows) impl.restoreConsoleIo else stru
     fn f(_: ?*anyopaque) void {}
 }.f;
 
-// Time (common implementation)
 pub fn timeSeconds(io: Io) i64 {
     return Io.Clock.now(.awake, io).toSeconds();
 }

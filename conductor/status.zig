@@ -1,9 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// `juliaclient --status` report: a tree of the conductor's worker pool grouped
-// host → projects → workers → clients (plus sandboxed and reserve groups),
-// rendered as styled text (color when the client is a TTY) or JSON.
+// `juliaclient --status` report: host → projects → workers → clients, plus
+// sandboxed and reserve groups, as a styled tree or JSON.
 
 const std = @import("std");
 const main = @import("main.zig");
@@ -16,9 +15,7 @@ const pal = @import("palette.zig");
 const Conductor = main.Conductor;
 const Worker = worker.Worker;
 
-// Minimal append-only sink over an owned byte buffer. Zig 0.16's ArrayList has
-// no generic `.writer()`, so this adapter exposes the few writer methods the
-// formatter needs while keeping `try w.print(...)` call sites unchanged.
+// Zig 0.16's ArrayList has no generic `.writer()`.
 const Writer = struct {
     list: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
@@ -36,30 +33,26 @@ const Writer = struct {
     }
 };
 
-/// How to render a report. `format` is the `--status=<value>` argument ("json"
-/// → machine output, else the styled tree); `tty` enables ANSI styling;
-/// `palette`, when the client answered the colour probe, drives truecolor
-/// gradients (else flat 8-color).
+/// `format` is the `--status=<value>` argument; `palette` is set when the
+/// client answered the colour probe.
 pub const Options = struct {
     format: ?[]const u8 = null,
     tty: bool = false,
     palette: ?*const pal.Palette = null,
 };
 
-/// A rendered report. `bytes` is caller-owned; `lines` counts newlines, for the
-/// live view's cursor-up redraw.
+/// `lines` is for the live view's cursor-up redraw.
 pub const Report = struct {
     bytes: []u8,
     lines: usize,
 };
 
-/// Render the report at the current time. Caller owns `Report.bytes`.
+/// Caller owns `Report.bytes`.
 pub fn render(c: *Conductor, opts: Options) !Report {
     return renderAt(c, opts, c.currentTime());
 }
 
-// Render against an explicit reference time; the standalone test harness has no
-// live `Io` clock.
+// For the test harness, which has no live `Io` clock.
 pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(c.allocator);
@@ -76,7 +69,7 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
 
 // --- Styling -----------------------------------------------------------------
 
-// 8-color ANSI so the user's terminal theme governs the exact hues.
+// 8-color, so the terminal theme governs the hues.
 const ansi = struct {
     const reset = "\x1b[0m";
     const bold = "\x1b[1m";
@@ -88,8 +81,6 @@ const ansi = struct {
     const cyan = "\x1b[36m";
 };
 
-// A styling sink that emits ANSI codes only when enabled; otherwise the text
-// passes through unstyled, so piped output stays plain but aligned.
 const Style = struct {
     enabled: bool,
     fn open(self: Style, w: Writer, comptime codes: []const u8) !void {
@@ -98,7 +89,6 @@ const Style = struct {
     fn close(self: Style, w: Writer) !void {
         if (self.enabled) try w.writeAll(ansi.reset);
     }
-    // Write `text` wrapped in `codes`, resetting after.
     fn wrap(self: Style, w: Writer, comptime codes: []const u8, text: []const u8) !void {
         try self.open(w, codes);
         try w.writeAll(text);
@@ -108,18 +98,9 @@ const Style = struct {
 
 // --- Gradients ----------------------------------------------------------------
 
-// Each stat ramps between two anchor colours as its value moves 0→1. An anchor
-// is a palette role — an ANSI slot (resolved from the probed terminal palette,
-// so it tracks the user's theme, with a muted fallback) or the default
-// foreground. Stat → (t=0 anchor → t=1 anchor):
-//   mem      green → red       (t = mem / memCeiling)
-//   cpu      blue  → magenta   (t = cpu% / 100)
-//   cull     fg    → yellow    (t = 1 − remaining/budget; near expiry → yellow)
-//   activity fg   → cyan       (t = activity value in [0,1])
 const Tint = enum { mem, cpu, cull, activity };
 
-// A gradient anchor: a soft neutral (fg pulled toward bg, muted on any theme),
-// or an ANSI slot with the fallback used when the terminal didn't report it.
+// `muted` is fg pulled toward bg, muted on any theme.
 const Anchor = union(enum) {
     muted,
     slot: struct { idx: usize, fallback: pal.Rgb },
@@ -135,7 +116,6 @@ const yellow = anslot(3, pal.Rgb.init(0xc8, 0xa0, 0x3c));
 const blue = anslot(4, pal.Rgb.init(0x50, 0x78, 0xd0));
 const magenta = anslot(5, pal.Rgb.init(0xc0, 0x50, 0xc0));
 const cyan = anslot(6, pal.Rgb.init(0x40, 0xb0, 0xb8));
-// The (t=0, t=1) anchor pair for each stat, indexed by Tint.
 const anchors = std.enums.directEnumArray(Tint, [2]Anchor, 0, .{
     .mem = .{ green, red },
     .cpu = .{ blue, magenta },
@@ -143,9 +123,6 @@ const anchors = std.enums.directEnumArray(Tint, [2]Anchor, 0, .{
     .activity = .{ .muted, cyan },
 });
 
-// The probed palette for one render, used to resolve gradient anchors. Present
-// only when the client is a truecolor TTY that answered the colour probe;
-// otherwise null and stats fall back to the flat 8-color styling.
 const Tints = struct {
     palette: *const pal.Palette,
 
@@ -159,7 +136,7 @@ const Tints = struct {
         };
     }
 
-    // Open the truecolor fg SGR for `tint` at fraction `t`. Caller resets.
+    // Caller resets.
     fn open(self: Tints, w: Writer, tint: Tint, t: f64) !void {
         const a = anchors[@intFromEnum(tint)];
         var buf: [pal.sgr_fg_len]u8 = undefined;
@@ -167,17 +144,11 @@ const Tints = struct {
     }
 };
 
-// Per-render invariants threaded through the tree alongside (c, s, now): the
-// resolved gradient anchors (null without a truecolor probe) and the footprint the
-// gradient treats as fully "hot" — see memCeiling.
 const Ctx = struct {
     tints: ?Tints,
     mem_ceiling: u64,
 };
 
-// The gradient anchors to use, present only when styling is on AND the terminal
-// answered the colour probe. Sites that would otherwise emit a flat ANSI colour
-// branch on this to decide between a truecolor ramp and their plain fallback.
 fn gradientTints(s: Style, ctx: Ctx) ?Tints {
     return if (s.enabled) ctx.tints else null;
 }
@@ -195,8 +166,7 @@ fn workerHealth(c: *Conductor, wk: *const Worker, now: i64) Health {
     return .healthy;
 }
 
-// The leading "●"/"◌" dot, colored by health (solid for active, hollow grey for
-// inactive). The glyph alone distinguishes states when styling is disabled.
+// The glyph alone distinguishes states when styling is disabled.
 fn writeHealthDot(s: Style, w: Writer, health: Health) !void {
     switch (health) {
         .healthy => try s.wrap(w, ansi.green, "●"),
@@ -219,14 +189,12 @@ fn writeBytes(w: Writer, bytes: u64) !void {
         try w.print("{d:.0}{s}", .{ v, units[u] });
 }
 
-// Compact duration: "8s", "41m", "2h14m", "3d2h".
+// "8s", "41m", "2h14m", "3d2h".
 fn writeDuration(w: Writer, total_seconds: i64) !void {
     var buf: [16]u8 = undefined;
     try w.writeAll(formatDuration(&buf, total_seconds));
 }
 
-// `writeDuration` left-padded to a fixed width (e.g. the uptime column), so the
-// stats after it align. Over-width values print unpadded.
 fn writeDurationPadded(w: Writer, total_seconds: i64, width: usize) !void {
     var buf: [16]u8 = undefined;
     const d = formatDuration(&buf, total_seconds);
@@ -234,8 +202,7 @@ fn writeDurationPadded(w: Writer, total_seconds: i64, width: usize) !void {
     try w.writeAll(d);
 }
 
-// Like formatDuration but second-precise under 10min, where a cull countdown's
-// final minutes are worth watching tick down ("9m02s", "47s").
+// Second-precise under 10min, where a countdown is worth watching tick.
 fn formatCountdown(buf: *[16]u8, total_seconds: i64) []const u8 {
     const s: u64 = @intCast(@max(0, total_seconds));
     if (s >= 600) return formatDuration(buf, total_seconds);
@@ -262,7 +229,6 @@ fn formatDuration(buf: *[16]u8, total_seconds: i64) []const u8 {
     };
 }
 
-// Contract a leading home-directory prefix to "~".
 fn contractHome(path: []const u8, home: []const u8) []const u8 {
     if (home.len == 0 or !std.mem.startsWith(u8, path, home)) return path;
     return path[home.len..]; // caller re-prepends "~"
@@ -276,8 +242,6 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, now: i64) !void
     const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(c) };
     const have_sandboxed = anySandboxed(c);
     var printed_any = false;
-    // Host group: real projects with non-sandboxed workers. The "host" header
-    // only appears when there are also sandboxed workers to contrast against.
     if (have_sandboxed) try writeGroupHeader(w, s, "host");
     var it = c.workers.iterator();
     while (it.next()) |entry| {
@@ -287,7 +251,6 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, now: i64) !void
         try renderProject(c, w, s, ctx, entry.value_ptr.items, entry.key_ptr.*, now, have_sandboxed);
         printed_any = true;
     }
-    // Sandboxed group: workers listed directly, no project sub-grouping.
     if (have_sandboxed) {
         try w.writeByte('\n');
         try writeGroupHeader(w, s, "◆ sandboxed");
@@ -303,7 +266,6 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, now: i64) !void
             }
         }
     }
-    // Reserve group: the warm spare, no project, no clients.
     if (c.reserve) |r| {
         try w.writeByte('\n');
         try writeGroupHeader(w, s, "◇ reserve");
@@ -322,11 +284,7 @@ fn writeGroupHeader(w: Writer, s: Style, label: []const u8) !void {
     try w.writeByte('\n');
 }
 
-// A project header: "  basename · parent/", with the basename in bold blue and
-// the parent path dimmed. A pooled-RSS total is appended only when the project
-// has multiple workers (with one worker its line already shows the figure).
-// When the whole project is inactive the header is dimmed too. Without styling,
-// the full path is printed plainly.
+// "  basename · parent/", with a pooled RSS for more than one worker.
 fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const *Worker, key: []const u8, now: i64, nested: bool) !void {
     const all_inactive = for (workers) |wk| {
         if (wk.active_clients > 0) break false;
@@ -335,7 +293,6 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const 
     const pad = if (nested) indent ++ indent else indent;
     try w.writeAll(pad);
     if (path.len == 0) {
-        // No project: a worker running in the default (global) environment.
         try s.wrap(w, ansi.bold ++ ansi.blue, "@");
         try w.writeByte(' ');
         try s.wrap(w, ansi.dim, "(default environment)");
@@ -375,11 +332,7 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const 
     }
 }
 
-// A worker line: "  ├─ ● #6  [label] v1.11 (interactive)  up 12m  490M  2%  <state>".
-// Inactive workers (and the reserve) render entirely dim; the state slot shows
-// the idle duration and the cull countdown.
-// The identity+descriptor column is padded to this visible width so the stat
-// columns (uptime, RSS, CPU) line up regardless of label/version/mode length.
+// "  ├─ ● #6  [label] v1.11 (interactive)  up 12m  490M  2%  <state>"
 const id_column_width = 26;
 
 fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: ?[]const u8, now: i64, nested: bool, is_last: bool) !void {
@@ -390,8 +343,6 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     try s.wrap(w, ansi.dim, if (is_last) "╰─ " else "├─ ");
     try writeHealthDot(s, w, health);
     try w.writeByte(' ');
-    // Inactive workers render uniformly dim: a single dim span with no inner
-    // resets. Active workers style each segment (id bold, label cyan, …).
     const id_text = idStr(wk.id);
     var col: usize = 1 + id_text.len; // visible width written so far in this column
     if (dim_line) {
@@ -436,14 +387,12 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
             col += 17;
         },
     }
-    // Pad the identity column so the stats align, then uptime, RSS, CPU%.
     if (col < id_column_width) try w.writeByteNTimes(' ', id_column_width - col);
     if (!dim_line) try s.open(w, ansi.dim);
     try w.writeAll(" up ");
     if (!dim_line) try s.close(w);
     try writeDurationPadded(w, now - wk.created_at, 5);
-    // Mem + CPU% gradients (green→red vs the pool's hottest, blue→magenta vs 100%);
-    // dim/plain without a palette. mem==0 means unmeasured, so both are suppressed.
+    // mem == 0 means unmeasured.
     if (wk.mem > 0) {
         try w.writeAll("  ");
         const t = if (ctx.mem_ceiling > 0)
@@ -459,56 +408,43 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
         try w.print("{d:.0}%", .{pct});
         try closeStat(w, s, dim_line, cpu_styled);
     }
-    // Activity (fg→cyan) sits right after CPU% on every worker — so the column
-    // aligns across active and idle lines — shown only under pressure eviction.
     const showed_activity = c.pressure_monitor.active();
     if (showed_activity) try writeActivity(c, w, s, ctx, wk, key, now, dim_line);
-    // State slot for inactive workers / reserve: idle + cull countdown.
     if (health == .inactive) try writeIdleState(c, w, s, ctx, wk, key, now, showed_activity);
     if (dim_line) try s.close(w);
     try w.writeByte('\n');
     if (health != .inactive) try renderClients(c, w, s, wk, now, nested, is_last);
 }
 
-// Open styling for a stat value (RSS/CPU); pair with `closeStat`. With a probed
-// palette the value gets a truecolor ramp at `t_frac`, kept dim on an idle line
-// so it reads as muted. Without a palette: an idle value inherits the line's dim
-// span (returns false, no close needed); an active value is dimmed to mark it.
+// Pair with `closeStat`. False when the value just inherits the line's dim.
 fn openStat(w: Writer, s: Style, ctx: Ctx, dim_line: bool, tint: Tint, t_frac: f64) !bool {
     if (gradientTints(s, ctx)) |t| {
         if (dim_line) try s.open(w, ansi.dim);
         try t.open(w, tint, t_frac);
         return true;
     }
-    if (dim_line) return false; // inherit the worker line's dim span
+    if (dim_line) return false;
     try s.open(w, ansi.dim);
     return true;
 }
 
-// Close an `openStat` span: reset, then restore the line's dim span if this was
-// an idle worker (whose remaining segments still expect dim).
 fn closeStat(w: Writer, s: Style, dim_line: bool, styled: bool) !void {
     if (!styled) return;
     try s.close(w);
     if (dim_line) try s.open(w, ansi.dim);
 }
 
-// "  idle 41m · culls in 1h19m" (activity, when shown, precedes this — see
-// renderWorker). Within the line's dim span; the cull countdown breaks out for
-// urgency (muted→yellow gradient, else amber/red steps) then restores dim. The
-// reserve reads "ready"/"warming".
+// "  idle 41m · culls in 1h19m", within the line's dim span.
 fn writeIdleState(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, key: ?[]const u8, now: i64, after_activity: bool) !void {
     const is_reserve = c.reserve == wk;
-    // " · " continues the activity segment; "   " starts a fresh column gap.
     try w.writeAll(if (after_activity) " · " else "   ");
     if (is_reserve) {
-        // Reserve is TTL-exempt (findExpired skips it); no cull countdown.
+        // The reserve is TTL-exempt.
         try w.writeAll(if (wk.ping_pending) "warming" else "ready");
         return;
     }
     try w.writeAll("idle ");
     try writeDuration(w, now - wk.last_active);
-    // Countdown to the worker's activity-scaled budget, not a flat max_ttl.
     if (c.cfg.max_ttl > 0) {
         const budget: i64 = @intCast(c.idleBudget(wk, key orelse ""));
         try w.writeAll(" · culls in ");
@@ -516,8 +452,7 @@ fn writeIdleState(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worke
     }
 }
 
-// " · activity 0.42", muted→cyan as it climbs. `in_dim` restores the worker
-// line's dim span afterward (idle workers); active workers pass false.
+// `in_dim` restores the line's dim span afterward.
 fn writeActivity(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, key: ?[]const u8, now: i64, in_dim: bool) !void {
     const activity = c.workerActivity(wk, key, now);
     try w.writeAll(" · activity ");
@@ -534,9 +469,8 @@ fn writeActivity(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
     }
 }
 
-// The cull countdown, breaking out of and then restoring the line's dim span.
-// With a palette it ramps muted→yellow against `color_budget` (max_ttl, so equal
-// time-left reads alike across workers); else discrete amber/red. ≤60s bolds.
+// Coloured against `color_budget` (max_ttl), so equal time left reads alike
+// across workers.
 fn writeCullCountdown(w: Writer, s: Style, ctx: Ctx, remaining: i64, color_budget: i64) !void {
     var buf: [16]u8 = undefined;
     const text = formatCountdown(&buf, remaining);
@@ -563,8 +497,6 @@ fn writeCullCountdown(w: Writer, s: Style, ctx: Ctx, remaining: i64, color_budge
     }
 }
 
-// Client leaves under a worker. The branch carries a "│" down past the worker
-// line when that worker has later siblings, so the tree stays connected.
 fn renderClients(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64, nested: bool, worker_last: bool) !void {
     const base = if (nested) indent ++ indent else indent;
     const total = countClients(c, wk);
@@ -665,14 +597,8 @@ fn groupMem(workers: []const *Worker) u64 {
     return total;
 }
 
-// The RSS the gradient paints as fully "hot" (red). Two anchors, whichever is
-// larger:
-//   - the heaviest worker in the pool, so the busiest worker always reads hot;
-//   - each worker's padded fair share of system memory, total / (n + 8), so a
-//     pool of uniform light workers spreads across the ramp instead of all
-//     pegging red. The +8 keeps the slice sane when n is tiny (n=1 over 32G →
-//     ~3.6G, not 32G).
-// Zero only when nothing is measurable, which disables the RSS ramp.
+// The RSS painted fully hot: the heaviest worker, or a padded fair share of
+// memory, total / (n + 8), so a pool of light workers doesn't all peg red.
 fn memCeiling(c: *Conductor) u64 {
     var max_mem: u64 = 0;
     var n: u64 = 0;
@@ -691,8 +617,7 @@ fn memCeiling(c: *Conductor) u64 {
     return @max(max_mem, fair_share);
 }
 
-// A juliaup channel ("+1.11", "+release") shown as a version ("v1.11") or a
-// named channel in parentheses ("(release)"). Returns the visible width written.
+// "+1.11" → "v1.11", "+release" → "(release)". Returns the visible width.
 fn writeChannel(w: Writer, channel: []const u8) !usize {
     const ch = if (channel.len > 0 and channel[0] == '+') channel[1..] else channel;
     if (ch.len > 0 and std.ascii.isDigit(ch[0])) {
@@ -741,7 +666,7 @@ fn renderJson(c: *Conductor, w: Writer, now: i64) !void {
     try w.writeByte('}');
 }
 
-// Emit one worker object; returns its footprint so the caller can total it.
+// Returns the worker's footprint, for the caller's total.
 fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8, now: i64) !u64 {
     const pid = platform.getChildPid(wk.process);
     const stats = if (wk.process.id) |id| platform.getProcessStats(id) else null;
