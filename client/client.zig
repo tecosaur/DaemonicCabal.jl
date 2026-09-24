@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const posix = std.posix;
 const protocol = @import("protocol.zig");
+const args = @import("args.zig");
 const platform = @import("platform/main.zig");
 
 const eloop = if (builtin.os.tag == .linux)
@@ -211,20 +212,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena.deinit();
     const inputs = try collectInputs(arena.allocator(), init);
     var env = scanEnv(inputs.env);
-    const addr_arg = extractAddressArg(inputs.args);
-    if (addr_arg.value) |addr| env.server_path = addr;
-    const sync = hasSyncArg(inputs.args);
-    for (inputs.args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--")) break;
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            platform.writeFile(platform.getStdoutHandle(), protocol.CLIENT_HELP);
-            return;
-        }
-        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            printVersion(env);
-            return;
-        }
+    const parsed = try args.parse(arena.allocator(), inputs.args);
+    if (parsed.getSwitch("--address")) |addr| if (addr.len > 0) {
+        env.server_path = addr;
+    };
+    if (parsed.hasSwitch("--help") or parsed.hasSwitch("-h")) {
+        platform.writeFile(platform.getStdoutHandle(), protocol.CLIENT_HELP);
+        return;
     }
+    if (parsed.hasSwitch("--version") or parsed.hasSwitch("-v")) {
+        printVersion(env);
+        return;
+    }
+    const sync = parsed.hasSwitch("--sync");
     const is_tty = platform.isatty(platform.getStdinHandle());
     const console = if (is_tty) platform.setupConsoleIo(platform.getStdoutHandle(), platform.getStderrHandle()) else null;
     defer platform.restoreConsoleIo(console);
@@ -236,7 +236,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var w = SocketWriter{ .handle = conductor };
     // The worker's own terminal knows nothing of ours.
     const color = is_tty and !hasNoColor(inputs.env);
-    try sendClientInfo(&w, env, is_tty, color, inputs.args, addr_arg.skip);
+    try sendClientInfo(&w, env, is_tty, color, try forwardedArgs(arena.allocator(), inputs.args, &parsed));
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers();
     signal_parser.sync_mode = sync;
@@ -245,9 +245,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
 fn collectInputs(a: std.mem.Allocator, init: std.process.Init.Minimal) !Inputs {
     var it = try std.process.Args.Iterator.initAllocator(init.args, a);
-    var args: std.ArrayList([]const u8) = .empty;
-    while (it.next()) |arg| try args.append(a, arg);
-    return .{ .args = args.items, .env = try platform.collectEnviron(a, init.environ) };
+    var argv: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |arg| try argv.append(a, arg);
+    return .{ .args = argv.items, .env = try platform.collectEnviron(a, init.environ) };
 }
 
 fn hasNoColor(env: []const []const u8) bool {
@@ -362,7 +362,7 @@ fn keepConductor(connection: protocol.Connection) posix.socket_t {
     return connection.socket;
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, args: []const []const u8, addr_skip: [2]usize) !void {
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, forwarded: []const []const u8) !void {
     w.writeInt(u32, protocol.client.magic);
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color }));
     w.writeSlice(&.{ 0, 0, 0 });
@@ -376,14 +376,8 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, arg
     std.mem.writeInt(u16, w.buf[len_pos..][0..2], @intCast(cwd_len), .little);
     w.pos += cwd_len;
     w.writeInt(u64, env.fingerprint);
-    // Args, less the client-only address flag
-    const skip_count = @as(u16, if (addr_skip[0] != sentinel) 1 else 0) +
-        @as(u16, if (addr_skip[1] != sentinel) 1 else 0);
-    w.writeInt(u16, @intCast(args.len - skip_count));
-    for (args, 0..) |arg, i| {
-        if (i == addr_skip[0] or i == addr_skip[1]) continue;
-        w.writeLenPrefixed(u16, arg);
-    }
+    w.writeInt(u16, @intCast(forwarded.len));
+    for (forwarded) |arg| w.writeLenPrefixed(u16, arg);
     w.flush();
 }
 
@@ -554,34 +548,14 @@ fn getTerminalSize() struct { height: u16, width: u16 } {
     return .{ .height = 24, .width = 80 };
 }
 
-const sentinel = std.math.maxInt(usize);
-
-fn hasSyncArg(args: []const []const u8) bool {
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--")) return false;
-        if (std.mem.eql(u8, arg, "--sync")) return true;
-    }
-    return false;
-}
-
-const AddressArg = struct {
-    value: ?[]const u8,
-    skip: [2]usize, // indices to omit when forwarding
-};
-
-fn extractAddressArg(args: []const []const u8) AddressArg {
-    const none = AddressArg{ .value = null, .skip = .{ sentinel, sentinel } };
-    for (args, 0..) |arg, i| {
-        if (i == 0) continue;
-        if (std.mem.eql(u8, arg, "--")) return none;
-        if (std.mem.startsWith(u8, arg, "--address="))
-            return .{ .value = arg["--address=".len..], .skip = .{ i, sentinel } };
-        if (arg.len > 2 and arg[0] == '-' and arg[1] == 'a')
-            return .{ .value = arg[2..], .skip = .{ i, sentinel } };
-        if (std.mem.eql(u8, arg, "--address") or std.mem.eql(u8, arg, "-a")) {
-            if (i + 1 < args.len) return .{ .value = args[i + 1], .skip = .{ i, i + 1 } };
-            return none;
-        }
-    }
-    return none;
+/// argv less the client's own `--address`.
+fn forwardedArgs(allocator: std.mem.Allocator, argv: []const []const u8, parsed: *const args.ParsedArgs) ![]const []const u8 {
+    const keep = try allocator.alloc(bool, argv.len);
+    @memset(keep, true);
+    for (parsed.switches.items) |sw| if (std.mem.eql(u8, sw.name, "--address")) {
+        @memset(keep[sw.index..][0..sw.words], false);
+    };
+    var forwarded: std.ArrayList([]const u8) = .empty;
+    for (argv, keep) |arg, kept| if (kept) try forwarded.append(allocator, arg);
+    return forwarded.items;
 }
