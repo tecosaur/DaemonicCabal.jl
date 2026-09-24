@@ -79,7 +79,7 @@ function prepare_module(client::ClientInfo)
     if !isempty(client.args)
         Core.eval(mod, :(ARGS = $(client.args)))
     end
-    if getval(client.switches, "--revise", get(ENV, "JULIA_DAEMON_REVISE", "no")) ∈ ("yes", "true", "1", "")
+    if isyes(getval(client.switches, "--revise", get(ENV, "JULIA_DAEMON_REVISE", "no")))
         # Two evals: a binding `using` creates is invisible to the frame that ran it.
         if isdefined(Main, :Revise) || !isnothing(Base.locate_package(REVISE_PKG))
             Core.eval(Main, :(using Revise))
@@ -101,7 +101,7 @@ end
 function clienthascolor(client::ClientInfo)
     cs = getval(client.switches, "--color", nothing)
     if cs !== nothing
-        cs ∈ ("yes", "true", "1", "")
+        isyes(cs)
     elseif client.color
         # terminfo misjudges terminals that set no TERM, as on Windows.
         true
@@ -159,12 +159,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                 term = get(ENV, "TERM", @static if Sys.iswindows() "" else "dumb" end)
                 color = @static if VERSION < v"1.12"
                     let color_switch = getval(client.switches, "--color", nothing)
-                        if isnothing(color_switch)
-                        elseif color_switch ∈ ("yes", "true", "1", "")
-                            true
-                        else
-                            false
-                        end
+                        if isnothing(color_switch) nothing else isyes(color_switch) end
                     end
                 else
                     hascolor
