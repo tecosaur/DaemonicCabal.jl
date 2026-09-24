@@ -203,6 +203,8 @@ pub fn execInSandbox(
         return SandboxError.ForkFailed;
     };
     if (pid1 != 0) return pid1;
+    // Child 1 never execs, so it would hold the conductor's descriptors open.
+    _ = linux.close_range(3, std.math.maxInt(i32), .{ .UNSHARE = false, .CLOEXEC = false });
     // Joined while the host's cgroup tree is still in view; the worker inherits it.
     if (cgroup) |cg| cgroupWrite(cg, "cgroup.procs", "0") catch |err|
         fatalChild("joining the sandbox cgroup", err);

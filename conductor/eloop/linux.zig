@@ -104,7 +104,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     var ping_timer = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_interval), .nsec = 0 };
     const pressure_active = conductor.pressure_monitor.active();
     var pressure_timer = linux.kernel_timespec{ .sec = @intCast(conductor.pressureIntervalS()), .nsec = 0 };
-    _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, 0) catch |err| {
+    _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC) catch |err| {
         std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
         return;
     };
@@ -225,7 +225,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
         if (pool_changed) conductor.noteLiveChange();
         if (need_rearm_accept) {
             client_addr_len = @sizeOf(std.Io.Threaded.PosixAddress);
-            _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, 0) catch |err| {
+            _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC) catch |err| {
                 std.debug.print("Fatal: failed to requeue accept: {}\n", .{err});
                 return;
             };
