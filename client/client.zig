@@ -319,6 +319,7 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     };
     const runtime_dir = located.runtime_dir;
     transport_mode = located.address.mode;
+    if (transport_mode == .local) platform.secureRuntimeDir(runtime_dir) catch exitClient(1);
     conductor_path = located.address.addr;
     const addr = conductor_path;
     const timeout = protocol.connect_timeout_ms;

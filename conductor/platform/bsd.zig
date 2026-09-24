@@ -19,6 +19,7 @@ pub const Timeval = c.timeval;
 // Process info
 pub const getpid = c.getpid;
 pub const getppid = c.getppid;
+pub const geteuid = c.geteuid;
 
 // I/O
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
@@ -196,6 +197,11 @@ pub fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
 }
 pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
     return c.connect(fd, addr, len) == 0;
+}
+pub fn fileOwner(fd: posix.fd_t) ?struct { uid: posix.uid_t, mode: u32 } {
+    var st: c.Stat = undefined;
+    if (c.fstat(fd, &st) != 0) return null;
+    return .{ .uid = st.uid, .mode = @intCast(st.mode) };
 }
 
 

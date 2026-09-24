@@ -42,6 +42,31 @@ pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     };
 }
 
+/// Owner-only: the sockets inside run code as us.
+pub const runtime_dir_permissions: Io.File.Permissions = .fromMode(0o700);
+/// Refuses `path` unless it is a directory of ours, not a symlink, which is
+/// narrowed to owner-only. Absent is fine: there is nothing in it to trust.
+pub fn secureRuntimeDir(path: []const u8) error{UntrustedRuntimeDir}!void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pathz = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return refuseRuntimeDir(path, "is too long a path", .{});
+    const fd = posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.SymLinkLoop => return refuseRuntimeDir(path, "is a symlink", .{}),
+        else => return refuseRuntimeDir(path, "cannot be opened ({s})", .{@errorName(err)}),
+    };
+    defer impl.rawClose(fd);
+    const owner = impl.fileOwner(fd) orelse return refuseRuntimeDir(path, "cannot be examined", .{});
+    if (owner.mode & posix.S.IFMT != posix.S.IFDIR) return refuseRuntimeDir(path, "is not a directory", .{});
+    const uid = impl.geteuid();
+    if (owner.uid != uid) return refuseRuntimeDir(path, "belongs to uid {d}, not to us ({d})", .{ owner.uid, uid });
+    if (owner.mode & 0o077 != 0 and posix.errno(posix.system.fchmod(fd, 0o700)) != .SUCCESS)
+        return refuseRuntimeDir(path, "is open to other users and cannot be narrowed", .{});
+}
+fn refuseRuntimeDir(path: []const u8, comptime reason: []const u8, args: anytype) error{UntrustedRuntimeDir} {
+    eprint("The runtime directory {s} " ++ reason ++ ", so another user could control it.\n" ++
+        "Remove it, or set JULIA_DAEMON_RUNTIME to a directory of your own.\n", .{path} ++ args);
+    return error.UntrustedRuntimeDir;
+}
 // Local transport: AF_UNIX sockets in the runtime dir.
 pub const max_local_addr = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len;
 pub fn localSocketDir(out: anytype, runtime_dir: []const u8) ![]const u8 {
