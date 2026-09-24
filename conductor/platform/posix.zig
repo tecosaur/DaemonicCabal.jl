@@ -42,6 +42,8 @@ pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     };
 }
 
+/// Owner-only: the sockets inside run code as us.
+pub const runtime_dir_permissions: Io.File.Permissions = .fromMode(0o700);
 // Local transport: AF_UNIX sockets in the runtime dir.
 pub const max_local_addr = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len;
 pub fn localSocketDir(out: anytype, runtime_dir: []const u8) ![]const u8 {

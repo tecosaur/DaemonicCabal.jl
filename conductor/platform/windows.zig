@@ -634,6 +634,9 @@ fn comptimeWide(comptime name: []const u8) [name.len:0]u16 {
     return out;
 }
 
+/// The runtime dir is under the per-user %LOCALAPPDATA%, and the pipes carry their own ACL.
+pub const runtime_dir_permissions: Io.File.Permissions = .default_dir;
+
 pub fn localSocketDir(out: anytype, _: []const u8) ![]const u8 {
     var wide: [257]u16 = undefined;
     var len: DWORD = wide.len;

@@ -2241,7 +2241,7 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.sandbox_session_bypass)
         std.debug.print(" - Sandbox session bypass: enabled\n", .{});
     // Needed even in TCP mode: the worker setup socket is always local.
-    try Io.Dir.cwd().createDirPath(io, cfg.runtime_dir);
+    _ = try Io.Dir.cwd().createDirPathStatus(io, cfg.runtime_dir, platform.runtime_dir_permissions);
     conductor.cleanupRuntimeDir();
     try conductor.run();
 }

@@ -50,6 +50,7 @@ pub const eprint = shared.eprint;
 pub const sendEof = if (os == .windows) impl.sendEof else shared.shutdownWrite;
 // Local transport: AF_UNIX on POSIX, named pipes on Windows.
 pub const Listener = shared.Listener;
+pub const runtime_dir_permissions = shared.runtime_dir_permissions;
 pub const localSocketDir = shared.localSocketDir;
 pub const localSocketPath = shared.localSocketPath;
 pub const listenLocal = shared.listenLocal;
