@@ -36,15 +36,20 @@ pub fn resolve(
     return null;
 }
 
+// As Base.project_names; the directory stands for whichever it holds.
+const project_names = [_][]const u8{ "JuliaProject.toml", "Project.toml" };
+
 fn findProjectToml(allocator: std.mem.Allocator, io: Io, start_dir: []const u8) !?[]const u8 {
     var dir = start_dir;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     while (true) {
-        const project_path = try std.fmt.bufPrint(&path_buf, "{s}/Project.toml", .{dir});
-        if (Io.Dir.openFileAbsolute(io, project_path, .{})) |file| {
-            file.close(io);
-            return try allocator.dupe(u8, dir);
-        } else |_| {}
+        for (project_names) |name| {
+            const project_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name });
+            if (Io.Dir.openFileAbsolute(io, project_path, .{})) |file| {
+                file.close(io);
+                return try allocator.dupe(u8, dir);
+            } else |_| {}
+        }
         const parent = std.fs.path.dirname(dir) orelse return null;
         if (std.mem.eql(u8, parent, dir)) return null;
         dir = parent;
