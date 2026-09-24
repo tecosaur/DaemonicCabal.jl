@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const SwitchList = std.array_list.AlignedManaged(Switch, null);
 
 const short_to_long = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "-a", "--address" },
     .{ "-e", "--eval" },
     .{ "-E", "--print" },
     .{ "-L", "--load" },
@@ -40,6 +41,9 @@ const optional_value_switches = std.StaticStringMap(void).initComptime(.{
 pub const Switch = struct {
     name: []const u8,
     value: []const u8,
+    /// The argv words it occupies: `words` of them from `index`.
+    index: usize,
+    words: usize,
 };
 
 pub const ParsedArgs = struct {
@@ -131,45 +135,31 @@ pub fn parse(allocator: Allocator, input_args: []const []const u8) !ParsedArgs {
     }
     const args = input_args;
     while (i < args.len and program_file == null) {
+        const index = i;
         const arg = args[i];
         i += 1;
         if (std.mem.eql(u8, arg, "--")) {
             seen_double_dash = true;
-        } else if (seen_double_dash) {
+            continue;
+        }
+        if (seen_double_dash or arg.len < 2 or arg[0] != '-') {
             program_file = arg;
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            if (std.mem.indexOf(u8, arg, "=")) |eq_pos| {
-                try switches.append(.{ .name = arg[0..eq_pos], .value = arg[eq_pos + 1 ..] });
-            } else if (no_value_switches.has(arg)) {
-                try switches.append(.{ .name = arg, .value = "" });
-            } else if (optional_value_switches.has(arg)) {
-                try switches.append(.{ .name = arg, .value = "" });
-            } else {
-                const value = if (i < args.len) blk: {
-                    const v = args[i];
-                    i += 1;
-                    break :blk v;
-                } else "";
-                try switches.append(.{ .name = arg, .value = value });
-            }
-        } else if (arg.len > 1 and arg[0] == '-') {
+            continue;
+        }
+        const Named = struct { name: []const u8, value: []const u8 };
+        const named: Named = if (std.mem.startsWith(u8, arg, "--")) blk: {
+            if (std.mem.indexOf(u8, arg, "=")) |eq_pos|
+                break :blk .{ .name = arg[0..eq_pos], .value = arg[eq_pos + 1 ..] };
+            if (no_value_switches.has(arg) or optional_value_switches.has(arg))
+                break :blk .{ .name = arg, .value = "" };
+            break :blk .{ .name = arg, .value = takeValue(args, &i) };
+        } else blk: {
             const short = arg[0..2];
             const name = short_to_long.get(short) orelse short;
-            if (no_value_switches.has(name)) {
-                try switches.append(.{ .name = name, .value = "" });
-            } else {
-                const value = if (arg.len > 2)
-                    arg[2..]
-                else if (i < args.len) blk: {
-                    const v = args[i];
-                    i += 1;
-                    break :blk v;
-                } else "";
-                try switches.append(.{ .name = name, .value = value });
-            }
-        } else {
-            program_file = arg;
-        }
+            if (no_value_switches.has(name)) break :blk .{ .name = name, .value = "" };
+            break :blk .{ .name = name, .value = if (arg.len > 2) arg[2..] else takeValue(args, &i) };
+        };
+        try switches.append(.{ .name = named.name, .value = named.value, .index = index, .words = i - index });
     }
     return .{
         .julia_channel = julia_channel,
@@ -177,4 +167,11 @@ pub fn parse(allocator: Allocator, input_args: []const []const u8) !ParsedArgs {
         .program_file = program_file,
         .program_args = args[i..],
     };
+}
+
+/// The next word as a switch's value, or "" at the end of argv.
+fn takeValue(args: []const []const u8, i: *usize) []const u8 {
+    if (i.* == args.len) return "";
+    defer i.* += 1;
+    return args[i.*];
 }
