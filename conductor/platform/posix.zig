@@ -60,6 +60,39 @@ pub fn connectLocalOnce(io: Io, path: []const u8) !posix.socket_t {
     Io.Dir.deleteFileAbsolute(io, path) catch {};
     return fd;
 }
+pub const local_transport_name = "unix socket";
+/// A local connect either succeeds or fails at once, so there is nothing to bound.
+pub fn probeLocal(path: []const u8, _: u32) bool {
+    impl.rawClose(rawConnectLocal(path) orelse return false);
+    return true;
+}
+/// Whether something accepts TCP connections at `ip` within `timeout_ms`.
+pub fn probeTcp(ip: Io.net.IpAddress, timeout_ms: u32) bool {
+    return switch (ip) {
+        .ip4 => |a| probeSockaddr(&posix.sockaddr.in{ .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.bytes) }, timeout_ms),
+        .ip6 => |a| probeSockaddr(&posix.sockaddr.in6{ .port = std.mem.nativeToBig(u16, a.port), .flowinfo = a.flow, .addr = a.bytes, .scope_id = a.interface.index }, timeout_ms),
+    };
+}
+fn probeSockaddr(sa: anytype, timeout_ms: u32) bool {
+    const fd = impl.rawSocket(sa.family, posix.SOCK.STREAM) orelse return false;
+    defer impl.rawClose(fd);
+    // Non-blocking, so an unanswered SYN is bounded by the poll, not the kernel.
+    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    if (posix.errno(flags) != .SUCCESS) return false;
+    const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, @as(usize, @intCast(flags)) | nonblock)) != .SUCCESS) return false;
+    switch (posix.errno(posix.system.connect(fd, @ptrCast(sa), @sizeOf(@TypeOf(sa.*))))) {
+        .SUCCESS => return true,
+        .INPROGRESS => {},
+        else => return false,
+    }
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    if ((posix.poll(&pfd, @intCast(timeout_ms)) catch return false) == 0) return false;
+    var err: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err), &len)) != .SUCCESS) return false;
+    return err == 0;
+}
 /// Connect with raw syscalls only, for use inside a signal handler; null on failure.
 pub fn rawConnectLocal(path: []const u8) ?posix.socket_t {
     var addr = std.mem.zeroes(posix.sockaddr.un);

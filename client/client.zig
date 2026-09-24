@@ -212,6 +212,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const addr_arg = extractAddressArg(init.args.vector);
     if (addr_arg.value) |addr| env.server_path = addr;
     const sync_arg = extractSyncArg(init.args.vector);
+    // Help and version need no daemon, and must not hang on an absent one.
+    for (init.args.vector[1..]) |arg_z| {
+        const arg = std.mem.span(arg_z);
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            platform.write(platform.getStdoutHandle(), protocol.CLIENT_HELP);
+            return;
+        }
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            printVersion(env);
+            return;
+        }
+    }
     // Set raw mode for TTY to avoid line buffering
     const is_tty = platform.isatty(platform.getStdinHandle());
     if (is_tty) platform.setRawMode(true);
@@ -257,20 +270,30 @@ fn scanEnv(block: EnvBlock) EnvInfo {
     return info;
 }
 
-fn connectToConductor(env: EnvInfo) !posix.socket_t {
-    var runtime_dir_buf: [max_socket_path]u8 = undefined;
+/// Where the conductor should be: the `-a`/JULIA_DAEMON_SERVER address, else
+/// the local socket for the runtime directory (also returned, for the pid file).
+fn locateConductor(env: EnvInfo, runtime_dir_buf: *[max_socket_path]u8) !struct { runtime_dir: []const u8, address: protocol.Address } {
     const runtime_dir = env.runtime_dir orelse
-        try platform.defaultRuntimeDir(&runtime_dir_buf, env.xdg_runtime_dir, env.home);
+        try platform.defaultRuntimeDir(runtime_dir_buf, env.xdg_runtime_dir, env.home);
     var socket_dir_buf: [max_socket_path]u8 = undefined;
     const socket_dir = try platform.localSocketDir(&socket_dir_buf, runtime_dir);
     const raw_path = env.server_path orelse
         try platform.localSocketPath(&conductor_path_buf, socket_dir, "conductor.sock", .{});
-    const parsed = protocol.parseAddress(raw_path) catch {
-        std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and local socket paths are supported.\n", .{raw_path});
-        exitClient(1);
+    return .{ .runtime_dir = runtime_dir, .address = try protocol.parseAddress(raw_path) };
+}
+
+fn connectToConductor(env: EnvInfo) !posix.socket_t {
+    var runtime_dir_buf: [max_socket_path]u8 = undefined;
+    const located = locateConductor(env, &runtime_dir_buf) catch |err| switch (err) {
+        error.UnsupportedScheme => {
+            std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and local socket paths are supported.\n", .{env.server_path orelse ""});
+            exitClient(1);
+        },
+        else => return err,
     };
-    transport_mode = parsed.mode;
-    conductor_path = parsed.addr;
+    const runtime_dir = located.runtime_dir;
+    transport_mode = located.address.mode;
+    conductor_path = located.address.addr;
     const addr = conductor_path;
     // First attempt
     if (protocol.connectAddress(io, transport_mode, addr)) |stream| return stream else |_| {}
@@ -312,6 +335,20 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
         \\
     , .{ addr, restart_hint });
     exitClient(127);
+}
+
+/// The client's version, and where a conductor answered, if one did.
+fn printVersion(env: EnvInfo) void {
+    const plain = "juliaclient " ++ protocol.VERSION;
+    var runtime_dir_buf: [max_socket_path]u8 = undefined;
+    const address: ?protocol.Address = if (locateConductor(env, &runtime_dir_buf)) |located|
+        (if (protocol.probeAddress(located.address.mode, located.address.addr, 1000)) located.address else null)
+    else |_| null;
+    var line_buf: [2 * max_socket_path]u8 = undefined;
+    const line = if (address) |a| std.fmt.bufPrint(&line_buf, plain ++ ", connected to conductor over {s} {s}\n", .{
+        if (a.mode == .tcp) "TCP" else platform.local_transport_name, a.addr,
+    }) catch plain ++ "\n" else plain ++ ", no conductor detected\n";
+    platform.write(platform.getStdoutHandle(), line);
 }
 
 fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, raw_args: std.process.Args, addr_skip: [2]usize, sync_skip: usize) !void {
