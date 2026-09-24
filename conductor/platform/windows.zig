@@ -117,6 +117,7 @@ extern "kernel32" fn CreateNamedPipeW(lpName: [*:0]const u16, dwOpenMode: DWORD,
 extern "kernel32" fn AcquireSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
 extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
 extern "kernel32" fn Sleep(dwMilliseconds: DWORD) void;
+extern "kernel32" fn GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: [*]u16) DWORD;
 extern "kernel32" fn GetCurrentProcess() HANDLE;
 extern "kernel32" fn DuplicateHandle(hSourceProcessHandle: HANDLE, hSourceHandle: HANDLE, hTargetProcessHandle: HANDLE, lpTargetHandle: *HANDLE, dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwOptions: DWORD) BOOL;
 extern "psapi" fn GetProcessMemoryInfo(hProcess: HANDLE, ppsmemCounters: *PROCESS_MEMORY_COUNTERS_EX, cb: DWORD) BOOL;
@@ -366,6 +367,15 @@ fn pipeSyncOp(h: HANDLE, read: bool, buf: []const u8) !usize {
     return result;
 }
 
+/// std.debug.print without its stderr locking and terminal handling, which
+/// cost the client ~110 KB. Truncates past 1 KiB.
+pub fn eprint(comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    w.print(fmt, args) catch {};
+    writeFile(getStderrHandle(), w.buffered());
+}
+
 pub fn socketWrite(fd: HANDLE, buf: []const u8) void {
     var sent: usize = 0;
     while (sent < buf.len) {
@@ -391,11 +401,11 @@ pub fn socketRead(fd: HANDLE, buf: []u8) usize {
     if (timeout_ms) |ms| return socketReadTimeout(fd, buf, ms);
     return switch (handleKind(fd)) {
         .pipe, .pipe_listener => pipeSyncOp(fd, true, buf) catch |err| {
-            std.debug.print("socketRead error: {}\n", .{err});
+            eprint("socketRead error: {}\n", .{err});
             return 0;
         },
         .afd => afdRecv(fd, buf) catch |err| {
-            std.debug.print("socketRead error: {}\n", .{err});
+            eprint("socketRead error: {}\n", .{err});
             return 0;
         },
     };
@@ -431,7 +441,7 @@ fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
         .SUCCESS => iosb.Information,
         .CANCELLED, .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE => 0,
         else => |status| blk: {
-            std.debug.print("socketReadTimeout: {any}\n", .{status});
+            eprint("socketReadTimeout: NTSTATUS 0x{x}\n", .{@intFromEnum(status)});
             break :blk 0;
         },
     };
@@ -575,14 +585,14 @@ fn boundedAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, timeout_ms
 pub fn rawSocket(family: u32, sock_type: u32) ?HANDLE {
     if (sock_type != posix.SOCK.STREAM) return null;
     return openAfdEndpoint(@intCast(family)) catch |err| {
-        std.debug.print("rawSocket: AFD endpoint creation failed: {}\n", .{err});
+        eprint("rawSocket: AFD endpoint creation failed: {}\n", .{err});
         return null;
     };
 }
 
 pub fn rawConnect(fd: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
     connectAfd(fd, addr, len, null) catch |err| {
-        std.debug.print("rawConnect failed: {}\n", .{err});
+        eprint("rawConnect failed: {}\n", .{err});
         return false;
     };
     return true;
@@ -789,20 +799,13 @@ pub fn listenLocal(io: Io, path: []const u8) !Listener {
 
 pub const local_transport_name = "named pipe";
 
-pub fn connectLocal(io: Io, path: []const u8, timeout_ms: u32) !HANDLE {
-    _ = io;
+pub fn connectLocal(path: []const u8, timeout_ms: u32) !HANDLE {
     return connectPipe(path, timeout_ms, false);
 }
 
 /// A pipe name vanishes with its last instance, so there is nothing to retire.
-pub fn connectLocalOnce(io: Io, path: []const u8) !HANDLE {
-    _ = io;
+pub fn connectLocalOnce(path: []const u8) !HANDLE {
     return connectPipe(path, 10_000, true);
-}
-
-/// Usable off the main thread.
-pub fn rawConnectLocal(path: []const u8) ?HANDLE {
-    return connectPipe(path, 1000, false) catch null;
 }
 
 const closeHandle = close; // unambiguous inside Listener, which has its own `close`
@@ -1014,7 +1017,7 @@ pub fn dumpChildStderr(io: Io, allocator: Allocator, child: *std.process.Child, 
     var fr = f.reader(io, &buf);
     const data = fr.interface.allocRemaining(allocator, .limited(1 << 20)) catch return;
     defer allocator.free(data);
-    if (data.len > 0) std.debug.print("Worker {d} stderr:\n{s}\n", .{ id, data });
+    if (data.len > 0) eprint("Worker {d} stderr:\n{s}\n", .{ id, data });
 }
 
 pub fn pidNumber(pid: posix.pid_t) u32 {
@@ -1089,8 +1092,75 @@ pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-pub fn requestSocketRecreate(_: u32) bool {
+pub fn requestSocketRecreate(_: []const u8) bool {
     return false;
+}
+
+pub fn sleepMs(ms: u32) void {
+    Sleep(ms);
+}
+
+pub fn currentDir(buf: []u8) ![]const u8 {
+    var wide: [4096]u16 = undefined;
+    const len = GetCurrentDirectoryW(wide.len, &wide);
+    if (len == 0 or len > wide.len) return error.CurrentDirUnavailable;
+    // The conversion writes unchecked, so the fit is established first.
+    if (std.unicode.calcWtf8Len(wide[0..len]) > buf.len) return error.NameTooLong;
+    return buf[0..std.unicode.wtf16LeToWtf8(buf, wide[0..len])];
+}
+
+// Name lookup through GetAddrInfoW, the one ws2_32 call here; Winsock starts
+// only when a name, not an address, needs resolving.
+
+const ADDRINFOW = extern struct {
+    flags: i32,
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+    addrlen: usize,
+    canonname: ?[*:0]u16,
+    addr: ?*posix.sockaddr,
+    next: ?*ADDRINFOW,
+};
+extern "ws2_32" fn WSAStartup(wVersionRequested: WORD, lpWSAData: *[512]u8) callconv(.winapi) i32;
+extern "ws2_32" fn GetAddrInfoW(pNodeName: [*:0]const u16, pServiceName: ?[*:0]const u16, pHints: ?*const ADDRINFOW, ppResult: *?*ADDRINFOW) callconv(.winapi) i32;
+extern "ws2_32" fn FreeAddrInfoW(pAddrInfo: *ADDRINFOW) callconv(.winapi) void;
+const WSAHOST_NOT_FOUND = 11001;
+var winsock_started = false;
+
+pub fn lookupHost(name: []const u8, port: u16, buf: []Io.net.IpAddress) ![]Io.net.IpAddress {
+    if (!winsock_started) {
+        var data: [512]u8 = undefined;
+        if (WSAStartup(0x0202, &data) != 0) return error.LookupFailed;
+        winsock_started = true;
+    }
+    var wide: [256:0]u16 = undefined;
+    const len = std.unicode.wtf8ToWtf16Le(&wide, name) catch return error.InvalidAddress;
+    if (len >= wide.len) return error.InvalidAddress;
+    wide[len] = 0;
+    const hints = std.mem.zeroInit(ADDRINFOW, .{ .socktype = posix.SOCK.STREAM });
+    var res: ?*ADDRINFOW = null;
+    switch (GetAddrInfoW(wide[0..len :0], null, &hints, &res)) {
+        0 => {},
+        WSAHOST_NOT_FOUND => return error.UnknownHostName,
+        else => return error.LookupFailed,
+    }
+    defer FreeAddrInfoW(res.?);
+    var n: usize = 0;
+    var next = res;
+    while (next) |ai| : (next = ai.next) {
+        const sa = ai.addr orelse continue;
+        if (sa.family != posix.AF.INET and sa.family != posix.AF.INET6) continue;
+        var storage: Io.Threaded.PosixAddress = undefined;
+        @memcpy(std.mem.asBytes(&storage)[0..ai.addrlen], @as([*]const u8, @ptrCast(sa))[0..ai.addrlen]);
+        var ip = Io.Threaded.addressFromPosix(&storage);
+        ip.setPort(port);
+        if (n < buf.len) {
+            buf[n] = ip;
+            n += 1;
+        }
+    }
+    return if (n == 0) error.UnknownHostName else buf[0..n];
 }
 
 pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const u8 {

@@ -77,11 +77,11 @@ pub fn run(
         var key: usize = 0;
         var ovl: ?*platform.OVERLAPPED = null;
         if (!platform.GetQueuedCompletionStatus(port, &bytes, &key, &ovl, platform.INFINITE).toBool() and ovl == null) {
-            std.debug.print("Fatal: GetQueuedCompletionStatus failed\n", .{});
+            platform.eprint("Fatal: GetQueuedCompletionStatus failed\n", .{});
             return error.IocpWaitFailed;
         }
         if (key >= 3) {
-            std.debug.print("event loop: stray completion (key={d}) — ignoring\n", .{key});
+            platform.eprint("event loop: stray completion (key={d}) — ignoring\n", .{key});
             continue;
         }
         if (ovl) |op| {
