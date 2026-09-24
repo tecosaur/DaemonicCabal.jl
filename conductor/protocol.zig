@@ -416,7 +416,7 @@ pub fn createListener(io_ctx: Io, mode: TransportMode, socket_dir: []const u8, s
     }
 }
 
-/// Port 0 is ephemeral.
+/// Port 0 is ephemeral. Labelled `:port`, since a wildcard bind is no host to dial.
 pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16) !Listener {
     const ip = try resolveListen(io_ctx, bind_addr, port);
     var server = try ip.listen(io_ctx, .{ .reuse_address = true });
@@ -425,7 +425,6 @@ pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16) !Listener {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,
     };
-    var buf: [64]u8 = undefined;
-    const addr_str = std.fmt.bufPrint(&buf, "{s}:{d}", .{ bind_addr, actual_port }) catch return error.NameTooLong;
-    return Listener.fromServer(server, .tcp, addr_str);
+    var buf: [8]u8 = undefined;
+    return Listener.fromServer(server, .tcp, try std.fmt.bufPrint(&buf, ":{d}", .{actual_port}));
 }
