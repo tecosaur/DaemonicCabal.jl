@@ -9,7 +9,9 @@ const short_to_long = std.StaticStringMap([]const u8).initComptime(.{
     .{ "-a", "--address" },
     .{ "-e", "--eval" },
     .{ "-E", "--print" },
+    .{ "-g", "--debug-info" },
     .{ "-L", "--load" },
+    .{ "-O", "--optimize" },
     .{ "-P", "--project" },
     .{ "-t", "--threads" },
 });
@@ -27,7 +29,8 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--quiet", {} },
 });
 
-// Only --switch=value: in `julia --project script.jl` the next word is the program.
+// Only --switch=value (or -Xvalue): in `julia --project script.jl` the next
+// word is the program.
 const optional_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },
     .{ "--status", {} },
@@ -36,6 +39,20 @@ const optional_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--code-coverage", {} },
     .{ "--track-allocation", {} },
     .{ "--debug-info", {} },
+    .{ "--optimize", {} },
+});
+
+// Every other switch only applies as Julia starts, which a reused worker
+// has done already. A value given here is the only one honoured.
+const honoured_switches = std.StaticStringMap(?[]const u8).initComptime(.{
+    .{ "--address", null },     .{ "--help", null },     .{ "-h", null },
+    .{ "--version", null },     .{ "-v", null },         .{ "--status", null },
+    .{ "--restart", null },     .{ "--sandbox", null },  .{ "--session", null },
+    .{ "--sync", null },        .{ "--project", null },  .{ "--threads", null },
+    .{ "--revise", null },      .{ "--eval", null },     .{ "--print", null },
+    .{ "--load", null },        .{ "-i", null },         .{ "-q", null },
+    .{ "--quiet", null },       .{ "--banner", null },   .{ "--color", null },
+    .{ "--history-file", null }, .{ "--startup-file", "no" },
 });
 
 pub const Switch = struct {
@@ -44,6 +61,11 @@ pub const Switch = struct {
     /// The argv words it occupies: `words` of them from `index`.
     index: usize,
     words: usize,
+
+    pub fn isHonoured(self: Switch) bool {
+        const only = honoured_switches.get(self.name) orelse return false;
+        return only == null or std.mem.eql(u8, only.?, self.value);
+    }
 };
 
 pub const ParsedArgs = struct {
@@ -164,7 +186,8 @@ pub fn parse(allocator: Allocator, input_args: []const []const u8) !ParsedArgs {
         } else blk: {
             const short = arg[0..2];
             const name = short_to_long.get(short) orelse short;
-            if (no_value_switches.has(name)) break :blk .{ .name = name, .value = "" };
+            if (no_value_switches.has(name) or (arg.len == 2 and optional_value_switches.has(name)))
+                break :blk .{ .name = name, .value = "" };
             break :blk .{ .name = name, .value = if (arg.len > 2) arg[2..] else takeValue(args, &i) };
         };
         try switches.append(.{ .name = named.name, .value = named.value, .index = index, .words = i - index });
