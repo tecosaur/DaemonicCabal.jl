@@ -312,7 +312,7 @@ pub const Worker = struct {
                 break :blk switch (launch) {
                     .client => |c| handed: {
                         try sendSpawnRequest(c.socket, argv.items, c.environ);
-                        break :handed .{ .id = null, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
+                        break :handed platform.no_child;
                     },
                     else => try platform.spawnWorker(io, argv.items),
                 };
@@ -324,7 +324,7 @@ pub const Worker = struct {
                 .allocator = allocator,
                 .id = id,
                 .process = child,
-                .socket = -1,
+                .socket = platform.no_socket,
                 .project = null,
                 .julia_channel = channel_copy,
                 .threads = threads,
@@ -394,7 +394,7 @@ pub const Worker = struct {
                     return error.UnknownWorkerPid;
                 };
                 w.pidfd = platform.pidfdOpen(w.process.id.?) orelse {
-                    std.debug.print("Worker {d}: pidfd_open failed for pid {d}; client-spawned workers need Linux 5.3+\n", .{ w.id, w.process.id.? });
+                    std.debug.print("Worker {d}: pidfd_open failed for pid {d}; client-spawned workers need Linux 5.3+\n", .{ w.id, platform.pidNumber(w.process.id.?) });
                     return error.PidfdUnsupported;
                 };
             }
@@ -433,6 +433,7 @@ pub const Worker = struct {
                 _ = platform.kill(pid, platform.SIG.KILL);
                 _ = platform.waitpidNonBlocking(pid);
             };
+            platform.dumpChildStderr(io, self.worker.allocator, &self.worker.process, self.worker.id);
             self.listener.close(io);
             if (self.worker.julia_channel) |ch| self.worker.allocator.free(ch);
         }
@@ -679,7 +680,7 @@ pub const Worker = struct {
         const send_buf = try allocator.alloc(u8, payload_size);
         defer allocator.free(send_buf);
         var w = BufWriter{ .buf = send_buf };
-        w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .force = client_info.force }));
+        w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .color = client_info.color, .force = client_info.force }));
         w.writeInt(u32, client_info.id);
         // The pid the worker will see on the client's stdio connections: a worker
         // the client launched shares its pid namespace, one of ours shares the
@@ -779,6 +780,7 @@ pub const Worker = struct {
 
 pub const ClientInfo = struct {
     tty: bool,
+    color: bool, // the client's terminal renders ANSI colour
     force: bool, // Bypass worker capacity check
     id: u32, // conductor-assigned; names the client in notifications and syncs
     pid: u32, // as the client reports itself

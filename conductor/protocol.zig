@@ -30,6 +30,13 @@ pub const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
         \\ tail -f ~/Library/Logs/julia-daemon.log
         \\
     ,
+    .windows =>
+        \\Daemon management (Task Scheduler):
+        \\
+        \\ schtasks /{run | end | query} /tn "Julia\JuliaDaemon"
+        \\ Get-Process julia-conductor   (status, PowerShell)
+        \\
+    ,
     else =>
         \\Daemon management:
         \\
@@ -96,7 +103,8 @@ pub const client = struct {
 
     pub const Flags = packed struct(u8) {
         tty: bool,
-        _reserved: u7 = 0,
+        color: bool = false, // the client's terminal renders ANSI colour
+        _reserved: u6 = 0,
     };
 };
 
@@ -133,8 +141,9 @@ pub const worker = struct {
 
     pub const Flags = packed struct(u8) {
         tty: bool,
+        color: bool = false, // the client's terminal renders ANSI colour
         force: bool = false, // Bypass capacity check (for labeled sessions)
-        _reserved: u6 = 0,
+        _reserved: u5 = 0,
     };
 };
 
@@ -339,10 +348,7 @@ fn parseHostPort(addr: []const u8) !Io.net.IpAddress {
 pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !std.posix.socket_t {
     switch (mode) {
         .local => return platform.connectLocal(io_ctx, addr),
-        .tcp => {
-            const ip = try parseHostPort(addr);
-            return (try ip.connect(io_ctx, .{ .mode = .stream })).socket.handle;
-        },
+        .tcp => return platform.connectTcp(io_ctx, try parseHostPort(addr)),
     }
 }
 
