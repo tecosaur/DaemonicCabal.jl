@@ -243,6 +243,12 @@ fn run(init: std.process.Init.Minimal) !void {
         printVersion(env);
         return;
     }
+    for (parsed.switches.items) |sw| if (!sw.isHonoured()) {
+        const words = inputs.args[sw.index..][0..sw.words];
+        platform.eprint("juliaclient: ignoring {s}{s}{s}, which only applies as Julia starts (set it for every worker in JULIA_DAEMON_WORKER_ARGS)\n", .{
+            words[0], if (words.len > 1) " " else "", if (words.len > 1) words[1] else "",
+        });
+    };
     const sync = parsed.hasSwitch("--sync");
     const is_tty = platform.isatty(platform.getStdinHandle());
     const console = if (is_tty) platform.setupConsoleIo(platform.getStdoutHandle(), platform.getStderrHandle()) else null;
