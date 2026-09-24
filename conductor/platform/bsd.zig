@@ -43,9 +43,9 @@ pub fn kill(pid: posix.pid_t, sig: SIG) usize {
     return if (ret < 0) 1 else 0;
 }
 
-pub fn rawWaitpid(pid: posix.pid_t) posix.pid_t {
+pub fn rawWaitpid(pid: posix.pid_t, block: bool) posix.pid_t {
     var status: c_int = 0;
-    return c.waitpid(pid, &status, 1); // WNOHANG = 1
+    return c.waitpid(pid, &status, if (block) 0 else 1); // WNOHANG = 1
 }
 // Width varies by sysctl, so read into the widest and zero-extend.
 fn sysctlUint(comptime name: [:0]const u8) ?u64 {

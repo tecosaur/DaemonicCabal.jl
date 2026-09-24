@@ -1042,6 +1042,11 @@ pub fn reapIfExited(pid: posix.pid_t) bool {
     return WaitForSingleObject(pid, 0) != WAIT_TIMEOUT;
 }
 
+/// Blocks, so only for a child already killed.
+pub fn waitForExit(pid: posix.pid_t) void {
+    _ = WaitForSingleObject(pid, INFINITE);
+}
+
 /// Once its process is no longer watched; it may still be running.
 pub fn releaseChild(child: *std.process.Child) void {
     const process = child.id orelse return;

@@ -66,6 +66,7 @@ pub const collectEnviron = shared.collectEnviron;
 pub const requestSocketRecreate = shared.requestSocketRecreate;
 pub const getChildPid = shared.getChildPid;
 pub const reapIfExited = shared.reapIfExited;
+pub const waitForExit = shared.waitForExit;
 /// Frees what holds a child process of ours, its pid aside.
 pub const releaseChild = if (os == .windows) impl.releaseChild else struct {
     fn f(_: *std.process.Child) void {}
