@@ -551,16 +551,16 @@ pub const Worker = struct {
     }
 
     /// The worker drops clients not in `pids`; returns its remaining count.
-    pub fn syncClients(self: *Worker, pids: []const u32) !u16 {
-        const payload_len: u16 = 2 + @as(u16, @intCast(pids.len)) * 4;
+    pub fn syncClients(self: *Worker, ids: []const u32) !void {
+        const payload_len: u16 = 2 + @as(u16, @intCast(ids.len)) * 4;
         self.writeHeader(.sync_clients, payload_len);
         var len_buf: [2]u8 = undefined;
-        std.mem.writeInt(u16, &len_buf, @intCast(pids.len), .little);
+        std.mem.writeInt(u16, &len_buf, @intCast(ids.len), .little);
         platform.write(self.socket, &len_buf);
-        for (pids) |pid| {
-            var pid_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &pid_buf, pid, .little);
-            platform.write(self.socket, &pid_buf);
+        for (ids) |id| {
+            var id_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &id_buf, id, .little);
+            platform.write(self.socket, &id_buf);
         }
         const header = try self.readHeader();
         if (header.msg_type != .ack) {
@@ -571,7 +571,6 @@ pub const Worker = struct {
         }
         var count_buf: [2]u8 = undefined;
         try readExact(self.socket, &count_buf);
-        return std.mem.readInt(u16, &count_buf, .little);
     }
 
     /// `error.TooManyClients` when `buf` overflows: a partial list would look

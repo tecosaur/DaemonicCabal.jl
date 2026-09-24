@@ -1713,16 +1713,19 @@ pub const Conductor = struct {
     }
 
     pub fn syncWorkerClients(self: *Conductor, w: *worker.Worker) void {
-        var ids: [32]u32 = undefined;
-        var count: u16 = 0;
+        // The worker kills every client not listed, so a partial list is never sent.
+        var ids: [max_tracked_clients]u32 = undefined;
+        var count: usize = 0;
         var it = self.active_clients.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.worker == w and count < 32) {
-                ids[count] = entry.key_ptr.*;
-                count += 1;
+        while (it.next()) |entry| if (entry.value_ptr.worker == w) {
+            if (count == ids.len) {
+                std.debug.print("Worker {d}: over {d} clients, skipping sync\n", .{ w.id, ids.len });
+                return;
             }
-        }
-        _ = w.syncClients(ids[0..count]) catch |err| {
+            ids[count] = entry.key_ptr.*;
+            count += 1;
+        };
+        w.syncClients(ids[0..count]) catch |err| {
             std.debug.print("Worker {d}: sync_clients failed: {}\n", .{ w.id, err });
             self.retireWorker(w);
             return;
