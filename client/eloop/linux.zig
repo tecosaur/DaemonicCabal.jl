@@ -70,8 +70,7 @@ pub fn run(
                 },
                 @intFromEnum(Location.local_stdin) => {
                     if (cqe.res <= 0) {
-                        // Half-close keeps the handle valid for a late Ctrl-C write.
-                        platform.shutdownWrite(stdin_fd);
+                        platform.sendEof(stdin_fd);
                         continue;
                     }
                     if (exit_code != null) continue;

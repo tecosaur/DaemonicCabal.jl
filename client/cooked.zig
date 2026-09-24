@@ -34,7 +34,7 @@ pub const CookedState = struct {
                 self.line_len = 0;
             },
             0x04 => {
-                if (self.line_len == 0) closeSocket(stdin_fd);
+                if (self.line_len == 0) platform.sendEof(stdin_fd);
             },
             else => {
                 if (byte >= 0x20 and self.line_len < self.line_buf.len) {
@@ -48,9 +48,5 @@ pub const CookedState = struct {
 
     fn writeLocal(data: []const u8) void {
         platform.write(platform.getStdoutHandle(), data);
-    }
-
-    fn closeSocket(fd: posix.socket_t) void {
-        platform.close(fd);
     }
 };
