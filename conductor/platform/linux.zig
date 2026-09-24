@@ -116,9 +116,9 @@ fn mountNsInode(pid: posix.pid_t) ?u64 {
     const close = std.mem.indexOfScalar(u8, link, ']') orelse return null;
     return std.fmt.parseInt(u64, link[open + 1 .. close], 10) catch null;
 }
-pub fn rawWaitpid(pid: posix.pid_t) posix.pid_t {
+pub fn rawWaitpid(pid: posix.pid_t, block: bool) posix.pid_t {
     var status: u32 = 0;
-    const ret = linux.waitpid(pid, &status, linux.W.NOHANG);
+    const ret = linux.waitpid(pid, &status, if (block) 0 else linux.W.NOHANG);
     return @intCast(@as(isize, @bitCast(ret)));
 }
 pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {

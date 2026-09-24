@@ -169,7 +169,11 @@ pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
 /// Reaps it if so.
 pub fn reapIfExited(pid: posix.pid_t) bool {
     // < 0 is ECHILD: already gone.
-    return impl.rawWaitpid(pid) != 0;
+    return impl.rawWaitpid(pid, false) != 0;
+}
+/// Blocks, so only for a child already killed.
+pub fn waitForExit(pid: posix.pid_t) void {
+    _ = impl.rawWaitpid(pid, true);
 }
 
 /// `cpu_seconds` is cumulative, not a rate.
