@@ -912,10 +912,13 @@ pub const Listener = struct {
         };
     }
     /// Accept the connection an event loop reported waiting.
-    pub fn accept(self: *Listener, io: Io) !HANDLE {
+    pub fn accept(self: *Listener, io: Io) !protocol.Accepted {
         return switch (self.backing) {
-            .pipe => self.takePipeConnection(),
-            .socket => |*s| (try s.accept(io)).socket.handle,
+            .pipe => .{ .socket = try self.takePipeConnection(), .peer = null },
+            .socket => |*s| blk: {
+                const stream = try s.accept(io);
+                break :blk .{ .socket = stream.socket.handle, .peer = stream.socket.address };
+            },
         };
     }
     /// Accept a connection arriving within `timeout_ms` (0: one already waiting); null when none does.

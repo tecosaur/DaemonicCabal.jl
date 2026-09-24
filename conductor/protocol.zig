@@ -307,6 +307,8 @@ pub const PortPool = struct {
 
 pub const TransportMode = enum { local, tcp };
 pub const Listener = platform.Listener;
+/// An accepted connection and, over TCP, the peer's address.
+pub const Accepted = struct { socket: std.posix.socket_t, peer: ?Io.net.IpAddress };
 
 pub const Address = struct {
     mode: TransportMode,
