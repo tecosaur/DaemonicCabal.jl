@@ -2154,8 +2154,7 @@ pub const Conductor = struct {
         const stdin = streams.fd(.stdin);
         const signals = streams.fd(.signals);
         platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
-        var qbuf: [pal.query_buf_len]u8 = undefined;
-        platform.write(streams.fd(.stdout), pal.writeQueries(&qbuf));
+        platform.write(streams.fd(.stdout), pal.queries);
         // This read blocks the event loop.
         platform.setRecvTimeout(stdin, palette_probe_timeout_s);
         defer platform.setRecvTimeout(stdin, 0);
