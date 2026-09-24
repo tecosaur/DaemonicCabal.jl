@@ -25,7 +25,7 @@ const max_socket_path = 256;
 const restart_hint = switch (builtin.os.tag) {
     .linux => "systemctl --user restart julia-daemon",
     .macos => "launchctl kickstart -k gui/$(id -u)/org.julialang.julia-daemon",
-    .windows => "schtasks /end /tn \"Julia\\JuliaDaemon\" & schtasks /run /tn \"Julia\\JuliaDaemon\"",
+    .windows => "taskkill /F /IM julia-conductor.exe & schtasks /run /tn \"Julia\\JuliaDaemon\"",
     else => "pkill -f julia-conductor && julia-conductor &",
 };
 
