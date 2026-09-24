@@ -33,7 +33,7 @@ include("setup.jl")
 include("run.jl")
 
 function __init__()
-    try_load_revise()
+    isyes(get(ENV, "JULIA_DAEMON_REVISE", "no")) && load_revise()
     WORKER_ID[] = String(rand('a':'z', 6))
     include(joinpath(@__DIR__, "overrides.jl"))
     @static if VERSION >= v"1.11"
