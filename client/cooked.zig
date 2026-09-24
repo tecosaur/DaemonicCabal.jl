@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Cooked mode emulation for --sync clients.
-// When the worker requests cooked mode (e.g. readline()), the client
-// emulates line editing locally: buffering, echo, backspace, and
-// sending complete lines on enter.
+// Cooked-mode line editing for --sync clients, done locally.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,8 +12,7 @@ pub const CookedState = struct {
     line_buf: [4096]u8 = undefined,
     line_len: usize = 0,
 
-    /// Process a single input byte in cooked mode.
-    /// stdin_fd is the worker's stdin socket; local echo goes to local stdout.
+    /// Echo goes to local stdout.
     pub fn process(self: *@This(), byte: u8, stdin_fd: posix.socket_t) void {
         switch (byte) {
             0x7F => {
@@ -55,6 +51,6 @@ pub const CookedState = struct {
     }
 
     fn closeSocket(fd: posix.socket_t) void {
-        platform.close(fd); // closesocket on Windows, close on POSIX
+        platform.close(fd);
     }
 };

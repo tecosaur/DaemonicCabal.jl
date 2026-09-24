@@ -22,7 +22,7 @@ const signal_pipe = &posix_signals.signal_pipe;
 const SIGNAL_SHUTDOWN = posix_signals.SIGNAL_SHUTDOWN;
 const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 
-// EventLoop (wraps io_uring + health check state)
+// EventLoop
 pub const EventLoop = struct {
     ring: linux.IoUring,
     health_check_ts: linux.kernel_timespec,
@@ -41,20 +41,16 @@ pub const EventLoop = struct {
         self.ring.deinit();
     }
 
-    /// Arm the unified live-repaint timer `delay_ms` out (Conductor picks the delay).
     pub fn armLiveTimer(self: *EventLoop, delay_ms: u64) void {
         self.live_ts = .{ .sec = @intCast(delay_ms / 1000), .nsec = @intCast((delay_ms % 1000) * std.time.ns_per_ms) };
         _ = self.ring.timeout(@intFromEnum(EventLocation.live_timer), &self.live_ts, 0, 0) catch {};
     }
 
-    /// Schedule a health check for a worker after a short delay.
     pub fn scheduleHealthCheck(self: *EventLoop, w: *worker.Worker) void {
         _ = self.ring.timeout(@intFromPtr(w) | 1, &self.health_check_ts, 0, 0) catch {};
     }
 
-    /// Watch `fd` for readability once, reporting `tag` (a pending record's
-    /// pointer with its low bits naming what) to the conductor; watch again to
-    /// keep watching.
+    /// One-shot. `tag` is a pending record's pointer, its low bits naming what.
     pub fn watchFd(self: *EventLoop, tag: usize, fd: posix.fd_t) void {
         _ = self.ring.poll_add(tag, fd, posix.POLL.IN) catch {};
     }
@@ -70,10 +66,7 @@ pub const EventLoop = struct {
         self.tick_armed = true;
     }
 
-    /// Cancel in-flight ops referencing `w`: the health-check timeout (`ptr|1`,
-    /// armable without a ping in flight) and the pending ping read (`ptr`).
-    /// Draining the cancels isn't relied upon — isLiveWorker rejects any stale
-    /// completion that still arrives.
+    /// Any completion that still arrives is rejected by isLiveWorker.
     pub fn cancelPendingPing(self: *EventLoop, w: *worker.Worker) void {
         _ = self.ring.cancel(@intFromEnum(EventLocation.ignored), @intFromPtr(w) | 1, 0) catch {};
         if (w.ping_pending) {
@@ -99,7 +92,6 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     var ping_timeout_ts = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_timeout), .nsec = 0 };
     const pressure_active = conductor.pressure_monitor.active();
     var pressure_timer = linux.kernel_timespec{ .sec = @intCast(@min(@as(u64, 5), conductor.cfg.ping_interval)), .nsec = 0 };
-    // Queue initial operations
     _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, 0) catch |err| {
         std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
         return;
@@ -127,8 +119,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
         var need_rearm_accept = false;
         var need_rearm_ping_timer = false;
         var need_rearm_pressure_timer = false;
-        // Any completion other than the live timers themselves may have changed
-        // what a live `--status` view shows; one repaint is scheduled per batch.
+        // Whether a live `--status` view needs a repaint, once per batch.
         var pool_changed = false;
         while (ring.cq_ready() > 0) {
             const cqe = ring.copy_cqe() catch |err| {
@@ -136,17 +127,16 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 return;
             };
             const user_data = cqe.user_data;
-            // Tagged pointers (user_data >= 0x1000): bits 1-2 set is a pending
-            // connection or spawn the conductor decodes, else a worker (bit 0:
-            // 0=pong, 1=health check timeout).
+            // Pointers: bits 1-2 set is a pending record, else a worker (bit 0:
+            // health check timeout).
             if (user_data >= 0x1000 and (user_data & 6) != 0) {
-                if (cqe.res >= 0) conductor.onReadable(@intCast(user_data)); // else cancelled
+                if (cqe.res >= 0) conductor.onReadable(@intCast(user_data));
                 pool_changed = true;
                 continue;
             }
             if (user_data >= 0x1000) {
                 const w: *worker.Worker = @ptrFromInt(user_data & ~@as(u64, 1));
-                if (!conductor.isLiveWorker(w)) continue; // stale completion for a retired worker
+                if (!conductor.isLiveWorker(w)) continue;
                 if ((user_data & 1) != 0) {
                     conductor.refreshIdleMemIfStale(w, conductor.currentTime());
                     const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
@@ -281,7 +271,6 @@ fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, cqe_res: i32) vo
     if (cqe_res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
         if (w.ping_pending) {
             w.ping_pending = false;
-            // A busy worker may legitimately be slow to pong; warn, don't retire.
             if (w.active_clients > 0) {
                 w.last_pinged = conductor.currentTime(); // hold the slow cadence
                 std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});

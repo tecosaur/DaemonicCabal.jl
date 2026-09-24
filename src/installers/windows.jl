@@ -6,7 +6,6 @@ const SILENT_LAUNCH_SCRIPT = joinpath(install_dir(), "silent_launch.vbs")
 
 function install_service(env::Dict)
     stop_service()
-    # this script is the script that actually runs the conductor with the correct environment.
     open(PS1_WRAPPER, "w") do io
         envs = join(["\$env:$k = '$v'" for (k, v) in env], "\n")
 
@@ -16,8 +15,7 @@ function install_service(env::Dict)
         & "$(installed_conductor())" *>> "$(joinpath(install_dir(), "conductor.log"))"
         """)
     end
-    # this script is used to invoke the launch script from the scheduled task without
-    # flashing a console on the screen. Simple powershell invocation flashes.
+    # Launching powershell directly flashes a console window.
     open(SILENT_LAUNCH_SCRIPT, "w") do io
         write(io, """
         Set shell = CreateObject("WScript.Shell")
@@ -26,7 +24,6 @@ function install_service(env::Dict)
     end
 
     @info "Installing startup task"
-    # This script is just here to create the Task
     tmpfile = tempname() * ".ps1"
     write(tmpfile, """
     \$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '$SILENT_LAUNCH_SCRIPT'

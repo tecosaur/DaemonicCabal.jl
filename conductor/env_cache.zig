@@ -60,7 +60,7 @@ pub const EnvCache = struct {
         return null;
     }
 
-    /// Takes ownership of env slice and its contents (caller must not free)
+    /// Takes ownership of `env` and its contents.
     pub fn insert(self: *EnvCache, fingerprint: u64, env: []EnvVar) LookupResult {
         var julia_project: ?[]const u8 = null;
         for (env) |e| {
@@ -93,7 +93,7 @@ pub const EnvCache = struct {
                     oldest_slot = i;
                 }
             } else {
-                return i; // empty slot, use it immediately
+                return i;
             }
         }
         return oldest_slot;

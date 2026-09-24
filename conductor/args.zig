@@ -26,8 +26,7 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--quiet", {} },
 });
 
-// Switches whose value may only be given as --switch=value; a following
-// argument is the program file, as in `julia --project script.jl`.
+// Only --switch=value: in `julia --project script.jl` the next word is the program.
 const optional_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },
     .{ "--status", {} },
@@ -44,7 +43,7 @@ pub const Switch = struct {
 };
 
 pub const ParsedArgs = struct {
-    julia_channel: ?[]const u8, // JuliaUp channel selector (e.g., "+1.10", "+release")
+    julia_channel: ?[]const u8, // JuliaUp's "+1.10"
     switches: SwitchList,
     program_file: ?[]const u8,
     program_args: []const []const u8,
@@ -68,30 +67,23 @@ pub const ParsedArgs = struct {
         return false;
     }
 
-    /// The effective `--threads`/`-t` spec, or `threads_unset` if absent/empty.
     pub fn threadSwitch(self: *const ParsedArgs) Threads {
         return parseThreads(self.getSwitch("--threads") orelse "");
     }
 };
 
-/// A Julia `--threads` spec as (default pool, interactive pool) counts.
-///
-/// Julia fixes thread counts at process startup, so this becomes part of a
-/// worker's identity: a client can only reuse a worker spawned with the same
-/// spec. Sentinels per field: `0` = unset (Julia default), `0xffff` = `auto`.
-/// A `[2]u16` compares directly and is cheap to use as a map key.
+/// (default pool, interactive pool) counts. Julia fixes these at startup, so
+/// they are part of a worker's identity.
 pub const Threads = [2]u16;
 pub const threads_unset: u16 = 0;
 pub const threads_auto: u16 = 0xffff;
 pub const threads_none = Threads{ threads_unset, threads_unset };
 
-/// A single comparable value identifying a spec, for embedding in pool keys.
 pub fn packThreads(spec: Threads) u32 {
     return (@as(u32, spec[0]) << 16) | spec[1];
 }
 
-/// Parse a `--threads` value (`N`, `auto`, `N,M`, `auto,M`). Unrecognised
-/// fields fall back to `auto`, leaving the final verdict to Julia at startup.
+/// Unrecognised fields fall back to `auto`, leaving the verdict to Julia.
 pub fn parseThreads(value: []const u8) Threads {
     if (value.len == 0) return threads_none;
     const comma = std.mem.indexOfScalar(u8, value, ',');
@@ -106,11 +98,9 @@ fn parseThreadField(field: []const u8) u16 {
     return std.fmt.parseInt(u16, field, 10) catch threads_auto;
 }
 
-/// Render a spec as a `--threads` value (`3`, `auto`, `4,1`), or null when
-/// unset. Caller owns the result.
+/// Null when unset.
 pub fn renderThreads(allocator: Allocator, spec: Threads) !?[]const u8 {
     if (spec[0] == threads_unset and spec[1] == threads_unset) return null;
-    // A u16 is at most 5 digits; "65535,65535" fits comfortably.
     var buf: [16]u8 = undefined;
     var d_buf: [8]u8 = undefined;
     const default = threadField(&d_buf, spec[0]);
@@ -123,7 +113,6 @@ pub fn renderThreads(allocator: Allocator, spec: Threads) !?[]const u8 {
     return try allocator.dupe(u8, rendered);
 }
 
-/// Format one field into `buf` as `auto` or a decimal count.
 fn threadField(buf: []u8, val: u16) []const u8 {
     if (val == threads_auto or val == threads_unset) return "auto";
     return std.fmt.bufPrint(buf, "{d}", .{val}) catch unreachable;
@@ -135,7 +124,6 @@ pub fn parse(allocator: Allocator, input_args: []const []const u8) !ParsedArgs {
     var seen_double_dash = false;
     var program_file: ?[]const u8 = null;
     var i: usize = 1;
-    // Check for JuliaUp channel selector as first argument (e.g., "+1.10")
     var julia_channel: ?[]const u8 = null;
     if (i < input_args.len and input_args[i].len > 0 and input_args[i][0] == '+') {
         julia_channel = input_args[i];
@@ -155,7 +143,6 @@ pub fn parse(allocator: Allocator, input_args: []const []const u8) !ParsedArgs {
             } else if (no_value_switches.has(arg)) {
                 try switches.append(.{ .name = arg, .value = "" });
             } else if (optional_value_switches.has(arg)) {
-                // Optional value switches: --switch or --switch=value (no space-separated value)
                 try switches.append(.{ .name = arg, .value = "" });
             } else {
                 const value = if (i < args.len) blk: {

@@ -1,25 +1,17 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-# Mock workload that exercises real code paths during precompilation.
-# Wrapping in `let` keeps all bindings local. The `jl_generating_output`
-# guard ensures the workload only runs during precompilation.
 if ccall(:jl_generating_output, Cint, ()) == 1
 let
-    # Helper: write a u16-length-prefixed string into an IOBuffer
     _ws(io, s) = (write(io, UInt16(ncodeunits(s))); write(io, s))
-    # -- Build mock conductor message stream ----------------------------------
+    # -- Conductor messages ------------------------------------------------------
     buf = IOBuffer()
     write(buf, UInt32(PROTOCOL_MAGIC))
-    # ping (type=0x01, len=0)
     write(buf, UInt8(MSG_TYPE.ping), UInt16(0))
-    # set_project (type=0x10)
     proj = "/tmp/test"
     write(buf, UInt8(MSG_TYPE.set_project), UInt16(2 + ncodeunits(proj)))
     _ws(buf, proj)
-    # query_state (type=0x30, len=0)
     write(buf, UInt8(MSG_TYPE.query_state), UInt16(0))
-    # client_run (type=0x20): build payload separately to compute length
     cr = IOBuffer()
     write(cr, UInt8(0x00))                        # flags: tty=false, force=false
     write(cr, UInt32(7))                          # client id
@@ -38,13 +30,11 @@ let
     cr_data = take!(cr)
     write(buf, UInt8(MSG_TYPE.client_run), UInt16(length(cr_data)))
     write(buf, cr_data)
-    # sync_clients (type=0x50)
     write(buf, UInt8(MSG_TYPE.sync_clients), UInt16(2 + 4))
     write(buf, UInt16(1), UInt32(12345))
-    # soft_exit (type=0x40, len=0)
     write(buf, UInt8(MSG_TYPE.soft_exit), UInt16(0))
     seekstart(buf)
-    # -- Exercise protocol reading --------------------------------------------
+    # -- Protocol reading ------------------------------------------------------
     verify_magic(buf)
     read_header(buf)                              # ping
     h = read_header(buf)                          # set_project
@@ -55,7 +45,7 @@ let
     read_header(buf)                              # sync_clients
     read(buf, UInt16); read(buf, UInt32)
     read_header(buf)                              # soft_exit
-    # -- Exercise protocol writing --------------------------------------------
+    # -- Protocol writing ------------------------------------------------------
     out = IOBuffer()
     send_pong(out, 0)
     send_sockets(out, "/a", "/b", "/c", "/d", 1)
@@ -68,8 +58,7 @@ let
     send_signal(out, SIGNAL_EXIT, UInt8[0])
     send_signal(out, SIGNAL_RAW_MODE, UInt8[true])
     send_signal(out, SIGNAL_QUERY_SIZE, UInt8[])
-    # send_notification takes an address string, not an IO — exercise via explicit directive
-    # -- Exercise helpers -----------------------------------------------------
+    # -- Helpers ---------------------------------------------------------------
     getval(client.switches, "--eval", "")
     getval(client.switches, "--missing", "default")
     getval(client.env, "TERM", "")
@@ -77,9 +66,8 @@ let
     is_tcp_address("127.0.0.1:8080")
     is_tcp_address("/tmp/test.sock")
     sync_session_label(client)
-    # create_module/prepare_module/runclient use Core.eval(Module(:Main), ...)
-    # which is forbidden during precompilation — covered by explicit directives below
-    # -- Exercise BroadcastWriter + OutputHistory ----------------------------
+    # create_module/prepare_module/runclient can't run here: Core.eval is forbidden.
+    # -- BroadcastWriter + OutputHistory ---------------------------------------
     history = OutputHistory(SYNC_HISTORY_BYTES)
     bw = BroadcastWriter(IO[IOBuffer(), IOBuffer()], history)
     iswritable(bw); isopen(bw); isreadable(bw); bytesavailable(bw)
@@ -87,24 +75,21 @@ let
     Base.unsafe_write(bw, pointer("test\n"), UInt(5))
     flush(bw)
     replay_history(IOBuffer(), history)
-    # -- Exercise ScopedIO (>= 1.11) -----------------------------------------
+    # -- ScopedIO --------------------------------------------------------------
     @static if VERSION >= v"1.11"
         scoped_out = ScopedStdout()
         scoped_err = ScopedStderr()
         scoped_in = ScopedStdin()
-        # Base.get dispatches
         Base.get(scoped_out, :color, false)
         Base.get(scoped_err, :color, false)
         Base.get(scoped_out, :other, 42)
-        # pipe_reader/pipe_writer (resolves via ACTIVE_TERM)
         Base.pipe_reader(scoped_in)
         Base.pipe_writer(scoped_out)
         Base.pipe_writer(scoped_err)
-        # IOContext construction
         ioc = IOContext(scoped_out, :color => true)
         IOContext(ioc, :module => Main)
         IOContext(scoped_out, :color => true, :module => Main)
-        # Write operations (WORKER_TERM pipes are unconnected, but methods still compile)
+        # WORKER_TERM's pipes are unconnected, but the methods still compile.
         try write(scoped_out, "test") catch end
         try print(ioc, "hello") catch end
         try write(ioc, "world") catch end
@@ -122,8 +107,7 @@ let
 end # let
 end # if jl_generating_output
 
-# Explicit precompile directives for PipeEndpoint/TCPSocket specialisations
-# (these runtime types cannot be safely instantiated during precompilation)
+# Stream types that cannot be instantiated during precompilation
 precompile(verify_magic, (Base.PipeEndpoint,))
 precompile(read_header, (Base.PipeEndpoint,))
 precompile(read_client_run, (Base.PipeEndpoint,))

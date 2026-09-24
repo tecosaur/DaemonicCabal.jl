@@ -1,22 +1,12 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Terminal palette probe + OKLab gradient interpolation for `--status`.
-//
-// The conductor renders the report but never touches the client's terminal; the
-// client proxies stdio over the session sockets. So the probe is conductor-
-// driven over that duplex path: `writeQueries` returns OSC bytes to write to the
-// client's stdout, `parse` folds the replies read back from its stdin. A
-// trailing CSI 5n bounds the read — every VT terminal answers it, in stream
-// order — and a 5n reply with no preceding OSC bodies means the terminal lacks
-// colour-query support, so callers degrade to the 8-colour path.
-//
-// Gradients mix in OKLab (so fraction t looks t-of-the-way at any luma), per
-// Julia's StyledStrings.blend: ^2.2 gamma, linear weighted L/a/b.
+// Terminal palette probe and OKLab gradients for `--status`, probed over the
+// client's proxied stdio. A trailing CSI 5n bounds the read: every VT terminal
+// answers it, in stream order.
 
 const std = @import("std");
 
-/// 8-bit sRGB triple.
 pub const Rgb = struct {
     r: u8,
     g: u8,
@@ -26,15 +16,11 @@ pub const Rgb = struct {
     }
 };
 
-/// Probed terminal colours; a field is null when unreported or malformed.
-/// `ansi` slot 1 is "red", 2 "green", etc.
 pub const Palette = struct {
     foreground: ?Rgb = null, // OSC 10
-    background: ?Rgb = null, // OSC 11 — the health-dot fade target
+    background: ?Rgb = null, // OSC 11
     ansi: [16]?Rgb = [_]?Rgb{null} ** 16, // OSC 4
 
-    /// Whether any colour reply landed. False for a bare CSI 5n (terminal
-    /// answered the sentinel but no colour queries) → nothing to gradient with.
     pub fn isPopulated(self: Palette) bool {
         if (self.foreground != null or self.background != null) return true;
         for (self.ansi) |c| if (c != null) return true;
@@ -44,14 +30,12 @@ pub const Palette = struct {
 
 // --- queries -----------------------------------------------------------------
 
-/// ANSI slots the gradients anchor on: red, green, yellow, blue, magenta, cyan.
 pub const probed_slots = [_]u8{ 1, 2, 3, 4, 5, 6 };
 
-/// CSI 5n device-status reply: ESC [ 0 n. Terminates the reply stream.
+/// The CSI 5n reply.
 pub const sentinel = "\x1b[0n";
 
-/// Write OSC 10 (fg) + OSC 11 (bg) + OSC 4;N (slots) + CSI 5n into `buf`,
-/// returning the slice. OSC queries are BEL-terminated (wider support than ST).
+/// BEL-terminated: wider support than ST.
 pub fn writeQueries(buf: *[query_buf_len]u8) []const u8 {
     var pos: usize = 0;
     for ([_][]const u8{ "\x1b]10;?\x07", "\x1b]11;?\x07" }) |q| {
@@ -64,15 +48,12 @@ pub fn writeQueries(buf: *[query_buf_len]u8) []const u8 {
     return buf[0..pos];
 }
 
-/// Upper bound on `writeQueries` output: OSC 10/11 (7 each) + 6 × OSC 4 (≤10
-/// each) + CSI 5n (4), rounded up.
+/// OSC 10/11 (7 each) + 6 × OSC 4 (≤10 each) + CSI 5n (4), rounded up.
 pub const query_buf_len = 96;
 
 // --- reply parsing -----------------------------------------------------------
 
-/// Scan `bytes` for OSC replies (ESC ] body TERM, TERM = BEL or ESC\) and fold
-/// each recognised body into `palette`. Unknown bodies and malformed sequences
-/// are skipped. Idempotent over re-scans of a growing buffer.
+/// Idempotent over re-scans of a growing buffer.
 pub fn parse(bytes: []const u8, palette: *Palette) void {
     var i: usize = 0;
     while (i + 1 < bytes.len) {
@@ -81,8 +62,6 @@ pub fn parse(bytes: []const u8, palette: *Palette) void {
             continue;
         }
         const body = bytes[i + 2 ..];
-        // Terminator is BEL (1 byte) or ST = ESC\ (2 bytes); an unterminated
-        // body runs to end-of-buffer.
         var end = body.len;
         var skip: usize = 0;
         for (body, 0..) |b, j| {
@@ -98,7 +77,6 @@ pub fn parse(bytes: []const u8, palette: *Palette) void {
     }
 }
 
-/// Fold one OSC body into `palette`: "10"→fg, "11"→bg, "4;N"→ANSI slot N.
 fn consumeReply(body: []const u8, palette: *Palette) void {
     var parts = std.mem.splitScalar(u8, body, ';');
     const kind = parts.next() orelse return;
@@ -114,15 +92,12 @@ fn consumeReply(body: []const u8, palette: *Palette) void {
     }
 }
 
-// The next ';'-delimited field parsed as an xterm rgb spec (whitespace-trimmed).
 fn nextColor(parts: *std.mem.SplitIterator(u8, .scalar)) ?Rgb {
     return parseXtermRgb(std.mem.trim(u8, parts.next() orelse return null, " "));
 }
 
-/// Parse `rgb:R/G/B` or `rgba:R/G/B/A`, each channel 1–4 hex digits. Each
-/// channel scales to 8-bit by aligning its high nibble (1 digit → << 4, 2 →
-/// as-is, 3 → >> 4, 4 → >> 8). Alpha is discarded. Returns null on any
-/// malformation.
+/// `rgb:R/G/B` or `rgba:R/G/B/A`, each channel 1–4 hex digits scaled by its
+/// high nibble.
 pub fn parseXtermRgb(s: []const u8) ?Rgb {
     const channels: usize, const body = if (std.mem.startsWith(u8, s, "rgb:"))
         .{ 3, s[4..] }
@@ -133,11 +108,11 @@ pub fn parseXtermRgb(s: []const u8) ?Rgb {
     var it = std.mem.splitScalar(u8, body, '/');
     var rgb: [3]u8 = undefined;
     for (0..channels) |n| {
-        const chan = it.next() orelse return null; // too few channels
+        const chan = it.next() orelse return null;
         const v = channelToU8(chan) orelse return null;
-        if (n < 3) rgb[n] = v; // 4th channel (alpha) is parsed but discarded
+        if (n < 3) rgb[n] = v;
     }
-    if (it.next() != null) return null; // too many channels
+    if (it.next() != null) return null;
     return Rgb.init(rgb[0], rgb[1], rgb[2]);
 }
 
@@ -155,8 +130,7 @@ fn channelToU8(h: []const u8) ?u8 {
 
 const Oklab = struct { l: f64, a: f64, b: f64 };
 
-// sRGB→OKLab using StyledStrings' ^2.2 gamma approximation and the standard
-// OKLab matrices.
+// StyledStrings' ^2.2 gamma approximation, so blends match Julia's.
 fn srgbToOklab(c: Rgb) Oklab {
     const r = std.math.pow(f64, @as(f64, @floatFromInt(c.r)) / 255.0, 2.2);
     const g = std.math.pow(f64, @as(f64, @floatFromInt(c.g)) / 255.0, 2.2);
@@ -191,8 +165,7 @@ fn toHex(v: f64) u8 {
     return @intFromFloat(@min(255.0, @round(255.0 * out)));
 }
 
-/// Blend `lo`→`hi` at fraction `t` (clamped to [0,1]) in OKLab. t=0 → lo, t=1 →
-/// hi. Linear weighted mix of L/a/b, matching StyledStrings.blend(lo=>1-t, hi=>t).
+/// Matches StyledStrings.blend(lo=>1-t, hi=>t).
 pub fn blend(lo: Rgb, hi: Rgb, t: f64) Rgb {
     const f = std.math.clamp(t, 0.0, 1.0);
     const a = srgbToOklab(lo);
@@ -206,17 +179,12 @@ pub fn blend(lo: Rgb, hi: Rgb, t: f64) Rgb {
 
 // --- gradient ----------------------------------------------------------------
 
-/// An SGR truecolour foreground sequence "\x1b[38;2;R;G;Bm" formatted into a
-/// fixed buffer (max 19 bytes).
 pub const sgr_fg_len = 19;
 
 pub fn sgrFg(c: Rgb, buf: *[sgr_fg_len]u8) []const u8 {
     return std.fmt.bufPrint(buf, "\x1b[38;2;{d};{d};{d}m", .{ c.r, c.g, c.b }) catch unreachable;
 }
 
-/// Resolve a palette slot, falling back to `default` when the terminal didn't
-/// report it. Slot indices follow ANSI (1 red, 2 green, …). The foreground is
-/// reached directly as `palette.foreground orelse default`.
 pub fn slot(palette: *const Palette, idx: usize, default: Rgb) Rgb {
     if (idx >= palette.ansi.len) return default;
     return palette.ansi[idx] orelse default;

@@ -12,12 +12,8 @@ bundled_conductor() = joinpath(conductor_bundle(), "Contents", "MacOS", "julia-c
 """
     install_conductor_bundle()
 
-Wrap the conductor in a minimal `.app` so Login Items shows a name and icon
-rather than the generic executable placeholder. The binary is hardlinked
-unchanged into `Contents/MacOS`; the bundle is metadata only.
-
-`LSUIElement` keeps the agent out of the Dock and app switcher, and
-`LSBackgroundOnly` marks it as having no UI at all.
+Wrap the conductor in a minimal `.app` so Login Items shows a name and icon.
+`LSUIElement` keeps it out of the Dock and app switcher.
 """
 function install_conductor_bundle()
     contents = joinpath(conductor_bundle(), "Contents")

@@ -1,15 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-# * Set up REPL-related overrides
-# Within `REPL`, `check_open` is called on our `stdout` IOContext,
-# and we need to add this method to make it work.
-# Core.eval(mod, :(Base.check_open(ioc::IOContext) = Base.check_open(ioc.io)))
-
-# Create a fresh module with MainInclude and DaemonClientExit pre-defined (expensive)
 function create_module()::Module
     mod = Module(:Main)
-    # MainInclude (taken from base/client.jl)
+    # From base/client.jl
     maininclude = quote
         baremodule MainInclude
         using ..Base
@@ -28,7 +22,6 @@ function create_module()::Module
     mod
 end
 
-# Get a module, using standby if available
 function get_module()::Module
     mod = @lock STATE.lock begin
         m = STATE.standby_module[]
@@ -38,7 +31,6 @@ function get_module()::Module
     if isnothing(mod) create_module() else mod end
 end
 
-# Ensure standby module exists (called after client disconnect or on startup)
 function ensure_standby_module()
     @lock STATE.lock begin
         if isnothing(STATE.standby_module[])
@@ -47,8 +39,7 @@ function ensure_standby_module()
     end
 end
 
-# Pre-warm the REPL frontend with a throwaway session: its Base/REPL-overriding methods
-# can't be precompiled, but the JIT'd code is process-global so real sessions reuse it.
+# The REPL overrides can't be precompiled, but JIT'd code is process-global.
 function warm_repl_path()
     @static if VERSION < v"1.11"
         return nothing
@@ -58,7 +49,7 @@ function warm_repl_path()
             cin  = Pipe(); Base.link_pipe!(cin;  reader_supports_async=true, writer_supports_async=true)
             cout = Pipe(); Base.link_pipe!(cout; reader_supports_async=true, writer_supports_async=true)
             cerr = Pipe(); Base.link_pipe!(cerr; reader_supports_async=true, writer_supports_async=true)
-            # Closed signals so raw!/displaysize short-circuit (no client round-trip).
+            # Closed, so raw!/displaysize skip the client round-trip.
             sig = Pipe(); Base.link_pipe!(sig); close(sig.in); close(sig.out)
             dout = errormonitor(@async try read(cout.out) catch end)
             derr = errormonitor(@async try read(cerr.out) catch end)
@@ -78,21 +69,18 @@ function warm_repl_path()
     end
 end
 
-# Finalize module for a specific client (cheap)
 function prepare_module(client::ClientInfo)
     mod = if any(p -> first(p) == "--session", client.switches)
         Main
     else
         get_module()
     end
-    # State
     Core.eval(mod, :(cd($(client.cwd))))
     if !isempty(client.args)
         Core.eval(mod, :(ARGS = $(client.args)))
     end
     if getval(client.switches, "--revise", get(ENV, "JULIA_DAEMON_REVISE", "no")) ∈ ("yes", "true", "1", "")
-        # Two evals, not `Main.Revise.revise()`: a binding `using` creates is only
-        # visible in the world age after it, never from the frame that ran it.
+        # Two evals: a binding `using` creates is invisible to the frame that ran it.
         if isdefined(Main, :Revise) || !isnothing(Base.locate_package(REVISE_PKG))
             Core.eval(Main, :(using Revise))
             Core.eval(Main, :(Revise.revise()))
@@ -115,8 +103,7 @@ function clienthascolor(client::ClientInfo)
     if cs !== nothing
         cs ∈ ("yes", "true", "1", "")
     elseif client.color
-        # The client's own verdict (a tty without NO_COLOR); the terminfo
-        # fallback below misjudges terminals that set no TERM, as on Windows.
+        # terminfo misjudges terminals that set no TERM, as on Windows.
         true
     elseif client.tty
         term = getval(client.env, "TERM", "")
@@ -132,7 +119,6 @@ end
 
 function is_repl_client(client::ClientInfo)
     switches = (s for (s, _) in client.switches)
-    # A client drops into the REPL unless it gave code to run (-e/-E) or a program file.
     "-i" ∈ switches || (isnothing(client.programfile) && "--eval" ∉ switches && "--print" ∉ switches)
 end
 
@@ -145,11 +131,8 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing,
                    replay::Union{Nothing, Tuple{StreamIO, SyncSession}}=nothing)
     hascolor = clienthascolor(client)
-    # Buffer stdout only for non-interactive clients: a REPL prompt is small and is
-    # written just before the frontend blocks on stdin, so buffering would strand it
-    # (the prompt never reaches the client). Bulk `print` throughput — the reason to
-    # buffer — is a non-interactive concern. teardown owns the buffer via owned_streams.
-    # The <1.11 `redirect_stdio` path needs a stream owning an fd, which this lacks.
+    # Buffering would strand a REPL prompt written just before the frontend
+    # blocks on stdin. Pre-1.11 `redirect_stdio` needs a stream owning an fd.
     client_stdout_b, owned_streams = if VERSION >= v"1.11" && !is_repl_client(client) && client_stdout isa StreamIO
         buffered = BufferedOutput(client_stdout)
         buffered, map(s -> if s === client_stdout; buffered else s end, owned_streams)
@@ -160,8 +143,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     stderrx = IOContext(client_stderr, :color => hascolor)
     exit_code = 0
     try
-        # Inside the try, so a failure (e.g. loading Revise) reaches the client
-        # rather than leaving it waiting forever.
+        # Inside the try, so a failure (e.g. loading Revise) reaches the client.
         mod = prepare_module(client)
         withenv(client.env...) do
             @static if VERSION < v"1.11"
@@ -212,9 +194,8 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
             exit_code = 1
         end
     finally
-        # disable_sigint: a force-thrown SIGINT (from interrupting a tight loop)
-        # landing mid uv_write in teardown would siglongjmp out of libuv and
-        # corrupt the task fiber, so the stream I/O must be async-interrupt-atomic.
+        # A force-thrown SIGINT mid uv_write would siglongjmp out of libuv and
+        # corrupt the task fiber.
         Base.disable_sigint() do
             teardown_client(client, client_stdin, client_stdout_b, client_stderr,
                             signals, owned_streams, exit_code)
@@ -222,10 +203,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     end
 end
 
-# Flush and close a finished client's streams, signal its exit, and unregister.
-# Outputs are flushed first so the client drains them before the EOF/exit signal.
-# owned_streams is empty for a sync REPL task (per-client cleanup happens in its
-# stdin_copy_loop instead), so the exit signal / unregister are skipped there.
+# A sync REPL task owns no streams; its clients are cleaned up by stdin_copy_loop.
 function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO,
                          client_stderr::IO, signals::IO, owned_streams::Tuple, exit_code::Int)
     try flush(client_stdout) catch end
@@ -235,8 +213,7 @@ function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO
     end
     try close(client_stdin) catch end
     isempty(owned_streams) && return
-    # `isopen` lags a peer close, so signalling a departed client throws; the
-    # unregister must happen regardless or the worker stays at capacity.
+    # `isopen` lags a peer close; unregister regardless or the worker stays at capacity.
     try
         if isopen(signals)
             send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
@@ -247,9 +224,7 @@ function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO
     end
 end
 
-# Basically a bootleg version of `exec_options` from `base/client.jl`. In a sync
-# session, `broadcast` is the session's shared writer: --print shows the result
-# plainly to this client's stdout and also renders it REPL-style to the broadcast.
+# After `exec_options` in base/client.jl.
 function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing)
     set_switches = [s for (s, _) in client.switches]
@@ -288,8 +263,7 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
         interactiveinput = client.tty
         hascolor = get(stdout, :color, clienthascolor(client))
         quiet = "-q" ∈ set_switches || "--quiet" ∈ set_switches
-        # The atreplinit hook emits the banner itself when replaying scrollback, so
-        # suppress the REPL's own to avoid a duplicate.
+        # The atreplinit hook prints the banner itself when replaying.
         banner = if REPLAY_TARGET[] !== nothing
             :no
         else
