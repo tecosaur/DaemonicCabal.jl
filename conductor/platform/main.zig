@@ -45,6 +45,8 @@ pub const socketWrite = shared.socketWrite;
 pub const socketRead = shared.socketRead;
 pub const close = shared.close;
 pub const shutdownWrite = shared.shutdownWrite;
+/// The peer reads EOF; the handle stays valid wherever the transport can half-close.
+pub const sendEof = if (os == .windows) impl.sendEof else shared.shutdownWrite;
 // Local transport: AF_UNIX on POSIX, named pipes on Windows.
 pub const Listener = shared.Listener;
 pub const localSocketDir = shared.localSocketDir;
