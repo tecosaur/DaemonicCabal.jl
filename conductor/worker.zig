@@ -387,7 +387,8 @@ pub const Worker = struct {
         pub fn abandon(self: *Spawn, io: Io) void {
             if (self.worker.launch != .client) if (self.worker.process.id) |pid| {
                 _ = platform.kill(pid, platform.SIG.KILL);
-                _ = platform.reapIfExited(pid);
+                // A nonblocking reap would race the kill, and its stderr is read to EOF next.
+                platform.waitForExit(pid);
             };
             platform.dumpChildStderr(io, self.worker.allocator, &self.worker.process, self.worker.id);
             self.listener.close(io);

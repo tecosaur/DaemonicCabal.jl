@@ -66,6 +66,7 @@ pub const collectEnviron = shared.collectEnviron;
 pub const requestSocketRecreate = shared.requestSocketRecreate;
 pub const getChildPid = shared.getChildPid;
 pub const reapIfExited = shared.reapIfExited;
+pub const waitForExit = shared.waitForExit;
 // Linux-only; elsewhere "unavailable", so no peer is ever refused.
 const linux_only = if (os == .linux) impl else struct {
     pub fn peerPid(_: std.posix.socket_t) ?std.posix.pid_t { return null; }
