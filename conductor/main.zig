@@ -1940,11 +1940,10 @@ pub const Conductor = struct {
             self.closeForExit(exit_code);
         }
 
+        // `deinit` closes right after, which is the EOF; a half-close first would
+        // wait, on Windows, on this client, itself waiting for that EOF.
         fn closeForExit(self: *const ClientStreams, exit_code: u8) void {
-            platform.shutdownWrite(self.fd(.stdout));
-            platform.shutdownWrite(self.fd(.stderr));
             platform.write(self.fd(.signals), &[_]u8{ protocol.signals.exit, 0x01, exit_code });
-            platform.shutdownWrite(self.fd(.signals));
         }
 
         fn deinit(self: *ClientStreams) void {
