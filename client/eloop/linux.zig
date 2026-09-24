@@ -19,6 +19,9 @@ const Location = enum(u64) {
 };
 
 /// Returns the worker's exit code.
+// A regular-file stdin must read on from its position, not from offset 0 forever.
+const at_file_position: u64 = std.math.maxInt(u64);
+
 pub fn run(
     stdin_fd: posix.fd_t,
     stdout_fd: posix.fd_t,
@@ -35,7 +38,7 @@ pub fn run(
     var worker_stderr_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
     var stdin_fwd = cooked.StdinForwarder{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw };
-    _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, 0);
+    _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, at_file_position);
     _ = try ring.read(@intFromEnum(Location.worker_stdout), stdout_fd, .{ .buffer = &worker_stdout_buf }, 0);
     _ = try ring.read(@intFromEnum(Location.worker_stderr), stderr_fd, .{ .buffer = &worker_stderr_buf }, 0);
     _ = try ring.read(@intFromEnum(Location.signals), signals_fd, .{ .buffer = &signals_buf }, 0);
@@ -75,7 +78,7 @@ pub fn run(
                     }
                     if (exit_code != null) continue;
                     stdin_fwd.forward(local_stdin_buf[0..len]);
-                    _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, 0);
+                    _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, at_file_position);
                 },
                 @intFromEnum(Location.signals) => {
                     if (cqe.res <= 0) {
