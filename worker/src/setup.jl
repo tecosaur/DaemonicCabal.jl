@@ -533,7 +533,9 @@ function serve_message(conn::IO, header::MessageHeader)
         end
     elseif header.msg_type == MSG_TYPE.client_run
         client = read_client_run(conn)
-        WORKER_TERM.have_color = client.color  # our own stdio is piped
+        @static if VERSION >= v"1.11"
+            WORKER_TERM.have_color = client.color  # our own stdio is piped
+        end
         active_count, draining = @lock STATE.lock (length(STATE.clients), STATE.soft_exit[])
         # force bypasses capacity (labeled sessions) but never the drain.
         if draining || (!client.force && MAX_CLIENTS > 0 && active_count >= MAX_CLIENTS)
