@@ -53,7 +53,7 @@ pub fn run(
     var stderr_buf: [buf_size]u8 = undefined;
     var stdin_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
-    var cooked_state = cooked.CookedState{};
+    var stdin_fwd = cooked.StdinForwarder{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw };
     var exit_code: ?u8 = null;
     var stdout_eof = false;
     var stderr_eof = false;
@@ -119,13 +119,7 @@ pub fn run(
                         const want = @min(remaining, stdin_buf.len);
                         const n = posix.read(posix.STDIN_FILENO, stdin_buf[0..want]) catch 0;
                         if (n == 0) break;
-                        if (sync_mode and !signal_parser.worker_wants_raw) {
-                            for (stdin_buf[0..n]) |byte| {
-                                cooked_state.process(byte, stdin_fd);
-                            }
-                        } else {
-                            platform.write(stdin_fd, stdin_buf[0..n]);
-                        }
+                        stdin_fwd.forward(stdin_buf[0..n]);
                         remaining -= n;
                     }
                     if ((ev.flags & EV_EOF) != 0) {
@@ -161,10 +155,8 @@ pub fn run(
             if (n == 0) {
                 platform.sendEof(stdin_fd);
                 stdin_closed = true;
-            } else if (sync_mode and !signal_parser.worker_wants_raw) {
-                for (stdin_buf[0..n]) |byte| cooked_state.process(byte, stdin_fd);
             } else {
-                platform.write(stdin_fd, stdin_buf[0..n]);
+                stdin_fwd.forward(stdin_buf[0..n]);
             }
         }
         if (exit_code != null and stdout_eof and stderr_eof) {

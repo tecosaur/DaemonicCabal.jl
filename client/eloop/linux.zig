@@ -34,7 +34,7 @@ pub fn run(
     var worker_stdout_buf: [buf_size]u8 = undefined;
     var worker_stderr_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
-    var cooked_state = cooked.CookedState{};
+    var stdin_fwd = cooked.StdinForwarder{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw };
     _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, 0);
     _ = try ring.read(@intFromEnum(Location.worker_stdout), stdout_fd, .{ .buffer = &worker_stdout_buf }, 0);
     _ = try ring.read(@intFromEnum(Location.worker_stderr), stderr_fd, .{ .buffer = &worker_stderr_buf }, 0);
@@ -74,13 +74,7 @@ pub fn run(
                         continue;
                     }
                     if (exit_code != null) continue;
-                    if (sync_mode and !signal_parser.worker_wants_raw) {
-                        for (local_stdin_buf[0..len]) |byte| {
-                            cooked_state.process(byte, stdin_fd);
-                        }
-                    } else {
-                        platform.write(stdin_fd, local_stdin_buf[0..len]);
-                    }
+                    stdin_fwd.forward(local_stdin_buf[0..len]);
                     _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, 0);
                 },
                 @intFromEnum(Location.signals) => {
