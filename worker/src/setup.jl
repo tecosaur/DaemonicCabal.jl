@@ -172,8 +172,10 @@ end
 
 function create_socket(port::Integer=0)::Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}
     if is_tcp_address(STATE.conductor_socket[])
-        bind_addr = get(ENV, "JULIA_DAEMON_BIND", "0.0.0.0")
-        server = Sockets.listen(Sockets.IPv4(bind_addr), port)
+        # Where the conductor listens, unless told otherwise: a daemon kept to
+        # loopback keeps its sessions' streams there too.
+        bind_host = get(() -> first(split_host_port(STATE.conductor_socket[])), ENV, "JULIA_DAEMON_BIND")
+        server = Sockets.listen(resolve_host(bind_host), port)
         _, actual_port = Sockets.getsockname(server)
         # Report just :port — the client prepends the conductor's host,
         # which is correct for both local and remote connections.
