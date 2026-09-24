@@ -302,13 +302,13 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
 
 /// False when the listener can no longer accept (a pipe name it failed to re-create).
 fn handleAccept(conductor: *Conductor, listener: *protocol.Listener) bool {
-    const client_fd = listener.accept(conductor.io) catch |err| {
+    const accepted = listener.accept(conductor.io) catch |err| {
         std.debug.print("Accept error: {}\n", .{err});
         return err != error.PipeCreateFailed;
     };
-    if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
-    const peer = main.PeerInfo{};
-    conductor.admitConnection(client_fd, &peer);
+    if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(accepted.socket);
+    const peer = main.PeerInfo{ .address = accepted.peer };
+    conductor.admitConnection(accepted.socket, &peer);
     return true;
 }
 

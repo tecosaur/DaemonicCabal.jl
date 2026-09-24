@@ -18,15 +18,35 @@ const pal = @import("palette.zig");
 const pressure = @import("pressure.zig");
 pub const worker = @import("worker.zig");
 
-/// Peer address info passed from the event loop's accept to connection handling.
+/// Who is on the other end of an accepted connection.
 pub const PeerInfo = struct {
-    addr: posix.sockaddr = std.mem.zeroes(posix.sockaddr),
-    len: posix.socklen_t = 0,
-    /// True if the peer is a non-loopback TCP connection (remote client).
+    /// The peer's IP address; null for a local peer, or a TCP peer whose
+    /// address is unknown, which counts as remote.
+    address: ?Io.net.IpAddress = null,
+
+    /// The peer an accept reported, from its socket address.
+    pub fn fromSockaddr(storage: *const Io.Threaded.PosixAddress) PeerInfo {
+        // std maps any other family to loopback, which must not pass as local.
+        return .{ .address = switch (storage.any.family) {
+            posix.AF.INET, posix.AF.INET6 => Io.Threaded.addressFromPosix(storage),
+            else => null,
+        } };
+    }
+
+    /// True for a TCP peer that is not provably on a loopback address.
     pub fn isRemote(self: *const PeerInfo, transport: protocol.TransportMode) bool {
         if (transport != .tcp) return false;
-        if (self.len == 0) return false;
-        return !platform.isLoopback(&self.addr, self.len);
+        return !isLoopback(self.address orelse return true);
+    }
+
+    /// 127.0.0.0/8, ::1, or 127.0.0.0/8 mapped into IPv6.
+    fn isLoopback(address: Io.net.IpAddress) bool {
+        const v4_mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+        return switch (address) {
+            .ip4 => |a| a.bytes[0] == 127,
+            .ip6 => |a| std.mem.eql(u8, &a.bytes, &Io.net.Ip6Address.loopback(0).bytes) or
+                (std.mem.eql(u8, a.bytes[0..12], &v4_mapped) and a.bytes[12] == 127),
+        };
     }
 };
 

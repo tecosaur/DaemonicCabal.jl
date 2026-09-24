@@ -254,16 +254,16 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
 
 fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
     // Accept is level-triggered, so we don't need to re-arm
-    var client_addr: posix.sockaddr = undefined;
-    var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-    const client_fd = c.accept(server_fd, @ptrCast(&client_addr), &client_addr_len);
+    var client_addr: std.Io.Threaded.PosixAddress = undefined;
+    var client_addr_len: posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
+    const client_fd = c.accept(server_fd, &client_addr.any, &client_addr_len);
     if (client_fd < 0) {
         const err: posix.E = @enumFromInt(c._errno().*);
         std.debug.print("Accept error: {}\n", .{err});
         return;
     }
     if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
-    const peer = main.PeerInfo{ .addr = client_addr, .len = client_addr_len };
+    const peer = main.PeerInfo.fromSockaddr(&client_addr);
     conductor.admitConnection(client_fd, &peer);
 }
 
