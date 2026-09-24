@@ -143,6 +143,14 @@ pub fn parse(allocator: Allocator, input_args: []const []const u8) !ParsedArgs {
             continue;
         }
         if (seen_double_dash or arg.len < 2 or arg[0] != '-') {
+            // After -e or -E, as in Julia, every positional is an ARG.
+            const evaluates = for (switches.items) |sw| {
+                if (std.mem.eql(u8, sw.name, "--eval") or std.mem.eql(u8, sw.name, "--print")) break true;
+            } else false;
+            if (evaluates) {
+                i = index;
+                break;
+            }
             program_file = arg;
             continue;
         }
