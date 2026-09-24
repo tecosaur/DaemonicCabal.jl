@@ -47,7 +47,8 @@ Daemon management (systemd):
  systemctl --user {start | stop | restart | status} julia-daemon
 #+end_example
 
-Supported platforms: Linux, macOS, FreeBSD, and OpenBSD.
+Supported platforms: Linux, macOS, FreeBSD, OpenBSD, and Windows. On Windows,
+=install()= registers a logon task, =Julia\JuliaDaemon=, managed with =schtasks=.
 
 * Sessions
 
@@ -160,8 +161,8 @@ Environment variables read at daemon startup:
 | Variable                       | Default                      | Description                                                                                                                      |
 |--------------------------------+------------------------------+----------------------------------------------------------------------------------------------------------------------------------|
 | =JULIA_DAEMON_RUNTIME=           | /(platform-specific)/          | Runtime directory for sockets and PID file                                                                                       |
-| =JULIA_DAEMON_SERVER=            | =<runtime_dir>/conductor.sock= | Socket path or =tcp://host:port= for TCP mode                                                                                      |
-| =JULIA_DAEMON_BIND=              | /(from server addr)/           | TCP bind address override (e.g. =0.0.0.0=)                                                                                         |
+| =JULIA_DAEMON_SERVER=            | =<runtime_dir>/conductor.sock= | Local socket path, or =tcp://host:port= for TCP mode (a name or address; IPv6 in brackets)                                         |
+| =JULIA_DAEMON_BIND=              | /(server address host)/        | TCP bind address for the conductor and its workers (e.g. =0.0.0.0=)                                                                |
 | =JULIA_DAEMON_PORTS=             | /unset/                        | Worker port range in TCP mode (e.g. =10000-10100=)                                                                                 |
 | =JULIA_DAEMON_WORKER_EXECUTABLE= | =julia=                        | Julia binary for workers                                                                                                         |
 | =JULIA_DAEMON_WORKER_ARGS=       | =--startup-file=no=            | Arguments passed to worker processes (split on whitespace)                                                                       |
@@ -195,7 +196,9 @@ Sandbox configuration (Linux only, applies to both =--sandbox= and remote client
 | =JULIA_DAEMON_SANDBOX_SESSION_BYPASS=    | =0=       | Allow remote =--session=<label>= to join local unsandboxed workers |
 
 Runtime directory defaults: Linux =/run/user/$UID/julia-daemon=, macOS
-=~/Library/Application Support/julia-daemon=, BSD =/tmp/julia-daemon-$UID=.
+=~/Library/Application Support/julia-daemon=, BSD =/tmp/julia-daemon-$UID=,
+Windows =%LOCALAPPDATA%\julia-daemon=. On Windows the local socket is a named
+pipe, =\\.\pipe\julia-daemon\<user>\conductor.sock=, open only to its owner.
 
 The client reads =JULIA_DAEMON_SERVER= and =JULIA_DAEMON_RUNTIME= to locate the
 conductor socket.
@@ -219,6 +222,7 @@ after its idle =MAX_TTL= deadline.
 Pressure is read from the kernel's PSI stall information where available, else
 from the free-memory level (=MemAvailable=). On FreeBSD only the pressure trigger
 is implemented (workers are ranked without a size term); OpenBSD is TTL-only.
+Windows reads the free-memory level and sizes workers by their resident set.
 =juliaclient --status= shows each idle worker's eviction warmth while pressure
 handling is active.
 
@@ -238,7 +242,7 @@ handling is active.
   and routes client requests.
 - *Worker*: Julia process serving client sessions for a single project.
 
-Platform-specific I/O: =io_uring= on Linux, =kqueue= on macOS/BSD.
+Platform-specific I/O: =io_uring= on Linux, =kqueue= on macOS/BSD, IOCP on Windows.
 
 * Caveats
 
