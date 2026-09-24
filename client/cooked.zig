@@ -63,6 +63,6 @@ pub const CookedState = struct {
     }
 
     fn writeLocal(data: []const u8) void {
-        platform.write(platform.getStdoutHandle(), data);
+        platform.writeFile(platform.getStdoutHandle(), data);
     }
 };
