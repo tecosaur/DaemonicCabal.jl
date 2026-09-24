@@ -92,15 +92,15 @@ pub const EventLoop = struct {
 pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     const ring = &conductor.event_loop.ring;
     var signal_buf: [16]u8 = undefined;
-    var client_addr: posix.sockaddr = undefined;
-    var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    var client_addr: std.Io.Threaded.PosixAddress = undefined;
+    var client_addr_len: posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
     var server_fd = listener.fd();
     var ping_timer = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_interval), .nsec = 0 };
     var ping_timeout_ts = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_timeout), .nsec = 0 };
     const pressure_active = conductor.pressure_monitor.active();
     var pressure_timer = linux.kernel_timespec{ .sec = @intCast(@min(@as(u64, 5), conductor.cfg.ping_interval)), .nsec = 0 };
     // Queue initial operations
-    _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr, &client_addr_len, 0) catch |err| {
+    _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, 0) catch |err| {
         std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
         return;
     };
@@ -164,7 +164,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                     if (cqe.res >= 0) {
                         const client_fd: posix.fd_t = @intCast(cqe.res);
                         if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
-                        const peer = main.PeerInfo{ .addr = client_addr, .len = client_addr_len };
+                        const peer = main.PeerInfo.fromSockaddr(&client_addr);
                         conductor.admitConnection(client_fd, &peer);
                     } else {
                         const err_code: u32 = @intCast(-cqe.res);
@@ -228,8 +228,8 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
         }
         if (pool_changed) conductor.noteLiveChange();
         if (need_rearm_accept) {
-            client_addr_len = @sizeOf(posix.sockaddr);
-            _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr, &client_addr_len, 0) catch |err| {
+            client_addr_len = @sizeOf(std.Io.Threaded.PosixAddress);
+            _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, 0) catch |err| {
                 std.debug.print("Fatal: failed to requeue accept: {}\n", .{err});
                 return;
             };

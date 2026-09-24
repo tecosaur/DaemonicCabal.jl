@@ -218,22 +218,6 @@ pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.sockle
     return c.connect(fd, addr, len) == 0;
 }
 
-// Network — check if a sockaddr is a loopback address
-pub fn isLoopback(addr: *const posix.sockaddr, addr_len: posix.socklen_t) bool {
-    if (addr_len >= @sizeOf(posix.sockaddr.in) and addr.family == posix.AF.INET) {
-        const in: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
-        const ip_bytes: [4]u8 = @bitCast(in.addr);
-        return ip_bytes[0] == 127;
-    }
-    if (addr_len >= @sizeOf(posix.sockaddr.in6) and addr.family == posix.AF.INET6) {
-        const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
-        const loopback = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
-        const v4mapped_prefix = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
-        if (std.mem.eql(u8, &in6.addr, &loopback)) return true;
-        if (std.mem.eql(u8, in6.addr[0..12], &v4mapped_prefix)) return in6.addr[12] == 127;
-    }
-    return false;
-}
 
 // Paths — BSD/macOS-specific default runtime directory
 pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, home: ?[]const u8) ![]const u8 {

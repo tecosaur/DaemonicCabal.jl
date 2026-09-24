@@ -129,14 +129,15 @@ pub const Listener = struct {
         return self.server.socket.handle;
     }
     /// Accept the connection an event loop reported waiting.
-    pub fn accept(self: *Listener, io: Io) !posix.socket_t {
-        return (try self.server.accept(io)).socket.handle;
+    pub fn accept(self: *Listener, io: Io) !protocol.Accepted {
+        const stream = try self.server.accept(io);
+        return .{ .socket = stream.socket.handle, .peer = if (self.mode == .tcp) stream.socket.address else null };
     }
     /// Accept a connection arriving within `timeout_ms` (0: one already waiting); null when none does.
     pub fn acceptTimeout(self: *Listener, io: Io, timeout_ms: i32) !?posix.socket_t {
         var pfd = [_]posix.pollfd{.{ .fd = self.fd(), .events = posix.POLL.IN, .revents = 0 }};
         if (try posix.poll(&pfd, timeout_ms) == 0) return null;
-        return try self.accept(io);
+        return (try self.accept(io)).socket;
     }
     pub fn close(self: *Listener, io: Io) void {
         self.server.deinit(io);
