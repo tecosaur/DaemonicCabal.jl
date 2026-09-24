@@ -3,29 +3,28 @@
 
 if ccall(:jl_generating_output, Cint, ()) == 1
 let
-    _ws(io, s) = (write(io, UInt16(ncodeunits(s))); write(io, s))
     # -- Conductor messages ------------------------------------------------------
     buf = IOBuffer()
     write(buf, UInt32(PROTOCOL_MAGIC))
     write(buf, UInt8(MSG_TYPE.ping), UInt16(0))
     proj = "/tmp/test"
     write(buf, UInt8(MSG_TYPE.set_project), UInt16(2 + ncodeunits(proj)))
-    _ws(buf, proj)
+    write_string(buf, proj)
     write(buf, UInt8(MSG_TYPE.query_state), UInt16(0))
     cr = IOBuffer()
     write(cr, UInt8(0x00))                        # flags: tty=false, force=false
     write(cr, UInt32(7))                          # client id
     write(cr, UInt32(12345))                      # pid
-    _ws(cr, "/tmp")                               # cwd
+    write_string(cr, "/tmp")                               # cwd
     write(cr, UInt16(2))                          # env_count
-    _ws(cr, "TERM"); _ws(cr, "xterm-256color")
-    _ws(cr, "HOME"); _ws(cr, "/home/test")
+    write_string(cr, "TERM"); write_string(cr, "xterm-256color")
+    write_string(cr, "HOME"); write_string(cr, "/home/test")
     write(cr, UInt16(2))                          # switch_count
-    _ws(cr, "--eval"); _ws(cr, "1+1")
-    _ws(cr, "--color"); _ws(cr, "yes")
+    write_string(cr, "--eval"); write_string(cr, "1+1")
+    write_string(cr, "--color"); write_string(cr, "yes")
     write(cr, UInt8(0))                           # has_programfile=false
     write(cr, UInt16(1))                          # arg_count
-    _ws(cr, "arg1")
+    write_string(cr, "arg1")
     write(cr, UInt16(0xFFFF))                     # port_set=NONE
     cr_data = take!(cr)
     write(buf, UInt8(MSG_TYPE.client_run), UInt16(length(cr_data)))
