@@ -26,6 +26,7 @@ const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 pub const EventLoop = struct {
     ring: linux.IoUring,
     health_check_ts: linux.kernel_timespec,
+    ping_timeout_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
     live_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
     tick_ts: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
     tick_armed: bool = false,
@@ -48,6 +49,18 @@ pub const EventLoop = struct {
 
     pub fn scheduleHealthCheck(self: *EventLoop, w: *worker.Worker) void {
         _ = self.ring.timeout(@intFromPtr(w) | 1, &self.health_check_ts, 0, 0) catch {};
+    }
+
+    /// The pong read is linked to a timeout, which cancels it on expiry.
+    pub fn queuePing(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
+        w.sendPing();
+        self.ping_timeout_ts = .{ .sec = @intCast(timeout_ms / 1000), .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms) };
+        const sqe = self.ring.read(@intFromPtr(w), w.socket, .{ .buffer = &w.pong_buf }, 0) catch {
+            w.ping_pending = false;
+            return;
+        };
+        sqe.flags |= linux.IOSQE_IO_LINK;
+        _ = self.ring.link_timeout(@intFromEnum(EventLocation.ignored), &self.ping_timeout_ts, 0) catch {};
     }
 
     /// One-shot. `tag` is a pending record's pointer, its low bits naming what.
@@ -89,9 +102,8 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     var client_addr_len: posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
     var server_fd = listener.fd();
     var ping_timer = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_interval), .nsec = 0 };
-    var ping_timeout_ts = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_timeout), .nsec = 0 };
     const pressure_active = conductor.pressure_monitor.active();
-    var pressure_timer = linux.kernel_timespec{ .sec = @intCast(@min(@as(u64, 5), conductor.cfg.ping_interval)), .nsec = 0 };
+    var pressure_timer = linux.kernel_timespec{ .sec = @intCast(conductor.pressureIntervalS()), .nsec = 0 };
     _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, 0) catch |err| {
         std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
         return;
@@ -138,13 +150,11 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 const w: *worker.Worker = @ptrFromInt(user_data & ~@as(u64, 1));
                 if (!conductor.isLiveWorker(w)) continue;
                 if ((user_data & 1) != 0) {
-                    conductor.refreshIdleMemIfStale(w, conductor.currentTime());
-                    const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
-                    if (w.active_clients == 0 and !w.ping_pending and !recently_pinged) {
-                        queuePing(ring, w, &ping_timeout_ts);
-                    }
+                    conductor.onHealthCheck(w);
+                } else if (cqe.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
+                    conductor.onPongTimeout(w);
                 } else {
-                    handlePongResponse(conductor, w, cqe.res);
+                    conductor.onPong(w, if (cqe.res > 0) @intCast(cqe.res) else 0);
                 }
                 pool_changed = true;
                 continue;
@@ -195,15 +205,12 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                     };
                 },
                 .ping_timer => {
-                    if (!pressure_active) conductor.sweepPendingKills();
-                    conductor.enforceMaxTtl();
-                    queueWorkerPings(conductor, ring, &ping_timeout_ts);
+                    conductor.onPingTimer();
                     need_rearm_ping_timer = true;
                     pool_changed = true;
                 },
                 .pressure_timer => {
-                    conductor.sweepPendingKills();
-                    conductor.runEvictionEpisode();
+                    conductor.onPressureTimer();
                     need_rearm_pressure_timer = true;
                     pool_changed = true;
                 },
@@ -237,63 +244,4 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
             };
         }
     }
-}
-
-// Health checking
-fn queueWorkerPings(conductor: *Conductor, ring: *linux.IoUring, timeout_ts: *linux.kernel_timespec) void {
-    const now = conductor.currentTime();
-    var it = conductor.workers.iterator();
-    while (it.next()) |entry| {
-        for (entry.value_ptr.items) |w| {
-            maybeQueuePing(conductor, ring, w, timeout_ts, now);
-        }
-    }
-    if (conductor.reserve) |r| maybeQueuePing(conductor, ring, r, timeout_ts, now);
-}
-
-fn maybeQueuePing(conductor: *Conductor, ring: *linux.IoUring, w: *worker.Worker, timeout_ts: *linux.kernel_timespec, now: i64) void {
-    conductor.refreshIdleMemIfStale(w, now);
-    if (!w.shouldPing(now, conductor.cfg.ping_interval)) return;
-    queuePing(ring, w, timeout_ts);
-}
-
-fn queuePing(ring: *linux.IoUring, w: *worker.Worker, timeout_ts: *linux.kernel_timespec) void {
-    w.sendPing();
-    const sqe = ring.read(@intFromPtr(w), w.socket, .{ .buffer = &w.pong_buf }, 0) catch {
-        w.ping_pending = false;
-        return;
-    };
-    sqe.flags |= linux.IOSQE_IO_LINK;
-    _ = ring.link_timeout(@intFromEnum(EventLocation.ignored), timeout_ts, 0) catch {};
-}
-
-fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, cqe_res: i32) void {
-    if (cqe_res == -@as(i32, @intFromEnum(linux.E.CANCELED))) {
-        if (w.ping_pending) {
-            w.ping_pending = false;
-            if (w.active_clients > 0) {
-                w.last_pinged = conductor.currentTime(); // hold the slow cadence
-                std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
-            } else {
-                std.debug.print("Worker {d}: ping timed out\n", .{w.id});
-                conductor.retireWorker(w);
-            }
-        }
-        return;
-    }
-    w.ping_pending = false;
-    if (cqe_res <= 0) {
-        std.debug.print("Worker {d}: ping failed (res={d})\n", .{ w.id, cqe_res });
-        conductor.retireWorker(w);
-        return;
-    }
-    const bytes_read: usize = @intCast(cqe_res);
-    if (bytes_read < 5) {
-        protocol.readExact(w.socket, w.pong_buf[bytes_read..]) catch {
-            std.debug.print("Worker {d}: pong short read\n", .{w.id});
-            conductor.retireWorker(w);
-            return;
-        };
-    }
-    conductor.processPong(w, &w.pong_buf);
 }

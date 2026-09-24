@@ -1825,9 +1825,72 @@ pub const Conductor = struct {
         return false;
     }
 
-    // --- Utilities ---
+    // --- Health checks ---
+    // Policy only: each event loop supplies `queuePing`, arming a pong read
+    // and a timeout, and reports back through the handlers below.
 
-    pub fn processPong(self: *Conductor, w: *worker.Worker, pong_buf: *const [5]u8) void {
+    pub fn pressureIntervalS(self: *const Conductor) u64 {
+        return @min(@as(u64, 5), self.cfg.ping_interval);
+    }
+
+    pub fn onPingTimer(self: *Conductor) void {
+        if (!self.pressure_monitor.active()) self.sweepPendingKills();
+        self.enforceMaxTtl();
+        const now = self.currentTime();
+        var it = self.workers.iterator();
+        while (it.next()) |entry| for (entry.value_ptr.items) |w| self.pingIfDue(w, now);
+        if (self.reserve) |r| self.pingIfDue(r, now);
+    }
+
+    pub fn onPressureTimer(self: *Conductor) void {
+        self.sweepPendingKills();
+        self.runEvictionEpisode();
+    }
+
+    /// Scheduled after a client leaves, so an idle worker is checked promptly.
+    pub fn onHealthCheck(self: *Conductor, w: *worker.Worker) void {
+        const now = self.currentTime();
+        self.refreshIdleMemIfStale(w, now);
+        if (w.active_clients == 0 and !w.ping_pending and now - w.last_pinged >= 2)
+            self.event_loop.queuePing(w, self.cfg.ping_timeout * 1000);
+    }
+
+    /// `read`: pong bytes the loop already read into `w.pong_buf` (0 at EOF or
+    /// error), or null for a readiness loop, whose socket is read here.
+    pub fn onPong(self: *Conductor, w: *worker.Worker, read: ?usize) void {
+        // A timeout in the same batch may have settled this ping already.
+        if (!w.ping_pending) return;
+        w.ping_pending = false;
+        const n = read orelse platform.socketRead(w.socket, &w.pong_buf);
+        if (n == 0) {
+            std.debug.print("Worker {d}: connection closed\n", .{w.id});
+            return self.retireWorker(w);
+        }
+        if (n < w.pong_buf.len) readExact(w.socket, w.pong_buf[n..]) catch {
+            std.debug.print("Worker {d}: pong short read\n", .{w.id});
+            return self.retireWorker(w);
+        };
+        self.processPong(w, &w.pong_buf);
+    }
+
+    pub fn onPongTimeout(self: *Conductor, w: *worker.Worker) void {
+        if (!w.ping_pending) return;
+        w.ping_pending = false;
+        if (w.active_clients > 0) {
+            w.last_pinged = self.currentTime(); // hold the slow cadence
+            std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
+            return;
+        }
+        std.debug.print("Worker {d}: ping timed out\n", .{w.id});
+        self.retireWorker(w);
+    }
+
+    fn pingIfDue(self: *Conductor, w: *worker.Worker, now: i64) void {
+        self.refreshIdleMemIfStale(w, now);
+        if (w.shouldPing(now, self.cfg.ping_interval)) self.event_loop.queuePing(w, self.cfg.ping_timeout * 1000);
+    }
+
+    fn processPong(self: *Conductor, w: *worker.Worker, pong_buf: *const [5]u8) void {
         w.last_pinged = self.currentTime();
         const worker_count = std.mem.readInt(u16, pong_buf[3..5], .little);
         if (worker_count != w.active_clients) {
@@ -1837,6 +1900,8 @@ pub const Conductor = struct {
             self.syncWorkerClients(w);
         }
     }
+
+    // --- Utilities ---
 
     pub fn currentTime(self: *Conductor) i64 {
         return platform.timeSeconds(self.io);
