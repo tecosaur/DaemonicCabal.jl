@@ -264,7 +264,7 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
         hascolor = get(stdout, :color, clienthascolor(client))
         quiet = "-q" ∈ set_switches || "--quiet" ∈ set_switches
         # The atreplinit hook prints the banner itself when replaying.
-        banner = if REPLAY_TARGET[] !== nothing
+        banner = if VERSION >= v"1.11" && REPLAY_TARGET[] !== nothing
             :no
         else
             Symbol(getval(client.switches, "--banner", ifelse(interactiveinput, "yes", "no")))
