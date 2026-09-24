@@ -14,7 +14,6 @@ pub const VERSION = blk: {
     const end = if (std.mem.indexOfPos(u8, project_toml, start, "\"")) |i| i else unreachable;
     break :blk project_toml[start..end];
 };
-pub const VERSION_STRING = "juliaclient " ++ VERSION ++ "\n";
 
 pub const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
     .linux =>
@@ -229,16 +228,6 @@ pub const BufReader = struct {
         try readExact(self.fd, buf);
         return buf;
     }
-
-    pub fn skip(self: BufReader, n: usize) !void {
-        var discard: [8]u8 = undefined;
-        var remaining = n;
-        while (remaining > 0) {
-            const to_read = @min(remaining, discard.len);
-            try readExact(self.fd, discard[0..to_read]);
-            remaining -= to_read;
-        }
-    }
 };
 
 pub fn randomSocketPath(io: Io, socket_dir: []const u8, suffix: []const u8, buf: []u8) ![]const u8 {
@@ -295,9 +284,6 @@ pub const Address = struct {
     addr: []const u8,
 };
 
-pub fn setTcpNodelay(fd: std.posix.socket_t) void {
-    platform.setTcpNodelay(fd);
-}
 
 /// Paths (containing a separator or starting with `.`) are local; the rest,
 /// with any `tcp://` stripped, are TCP.

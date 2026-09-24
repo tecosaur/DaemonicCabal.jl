@@ -166,11 +166,10 @@ pub const no_child = std.process.Child{ .id = null, .thread_handle = {}, .stdin 
 pub fn getChildPid(child: anytype) @TypeOf(child.id orelse 0) {
     return child.id orelse 0;
 }
-pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };
-pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
+/// Reaps it if so.
+pub fn reapIfExited(pid: posix.pid_t) bool {
     // < 0 is ECHILD: already gone.
-    const ret = impl.rawWaitpid(pid);
-    return .{ .pid = ret, .exited = ret != 0 };
+    return impl.rawWaitpid(pid) != 0;
 }
 
 /// `cpu_seconds` is cumulative, not a rate.
@@ -211,8 +210,8 @@ pub fn setTcpNodelay(socket: posix.fd_t) void {
 
 // Terminal raw mode
 var saved_termios: ?posix.termios = null;
-pub fn setRawModeStdin(raw: bool) void { setRawMode(impl.STDIN_HANDLE, raw); }
-pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
+pub fn setRawMode(raw: bool) void {
+    const stdin = impl.STDIN_HANDLE;
     if (raw) {
         var termios = posix.tcgetattr(stdin) catch return;
         if (saved_termios == null) saved_termios = termios;
