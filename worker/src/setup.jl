@@ -65,8 +65,8 @@ function set_parent_death_signal()
     end
 end
 
-# Closing streams unwinds a task on its own thread; an injected exception is
-# fatal when the task runs on another interactive thread.
+# Closing streams unwinds a task blocked on them, but not one looping on
+# other waits (`sleep`, timers), which needs the exception injected.
 function kill_stuck_clients(active_ids::Set{Int})
     stuck = @lock STATE.lock [
         ct for (id, ct) in STATE.client_tasks
@@ -74,6 +74,11 @@ function kill_stuck_clients(active_ids::Set{Int})
     ]
     for ct in stuck, io in ct.streams
         try close(io) catch end
+    end
+    for ct in stuck
+        # Injecting into a task on another thread is fatal.
+        Threads.threadid(ct.task) == Threads.threadid() || continue
+        try schedule(ct.task, InterruptException(); error=true) catch end
     end
     # A CPU-bound task only dies to the conductor's SIGINT, so bound the wait.
     deadline = time() + 2.0
