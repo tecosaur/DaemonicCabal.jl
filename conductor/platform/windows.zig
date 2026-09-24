@@ -401,34 +401,22 @@ pub fn socketRead(fd: HANDLE, buf: []u8) usize {
     };
 }
 
-fn issueReadEvent(fd: HANDLE, buf: []u8, ev: HANDLE, iosb: *win32.IO_STATUS_BLOCK) !void {
-    switch (handleKind(fd)) {
-        .pipe, .pipe_listener => switch (ntdll.NtReadFile(fd, ev, null, null, iosb, buf.ptr, @intCast(buf.len), null, null)) {
-            .SUCCESS, .PENDING => {},
-            else => |status| return win32.unexpectedStatus(status),
-        },
-        .afd => {
-            var iovecs = [_]win32.AFD.WSABUF(.@"var"){.{ .len = @intCast(buf.len), .buf = buf.ptr }};
-            var info: win32.AFD.RECV_INFO = .{
-                .BufferArray = &iovecs,
-                .BufferCount = 1,
-                .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
-                .TdiFlags = .{ .NORMAL = true },
-            };
-            switch (ntdll.NtDeviceIoControlFile(fd, ev, null, null, iosb, win32.IOCTL.AFD.RECEIVE, std.mem.asBytes(&info), @intCast(@sizeOf(win32.AFD.RECV_INFO)), null, 0)) {
-                .SUCCESS, .PENDING => {},
-                else => |status| return win32.unexpectedStatus(status),
-            }
-        },
-    }
-}
-
-/// Neither pipes nor AFD handles take a receive timeout, so cancel on expiry.
+/// Neither pipes nor AFD handles take a receive timeout. AFD waits for
+/// readiness, which bounds itself; a receive left pending past this frame
+/// would outlive its RECV_INFO and WSABUF.
 fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
+    if (handleKind(fd) == .afd) {
+        if (!(pollReadable(fd, @intCast(timeout_ms)) catch return 0)) return 0;
+        return afdRecv(fd, buf) catch 0;
+    }
+    // The IRP writes into this frame, so an expired read is cancelled and waited out.
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = ensureEvent() catch return 0;
     defer win32.CloseHandle(ev);
-    issueReadEvent(fd, buf, ev, &iosb) catch return 0;
+    switch (ntdll.NtReadFile(fd, ev, null, null, &iosb, buf.ptr, @intCast(buf.len), null, null)) {
+        .SUCCESS, .PENDING => {},
+        else => return 0,
+    }
     switch (WaitForSingleObject(ev, timeout_ms)) {
         WAIT_OBJECT_0 => {},
         WAIT_TIMEOUT => {
@@ -441,7 +429,7 @@ fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
     }
     return switch (iosb.u.Status) {
         .SUCCESS => iosb.Information,
-        .CANCELLED, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET, .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE => 0,
+        .CANCELLED, .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE => 0,
         else => |status| blk: {
             std.debug.print("socketReadTimeout: {any}\n", .{status});
             break :blk 0;
