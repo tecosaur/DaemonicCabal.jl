@@ -287,7 +287,16 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
         elseif VERSION < v"1.12"
             Base.run_main_repl(interactiveinput, quiet, banner, histfile, hascolor)
         else
-            Base.run_main_repl(interactiveinput, quiet, banner, histfile)
+            # run_main_repl restores the backend it installs into a local, and
+            # later runs would take the dead one for a live REPL (Infiltrator
+            # then refuses to infiltrate). Before 1.12 Base takes any assigned
+            # backend as usable, so it has to stay.
+            backend = Base.active_repl_backend
+            try
+                Base.run_main_repl(interactiveinput, quiet, banner, histfile)
+            finally
+                setglobal!(Base, :active_repl_backend, backend)
+            end
         end
     end
 end
