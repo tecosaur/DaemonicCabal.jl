@@ -29,7 +29,7 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
             @branchHint(.cold);
             const e = @as(linux.E, @enumFromInt(@as(u16, @intCast(-signed))));
             if (e == .INTR) continue;
-            std.debug.print("write error on fd {}: {}\n", .{ fd, e });
+            shared.eprint("write error on fd {d}: errno {d}\n", .{ fd, @intFromEnum(e) });
             return;
         }
         if (signed == 0) return; // no progress; avoid spinning
@@ -241,4 +241,89 @@ pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, _: ?[]const
     if (xdg_runtime_dir) |xdg|
         return shared.print(out, "{s}/julia-daemon", .{xdg});
     return shared.print(out, "/run/user/{d}/julia-daemon", .{linux.getuid()});
+}
+
+pub fn currentDir(buf: []u8) ![]const u8 {
+    const rc = linux.getcwd(buf.ptr, buf.len);
+    if (linux.errno(rc) != .SUCCESS) return error.CurrentDirUnavailable;
+    return buf[0 .. rc - 1]; // the length counts the NUL
+}
+
+// Name lookup. A static binary links no libc, so `getent` runs the system's
+// own getaddrinfo, NSS included; std's resolver would cost the client ~100 KB.
+
+const IpAddress = std.Io.net.IpAddress;
+const lookup_timeout_ms = 5000;
+
+pub fn lookupHost(name: []const u8, port: u16, buf: []IpAddress) ![]IpAddress {
+    for ([_][*:0]const u8{ "ahosts", "hosts" }) |database| {
+        var out: [8192]u8 = undefined;
+        const run = try getent(database, name, &out);
+        switch (run.status) {
+            0 => return parseHosts(run.output, port, buf),
+            1 => continue, // this getent lacks the database
+            2 => return error.UnknownHostName,
+            127 => {
+                shared.eprint("Resolving host names needs `getent` (from glibc or musl-utils), which is not installed.\n", .{});
+                return error.LookupFailed;
+            },
+            else => return error.LookupFailed,
+        }
+    }
+    return error.LookupFailed;
+}
+
+fn getent(database: [*:0]const u8, name: []const u8, out: []u8) !struct { status: u8, output: []const u8 } {
+    var name_buf: [256]u8 = undefined;
+    if (name.len >= name_buf.len) return error.InvalidAddress;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.LookupFailed;
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        return error.LookupFailed;
+    }
+    if (fork_rc == 0) {
+        _ = linux.dup2(fds[1], 1);
+        const argv = [_:null]?[*:0]const u8{ "getent", database, name_buf[0..name.len :0] };
+        const envp = [_:null]?[*:0]const u8{};
+        for ([_][*:0]const u8{ "/usr/bin/getent", "/bin/getent" }) |exe| _ = linux.execve(exe, &argv, &envp);
+        linux.exit_group(127);
+    }
+    const pid: posix.pid_t = @intCast(fork_rc);
+    _ = linux.close(fds[1]);
+    defer _ = linux.close(fds[0]);
+    var n: usize = 0;
+    const finished = while (n < out.len) {
+        var pfd = [_]posix.pollfd{.{ .fd = fds[0], .events = posix.POLL.IN, .revents = 0 }};
+        if ((posix.poll(&pfd, lookup_timeout_ms) catch 0) == 0) break false;
+        const rc: isize = @bitCast(linux.read(fds[0], out[n..].ptr, out.len - n));
+        if (rc <= 0) break true;
+        n += @intCast(rc);
+    } else false;
+    if (!finished) _ = linux.kill(pid, .KILL);
+    var status: u32 = 0;
+    _ = linux.waitpid(pid, &status, 0);
+    const exited = status & 0x7f == 0;
+    return .{ .status = if (finished and exited) @intCast((status >> 8) & 0xff) else 255, .output = out[0..n] };
+}
+
+/// Each line opens with an address; `ahosts` lists one per socket type.
+fn parseHosts(output: []const u8, port: u16, buf: []IpAddress) ![]IpAddress {
+    var n: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        var words = std.mem.tokenizeAny(u8, line, " \t");
+        const ip = IpAddress.parse(words.next() orelse continue, port) catch continue;
+        for (buf[0..n]) |*seen| {
+            if (seen.eql(&ip)) break;
+        } else if (n < buf.len) {
+            buf[n] = ip;
+            n += 1;
+        }
+    }
+    return if (n == 0) error.UnknownHostName else buf[0..n];
 }
