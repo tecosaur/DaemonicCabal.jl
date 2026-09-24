@@ -52,8 +52,8 @@ pub const EventLoop = struct {
     }
 
     /// The pong read is linked to a timeout, which cancels it on expiry.
-    pub fn queuePing(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
-        w.sendPing();
+    pub fn awaitPong(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
+        w.ping_pending = true;
         self.ping_timeout_ts = .{ .sec = @intCast(timeout_ms / 1000), .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms) };
         const sqe = self.ring.read(@intFromPtr(w), w.socket, .{ .buffer = &w.pong_buf }, 0) catch {
             w.ping_pending = false;

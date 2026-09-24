@@ -955,6 +955,7 @@ pub const Conductor = struct {
     fn isWorkerAvailable(self: *Conductor, w: *worker.Worker, interactive: bool, now: i64) bool {
         const max = self.cfg.worker_maxclients;
         if (max != 0 and w.active_clients >= max) return false;
+        if (w.unresponsive_interrupted) return false;
         if (w.session_label != null and !self.isLabelExpired(w, now)) return false;
         if (w.interactive != interactive) return false;
         return true;
@@ -1721,15 +1722,18 @@ pub const Conductor = struct {
             ids[count] = entry.key_ptr.*;
             count += 1;
         };
-        w.syncClients(ids[0..count]) catch |err| {
+        const worker_count = w.syncClients(ids[0..count]) catch |err| {
             std.debug.print("Worker {d}: sync_clients failed: {}\n", .{ w.id, err });
             self.retireWorker(w);
             return;
         };
         self.reconcileClientMap(w);
-        // Count from our map, not the worker's report: a task stuck on a dead socket
-        // over-counts, leaking a phantom client no later sync clears.
         const remaining = self.countMapClients(w);
+        // The worker's surplus is departed clients' code it could not stop.
+        if (worker_count > remaining and remaining == 0) {
+            std.debug.print("Worker {d}: {d} departed client(s) still running, retiring\n", .{ w.id, worker_count });
+            return self.retireWorker(w);
+        }
         w.active_clients = remaining;
         const now = self.currentTime();
         if (remaining == 0 and w.occupancy.fast.busy) {
@@ -1819,7 +1823,7 @@ pub const Conductor = struct {
     }
 
     // --- Health checks ---
-    // Policy only: each event loop supplies `queuePing`, arming a pong read
+    // Policy only: each event loop supplies `awaitPong`, arming a pong read
     // and a timeout, and reports back through the handlers below.
 
     pub fn pressureIntervalS(self: *const Conductor) u64 {
@@ -1845,7 +1849,7 @@ pub const Conductor = struct {
         const now = self.currentTime();
         self.refreshIdleMemIfStale(w, now);
         if (w.active_clients == 0 and !w.ping_pending and now - w.last_pinged >= 2)
-            self.event_loop.queuePing(w, self.cfg.ping_timeout * 1000);
+            self.queuePing(w);
     }
 
     /// `read`: pong bytes the loop already read into `w.pong_buf` (0 at EOF or
@@ -1874,17 +1878,30 @@ pub const Conductor = struct {
             std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
             return;
         }
+        // An idle worker's thread 0 may still be spinning in a departed client's code.
+        if (!w.unresponsive_interrupted) {
+            std.debug.print("Worker {d}: ping timed out, interrupting\n", .{w.id});
+            w.unresponsive_interrupted = true;
+            w.forceInterrupt();
+            return self.event_loop.awaitPong(w, self.cfg.ping_timeout * 1000);
+        }
         std.debug.print("Worker {d}: ping timed out\n", .{w.id});
         self.retireWorker(w);
     }
 
     fn pingIfDue(self: *Conductor, w: *worker.Worker, now: i64) void {
         self.refreshIdleMemIfStale(w, now);
-        if (w.shouldPing(now, self.cfg.ping_interval)) self.event_loop.queuePing(w, self.cfg.ping_timeout * 1000);
+        if (w.shouldPing(now, self.cfg.ping_interval)) self.queuePing(w);
+    }
+
+    fn queuePing(self: *Conductor, w: *worker.Worker) void {
+        w.sendPing();
+        self.event_loop.awaitPong(w, self.cfg.ping_timeout * 1000);
     }
 
     fn processPong(self: *Conductor, w: *worker.Worker, pong_buf: *const [5]u8) void {
         w.last_pinged = self.currentTime();
+        w.unresponsive_interrupted = false;
         const worker_count = std.mem.readInt(u16, pong_buf[3..5], .little);
         if (worker_count != w.active_clients) {
             std.debug.print("Worker {d}: client count mismatch (worker={d}, conductor={d}), syncing\n", .{

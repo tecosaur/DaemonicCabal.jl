@@ -146,6 +146,8 @@ pub const Worker = struct {
     last_active: i64,
     last_pinged: i64,
     ping_pending: bool = false,
+    /// Set once an unanswered ping has been met with `forceInterrupt`.
+    unresponsive_interrupted: bool = false,
     pong_buf: [5]u8 = undefined,
     active_clients: u32,
     occupancy: Occupancies = .{},
@@ -513,7 +515,16 @@ pub const Worker = struct {
 
     pub fn sendPing(self: *Worker) void {
         self.writeHeader(.ping, 0);
-        self.ping_pending = true;
+    }
+
+    /// Julia force-throws past a tight loop from the fifth SIGINT in quick
+    /// succession (one more is sent to spare), and a signal still pending when
+    /// the next is sent merges with it.
+    pub fn forceInterrupt(self: *const Worker) void {
+        for (0..6) |i| {
+            if (i > 0) platform.sleepMs(50);
+            self.signal(.INT);
+        }
     }
 
     /// Takes ownership of `project` on success.
@@ -552,7 +563,8 @@ pub const Worker = struct {
     }
 
     /// The worker drops clients not in `pids`; returns its remaining count.
-    pub fn syncClients(self: *Worker, ids: []const u32) !void {
+    /// Returns the worker's count of clients still running.
+    pub fn syncClients(self: *Worker, ids: []const u32) !u16 {
         const payload_len: u16 = 2 + @as(u16, @intCast(ids.len)) * 4;
         self.writeHeader(.sync_clients, payload_len);
         var len_buf: [2]u8 = undefined;
@@ -572,6 +584,7 @@ pub const Worker = struct {
         }
         var count_buf: [2]u8 = undefined;
         try readExact(self.socket, &count_buf);
+        return std.mem.readInt(u16, &count_buf, .little);
     }
 
     /// `error.TooManyClients` when `buf` overflows: a partial list would look

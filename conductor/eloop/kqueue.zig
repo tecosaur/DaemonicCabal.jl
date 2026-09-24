@@ -72,8 +72,8 @@ pub const EventLoop = struct {
     }
 
     /// The pong read and its timeout race; whichever fires first settles the ping.
-    pub fn queuePing(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
-        w.sendPing();
+    pub fn awaitPong(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
+        w.ping_pending = true;
         var changes = [2]c.Kevent{
             makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.ADD | c.EV.ONESHOT, 0, 0, @intFromPtr(w)),
             makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.ADD | c.EV.ONESHOT, 0, @intCast(timeout_ms), @intFromPtr(w)),
