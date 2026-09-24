@@ -30,26 +30,17 @@ pub const Palette = struct {
 
 // --- queries -----------------------------------------------------------------
 
-pub const probed_slots = [_]u8{ 1, 2, 3, 4, 5, 6 };
+const probed_slots = [_]u8{ 1, 2, 3, 4, 5, 6 };
 
 /// The CSI 5n reply.
 pub const sentinel = "\x1b[0n";
 
 /// BEL-terminated: wider support than ST.
-pub fn writeQueries(buf: *[query_buf_len]u8) []const u8 {
-    var pos: usize = 0;
-    for ([_][]const u8{ "\x1b]10;?\x07", "\x1b]11;?\x07" }) |q| {
-        pos += (std.fmt.bufPrint(buf[pos..], "{s}", .{q}) catch unreachable).len;
-    }
-    for (probed_slots) |n| {
-        pos += (std.fmt.bufPrint(buf[pos..], "\x1b]4;{d};?\x07", .{n}) catch unreachable).len;
-    }
-    pos += (std.fmt.bufPrint(buf[pos..], "\x1b[5n", .{}) catch unreachable).len;
-    return buf[0..pos];
-}
-
-/// OSC 10/11 (7 each) + 6 × OSC 4 (≤10 each) + CSI 5n (4), rounded up.
-pub const query_buf_len = 96;
+pub const queries = blk: {
+    var q: []const u8 = "\x1b]10;?\x07\x1b]11;?\x07";
+    for (probed_slots) |n| q = q ++ std.fmt.comptimePrint("\x1b]4;{d};?\x07", .{n});
+    break :blk q ++ "\x1b[5n";
+};
 
 // --- reply parsing -----------------------------------------------------------
 
@@ -98,7 +89,7 @@ fn nextColor(parts: *std.mem.SplitIterator(u8, .scalar)) ?Rgb {
 
 /// `rgb:R/G/B` or `rgba:R/G/B/A`, each channel 1–4 hex digits scaled by its
 /// high nibble.
-pub fn parseXtermRgb(s: []const u8) ?Rgb {
+fn parseXtermRgb(s: []const u8) ?Rgb {
     const channels: usize, const body = if (std.mem.startsWith(u8, s, "rgb:"))
         .{ 3, s[4..] }
     else if (std.mem.startsWith(u8, s, "rgba:"))
