@@ -139,9 +139,10 @@ pub fn run(
                         }
                         remaining -= n;
                     }
-                    // Close stdin socket on local stdin EOF so worker sees EOF
+                    // Half-close on local stdin EOF: the worker sees EOF, and the
+                    // handle stays valid for a late Ctrl-C write rather than being reused.
                     if ((ev.flags & EV_EOF) != 0) {
-                        platform.close(stdin_fd);
+                        platform.shutdownWrite(stdin_fd);
                         stdin_closed = true;
                     }
                 },
@@ -167,11 +168,11 @@ pub fn run(
                 else => {},
             }
         }
-        // Drain non-pollable stdin directly; read()==0 is EOF, so close to signal it.
+        // Drain non-pollable stdin directly; read()==0 is EOF, so half-close to signal it.
         if (!stdin_polled and !stdin_closed and exit_code == null) {
             const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch 0;
             if (n == 0) {
-                platform.close(stdin_fd);
+                platform.shutdownWrite(stdin_fd);
                 stdin_closed = true;
             } else if (sync_mode and !signal_parser.worker_wants_raw) {
                 for (stdin_buf[0..n]) |byte| cooked_state.process(byte, stdin_fd);

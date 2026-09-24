@@ -55,8 +55,9 @@ fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
             platform.write(args.dst, buf[0..got]);
         }
     }
-    // stdin EOF: close the worker stdin socket so the worker sees EOF too.
-    platform.close(args.dst);
+    // stdin EOF: pass it on. A socket half-closes, keeping its handle valid for
+    // a late Ctrl-C write; a pipe has no half-close, so it must be closed.
+    if (platform.handleKind(args.dst) == .afd) platform.shutdownWrite(args.dst) else platform.close(args.dst);
     return 0;
 }
 
