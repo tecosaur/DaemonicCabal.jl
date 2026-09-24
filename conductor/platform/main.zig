@@ -45,6 +45,7 @@ pub const socketWrite = shared.socketWrite;
 pub const socketRead = shared.socketRead;
 pub const close = shared.close;
 pub const shutdownWrite = shared.shutdownWrite;
+pub const eprint = shared.eprint;
 /// The peer reads EOF; the handle stays valid wherever the transport can half-close.
 pub const sendEof = if (os == .windows) impl.sendEof else shared.shutdownWrite;
 // Local transport: AF_UNIX on POSIX, named pipes on Windows.
@@ -54,7 +55,6 @@ pub const localSocketPath = shared.localSocketPath;
 pub const listenLocal = shared.listenLocal;
 pub const connectLocal = shared.connectLocal;
 pub const connectLocalOnce = shared.connectLocalOnce;
-pub const rawConnectLocal = shared.rawConnectLocal;
 pub const connectTcp = shared.connectTcp;
 pub const local_transport_name = shared.local_transport_name;
 pub const spawnWorker = shared.spawnWorker;
@@ -64,6 +64,9 @@ pub const pidNumber = shared.pidNumber;
 pub const dumpChildStderr = shared.dumpChildStderr;
 pub const collectEnviron = shared.collectEnviron;
 pub const requestSocketRecreate = shared.requestSocketRecreate;
+pub const sleepMs = shared.sleepMs;
+pub const currentDir = shared.currentDir;
+pub const lookupHost = shared.lookupHost;
 pub const getChildPid = shared.getChildPid;
 pub const reapIfExited = shared.reapIfExited;
 pub const waitForExit = shared.waitForExit;

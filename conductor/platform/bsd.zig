@@ -29,7 +29,7 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
             @branchHint(.cold);
             const e = @as(posix.E, @enumFromInt(c._errno().*));
             if (e == .INTR) continue;
-            std.debug.print("write error on fd {}: {}\n", .{ fd, e });
+            shared.eprint("write error on fd {d}: errno {d}\n", .{ fd, @intFromEnum(e) });
             return;
         }
         if (ret == 0) return; // no progress; avoid spinning
@@ -217,4 +217,36 @@ pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, home: ?[]co
     if (xdg_runtime_dir) |xdg|
         return shared.print(out, "{s}/julia-daemon", .{xdg});
     return shared.print(out, "/tmp/julia-daemon-{d}", .{c.getuid()});
+}
+
+pub fn currentDir(buf: []u8) ![]const u8 {
+    const cwd = c.getcwd(buf.ptr, buf.len) orelse return error.CurrentDirUnavailable;
+    return std.mem.sliceTo(@as([*:0]u8, @ptrCast(cwd)), 0);
+}
+
+const IpAddress = std.Io.net.IpAddress;
+
+pub fn lookupHost(name: []const u8, port: u16, buf: []IpAddress) ![]IpAddress {
+    var name_buf: [256]u8 = undefined;
+    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch return error.InvalidAddress;
+    const hints = std.mem.zeroInit(c.addrinfo, .{ .socktype = posix.SOCK.STREAM });
+    var res: ?*c.addrinfo = null;
+    const rc = c.getaddrinfo(name_z, null, &hints, &res);
+    if (@intFromEnum(rc) != 0) return if (rc == .NONAME) error.UnknownHostName else error.LookupFailed;
+    defer c.freeaddrinfo(res.?);
+    var n: usize = 0;
+    var next = res;
+    while (next) |ai| : (next = ai.next) {
+        const sa = ai.addr orelse continue;
+        if (sa.family != posix.AF.INET and sa.family != posix.AF.INET6) continue;
+        var storage: std.Io.Threaded.PosixAddress = undefined;
+        @memcpy(std.mem.asBytes(&storage)[0..ai.addrlen], @as([*]const u8, @ptrCast(sa))[0..ai.addrlen]);
+        var ip = std.Io.Threaded.addressFromPosix(&storage);
+        ip.setPort(port);
+        if (n < buf.len) {
+            buf[n] = ip;
+            n += 1;
+        }
+    }
+    return if (n == 0) error.UnknownHostName else buf[0..n];
 }

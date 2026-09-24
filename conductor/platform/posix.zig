@@ -11,6 +11,15 @@ const protocol = @import("../protocol.zig");
 const impl = if (builtin.os.tag == .linux) @import("linux.zig") else @import("bsd.zig");
 
 /// Into an allocator (owned slice) or a `[]u8` buffer (sub-slice).
+/// std.debug.print without its stderr locking and terminal handling, which
+/// cost the client ~110 KB. Truncates past 1 KiB.
+pub fn eprint(comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print(fmt, args) catch {};
+    _ = posix.system.write(posix.STDERR_FILENO, w.buffered().ptr, w.buffered().len);
+}
+
 pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
     if (@TypeOf(out) == std.mem.Allocator)
         return std.fmt.allocPrint(out, fmt, args)
@@ -28,7 +37,7 @@ pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     return posix.read(fd, buf) catch |err| {
         @branchHint(.cold);
         if (err != error.ConnectionResetByPeer)
-            std.debug.print("socketRead error: {}\n", .{err});
+            eprint("socketRead error: {}\n", .{err});
         return 0;
     };
 }
@@ -46,15 +55,26 @@ pub fn listenLocal(io: Io, path: []const u8) !Listener {
     const ua = try Io.net.UnixAddress.init(path);
     return Listener.fromServer(try ua.listen(io, .{ .kernel_backlog = 128 }), .local, path);
 }
-pub fn connectLocal(io: Io, path: []const u8, _: u32) !posix.socket_t {
-    if (path.len >= max_local_addr) return error.PathTooLong;
-    const ua = try Io.net.UnixAddress.init(path);
-    return (try ua.connect(io)).socket.handle;
+/// Raw syscalls only, so usable inside a signal handler.
+pub fn connectLocal(path: []const u8, _: u32) !posix.socket_t {
+    var addr = std.mem.zeroes(posix.sockaddr.un);
+    addr.family = posix.AF.UNIX;
+    if (path.len >= addr.path.len) return error.PathTooLong;
+    @memcpy(addr.path[0..path.len], path);
+    const fd = impl.rawSocket(posix.AF.UNIX, posix.SOCK.STREAM) orelse return error.SocketCreateFailed;
+    errdefer impl.rawClose(fd);
+    switch (posix.errno(posix.system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)))) {
+        .SUCCESS => return fd,
+        else => |e| return connectError(e),
+    }
 }
 /// Retire the single-use address, so nothing else can connect.
-pub fn connectLocalOnce(io: Io, path: []const u8) !posix.socket_t {
-    const fd = try connectLocal(io, path, 0);
-    Io.Dir.deleteFileAbsolute(io, path) catch {};
+pub fn connectLocalOnce(path: []const u8) !posix.socket_t {
+    const fd = try connectLocal(path, 0);
+    var buf: [max_local_addr]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    _ = posix.system.unlink(buf[0..path.len :0]);
     return fd;
 }
 pub const local_transport_name = "unix socket";
@@ -87,6 +107,7 @@ pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !posix.socket_t {
 fn connectError(e: posix.E) anyerror {
     return switch (e) {
         .CONNREFUSED => error.ConnectionRefused,
+        .NOENT => error.FileNotFound,
         .TIMEDOUT => error.ConnectionTimedOut,
         .NETUNREACH => error.NetworkUnreachable,
         .HOSTUNREACH => error.HostUnreachable,
@@ -97,17 +118,6 @@ fn fcntl(fd: posix.fd_t, cmd: anytype, arg: usize) !usize {
     const rc = posix.system.fcntl(fd, cmd, arg);
     if (posix.errno(rc) != .SUCCESS) return error.Unexpected;
     return @intCast(rc);
-}
-/// Raw syscalls only, for use inside a signal handler.
-pub fn rawConnectLocal(path: []const u8) ?posix.socket_t {
-    var addr = std.mem.zeroes(posix.sockaddr.un);
-    addr.family = posix.AF.UNIX;
-    if (path.len >= addr.path.len) return null;
-    @memcpy(addr.path[0..path.len], path);
-    const fd = impl.rawSocket(posix.AF.UNIX, posix.SOCK.STREAM) orelse return null;
-    if (impl.rawConnect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un))) return fd;
-    impl.rawClose(fd);
-    return null;
 }
 
 pub const Listener = struct {
@@ -155,9 +165,23 @@ pub fn collectEnviron(allocator: std.mem.Allocator, environ: std.process.Environ
     for (environ.block.slice, entries) |entry, *kv| kv.* = std.mem.span(entry.?);
     return entries;
 }
-pub fn requestSocketRecreate(pid: u32) bool {
-    return impl.kill(@intCast(pid), posix.SIG.USR1) == 0;
+/// Signal the conductor whose pid `pid_path` holds (its SIGUSR1 handler).
+pub fn requestSocketRecreate(pid_path: []const u8) bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{pid_path}) catch return false;
+    const fd = posix.openatZ(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer impl.rawClose(fd);
+    var buf: [16]u8 = undefined;
+    const n = posix.read(fd, &buf) catch return false;
+    const pid = std.fmt.parseInt(posix.pid_t, std.mem.trimEnd(u8, buf[0..n], "\n\r "), 10) catch return false;
+    // 0 and negatives name process groups, down to everything we may signal.
+    return pid > 0 and impl.kill(pid, posix.SIG.USR1) == 0;
 }
+pub fn sleepMs(ms: u32) void {
+    _ = posix.poll(&.{}, @intCast(ms)) catch {};
+}
+pub const currentDir = impl.currentDir;
+pub const lookupHost = impl.lookupHost;
 pub fn pidNumber(pid: posix.pid_t) u32 {
     return @intCast(pid);
 }

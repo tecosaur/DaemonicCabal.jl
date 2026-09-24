@@ -18,8 +18,6 @@ else if (builtin.os.tag == .windows)
 else
     @compileError("unsupported OS");
 
-const io: Io = Io.Threaded.global_single_threaded.io();
-
 const max_socket_path = 256;
 
 const restart_hint = switch (builtin.os.tag) {
@@ -96,7 +94,7 @@ const SignalParser = struct {
 
     pub fn feed(self: *@This(), input: []const u8, fd: posix.socket_t) Result {
         if (self.len + input.len > self.buf.len) {
-            std.debug.print("[client] signal buffer overflow\n", .{});
+            platform.eprint("[client] signal buffer overflow\n", .{});
             self.len = 0;
             return .none;
         }
@@ -188,12 +186,12 @@ fn signalWriteStdin(ptr: *anyopaque, data: []const u8) void {
 }
 
 fn signalNotifyExit() void {
-    notifyExit();
+    notifyConductor(.client_exit);
     platform.setRawMode(false);
 }
 
 fn signalNotifyInterrupt() void {
-    notifyInterruptRaw();
+    notifyConductor(.client_interrupt);
 }
 
 fn registerSignalHandlers() void {
@@ -207,7 +205,28 @@ fn registerSignalHandlers() void {
 
 // --- Main pipeline ---
 
-pub fn main(init: std.process.Init.Minimal) !void {
+// The segfault handler's stack traces need debug info a release lacks, and
+// its signal stack is 256 KiB.
+pub const std_options: std.Options = .{ .enable_segfault_handler = false, .signal_stack_size = null };
+
+// std's default handler reaches the same stderr lock.
+pub const panic = std.debug.FullPanic(struct {
+    fn report(msg: []const u8, _: ?usize) noreturn {
+        platform.eprint("panic: {s}\n", .{msg});
+        exitClient(134);
+    }
+}.report);
+
+// An error returned from main is reported through std's stderr lock, which
+// links all of Io.Threaded (~110 KB); report it here instead.
+pub fn main(init: std.process.Init.Minimal) void {
+    run(init) catch |err| {
+        platform.eprint("error: {s}\n", .{@errorName(err)});
+        exitClient(1);
+    };
+}
+
+fn run(init: std.process.Init.Minimal) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const inputs = try collectInputs(arena.allocator(), init);
@@ -232,7 +251,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer platform.setRawMode(false);
     const conductor = try connectToConductor(env);
     if (transport_mode == .tcp) platform.setTcpNodelay(conductor);
-    defer notifyExit();
+    defer notifyConductor(.client_exit);
     var w = SocketWriter{ .handle = conductor };
     // The worker's own terminal knows nothing of ours.
     const color = is_tty and !hasNoColor(inputs.env);
@@ -293,7 +312,7 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
     const located = locateConductor(env, &runtime_dir_buf) catch |err| switch (err) {
         error.UnsupportedScheme => {
-            std.debug.print("Unsupported address scheme: {s}\nOnly tcp:// and local socket paths are supported.\n", .{env.server_path orelse ""});
+            platform.eprint("Unsupported address scheme: {s}\nOnly tcp:// and local socket paths are supported.\n", .{env.server_path orelse ""});
             exitClient(1);
         },
         else => return err,
@@ -303,32 +322,36 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     conductor_path = located.address.addr;
     const addr = conductor_path;
     const timeout = protocol.connect_timeout_ms;
-    const first_err = if (protocol.connectAddress(io, transport_mode, addr, timeout)) |c| return keepConductor(c) else |err| err;
+    const first_err = if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c) else |err| err;
     // A refusal may be a conductor restarting, and a live conductor can be asked
     // to recreate a missing socket; a timeout is not worth repeating.
     const worth_retrying = switch (transport_mode) {
         .tcp => first_err == error.ConnectionRefused,
         .local => blk: {
             var pid_buf: [max_socket_path]u8 = undefined;
-            break :blk readPidAndSignal(std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong);
+            break :blk platform.requestSocketRecreate(std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong);
         },
     };
     if (worth_retrying) {
         for (0..20) |_| {
-            Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
-            if (protocol.connectAddress(io, transport_mode, addr, timeout)) |c| return keepConductor(c) else |_| {}
+            platform.sleepMs(100);
+            if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c) else |_| {}
         }
         // Alive with no local socket: it may be listening on TCP.
         if (transport_mode == .local) {
             const tcp_addr = std.fmt.comptimePrint("localhost:{d}", .{protocol.default_tcp_port});
-            if (protocol.connectAddress(io, .tcp, tcp_addr, timeout)) |c| {
+            if (protocol.connectAddress(.tcp, tcp_addr, timeout)) |c| {
                 transport_mode = .tcp;
                 conductor_path = tcp_addr;
                 return keepConductor(c);
             } else |_| {}
         }
     }
-    std.debug.print(
+    if (first_err == error.UnknownHostName) {
+        platform.eprint("Cannot resolve the host in {s}.\n", .{addr});
+        exitClient(127);
+    }
+    platform.eprint(
         \\Failed to connect to {s}
         \\
         \\Try restarting the daemon:
@@ -345,7 +368,7 @@ fn printVersion(env: EnvInfo) void {
     const plain = "juliaclient " ++ protocol.VERSION;
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
     const address: ?protocol.Address = if (locateConductor(env, &runtime_dir_buf)) |located|
-        (if (protocol.probeAddress(io, located.address.mode, located.address.addr, 1000)) located.address else null)
+        (if (protocol.probeAddress(located.address.mode, located.address.addr, 1000)) located.address else null)
     else |_| null;
     var line_buf: [2 * max_socket_path]u8 = undefined;
     const line = if (address) |a| std.fmt.bufPrint(&line_buf, plain ++ ", connected to conductor over {s} {s}\n", .{
@@ -369,7 +392,7 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, for
     if (w.pos + 2 >= w.buf.len) w.flush();
     const len_pos = w.pos;
     w.pos += 2;
-    const cwd_len = try std.process.currentPath(io, w.buf[w.pos..]);
+    const cwd_len = (try platform.currentDir(w.buf[w.pos..])).len;
     std.mem.writeInt(u16, w.buf[len_pos..][0..2], @intCast(cwd_len), .little);
     w.pos += cwd_len;
     w.writeInt(u64, env.fingerprint);
@@ -406,7 +429,7 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
 
 // A daemon that recognises a protocol mismatch says so; an older one just closes.
 fn replyFailure(err: anyerror) noreturn {
-    std.debug.print(
+    platform.eprint(
         \\The daemon did not reply as expected ({s}).
         \\It is probably running a different protocol version than this juliaclient:
         \\restart it after installing, or rebuild juliaclient to match.
@@ -434,10 +457,10 @@ fn spawnWorker(reader: protocol.BufReader, kvs: []const []const u8) !void {
     for (kvs, envp[envc .. envc + kvs.len]) |kv, *entry| entry.* = (try a.dupeZ(u8, kv)).ptr;
     envp[envc + kvs.len] = null;
     platform.spawnDetached(@ptrCast(argv.ptr), @ptrCast(envp.ptr)) catch |err| {
-        std.debug.print("Cannot start a Julia worker inside this sandbox: {s} ({s}).\n", .{
+        platform.eprint("Cannot start a Julia worker inside this sandbox: {s} ({s}).\n", .{
             std.mem.span(argv[0].?), @errorName(err),
         });
-        if (err == error.ExecutableNotFound) std.debug.print(
+        if (err == error.ExecutableNotFound) platform.eprint(
             \\A sandboxed client runs its own worker, so the sandbox must also see the Julia install,
             \\the DaemonWorker project and the Julia depot (~/.julia or JULIA_DEPOT_PATH).
             \\
@@ -466,7 +489,7 @@ fn sendFullEnv(w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) void {
 
 fn runEventLoop(sync_mode: bool) !void {
     const exit_code = try eloop.run(sockets.stdin, sockets.stdout, sockets.stderr, sockets.signals, &signal_parser, sync_mode);
-    notifyExit();
+    notifyConductor(.client_exit);
     exitClient(exit_code);
 }
 
@@ -485,55 +508,28 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.sock
         ip.setPort(std.fmt.parseInt(u16, raw[1..], 10) catch break :blk error.InvalidAddress);
         break :blk platform.connectTcp(ip, protocol.connect_timeout_ms);
     } else switch ((protocol.parseAddress(raw) catch unreachable).mode) {
-        .local => platform.connectLocalOnce(io, raw),
-        .tcp => if (protocol.connectAddress(io, .tcp, raw, protocol.connect_timeout_ms)) |c| c.socket else |e| e,
+        .local => platform.connectLocalOnce(raw),
+        .tcp => if (protocol.connectAddress(.tcp, raw, protocol.connect_timeout_ms)) |c| c.socket else |e| e,
     };
     return connected catch |e| {
-        std.debug.print("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ raw, e });
+        platform.eprint("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ raw, e });
         exitClient(127);
     };
 }
 
-fn readPidAndSignal(pid_path: []const u8) bool {
-    var buf: [16]u8 = undefined;
-    const content = Io.Dir.readFile(.cwd(), io, pid_path, &buf) catch return false;
-    const pid_str = std.mem.trimEnd(u8, content, &.{ '\n', '\r', ' ' });
-    const pid = std.fmt.parseInt(u32, pid_str, 10) catch return false;
-    return platform.requestSocketRecreate(pid);
-}
-
-fn notifyExit() void {
-    const fd = (protocol.connectAddress(io, transport_mode, conductor_path, protocol.connect_timeout_ms) catch return).socket;
+/// Dials the conductor already reached, never resolving a name again, as
+/// this also runs in signal handlers. Errors are dropped.
+fn notifyConductor(kind: protocol.notification.Type) void {
+    var buf: [9]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
+    buf[4] = @intFromEnum(kind);
+    std.mem.writeInt(u32, buf[5..9], client_id, .little);
+    const fd = switch (transport_mode) {
+        .local => platform.connectLocal(conductor_path, protocol.connect_timeout_ms),
+        .tcp => platform.connectTcp(conductor_peer orelse return, protocol.connect_timeout_ms),
+    } catch return;
     defer platform.close(fd);
-    var buf: [9]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
-    buf[4] = @intFromEnum(protocol.notification.Type.client_exit);
-    std.mem.writeInt(u32, buf[5..9], client_id, .little);
     platform.socketWrite(fd, &buf);
-}
-
-/// Signal-handler-safe: raw syscalls, not std.Io, which would corrupt the
-/// io_uring state. Errors are dropped; the \x03 stdin path is the fallback.
-fn notifyInterruptRaw() void {
-    var buf: [9]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
-    buf[4] = @intFromEnum(protocol.notification.Type.client_interrupt);
-    std.mem.writeInt(u32, buf[5..9], client_id, .little);
-    switch (transport_mode) {
-        .local => {
-            const fd = platform.rawConnectLocal(conductor_path) orelse return;
-            defer platform.rawClose(fd);
-            platform.socketWrite(fd, &buf);
-        },
-        .tcp => {
-            const ip = conductor_peer orelse return;
-            var storage: Io.Threaded.PosixAddress = undefined;
-            const len = Io.Threaded.addressToPosix(&ip, &storage);
-            const fd = platform.rawSocket(storage.any.family, posix.SOCK.STREAM) orelse return;
-            defer platform.rawClose(fd);
-            if (platform.rawConnect(fd, &storage.any, len)) platform.socketWrite(fd, &buf);
-        },
-    }
 }
 
 fn getTerminalSize() struct { height: u16, width: u16 } {

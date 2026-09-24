@@ -326,37 +326,26 @@ pub fn splitHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
     return .{ .host = host, .port = port };
 }
 
-/// In resolver order, narrowed to `family` when one is given.
-pub fn resolveHost(io_ctx: Io, host: []const u8, port: u16, family: ?Io.net.IpAddress.Family, buf: []Io.net.IpAddress) ![]Io.net.IpAddress {
+/// For connecting, in resolver order. Through the platform, not std, whose
+/// resolver would cost the client ~100 KB.
+pub fn resolveHost(host: []const u8, port: u16, buf: []Io.net.IpAddress) ![]Io.net.IpAddress {
     if (Io.net.IpAddress.parse(host, port)) |ip| {
         buf[0] = ip;
         return buf[0..1];
     } else |_| {}
-    const name = Io.net.HostName.init(host) catch return error.InvalidAddress;
-    // Lookup never blocks on a queue of at least 16, so it can run inline.
-    var results: [16]Io.net.HostName.LookupResult = undefined;
-    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&results);
-    try name.lookup(io_ctx, &queue, .{ .port = port, .family = family });
-    var n: usize = 0;
-    while (queue.getOne(io_ctx)) |result| switch (result) {
-        .address => |ip| if (n < buf.len) {
-            buf[n] = ip;
-            n += 1;
-        },
-        .canonical_name => {},
-    } else |_| {}
-    return if (n == 0) error.UnknownHostName else buf[0..n];
+    Io.net.HostName.validate(host) catch return error.InvalidAddress;
+    return platform.lookupHost(host, port, buf);
 }
 
 /// Tries each address a TCP host resolves to in turn.
-pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8, timeout_ms: u32) !Connection {
+pub fn connectAddress(mode: TransportMode, addr: []const u8, timeout_ms: u32) !Connection {
     switch (mode) {
-        .local => return .{ .socket = try platform.connectLocal(io_ctx, addr, timeout_ms), .peer = null },
+        .local => return .{ .socket = try platform.connectLocal(addr, timeout_ms), .peer = null },
         .tcp => {
             const target = try splitHostPort(addr);
             var buf: [8]Io.net.IpAddress = undefined;
             var last_err: anyerror = error.UnknownHostName;
-            for (try resolveHost(io_ctx, target.host, target.port, null, &buf)) |ip| {
+            for (try resolveHost(target.host, target.port, &buf)) |ip| {
                 const socket = platform.connectTcp(ip, timeout_ms) catch |err| {
                     last_err = err;
                     continue;
@@ -368,17 +357,30 @@ pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8, timeout
     }
 }
 
-pub fn probeAddress(io_ctx: Io, mode: TransportMode, addr: []const u8, timeout_ms: u32) bool {
-    const connection = connectAddress(io_ctx, mode, addr, timeout_ms) catch return false;
+pub fn probeAddress(mode: TransportMode, addr: []const u8, timeout_ms: u32) bool {
+    const connection = connectAddress(mode, addr, timeout_ms) catch return false;
     platform.close(connection.socket);
     return true;
 }
 
-/// Prefers IPv4, as a name like `localhost` is most commonly reached that way.
+/// For listening, which only the conductor does, so through std. Prefers IPv4,
+/// as a name like `localhost` is most commonly reached that way.
 fn resolveListen(io_ctx: Io, host: []const u8, port: u16) !Io.net.IpAddress {
-    var buf: [1]Io.net.IpAddress = undefined;
-    const found = resolveHost(io_ctx, host, port, .ip4, &buf) catch try resolveHost(io_ctx, host, port, null, &buf);
-    return found[0];
+    if (Io.net.IpAddress.parse(host, port)) |ip| return ip else |_| {}
+    const name = Io.net.HostName.init(host) catch return error.InvalidAddress;
+    // Lookup never blocks on a queue of at least 16, so it can run inline.
+    var results: [16]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&results);
+    try name.lookup(io_ctx, &queue, .{ .port = port });
+    var first: ?Io.net.IpAddress = null;
+    while (queue.getOne(io_ctx)) |result| switch (result) {
+        .address => |ip| {
+            if (ip == .ip4) return ip;
+            if (first == null) first = ip;
+        },
+        .canonical_name => {},
+    } else |_| {}
+    return first orelse error.UnknownHostName;
 }
 
 pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Listener {
