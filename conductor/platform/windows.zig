@@ -1039,10 +1039,8 @@ pub fn getChildPid(child: anytype) DWORD {
     return if (child.id) |process| GetProcessId(process) else 0;
 }
 
-pub const WaitPidResult = struct { pid: posix.pid_t, exited: bool };
-
-pub fn waitpidNonBlocking(pid: posix.pid_t) WaitPidResult {
-    return .{ .pid = pid, .exited = WaitForSingleObject(pid, 0) != WAIT_TIMEOUT };
+pub fn reapIfExited(pid: posix.pid_t) bool {
+    return WaitForSingleObject(pid, 0) != WAIT_TIMEOUT;
 }
 
 pub const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };
@@ -1154,7 +1152,8 @@ const ENABLE_VIRTUAL_TERMINAL_INPUT: DWORD = 0x0200;
 var saved_mode: ?DWORD = null;
 
 // Processed input stays on so Ctrl-C still reaches the ctrl handler.
-pub fn setRawMode(stdin: HANDLE, raw: bool) void {
+pub fn setRawMode(raw: bool) void {
+    const stdin = getStdinHandle();
     if (raw) {
         var mode: DWORD = undefined;
         if (!GetConsoleMode(stdin, &mode).toBool()) return;
@@ -1164,9 +1163,6 @@ pub fn setRawMode(stdin: HANDLE, raw: bool) void {
         _ = SetConsoleMode(stdin, mode);
         saved_mode = null;
     }
-}
-pub fn setRawModeStdin(raw: bool) void {
-    setRawMode(getStdinHandle(), raw);
 }
 
 const ConsoleSaved = struct { stdout: HANDLE, stderr: HANDLE, out_mode: DWORD, err_mode: DWORD, out_cp: DWORD, in_cp: DWORD };

@@ -163,7 +163,6 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 .accept => {
                     if (cqe.res >= 0) {
                         const client_fd: posix.fd_t = @intCast(cqe.res);
-                        if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
                         const peer = main.PeerInfo.fromSockaddr(&client_addr);
                         conductor.admitConnection(client_fd, &peer);
                     } else {

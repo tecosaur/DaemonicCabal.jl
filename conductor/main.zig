@@ -298,6 +298,7 @@ pub const Conductor = struct {
 
     /// Read once readable, or dropped after `request_timeout_s`.
     pub fn admitConnection(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) void {
+        if (self.cfg.transport == .tcp) platform.setTcpNodelay(socket);
         const pc = self.allocator.create(PendingConnection) catch return platform.close(socket);
         pc.* = .{ .socket = socket, .peer = peer.*, .deadline = self.currentTime() + request_timeout_s };
         self.pending_connections.append(self.allocator, pc) catch {
@@ -440,14 +441,6 @@ pub const Conductor = struct {
         var request_held = false; // moved into a HeldClient while its worker starts
         defer if (!request_held) request.deinit(self.allocator);
         self.client_counter += 1;
-        if (request.parsed.hasSwitch("--help") or request.parsed.hasSwitch("-h")) {
-            try self.serveString(socket, protocol.CLIENT_HELP, 0);
-            return .done;
-        }
-        if (request.parsed.hasSwitch("--version") or request.parsed.hasSwitch("-v")) {
-            try self.serveString(socket, protocol.VERSION_STRING, 0);
-            return .done;
-        }
         if (request.parsed.hasSwitch("--status")) {
             try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty);
             return .done;

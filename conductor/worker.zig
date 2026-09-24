@@ -377,7 +377,7 @@ pub const Worker = struct {
                 std.debug.print("Worker {d}: no connection from the new worker within {d}s (JULIA_DAEMON_SPAWN_TIMEOUT)\n", .{ self.worker.id, cfg.spawn_timeout });
                 return error.WorkerSpawnTimeout;
             }
-            if (self.worker.process.id) |pid| if (platform.waitpidNonBlocking(pid).exited) {
+            if (self.worker.process.id) |pid| if (platform.reapIfExited(pid)) {
                 self.worker.process.id = null; // reaped; the pid may be reused
                 std.debug.print("Worker {d}: process exited before connecting; its output is above\n", .{self.worker.id});
                 return error.WorkerExitedEarly;
@@ -387,7 +387,7 @@ pub const Worker = struct {
         pub fn abandon(self: *Spawn, io: Io) void {
             if (self.worker.launch != .client) if (self.worker.process.id) |pid| {
                 _ = platform.kill(pid, platform.SIG.KILL);
-                _ = platform.waitpidNonBlocking(pid);
+                _ = platform.reapIfExited(pid);
             };
             platform.dumpChildStderr(io, self.worker.allocator, &self.worker.process, self.worker.id);
             self.listener.close(io);
@@ -433,7 +433,7 @@ pub const Worker = struct {
     pub fn exited(self: *const Worker) bool {
         if (self.pidfd) |fd| return platform.pidfdExited(fd);
         const pid = self.process.id orelse return true;
-        return platform.waitpidNonBlocking(pid).exited;
+        return platform.reapIfExited(pid);
     }
 
     /// Null once a pidfd-backed worker has exited: its pid may be reused.
