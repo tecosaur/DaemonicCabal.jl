@@ -181,6 +181,9 @@ var sockets: SocketSet = undefined;
 var conductor_path_buf: [max_socket_path]u8 = undefined;
 var conductor_path: []const u8 = &.{};
 var transport_mode: protocol.TransportMode = .local;
+// Where a TCP conductor was reached: worker ports are on its host, and a
+// signal handler cannot resolve its name again.
+var conductor_peer: ?Io.net.IpAddress = null;
 var signal_parser = SignalParser{};
 var client_id: u32 = 0; // conductor-assigned with the socket paths; names us in notifications
 
@@ -317,33 +320,36 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     transport_mode = located.address.mode;
     conductor_path = located.address.addr;
     const addr = conductor_path;
-    // First attempt
-    if (protocol.connectAddress(io, transport_mode, addr)) |stream| return stream else |_| {}
-    // In TCP mode, no PID file / SIGUSR1 recovery — just retry briefly
-    if (transport_mode == .tcp) {
-        var attempts: u32 = 0;
-        while (attempts < 20) : (attempts += 1) {
-            Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
-            if (protocol.connectAddress(io, transport_mode, addr)) |stream| return stream else |_| {}
-        }
-    } else {
-        // Local mode: try to signal conductor to recreate socket
-        var pid_buf: [max_socket_path]u8 = undefined;
-        const pid_path = std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong;
-        if (readPidAndSignal(pid_path)) {
+    const timeout = protocol.connect_timeout_ms;
+    if (protocol.connectAddress(io, transport_mode, addr, timeout)) |c| return keepConductor(c) else |err| switch (transport_mode) {
+        // A refusal may be a conductor restarting, so retry briefly; a host
+        // that did not answer in time is not worth asking again.
+        .tcp => if (err == error.ConnectionRefused) {
             var attempts: u32 = 0;
             while (attempts < 20) : (attempts += 1) {
                 Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
-                if (platform.connectLocal(io, addr)) |stream| return stream else |_| {}
+                if (protocol.connectAddress(io, .tcp, addr, timeout)) |c| return keepConductor(c) else |_| {}
             }
-            // Local socket still missing but conductor is alive — try default TCP port
-            const tcp_addr = std.fmt.bufPrint(&conductor_path_buf, "localhost:{d}", .{protocol.default_tcp_port}) catch unreachable;
-            if (protocol.connectAddress(io, .tcp, tcp_addr)) |stream| {
-                transport_mode = .tcp;
-                conductor_path = tcp_addr;
-                return stream;
-            } else |_| {}
-        }
+        },
+        // A live conductor whose socket went missing can be asked to recreate it.
+        .local => {
+            var pid_buf: [max_socket_path]u8 = undefined;
+            const pid_path = std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong;
+            if (readPidAndSignal(pid_path)) {
+                var attempts: u32 = 0;
+                while (attempts < 20) : (attempts += 1) {
+                    Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
+                    if (protocol.connectAddress(io, .local, addr, timeout)) |c| return keepConductor(c) else |_| {}
+                }
+                // Local socket still missing but conductor is alive — try default TCP port
+                const tcp_addr = std.fmt.bufPrint(&conductor_path_buf, "localhost:{d}", .{protocol.default_tcp_port}) catch unreachable;
+                if (protocol.connectAddress(io, .tcp, tcp_addr, timeout)) |c| {
+                    transport_mode = .tcp;
+                    conductor_path = tcp_addr;
+                    return keepConductor(c);
+                } else |_| {}
+            }
+        },
     }
     // Give up
     std.debug.print(
@@ -364,13 +370,18 @@ fn printVersion(env: EnvInfo) void {
     const plain = "juliaclient " ++ protocol.VERSION;
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
     const address: ?protocol.Address = if (locateConductor(env, &runtime_dir_buf)) |located|
-        (if (protocol.probeAddress(located.address.mode, located.address.addr, 1000)) located.address else null)
+        (if (protocol.probeAddress(io, located.address.mode, located.address.addr, 1000)) located.address else null)
     else |_| null;
     var line_buf: [2 * max_socket_path]u8 = undefined;
     const line = if (address) |a| std.fmt.bufPrint(&line_buf, plain ++ ", connected to conductor over {s} {s}\n", .{
         if (a.mode == .tcp) "TCP" else platform.local_transport_name, a.addr,
     }) catch plain ++ "\n" else plain ++ ", no conductor detected\n";
     platform.writeFile(platform.getStdoutHandle(), line);
+}
+
+fn keepConductor(connection: protocol.Connection) posix.socket_t {
+    conductor_peer = connection.peer;
+    return connection.socket;
 }
 
 fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, args: []const []const u8, addr_skip: [2]usize, sync_skip: usize) !void {
@@ -509,32 +520,20 @@ fn exitClient(code: u8) noreturn {
 }
 
 fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.socket_t {
-    // In TCP mode the conductor sends just `:port` — prepend the conductor host
-    var addr_buf: [max_socket_path]u8 = undefined;
-    const addr = if (raw.len > 0 and raw[0] == ':') blk: {
-        const host = conductorHost();
-        if (host.len + raw.len > addr_buf.len) {
-            std.debug.print("Worker " ++ label ++ " address too long\n", .{});
-            exitClient(127);
-        }
-        @memcpy(addr_buf[0..host.len], host);
-        @memcpy(addr_buf[host.len..][0..raw.len], raw);
-        break :blk addr_buf[0 .. host.len + raw.len];
-    } else raw;
-    // Each address is single-use, so a local one is retired once connected.
-    const connected = switch ((protocol.parseAddress(addr) catch unreachable).mode) {
-        .local => platform.connectLocalOnce(io, addr),
-        .tcp => protocol.connectAddress(io, .tcp, addr),
+    const connected = if (raw.len > 0 and raw[0] == ':') blk: {
+        // A worker sends just `:port`, a port on the conductor's host.
+        var ip = conductor_peer orelse break :blk error.NoConductorAddress;
+        ip.setPort(std.fmt.parseInt(u16, raw[1..], 10) catch break :blk error.InvalidAddress);
+        break :blk platform.connectTcp(ip, protocol.connect_timeout_ms);
+    } else switch ((protocol.parseAddress(raw) catch unreachable).mode) {
+        // Each address is single-use, so a local one is retired once connected.
+        .local => platform.connectLocalOnce(io, raw),
+        .tcp => if (protocol.connectAddress(io, .tcp, raw, protocol.connect_timeout_ms)) |c| c.socket else |e| e,
     };
     return connected catch |e| {
-        std.debug.print("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ addr, e });
+        std.debug.print("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ raw, e });
         exitClient(127);
     };
-}
-
-fn conductorHost() []const u8 {
-    const colon = std.mem.lastIndexOfScalar(u8, conductor_path, ':') orelse return conductor_path;
-    return conductor_path[0..colon];
 }
 
 fn readPidAndSignal(pid_path: []const u8) bool {
@@ -543,12 +542,11 @@ fn readPidAndSignal(pid_path: []const u8) bool {
     const content = Io.Dir.readFile(.cwd(), io, pid_path, &buf) catch return false;
     const pid_str = std.mem.trimEnd(u8, content, &.{ '\n', '\r', ' ' });
     const pid = std.fmt.parseInt(u32, pid_str, 10) catch return false;
-    platform.requestSocketRecreate(pid);
-    return true;
+    return platform.requestSocketRecreate(pid);
 }
 
 fn notifyExit() void {
-    const fd = protocol.connectAddress(io, transport_mode, conductor_path) catch return;
+    const fd = (protocol.connectAddress(io, transport_mode, conductor_path, protocol.connect_timeout_ms) catch return).socket;
     defer platform.close(fd);
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
@@ -573,37 +571,14 @@ fn notifyInterruptRaw() void {
             platform.socketWrite(fd, &buf);
         },
         .tcp => {
-            // Parse host:port from conductor_path
-            const colon = std.mem.lastIndexOfScalar(u8, conductor_path, ':') orelse return;
-            const host = conductor_path[0..colon];
-            const port = std.fmt.parseInt(u16, conductor_path[colon + 1 ..], 10) catch return;
-            // Only support IPv4 loopback/simple addresses from signal handler
-            const ip = parseIPv4(host) orelse return;
-            const fd = platform.rawSocket(posix.AF.INET, posix.SOCK.STREAM) orelse return;
+            const ip = conductor_peer orelse return;
+            var storage: Io.Threaded.PosixAddress = undefined;
+            const len = Io.Threaded.addressToPosix(&ip, &storage);
+            const fd = platform.rawSocket(storage.any.family, posix.SOCK.STREAM) orelse return;
             defer platform.rawClose(fd);
-            var addr = std.mem.zeroes(posix.sockaddr.in);
-            addr.family = posix.AF.INET;
-            addr.port = std.mem.nativeToBig(u16, port);
-            addr.addr = ip;
-            if (platform.rawConnect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) {
-                platform.socketWrite(fd, &buf);
-            }
+            if (platform.rawConnect(fd, &storage.any, len)) platform.socketWrite(fd, &buf);
         },
     }
-}
-
-/// Parse a dotted-decimal IPv4 address into a u32 (network byte order).
-fn parseIPv4(host: []const u8) ?u32 {
-    var parts: [4]u8 = undefined;
-    var i: usize = 0;
-    var it = std.mem.splitScalar(u8, host, '.');
-    while (it.next()) |part| {
-        if (i >= 4) return null;
-        parts[i] = std.fmt.parseInt(u8, part, 10) catch return null;
-        i += 1;
-    }
-    if (i != 4) return null;
-    return @bitCast(parts);
 }
 
 fn getTerminalSize() struct { height: u16, width: u16 } {

@@ -307,8 +307,8 @@ pub const PortPool = struct {
 
 pub const TransportMode = enum { local, tcp };
 pub const Listener = platform.Listener;
-/// An accepted connection and, over TCP, the peer's address.
-pub const Accepted = struct { socket: std.posix.socket_t, peer: ?Io.net.IpAddress };
+/// A connected or accepted socket and, over TCP, the address at the other end.
+pub const Connection = struct { socket: std.posix.socket_t, peer: ?Io.net.IpAddress };
 
 pub const Address = struct {
     mode: TransportMode,
@@ -337,37 +337,96 @@ pub fn parseAddress(raw: []const u8) error{UnsupportedScheme}!Address {
 
 pub const default_tcp_port: u16 = 9345;
 
-fn parseHostPort(addr: []const u8) !Io.net.IpAddress {
-    const colon = std.mem.lastIndexOfScalar(u8, addr, ':');
-    const host = if (colon) |c| addr[0..c] else addr;
-    const port: u16 = if (colon) |c|
-        std.fmt.parseInt(u16, addr[c + 1 ..], 10) catch return error.InvalidAddress
-    else
-        default_tcp_port;
-    return Io.net.IpAddress.parse(host, port) catch return error.InvalidAddress;
+/// How long connecting to one address may take before it counts as unreachable.
+pub const connect_timeout_ms: u32 = 5000;
+
+/// Split `host[:port]`, the host optionally bracketed (as an IPv6 address with
+/// a port must be) and the port defaulting to `default_tcp_port`.
+pub fn splitHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
+    var host = addr;
+    var port_text: ?[]const u8 = null;
+    if (addr.len > 0 and addr[0] == '[') {
+        const end = std.mem.indexOfScalar(u8, addr, ']') orelse return error.InvalidAddress;
+        host = addr[1..end];
+        const rest = addr[end + 1 ..];
+        if (rest.len > 0) {
+            if (rest[0] != ':') return error.InvalidAddress;
+            port_text = rest[1..];
+        }
+    } else if (std.mem.lastIndexOfScalar(u8, addr, ':')) |colon| {
+        host = addr[0..colon];
+        port_text = addr[colon + 1 ..];
+    }
+    const port = if (port_text) |text| std.fmt.parseInt(u16, text, 10) catch return error.InvalidAddress else default_tcp_port;
+    return .{ .host = host, .port = port };
 }
 
-pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !std.posix.socket_t {
+/// The addresses `host` names, in resolver order, into `buf`: a numeric host
+/// as it stands, a name by lookup, narrowed to `family` when one is given.
+pub fn resolveHost(io_ctx: Io, host: []const u8, port: u16, family: ?Io.net.IpAddress.Family, buf: []Io.net.IpAddress) ![]Io.net.IpAddress {
+    if (Io.net.IpAddress.parse(host, port)) |ip| {
+        buf[0] = ip;
+        return buf[0..1];
+    } else |_| {}
+    const name = Io.net.HostName.init(host) catch return error.InvalidAddress;
+    // Lookup never blocks on a queue of at least 16, so it can run inline.
+    var results: [16]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&results);
+    try name.lookup(io_ctx, &queue, .{ .port = port, .family = family });
+    var n: usize = 0;
+    while (queue.getOne(io_ctx)) |result| switch (result) {
+        .address => |ip| if (n < buf.len) {
+            buf[n] = ip;
+            n += 1;
+        },
+        .canonical_name => {},
+    } else |_| {}
+    return if (n == 0) error.UnknownHostName else buf[0..n];
+}
+
+/// Connect to `addr`, giving each address a TCP host resolves to `timeout_ms`
+/// in turn; the connection records the one it reached.
+pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8, timeout_ms: u32) !Connection {
     switch (mode) {
-        .local => return platform.connectLocal(io_ctx, addr),
-        .tcp => return platform.connectTcp(io_ctx, try parseHostPort(addr)),
+        .local => return .{ .socket = try platform.connectLocal(io_ctx, addr, timeout_ms), .peer = null },
+        .tcp => {
+            const target = try splitHostPort(addr);
+            var buf: [8]Io.net.IpAddress = undefined;
+            var last_err: anyerror = error.UnknownHostName;
+            for (try resolveHost(io_ctx, target.host, target.port, null, &buf)) |ip| {
+                const socket = platform.connectTcp(ip, timeout_ms) catch |err| {
+                    last_err = err;
+                    continue;
+                };
+                return .{ .socket = socket, .peer = ip };
+            }
+            return last_err;
+        },
     }
 }
 
-/// Whether something accepts connections at `addr` within `timeout_ms`, so an
-/// unreachable host cannot stall the caller. The connection is closed unused.
-pub fn probeAddress(mode: TransportMode, addr: []const u8, timeout_ms: u32) bool {
-    return switch (mode) {
-        .local => platform.probeLocal(addr, timeout_ms),
-        .tcp => platform.probeTcp(parseHostPort(addr) catch return false, timeout_ms),
-    };
+/// Whether something accepts connections at `addr` within `timeout_ms` per
+/// address. The connection is closed unused.
+pub fn probeAddress(io_ctx: Io, mode: TransportMode, addr: []const u8, timeout_ms: u32) bool {
+    const connection = connectAddress(io_ctx, mode, addr, timeout_ms) catch return false;
+    platform.close(connection.socket);
+    return true;
+}
+
+/// The address to listen on for `host`: its IPv4 address where it has one, as
+/// a name like `localhost` is most commonly reached that way.
+fn resolveListen(io_ctx: Io, host: []const u8, port: u16) !Io.net.IpAddress {
+    var buf: [1]Io.net.IpAddress = undefined;
+    const found = resolveHost(io_ctx, host, port, .ip4, &buf) catch try resolveHost(io_ctx, host, port, null, &buf);
+    return found[0];
 }
 
 pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Listener {
     switch (mode) {
         .local => return platform.listenLocal(io_ctx, addr),
         .tcp => {
-            const ip = try parseHostPort(addr);
+            const target = try splitHostPort(addr);
+            const ip = try resolveListen(io_ctx, target.host, target.port);
             var server = try ip.listen(io_ctx, .{ .kernel_backlog = 128, .reuse_address = true });
             errdefer server.deinit(io_ctx);
             return Listener.fromServer(server, .tcp, addr);
@@ -388,7 +447,7 @@ pub fn createListener(io_ctx: Io, mode: TransportMode, socket_dir: []const u8, s
 
 /// Port 0 = ephemeral (OS-assigned).
 pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16) !Listener {
-    const ip = Io.net.IpAddress.parse(bind_addr, port) catch return error.InvalidAddress;
+    const ip = try resolveListen(io_ctx, bind_addr, port);
     var server = try ip.listen(io_ctx, .{ .reuse_address = true });
     errdefer server.deinit(io_ctx);
     const actual_port = switch (server.socket.address) {
