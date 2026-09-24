@@ -17,6 +17,7 @@ function systemd_service_content(env::Dict{String,String})
     ExecStart=$(installed_conductor())
     $env_lines
     Restart=on-failure
+    Delegate=yes
 
     [Install]
     WantedBy=default.target

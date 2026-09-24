@@ -10,7 +10,7 @@ const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
 const config = @import("config.zig");
 const args = @import("args.zig");
-const sandbox = if (builtin.os.tag == .linux) @import("sandbox.zig") else struct {};
+pub const sandbox = if (builtin.os.tag == .linux) @import("sandbox.zig") else struct {};
 
 const BufWriter = protocol.BufWriter;
 const readExact = protocol.readExact;
