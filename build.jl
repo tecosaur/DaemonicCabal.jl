@@ -47,8 +47,8 @@ const ZIG = let vendored = joinpath(@__DIR__, "zig", "zig" * (Sys.iswindows() ? 
 end
 const BASE_FLAGS = ["-fsingle-threaded", "-fPIE"]
 const BINARIES = [
-    ("julia-conductor" * (Sys.iswindows() ? ".exe" : ""), "conductor/main.zig"),
-    ("juliaclient" * (Sys.iswindows() ? ".exe" : ""),     "client/client.zig"),
+    ("julia-conductor", "conductor/main.zig"),
+    ("juliaclient",     "client/client.zig"),
 ]
 const SERVICE_NAME = "julia-daemon"
 const SERVICE_FILE = joinpath(get(ENV, "XDG_CONFIG_HOME",
@@ -81,9 +81,10 @@ function with_srcdir(f)
     end
 end
 
-function build_binaries(srcdir; outdir=".", flags, runner=run)
+# `exe` is the target's executable suffix, which the installer expects.
+function build_binaries(srcdir; outdir=".", flags, exe=Sys.iswindows() ? ".exe" : "", runner=run)
     map(BINARIES) do (name, src)
-        runner(`$ZIG build-exe $flags -femit-bin=$outdir/$name --name $name $srcdir/$src`)
+        runner(`$ZIG build-exe $flags -femit-bin=$outdir/$name$exe --name $name $srcdir/$src`)
     end
 end
 
@@ -147,19 +148,17 @@ function build()
             ("windows", "x86_64",  String[]),
             ("windows", "aarch64", String[]),
         ]
-        # Cross-compile, package, and collect artifact metadata
-        artifacts = mktempdir() do workdir
-            map(BUILD_SPECS) do (os, arch, extra)
-                @info "$os-$arch"
-                build_binaries(srcdir; outdir=workdir,
+        # Cross-compile, package, and collect artifact metadata. Each target
+        # builds alone, so nothing another emits can reach its bundle.
+        artifacts = map(BUILD_SPECS) do (os, arch, extra)
+            @info "$os-$arch"
+            mktempdir() do workdir
+                build_binaries(srcdir; outdir=workdir, exe=os == "windows" ? ".exe" : "",
                                flags=[flags; extra; "-target"; "$arch-$os"])
                 tarball = joinpath(builddir, "$os-$arch.tar.gz")
                 run(`tar -czf $tarball -C $workdir .`)
                 sha = open(io -> bytes2hex(sha256(io)), tarball)
                 treehash = bytes2hex(Pkg.GitTools.tree_hash(workdir))
-                for (name, _) in BINARIES
-                    rm(joinpath(workdir, name), force=true)
-                end
                 Dict{String, Any}(
                     "arch" => arch, "os" => os,
                     "git-tree-sha1" => treehash,
