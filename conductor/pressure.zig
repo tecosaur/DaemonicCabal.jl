@@ -1,10 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Host memory-pressure monitor for pressure-reactive worker caching. Resolves
-// the best available signal once at startup (PSI stall where present, else the
-// always-available free-memory level) and applies two-band hysteresis so a host
-// hovering at the threshold doesn't flap in and out of eviction episodes.
+// Host memory-pressure monitor. Two-band hysteresis keeps a host hovering at
+// the threshold from flapping in and out of eviction episodes.
 
 const std = @import("std");
 const platform = @import("platform/main.zig");
@@ -16,7 +14,6 @@ pub const Monitor = struct {
     source: Source,
     under_pressure: bool = false,
 
-    /// Resolve the active source (silently; call logResolution to report it).
     pub fn init(cfg: *const config.Config) Monitor {
         if (!cfg.memory_pressure) return .{ .source = .none };
         const source: Source = if (platform.readPsiSomeAvg10() != null)
@@ -28,8 +25,6 @@ pub const Monitor = struct {
         return .{ .source = source };
     }
 
-    /// Three-state startup report: which source resolved, the normal
-    /// PSI-absent-but-level-OK case, or the loud no-signal warning.
     pub fn logResolution(self: *const Monitor, cfg: *const config.Config) void {
         if (!cfg.memory_pressure) {
             std.debug.print(" - Memory pressure: disabled (TTL-only)\n", .{});
@@ -46,12 +41,9 @@ pub const Monitor = struct {
         return self.source != .none;
     }
 
-    /// Re-read the signal once and update the hysteresis state: enter pressure
-    /// past the "low" band, leave only once recovered past the "high" band.
     pub fn poll(self: *Monitor, cfg: *const config.Config) bool {
         switch (self.source) {
-            // PSI rises with pressure; single threshold, no hysteresis gap (the
-            // 10s average is already smooth).
+            // No hysteresis: the 10s average is already smooth.
             .psi => self.under_pressure = (platform.readPsiSomeAvg10() orelse 0) >= cfg.psi_threshold,
             .memfree => if (platform.readMemInfo()) |m| {
                 if (cfg.memfree_low.satisfied(m.available, m.total))

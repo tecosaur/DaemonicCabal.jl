@@ -1,13 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-# Circular buffer of the most recent bytes written to a sync session, so a newly
-# attaching client can be shown recent context. A session's stdout and stderr
-# BroadcastWriters tee into one shared history, recording both streams interleaved
-# in write order — the byte stream a terminal would have displayed. `bytes` is
-# allocated once at capacity; `pos` is the next write slot (0-based, wraps) and
-# `total` the count of all bytes ever written, from which the live byte count
-# (`min(total, cap)`) and the dropped count (`total - cap`) derive.
+# A ring of a sync session's recent stdout and stderr, interleaved as a terminal
+# would show them. `pos` is the 0-based next write slot; `total` counts every
+# byte ever written, so the live and dropped counts derive from it.
 mutable struct OutputHistory
     const bytes::Vector{UInt8}
     const lock::SpinLock
@@ -33,9 +29,7 @@ function capture!(h::OutputHistory, data)
     nothing
 end
 
-# The valid bytes oldest-first, plus how many earlier bytes were dropped (0 if the
-# ring has not yet cycled). The live region is at most two contiguous runs — from
-# the oldest byte to the end of the buffer, then from the start up to `pos`.
+# The live bytes oldest-first, plus how many earlier bytes were dropped.
 function linearise(h::OutputHistory)
     @lock h.lock begin
         cap = length(h.bytes)
@@ -70,7 +64,6 @@ function replay_start(bytes::Vector{UInt8}, overflowed::Bool, maxlines::Int)
     cutoff = line_limited_start(bytes, maxlines)
     start = nothing
     for i in cutoff:lastindex(bytes)
-        # prompt boundary-like check
         if i + 4 <= lastindex(bytes) &&
             bytes[i] == UInt8('\r') && bytes[i+1] == UInt8('\e') && bytes[i+2] == UInt8('[') &&
             bytes[i+3] in (UInt8('2'), UInt8('0')) && bytes[i+4] == UInt8('K')

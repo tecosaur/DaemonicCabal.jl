@@ -5,8 +5,7 @@ const std = @import("std");
 const Io = std.Io;
 const args = @import("args.zig");
 
-/// Find project path from parsed args or environment.
-/// Returns allocated string that caller must free, or null for default (@v#.#).
+/// Caller frees; null means the default environment (@v#.#).
 pub fn resolve(
     allocator: std.mem.Allocator,
     io: Io,
@@ -15,14 +14,13 @@ pub fn resolve(
     home_dir: []const u8,
     cwd: []const u8,
 ) !?[]const u8 {
-    // 1. Check --project switch (last occurrence wins)
+    // The last --project wins
     if (parsed.getSwitch("--project")) |project| {
         if (project.len == 0 or std.mem.eql(u8, project, "@.")) {
             return findProjectToml(allocator, io, cwd);
         }
         return try allocator.dupe(u8, project);
     }
-    // 2. Check JULIA_PROJECT env var
     if (julia_project) |project| {
         if (project.len == 0 or std.mem.eql(u8, project, "@.")) {
             return findProjectToml(allocator, io, cwd);
@@ -35,7 +33,6 @@ pub fn resolve(
         }
         return try allocator.dupe(u8, project);
     }
-    // No --project or JULIA_PROJECT: use default environment (@v#.#)
     return null;
 }
 

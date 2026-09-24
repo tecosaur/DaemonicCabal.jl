@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// Linux platform — direct syscalls (std.os.linux).
-// Only raw primitives that differ from BSD live here; shared logic is in posix.zig.
+// Linux platform primitives, over raw syscalls; shared logic is in posix.zig.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -20,8 +19,7 @@ pub const Timeval = linux.timeval;
 pub const getpid = linux.getpid;
 pub const getppid = linux.getppid;
 
-// I/O — write wraps the raw syscall to take a slice and log errors.
-// Loops until the whole buffer is written, as a single write() can be short.
+// I/O
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
     var written: usize = 0;
     while (written < buf.len) {
@@ -39,7 +37,7 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
     }
 }
 
-// Raw syscall primitives used by posix.zig shared implementations
+// Raw primitives
 pub const kill = linux.kill;
 
 /// A pidfd turns readable once its process has exited.
@@ -67,7 +65,7 @@ pub fn peerPid(socket: posix.socket_t) ?posix.pid_t {
     return if (cred.pid != 0) cred.pid else null; // zeros on a TCP socket
 }
 
-var own_mount_ns: ?u64 = null; // ours never changes; read once
+var own_mount_ns: ?u64 = null;
 pub fn peerMountNs(socket: posix.socket_t) ?u64 {
     return mountNsInode(peerPid(socket) orelse return null);
 }
@@ -79,10 +77,10 @@ pub fn peerForeignMountNs(socket: posix.socket_t) ?u64 {
     return if (peer == own) null else peer;
 }
 
-/// Forked twice so the parent is init, not the caller: the worker's parent-death
-/// signal then means "die with the sandbox".
+/// Forked twice so the parent is init: the worker's parent-death signal then
+/// means "die with the sandbox".
 pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) !void {
-    // Checked here: a missing executable or /dev/null in the grandchild would die unwatched.
+    // Checked here, as the grandchild would fail unwatched.
     const exe = argv[0].?;
     if (!canExec(exe)) return error.ExecutableNotFound;
     const devnull_rc = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
@@ -93,7 +91,7 @@ pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*
     if (linux.errno(pid) != .SUCCESS) return error.ForkFailed;
     if (pid != 0) {
         var status: u32 = 0;
-        _ = linux.waitpid(@intCast(pid), &status, 0); // the intermediate exits at once
+        _ = linux.waitpid(@intCast(pid), &status, 0);
         return;
     }
     _ = linux.setsid();
@@ -139,7 +137,6 @@ pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.sockle
 }
 
 
-// Read a file into `buf`, returning the bytes read (null if unopenable).
 fn readFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
     const fd_rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
     const fd_signed: isize = @bitCast(fd_rc);
@@ -161,17 +158,13 @@ fn readProc(comptime fmt: []const u8, pid: posix.pid_t, buf: []u8) ?[]const u8 {
     return readFile(path.ptr, buf);
 }
 
-// The command name of `pid`'s parent process, copied into `out`. Resolves the
-// parent pid from /proc/<pid>/stat (field 4), then reads /proc/<ppid>/comm.
-// Returns null if either step fails (e.g. a remote client with no local /proc).
 pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
     const ppid = parentPid(pid) orelse return null;
     const comm = readProc("/proc/{d}/comm", ppid, out) orelse return null;
     return std.mem.trimEnd(u8, comm, "\n");
 }
 
-// Field 4 of /proc/<pid>/stat, parsed from after the final ')' so a comm string
-// containing spaces or parens is skipped.
+// Parsed after the final ')', as comm may contain spaces or parens.
 pub fn parentPid(pid: posix.pid_t) ?posix.pid_t {
     var buf: [256]u8 = undefined;
     const content = readProc("/proc/{d}/stat", pid, &buf) orelse return null;
@@ -182,14 +175,9 @@ pub fn parentPid(pid: posix.pid_t) ?posix.pid_t {
     return if (ppid > 0) ppid else null;
 }
 
-// False: getProcessStats returns RSS (cheap, from /proc/<pid>/stat), but true USS
-// requires an smaps walk (processReclaimable), so eviction refines candidates with
-// a second pass. See runEvictionEpisode and bsd.zig's mem_is_reclaimable.
+// RSS; USS needs the smaps walk in processReclaimable.
 pub const mem_is_reclaimable = false;
 
-// Process stats — read resident memory and CPU time from /proc/<pid>/stat.
-// Returns null if the process is gone or /proc is unreadable. Fields are parsed
-// from after the final ')' so a comm string containing spaces/parens is skipped.
 pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
     var buf: [4096]u8 = undefined;
     const content = readProc("/proc/{d}/stat", pid, &buf) orelse return null;
@@ -205,8 +193,7 @@ pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
     const utime = vals[11]; // field 14
     const stime = vals[12]; // field 15
     const rss_pages = vals[21]; // field 24
-    // USER_HZ (_SC_CLK_TCK) is 100 on every mainstream Linux config; reading it
-    // exactly needs libc, which the conductor deliberately doesn't link.
+    // USER_HZ is 100 on every mainstream config; reading it needs libc.
     const ticks_per_sec: f64 = 100;
     return .{
         .mem_bytes = rss_pages * std.heap.pageSize(),
@@ -214,9 +201,6 @@ pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
     };
 }
 
-// Reclaimable (USS) bytes from /proc/<pid>/smaps_rollup: Private_Clean +
-// Private_Dirty — the private pages freed when this process dies. Null if the
-// file is absent (very old kernels) or unparseable.
 pub fn processReclaimable(pid: posix.pid_t) ?u64 {
     var buf: [4096]u8 = undefined;
     const content = readProc("/proc/{d}/smaps_rollup", pid, &buf) orelse return null;
@@ -225,7 +209,6 @@ pub fn processReclaimable(pid: posix.pid_t) ?u64 {
     return (clean + dirty) * 1024;
 }
 
-// First numeric token after `field` in a "Field:  <n> kB"-style file, or null.
 fn fieldKb(content: []const u8, field: []const u8) ?u64 {
     const start = std.mem.indexOf(u8, content, field) orelse return null;
     var toks = std.mem.tokenizeAny(u8, content[start + field.len ..], " \n");
@@ -234,7 +217,7 @@ fn fieldKb(content: []const u8, field: []const u8) ?u64 {
 
 // --- Memory pressure sources ---
 
-// PSI "some avg10" %, or null if PSI is compiled out (common on stock distros).
+// Null where PSI is compiled out, common on stock distros.
 pub fn readPsiSomeAvg10() ?f64 {
     var buf: [256]u8 = undefined;
     const content = readFile("/proc/pressure/memory", &buf) orelse return null;
@@ -245,7 +228,6 @@ pub fn readPsiSomeAvg10() ?f64 {
 
 pub const MemInfo = struct { available: u64, total: u64 };
 
-// MemAvailable (excludes reclaimable cache) vs MemTotal. Always present on Linux.
 pub fn readMemInfo() ?MemInfo {
     var buf: [2048]u8 = undefined;
     const content = readFile("/proc/meminfo", &buf) orelse return null;
@@ -254,7 +236,7 @@ pub fn readMemInfo() ?MemInfo {
     return .{ .available = avail * 1024, .total = total * 1024 };
 }
 
-// Paths — Linux-specific default runtime directory
+// Paths
 pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, _: ?[]const u8) ![]const u8 {
     if (xdg_runtime_dir) |xdg|
         return shared.print(out, "{s}/julia-daemon", .{xdg});

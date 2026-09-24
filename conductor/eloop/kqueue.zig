@@ -1,16 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// BSD/macOS kqueue-based event loop for the conductor.
-//
-// This implementation mirrors the io_uring-based Linux event loop, handling:
-// - Client connection acceptance
-// - Signal-to-pipe conversion for graceful shutdown
-// - Periodic worker health checks (ping/pong with timeouts)
-//
-// Key difference from io_uring: linked operations (read + timeout) must be
-// managed manually with two separate kqueue registrations, coordinated via
-// the worker's `ping_pending` flag.
+// BSD/macOS kqueue-based event loop for the conductor. A ping's read and
+// timeout are two registrations, settled by whichever clears `ping_pending`.
 
 const std = @import("std");
 const c = std.c;
@@ -30,23 +22,23 @@ const signal_pipe = &posix_signals.signal_pipe;
 const SIGNAL_SHUTDOWN = posix_signals.SIGNAL_SHUTDOWN;
 const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 
-// EV flags - some BSD variants have gaps in Zig's bindings
+// Some BSDs lack it in Zig's bindings.
 const EV_ERROR: u16 = if (@hasDecl(c.EV, "ERROR")) c.EV.ERROR else 0x4000;
 
-// Sentinel udata values for fixed event sources (worker pointers are >= 0x1000)
+// Worker pointers are >= 0x1000.
 const UDATA_ACCEPT: usize = 0;
 const UDATA_SIGNAL: usize = 1;
 const UDATA_PING_TIMER: usize = 2;
 const UDATA_PRESSURE_TIMER: usize = 4;
 const UDATA_LIVE_TIMER: usize = 5;
 const UDATA_TICK_TIMER: usize = 6;
-// Unique idents for periodic timers (won't collide with file descriptors)
+// Clear of any file descriptor.
 const TIMER_IDENT_PING: usize = 0xFFFF_0001;
 const TIMER_IDENT_PRESSURE: usize = 0xFFFF_0002;
 const TIMER_IDENT_LIVE: usize = 0xFFFF_0003;
 const TIMER_IDENT_TICK: usize = 0xFFFF_0004;
 
-// EventLoop (wraps kqueue fd + configuration)
+// EventLoop
 pub const EventLoop = struct {
     kq: posix.fd_t,
     ping_interval_ms: isize,
@@ -67,30 +59,24 @@ pub const EventLoop = struct {
         _ = c.close(self.kq);
     }
 
-    /// Arm the unified live-repaint timer `delay_ms` out (Conductor picks the delay).
     pub fn armLiveTimer(self: *EventLoop, delay_ms: u64) void {
         var ch = [1]c.Kevent{makeKevent(TIMER_IDENT_LIVE, c.EVFILT.TIMER, c.EV.ADD | c.EV.ONESHOT, 0, @intCast(delay_ms), UDATA_LIVE_TIMER)};
         _ = keventSubmit(self.kq, &ch);
     }
 
-    /// Schedule a health check for a worker after a short delay (1 second).
-    /// Uses bit 0 of udata to distinguish from pong timeouts.
     pub fn scheduleHealthCheck(self: *EventLoop, w: *worker.Worker) void {
         const udata_tagged = @intFromPtr(w) | 1;
         var changes = [1]c.Kevent{makeKevent(
-            udata_tagged, // ident: use tagged pointer for uniqueness
+            udata_tagged,
             c.EVFILT.TIMER,
             c.EV.ADD | c.EV.ONESHOT,
             0,
-            1000, // 1 second delay
+            1000,
             udata_tagged,
         )};
         _ = keventSubmit(self.kq, &changes);
     }
 
-    /// Watch `fd` for readability once, reporting `tag` (a pending record's
-    /// pointer with its low bits naming what) to the conductor; watch again to
-    /// keep watching.
     pub fn watchFd(self: *EventLoop, tag: usize, fd: posix.fd_t) void {
         var ch = [1]c.Kevent{makeKevent(@intCast(fd), c.EVFILT.READ, c.EV.ADD | c.EV.ONESHOT, 0, 0, tag)};
         _ = keventSubmit(self.kq, &ch);
@@ -114,20 +100,16 @@ pub const EventLoop = struct {
         self.tick_armed = false;
     }
 
-    /// Delete kqueue registrations referencing `w`: the health-check timer
-    /// (`ptr|1`, armable without a ping in flight) and, when a ping is pending,
-    /// the read + pong-timeout timer (`ptr`). isLiveWorker guards any stale event.
+    /// isLiveWorker rejects any stale event.
     pub fn cancelPendingPing(self: *EventLoop, w: *worker.Worker) void {
         var hc = [1]c.Kevent{makeKevent(@intFromPtr(w) | 1, c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
         _ = keventSubmit(self.kq, &hc);
         if (!w.ping_pending) return;
-        // Delete the read registration (may already be gone if it fired)
         var changes = [2]c.Kevent{
             makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0),
             makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0),
         };
         _ = keventSubmit(self.kq, &changes);
-        // Drain pong synchronously
         var buf: [5]u8 = undefined;
         protocol.readExact(w.socket, &buf) catch {};
         w.ping_pending = false;
@@ -138,18 +120,12 @@ pub const EventLoop = struct {
 pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     const kq = conductor.event_loop.kq;
     var server_fd: posix.fd_t = listener.fd();
-    // Store timeout configuration
     conductor.event_loop.ping_interval_ms = @intCast(conductor.cfg.ping_interval * 1000);
     conductor.event_loop.ping_timeout_ms = @intCast(conductor.cfg.ping_timeout * 1000);
-    // Buffers
     var signal_buf: [16]u8 = undefined;
-    // Register initial events
     var init_changes: [3]c.Kevent = .{
-        // Server accept (level-triggered read)
         makeKevent(@intCast(server_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT),
-        // Signal pipe read
         makeKevent(@intCast(signal_pipe[0]), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_SIGNAL),
-        // Periodic ping timer
         makeKevent(
             TIMER_IDENT_PING,
             c.EVFILT.TIMER,
@@ -170,26 +146,20 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
         var pc = [1]c.Kevent{makeKevent(TIMER_IDENT_PRESSURE, c.EVFILT.TIMER, c.EV.ADD, 0, interval_ms, UDATA_PRESSURE_TIMER)};
         _ = keventSubmit(kq, &pc);
     }
-    // Event buffer
     var events: [32]c.Kevent = undefined;
-    // Empty changelist for calls where we only want to wait for events
     var no_changes: [0]c.Kevent = undefined;
-    // Main loop
     while (true) {
         const nevents = keventCall(kq, &no_changes, &events);
         if (nevents < 0) {
-            // Check errno for EINTR (signal interrupted)
             const err: posix.E = @enumFromInt(c._errno().*);
             if (err == .INTR) continue;
             std.debug.print("Fatal: kevent wait failed: {}\n", .{err});
             return;
         }
         const event_count: usize = @intCast(nevents);
-        // Any event other than the live timers themselves may have changed what
-        // a live `--status` view shows; one repaint is scheduled per batch.
+        // Whether a live `--status` view needs a repaint, once per batch.
         var pool_changed = false;
         for (events[0..event_count]) |ev| {
-            // Check for errors on this event
             if ((ev.flags & EV_ERROR) != 0) {
                 std.debug.print("kevent error on ident {}: {}\n", .{ ev.ident, ev.data });
                 continue;
@@ -221,9 +191,8 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                     pool_changed = true;
                 },
                 else => {
-                    // Tagged pointer: bits 1-2 set is a pending connection or spawn the
-                    // conductor decodes, else a worker (bit 0: 0 = pong read/timeout,
-                    // 1 = health check timeout).
+                    // Bits 1-2 set is a pending record, else a worker (bit 0:
+                    // health check).
                     if ((udata & 6) != 0) {
                         conductor.onReadable(udata);
                         pool_changed = true;
@@ -231,7 +200,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                     }
                     const is_health_check = (udata & 1) != 0;
                     const w: *worker.Worker = @ptrFromInt(udata & ~@as(usize, 1));
-                    if (!conductor.isLiveWorker(w)) continue; // stale event for a retired worker
+                    if (!conductor.isLiveWorker(w)) continue;
                     if (ev.filter == c.EVFILT.TIMER) {
                         if (is_health_check) {
                             handleHealthCheck(conductor, kq, w);
@@ -239,7 +208,6 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                             handlePongTimeout(conductor, kq, w);
                         }
                     } else {
-                        // EVFILT_READ: pong data ready
                         handlePongReady(conductor, kq, w);
                     }
                     pool_changed = true;
@@ -253,7 +221,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
 // Event handlers
 
 fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
-    // Accept is level-triggered, so we don't need to re-arm
+    // Level-triggered, so never re-armed.
     var client_addr: std.Io.Threaded.PosixAddress = undefined;
     var client_addr_len: posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
     const client_fd = c.accept(server_fd, &client_addr.any, &client_addr_len);
@@ -267,7 +235,7 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
     conductor.admitConnection(client_fd, &peer);
 }
 
-/// Handle signal pipe read. Returns true if shutdown requested.
+/// True when shutdown was requested.
 fn handleSignal(
     conductor: *Conductor,
     listener: *protocol.Listener,
@@ -288,7 +256,6 @@ fn handleSignal(
             },
             SIGNAL_RECREATE => {
                 std.debug.print("Recreating socket due to SIGUSR1\n", .{});
-                // Remove old server fd from kqueue
                 var del_changes = [1]c.Kevent{makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
                 _ = keventSubmit(kq, &del_changes);
                 listener.close(conductor.io);
@@ -297,7 +264,6 @@ fn handleSignal(
                     continue;
                 };
                 server_fd.* = listener.fd();
-                // Register new server fd
                 var add_changes = [1]c.Kevent{makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT)};
                 _ = keventSubmit(kq, &add_changes);
             },
@@ -328,25 +294,22 @@ fn maybeQueuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker, now:
 
 fn queuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
     w.sendPing();
-    // Register both read and timeout for this ping
     var changes: [2]c.Kevent = .{
-        // Read on worker socket (one-shot)
         makeKevent(
             @intCast(w.socket),
             c.EVFILT.READ,
             c.EV.ADD | c.EV.ONESHOT,
             0,
             0,
-            @intFromPtr(w), // udata = worker ptr (bit 0 clear)
+            @intFromPtr(w),
         ),
-        // Timeout timer (one-shot)
         makeKevent(
-            @intFromPtr(w), // ident = worker ptr for uniqueness
+            @intFromPtr(w),
             c.EVFILT.TIMER,
             c.EV.ADD | c.EV.ONESHOT,
             0,
             conductor.event_loop.ping_timeout_ms,
-            @intFromPtr(w), // udata = worker ptr (bit 0 clear)
+            @intFromPtr(w),
         ),
     };
     if (keventSubmit(kq, &changes) < 0) {
@@ -355,7 +318,6 @@ fn queuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
 }
 
 fn handleHealthCheck(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
-    // Health check timer fired - send a ping if conditions are met
     const now = conductor.currentTime();
     conductor.refreshIdleMemIfStale(w, now);
     if (w.shouldPing(now, conductor.cfg.ping_interval)) {
@@ -364,13 +326,11 @@ fn handleHealthCheck(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) v
 }
 
 fn handlePongReady(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
-    // Guard against race with timeout (both may fire in same kevent batch)
+    // The timeout may fire in the same batch.
     if (!w.ping_pending) return;
-    w.ping_pending = false; // Clear FIRST, before any fallible operations
-    // Cancel timeout timer (may fail if already fired - that's fine)
+    w.ping_pending = false;
     var changes = [1]c.Kevent{makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
     _ = keventSubmit(kq, &changes);
-    // Read pong into worker's own buffer (socket is ready, but may need multiple reads for the full 5 bytes)
     const n = posix.read(w.socket, &w.pong_buf) catch |err| {
         std.debug.print("Worker {d}: pong read error: {}\n", .{ w.id, err });
         conductor.retireWorker(w);
@@ -387,10 +347,9 @@ fn handlePongReady(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) voi
 }
 
 fn handlePongTimeout(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
-    // Guard against race with read (both may fire in same kevent batch)
+    // The read may fire in the same batch.
     if (!w.ping_pending) return;
     w.ping_pending = false;
-    // Cancel read registration (may fail if already fired - that's fine)
     var changes = [1]c.Kevent{makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
     _ = keventSubmit(kq, &changes);
     if (w.active_clients > 0) {
@@ -424,12 +383,10 @@ fn makeKevent(
 fn udataInt(ev: c.Kevent) usize {
     return ev.udata;
 }
-/// Wrapper for kevent syscall using slices
 fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent) c_int {
     return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), null);
 }
-/// Submit kevent changes, ignoring the event list. Returns number of changes
-/// processed, or -1 on error.
+/// -1 on error.
 fn keventSubmit(kq: posix.fd_t, changelist: []const c.Kevent) c_int {
     var dummy: [0]c.Kevent = undefined;
     return keventCall(kq, changelist, &dummy);

@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-# BSD systems lack a standard user-level service manager.
-# We print instructions for manual daemon setup.
+# BSD has no standard user-level service manager.
 
 function install_service(env::Dict{String,String})
     env_exports = join(["export $k=\"$v\"" for (k, v) in env], "\n       ")

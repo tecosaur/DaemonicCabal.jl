@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 //
-// BSD/Darwin platform — libc (std.c).
-// Only raw primitives that differ from Linux live here; shared logic is in posix.zig.
+// BSD/Darwin platform primitives, over libc; shared logic is in posix.zig.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,8 +20,7 @@ pub const Timeval = c.timeval;
 pub const getpid = c.getpid;
 pub const getppid = c.getppid;
 
-// I/O — write wraps the libc call; loops until the whole buffer is written, as a
-// single write() can be short and silently dropping the remainder truncates output.
+// I/O
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
     var written: usize = 0;
     while (written < buf.len) {
@@ -39,7 +37,7 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
     }
 }
 
-// Raw syscall primitives used by posix.zig shared implementations
+// Raw primitives
 pub fn kill(pid: posix.pid_t, sig: SIG) usize {
     const ret = c.kill(pid, sig);
     return if (ret < 0) 1 else 0;
@@ -49,7 +47,6 @@ pub fn rawWaitpid(pid: posix.pid_t) posix.pid_t {
     var status: c_int = 0;
     return c.waitpid(pid, &status, 1); // WNOHANG = 1
 }
-// Read a single unsigned integer named sysctl (e.g. "vm.stats.vm.v_free_count").
 // Width varies by sysctl, so read into the widest and zero-extend.
 fn sysctlUint(comptime name: [:0]const u8) ?u64 {
     var val: u64 = 0;
@@ -62,17 +59,12 @@ fn sysctlUint(comptime name: [:0]const u8) ?u64 {
     };
 }
 
-// True: the size from getProcessStats is already the reclaimable (USS-equivalent)
-// figure, so the eviction selection pass is authoritative and needs no separate
-// processReclaimable validation pass (see runEvictionEpisode). macOS phys_footprint
-// is both cheap (same syscall) and accurate; FreeBSD/OpenBSD report nothing.
+// macOS phys_footprint is already the reclaimable figure.
 pub const mem_is_reclaimable = builtin.os.tag == .macos;
 
-// macOS per-process stats via libproc's proc_pid_rusage, which works on any
-// same-user process — unlike task_info, whose task_for_pid port is denied to
-// unprivileged callers. Size is phys_footprint, not resident_size: it excludes
-// shared clean pages (the sysimage every worker maps) and is what we reclaim by
-// killing the worker. FreeBSD/OpenBSD return null (kinfo_proc ABI unverifiable).
+// proc_pid_rusage, as task_for_pid is denied to unprivileged callers.
+// phys_footprint excludes the shared sysimage pages every worker maps.
+// FreeBSD/OpenBSD: null, their kinfo_proc ABI being unverifiable.
 pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
     if (builtin.os.tag != .macos) return null;
     const ru = darwinRusage(pid) orelse return null;
@@ -80,8 +72,7 @@ pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
     return .{ .mem_bytes = ru.ri_phys_footprint, .cpu_seconds = cpu_ns / 1_000_000_000.0 };
 }
 
-// ri_user_time / ri_system_time are mach time units (1:1 with ns on Intel, 125:3
-// on Apple Silicon), so scale by the timebase. Cached after the first read.
+// Mach time units: 1:1 with ns on Intel, 125:3 on Apple Silicon.
 var timebase: ?c.mach_timebase_info_data = null;
 fn machToNanos(ticks: u64) u64 {
     const tb = timebase orelse blk: {
@@ -94,18 +85,13 @@ fn machToNanos(ticks: u64) u64 {
     return ticks * tb.numer / tb.denom;
 }
 
-// Reclaimable footprint. On macOS, phys_footprint is the per-task private memory
-// (excludes clean shared sysimage text) — closer to USS than RSS. Elsewhere null
-// (eviction falls back to RSS, here also null).
 pub fn processReclaimable(pid: posix.pid_t) ?u64 {
     if (builtin.os.tag != .macos) return null;
     const ru = darwinRusage(pid) orelse return null;
     return ru.ri_phys_footprint;
 }
 
-// rusage_info_v0 from <libproc.h>/<sys/resource.h>; field order and widths are
-// load-bearing (the kernel fills it by offset). V0 carries everything we need —
-// CPU time, RSS, and phys_footprint.
+// rusage_info_v0 from <libproc.h>; the kernel fills it by offset.
 const RUSAGE_INFO_V0: c_int = 0;
 const rusage_info_v0 = extern struct {
     ri_uuid: [16]u8,
@@ -131,13 +117,10 @@ fn darwinRusage(pid: posix.pid_t) ?rusage_info_v0 {
 
 pub const MemInfo = struct { available: u64, total: u64 };
 
-// No PSI equivalent on BSD/macOS; the level path (readMemInfo) is used instead.
 pub fn readPsiSomeAvg10() ?f64 {
     return null;
 }
 
-// Free-memory level: available = reclaimable-without-paging pages × page size,
-// total = physical RAM. Per-OS; null if unreadable (feature stays TTL-only).
 pub fn readMemInfo() ?MemInfo {
     return switch (builtin.os.tag) {
         .macos => darwinMemInfo(),
@@ -155,12 +138,9 @@ pub fn readMemInfo() ?MemInfo {
 
 const shared_page_size = std.heap.pageSize;
 
-// macOS available memory via host_statistics64(HOST_VM_INFO64). free_count alone
-// understates badly (macOS keeps little truly free), so include inactive,
-// purgeable and external — pages reclaimable without paging out anonymous memory.
+// macOS keeps little truly free, so count inactive, purgeable and external too.
 const HOST_VM_INFO64: c_int = 4;
-// vm_statistics64_data_t from <mach/vm_statistics.h>; @sizeOf/4 must equal the
-// kernel's HOST_VM_INFO64_COUNT (38), so every field width below is load-bearing.
+// <mach/vm_statistics.h>; @sizeOf/4 must equal HOST_VM_INFO64_COUNT (38).
 const vm_statistics64 = extern struct {
     free_count: u32,
     active_count: u32,
@@ -219,13 +199,11 @@ pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.sockle
 }
 
 
-// Paths — BSD/macOS-specific default runtime directory
+// Paths
 pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, home: ?[]const u8) ![]const u8 {
     if (builtin.os.tag == .macos) {
-        // macOS has no standard XDG_RUNTIME_DIR. Honoring it points sockets at a
-        // per-process, often sandbox-private /var/folders path that the client
-        // (a separate process) can't reach, so ignore it and use the native,
-        // shared location. Users can still override with JULIA_DAEMON_RUNTIME.
+        // A macOS XDG_RUNTIME_DIR is often a sandbox-private path other
+        // processes can't reach.
         const home_dir = home orelse blk: {
             var pwd: c.passwd = undefined;
             var pw_result: ?*c.passwd = null;

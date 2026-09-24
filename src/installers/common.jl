@@ -4,9 +4,6 @@
 const SOURCE_WORKER_PROJECT = joinpath(dirname(dirname(@__DIR__)), "worker")
 
 install_dir() = Sys.iswindows() ?
-        # Local app data is the usual USER installation folder
-        # for example, VS Code user installation is installed in
-        # %LOCALAPPDATA%/Programs/Microsoft VS Code/
        joinpath(ENV["LOCALAPPDATA"], "Programs", "julia-daemon") :
        BaseDirs.User.data(BaseDirs.App("julia-daemon"), create=false)
 
@@ -15,10 +12,7 @@ installed_conductor() = joinpath(install_dir(), "julia-conductor$EXE")
 installed_client() = joinpath(install_dir(), CLIENT_NAME)
 client_symlink_path() = begin
     @static if Sys.iswindows()
-        # Here we pick "Microsoft/WindowsApps" because this path should be
-        # in the PATH by default. so we don't have to inject PATHs anywhere.
-        # It's a bit tongue in cheek and a shortcut, but it somewhat customary
-        # and the blast radius is non existent.
+        # On PATH by default.
         joinpath(ENV["LOCALAPPDATA"],
             "Microsoft", "WindowsApps", CLIENT_NAME
         )
@@ -31,11 +25,6 @@ worker_executable() = something(
     Sys.which("julia"),
     joinpath(Sys.BINDIR, "julia"))
 
-"""
-    daemon_env(; worker_maxclients, worker_ttl, worker_args, mode, conductor_host, conductor_port, ports, env) -> Dict{String,String}
-
-Build the complete environment variable dict for the conductor process.
-"""
 function daemon_env(; worker_maxclients::Integer, worker_ttl::Integer,
                     worker_args::AbstractString, mode::Symbol,
                     conductor_host::AbstractString, conductor_port::Integer,
@@ -71,9 +60,7 @@ end
 function install_files()
     dest = install_dir()
     if isdir(dest)
-        # Windows: Julia's chmod rewrites the DACL (stripping delete rights the
-        # owner needs for non-Julia tools to clean up) rather than setting a
-        # read-only bit, so skip the permission dance entirely.
+        # On Windows, chmod rewrites the DACL and strips the owner's delete rights.
         if !Sys.iswindows()
             for (root, _, _) in walkdir(dest; topdown=true)
                 chmod(root, 0o755)
@@ -100,8 +87,7 @@ function install_client_symlink()
     binpath = client_symlink_path()
     rm(binpath; force=true)
     @static if Sys.iswindows()
-        # symlinking on windows is a pain.
-        # we install in %LOCALAPPDATA% so always same drive
+        # Unprivileged symlinks need developer mode; both paths share a drive.
         @info "Hardlinking client to $binpath"
         hardlink(installed_client(), binpath)
     else

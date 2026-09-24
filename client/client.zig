@@ -17,10 +17,8 @@ else if (builtin.os.tag == .windows)
 else
     @compileError("unsupported OS");
 
-// Single-threaded Io for cross-platform operations (no thread pool overhead)
 const io: Io = Io.Threaded.global_single_threaded.io();
 
-// Runtime socket paths are short (runtime_dir + hex name + suffix), 256 bytes is ample.
 const max_socket_path = 256;
 
 const restart_hint = switch (builtin.os.tag) {
@@ -32,7 +30,6 @@ const restart_hint = switch (builtin.os.tag) {
 
 // --- Types ---
 
-/// Buffered socket writer — flushes automatically when the buffer fills.
 const SocketWriter = struct {
     buf: [8192]u8 = undefined,
     pos: usize = 0,
@@ -80,17 +77,16 @@ const EnvInfo = struct {
     home: ?[]const u8,
 };
 
-/// argv and the environment as UTF-8 slices, whatever the OS hands over.
+/// UTF-8, whatever the OS hands over.
 const Inputs = struct { args: []const []const u8, env: []const []const u8 };
 
-// Signal parser with buffering for fragmented reads.
-// Protocol: <id:u8><len:u8><data> (may contain multiple signals)
+// <id:u8><len:u8><data>, possibly fragmented across reads.
 const SignalParser = struct {
     buf: [256]u8 = undefined,
     len: usize = 0,
     sync_mode: bool = false,
     worker_wants_raw: bool = false,
-    const header_size = 2; // id (1) + len (1)
+    const header_size = 2;
 
     pub const Result = union(enum) {
         none,
@@ -115,12 +111,11 @@ const SignalParser = struct {
             const id = self.buf[pos];
             const data_len: usize = self.buf[pos + 1];
             const total_len = header_size + data_len;
-            if (pos + total_len > self.len) break; // incomplete signal
+            if (pos + total_len > self.len) break;
             const signal = self.dispatch(id, self.buf[pos + header_size .. pos + total_len], fd);
-            if (result != .exit) result = signal; // exit is terminal; later signals can't unset it
+            if (result != .exit) result = signal; // exit is terminal
             pos += total_len;
         }
-        // Compact buffer
         if (pos > 0) {
             const remaining = self.len - pos;
             if (remaining > 0) {
@@ -138,18 +133,17 @@ const SignalParser = struct {
                 if (data.len == 1) {
                     platform.setWorkerRawMode(data[0] != 0);
                     if (self.sync_mode) {
-                        // In sync mode, track worker's desired state but stay in raw mode
+                        // Sync mode stays raw, emulating cooked input itself.
                         self.worker_wants_raw = data[0] != 0;
                     } else {
                         platform.setRawMode(data[0] != 0);
                     }
                 }
-                platform.socketWrite(fd, &[_]u8{ id, 0 }); // ack: id + len:u8=0
+                platform.socketWrite(fd, &[_]u8{ id, 0 }); // ack
                 break :blk .none;
             },
             protocol.signals.executing => blk: {
-                // Unacknowledged: the worker does not read a reply, and a stray one
-                // would be consumed by the next raw_mode ack.
+                // No ack: a stray one would be taken for the next raw_mode ack.
                 if (data.len == 1) platform.setWorkerExecuting(data[0] != 0);
                 break :blk .none;
             },
@@ -157,7 +151,7 @@ const SignalParser = struct {
                 const size = getTerminalSize();
                 var resp: [6]u8 = undefined;
                 resp[0] = id;
-                resp[1] = 4; // len:u8 = 4 bytes of data
+                resp[1] = 4;
                 std.mem.writeInt(u16, resp[2..4], size.height, .little);
                 std.mem.writeInt(u16, resp[4..6], size.width, .little);
                 platform.socketWrite(fd, &resp);
@@ -165,7 +159,7 @@ const SignalParser = struct {
             },
             protocol.signals.nodelay => blk: {
                 protocol.setTcpNodelay(sockets.stdin);
-                protocol.setTcpNodelay(fd); // signals socket
+                protocol.setTcpNodelay(fd);
                 break :blk .none;
             },
             else => .none,
@@ -175,17 +169,15 @@ const SignalParser = struct {
 
 // --- Globals ---
 
-// Global socket set (needed for signal handler which can't capture state)
+// Globals, as a signal handler can't capture state.
 var sockets: SocketSet = undefined;
-// Conductor address for exit notification (global buffer so it outlives connectToConductor)
 var conductor_path_buf: [max_socket_path]u8 = undefined;
 var conductor_path: []const u8 = &.{};
 var transport_mode: protocol.TransportMode = .local;
-// Where a TCP conductor was reached: worker ports are on its host, and a
-// signal handler cannot resolve its name again.
+// Kept because a signal handler cannot resolve the conductor's name again.
 var conductor_peer: ?Io.net.IpAddress = null;
 var signal_parser = SignalParser{};
-var client_id: u32 = 0; // conductor-assigned with the socket paths; names us in notifications
+var client_id: u32 = 0; // conductor-assigned
 
 // --- Signal handler wiring ---
 
@@ -222,7 +214,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const addr_arg = extractAddressArg(inputs.args);
     if (addr_arg.value) |addr| env.server_path = addr;
     const sync_arg = extractSyncArg(inputs.args);
-    // Help and version need no daemon, and must not hang on an absent one.
     for (inputs.args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -234,25 +225,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
             return;
         }
     }
-    // Raw mode avoids line buffering; the console must also render the
-    // worker's escapes and UTF-8 where that is not the default.
     const is_tty = platform.isatty(platform.getStdinHandle());
     const console = if (is_tty) platform.setupConsoleIo(platform.getStdoutHandle(), platform.getStderrHandle()) else null;
     defer platform.restoreConsoleIo(console);
     if (is_tty) platform.setRawMode(true);
     defer platform.setRawMode(false);
-    // Connect to conductor and send client info
     const conductor = try connectToConductor(env);
     if (transport_mode == .tcp) protocol.setTcpNodelay(conductor);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor };
-    // The client decides colour: NO_COLOR is honoured as Julia does, and the
-    // worker's own terminal knows nothing of ours.
+    // The worker's own terminal knows nothing of ours.
     const color = is_tty and !hasNoColor(inputs.env);
     try sendClientInfo(&w, env, is_tty, color, inputs.args, addr_arg.skip, sync_arg.skip);
-    // Get worker socket paths (conductor may request full env on cache miss)
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
-    // Forward signals to worker instead of terminating
     registerSignalHandlers();
     signal_parser.sync_mode = sync_arg.sync;
     try runEventLoop(sync_arg.sync);
@@ -279,13 +264,12 @@ fn scanEnv(kvs: []const []const u8) EnvInfo {
         .{ "HOME=", "home" },
     };
     for (kvs) |kv| {
-        if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // benchmarking noise
+        if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // varies per benchmark run
         info.count += 1;
-        // XOR hash for order-independent fingerprint
+        // XOR, so the fingerprint ignores order.
         var h = std.hash.Wyhash.init(kv.len);
         h.update(kv);
         info.fingerprint ^= h.final();
-        // Extract config paths if present
         inline for (env_vars) |ev| {
             if (std.mem.startsWith(u8, kv, ev[0])) {
                 @field(info, ev[1]) = kv[ev[0].len..];
@@ -295,8 +279,6 @@ fn scanEnv(kvs: []const []const u8) EnvInfo {
     return info;
 }
 
-/// Where the conductor should be: the `-a`/JULIA_DAEMON_SERVER address, else
-/// the local socket for the runtime directory (also returned, for the pid file).
 fn locateConductor(env: EnvInfo, runtime_dir_buf: *[max_socket_path]u8) !struct { runtime_dir: []const u8, address: protocol.Address } {
     const runtime_dir = env.runtime_dir orelse
         try platform.defaultRuntimeDir(runtime_dir_buf, env.xdg_runtime_dir, env.home);
@@ -322,8 +304,7 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     const addr = conductor_path;
     const timeout = protocol.connect_timeout_ms;
     if (protocol.connectAddress(io, transport_mode, addr, timeout)) |c| return keepConductor(c) else |err| switch (transport_mode) {
-        // A refusal may be a conductor restarting, so retry briefly; a host
-        // that did not answer in time is not worth asking again.
+        // A refusal may be a conductor restarting; a timeout is not worth repeating.
         .tcp => if (err == error.ConnectionRefused) {
             var attempts: u32 = 0;
             while (attempts < 20) : (attempts += 1) {
@@ -331,7 +312,6 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
                 if (protocol.connectAddress(io, .tcp, addr, timeout)) |c| return keepConductor(c) else |_| {}
             }
         },
-        // A live conductor whose socket went missing can be asked to recreate it.
         .local => {
             var pid_buf: [max_socket_path]u8 = undefined;
             const pid_path = std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong;
@@ -341,7 +321,7 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
                     Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
                     if (protocol.connectAddress(io, .local, addr, timeout)) |c| return keepConductor(c) else |_| {}
                 }
-                // Local socket still missing but conductor is alive — try default TCP port
+                // The conductor is alive but its socket is still missing.
                 const tcp_addr = std.fmt.bufPrint(&conductor_path_buf, "localhost:{d}", .{protocol.default_tcp_port}) catch unreachable;
                 if (protocol.connectAddress(io, .tcp, tcp_addr, timeout)) |c| {
                     transport_mode = .tcp;
@@ -351,7 +331,6 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
             }
         },
     }
-    // Give up
     std.debug.print(
         \\Failed to connect to {s}
         \\
@@ -365,7 +344,6 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     exitClient(127);
 }
 
-/// The client's version, and where a conductor answered, if one did.
 fn printVersion(env: EnvInfo) void {
     const plain = "juliaclient " ++ protocol.VERSION;
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
@@ -385,25 +363,20 @@ fn keepConductor(connection: protocol.Connection) posix.socket_t {
 }
 
 fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, args: []const []const u8, addr_skip: [2]usize, sync_skip: usize) !void {
-    // Header: magic + flags + reserved + pid + ppid
     w.writeInt(u32, protocol.client.magic);
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color }));
     w.writeSlice(&.{ 0, 0, 0 });
     w.writeInt(u32, @intCast(platform.getpid()));
     w.writeInt(u32, @intCast(platform.getppid()));
-    // CWD (read directly into the writer's buffer after a 2-byte length prefix)
+    // CWD, read straight into the buffer behind its length
     if (w.pos + 2 >= w.buf.len) w.flush();
     const len_pos = w.pos;
-    w.pos += 2; // reserve space for length prefix
+    w.pos += 2;
     const cwd_len = try std.process.currentPath(io, w.buf[w.pos..]);
     std.mem.writeInt(u16, w.buf[len_pos..][0..2], @intCast(cwd_len), .little);
     w.pos += cwd_len;
-    // Environment fingerprint
     w.writeInt(u64, env.fingerprint);
-    // Args (skip address flag and --sync indices — client-only, not forwarded to worker as-is)
-    // NOTE: --sync IS forwarded (it's in the switch list), but it is extracted from argv
-    // separately by extractSyncArg for the client to act on locally. The conductor receives
-    // it because it's not skipped from the args sent on the wire.
+    // Args, less the client-only address flag
     const skip_count = @as(u16, if (addr_skip[0] != sentinel) 1 else 0) +
         @as(u16, if (addr_skip[1] != sentinel) 1 else 0);
     w.writeInt(u16, @intCast(args.len - skip_count));
@@ -441,9 +414,7 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
     return result;
 }
 
-// The daemon closed without replying, or replied in a framing this client does
-// not know: almost always a daemon of another protocol version. (A daemon that
-// recognises the mismatch says so itself; one older than that cannot.)
+// A daemon that recognises a protocol mismatch says so; an older one just closes.
 fn replyFailure(err: anyerror) noreturn {
     std.debug.print(
         \\The daemon did not reply as expected ({s}).
@@ -456,8 +427,7 @@ fn replyFailure(err: anyerror) noreturn {
     exitClient(127);
 }
 
-/// Start the worker the conductor describes, detached, in this client's mount
-/// namespace, which the conductor cannot see into.
+/// In this client's mount namespace, which the conductor cannot see into.
 fn spawnWorker(reader: protocol.BufReader, kvs: []const []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -512,8 +482,7 @@ fn runEventLoop(sync_mode: bool) !void {
 
 // --- Helpers ---
 
-// Exit restoring cooked mode first; std.process.exit skips main's defer, which
-// would otherwise leave the terminal raw. No-op unless raw mode was entered.
+// std.process.exit skips main's defer, which restores cooked mode.
 fn exitClient(code: u8) noreturn {
     platform.setRawMode(false);
     std.process.exit(code);
@@ -526,7 +495,6 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.sock
         ip.setPort(std.fmt.parseInt(u16, raw[1..], 10) catch break :blk error.InvalidAddress);
         break :blk platform.connectTcp(ip, protocol.connect_timeout_ms);
     } else switch ((protocol.parseAddress(raw) catch unreachable).mode) {
-        // Each address is single-use, so a local one is retired once connected.
         .local => platform.connectLocalOnce(io, raw),
         .tcp => if (protocol.connectAddress(io, .tcp, raw, protocol.connect_timeout_ms)) |c| c.socket else |e| e,
     };
@@ -537,7 +505,6 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.sock
 }
 
 fn readPidAndSignal(pid_path: []const u8) bool {
-    // Read PID from file
     var buf: [16]u8 = undefined;
     const content = Io.Dir.readFile(.cwd(), io, pid_path, &buf) catch return false;
     const pid_str = std.mem.trimEnd(u8, content, &.{ '\n', '\r', ' ' });
@@ -555,10 +522,8 @@ fn notifyExit() void {
     platform.socketWrite(fd, &buf);
 }
 
-/// Signal-handler-safe interrupt notification using raw POSIX syscalls.
-/// Connects to the conductor, sends a client_interrupt notification, and closes.
-/// Uses raw syscalls (not std.Io) to avoid corrupting io_uring state.
-/// Silently returns on any error — the \x03 stdin path provides the fallback.
+/// Signal-handler-safe: raw syscalls, not std.Io, which would corrupt the
+/// io_uring state. Errors are dropped; the \x03 stdin path is the fallback.
 fn notifyInterruptRaw() void {
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
@@ -582,35 +547,33 @@ fn notifyInterruptRaw() void {
 }
 
 fn getTerminalSize() struct { height: u16, width: u16 } {
-    // A degenerate winsize (ioctl succeeds but reports 0 rows/cols — a pty with
-    // no size set, or a terminal mid-teardown) is as useless as no tty: the
-    // worker's REPL divides by the column count, so a 0 must never go on the wire.
-    // Only an output handle answers on Windows, so stdout is the fallback.
+    // The worker's REPL divides by the column count, so never send a 0.
+    // Only an output handle answers on Windows.
     const size = platform.getTerminalSize(platform.getStdinHandle()) orelse platform.getTerminalSize(platform.getStdoutHandle());
     if (size) |sz| if (sz.rows != 0 and sz.cols != 0)
         return .{ .height = sz.rows, .width = sz.cols };
-    return .{ .height = 24, .width = 80 }; // fallback
+    return .{ .height = 24, .width = 80 };
 }
 
 const sentinel = std.math.maxInt(usize);
 
 const SyncArg = struct {
     sync: bool,
-    skip: usize, // index to omit when forwarding; sentinel = unused
+    skip: usize, // index to omit when forwarding
 };
 
 fn extractSyncArg(args: []const []const u8) SyncArg {
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) return .{ .sync = false, .skip = sentinel };
         if (std.mem.eql(u8, arg, "--sync"))
-            return .{ .sync = true, .skip = sentinel }; // keep in forwarded args
+            return .{ .sync = true, .skip = sentinel }; // the worker needs it too
     }
     return .{ .sync = false, .skip = sentinel };
 }
 
 const AddressArg = struct {
     value: ?[]const u8,
-    skip: [2]usize, // indices to omit when forwarding; sentinel = unused
+    skip: [2]usize, // indices to omit when forwarding
 };
 
 fn extractAddressArg(args: []const []const u8) AddressArg {
@@ -618,12 +581,10 @@ fn extractAddressArg(args: []const []const u8) AddressArg {
     for (args, 0..) |arg, i| {
         if (i == 0) continue;
         if (std.mem.eql(u8, arg, "--")) return none;
-        // --address=<value> or -a<value>
         if (std.mem.startsWith(u8, arg, "--address="))
             return .{ .value = arg["--address=".len..], .skip = .{ i, sentinel } };
         if (arg.len > 2 and arg[0] == '-' and arg[1] == 'a')
             return .{ .value = arg[2..], .skip = .{ i, sentinel } };
-        // --address <value> or -a <value>
         if (std.mem.eql(u8, arg, "--address") or std.mem.eql(u8, arg, "-a")) {
             if (i + 1 < args.len) return .{ .value = args[i + 1], .skip = .{ i, i + 1 } };
             return none;

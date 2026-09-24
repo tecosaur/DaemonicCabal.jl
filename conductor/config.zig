@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 // SPDX-License-Identifier: MPL-2.0
 
-// Configuration loading from environment variables
 const std = @import("std");
 const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
@@ -10,34 +9,34 @@ pub const Config = struct {
     allocator: std.mem.Allocator,
     socket_path: []const u8,
     runtime_dir: []const u8,
-    socket_dir: []const u8, // where local (path-addressed) sockets are created
+    socket_dir: []const u8,
     transport: protocol.TransportMode,
-    bind_address: []const u8, // TCP bind address (e.g. "0.0.0.0"); empty in local mode
+    bind_address: []const u8, // empty in local mode
     worker_executable: []const u8,
     worker_args: []const u8,
     worker_project: []const u8,
     worker_maxclients: u32,
-    min_ttl: u64, // seconds - protected floor: idle workers younger than this are never culled under pressure
-    max_ttl: u64, // seconds - idle deadline: workers idle longer are always culled (supersedes WORKER_TTL)
-    label_ttl: u64, // seconds - how long to keep session labels after last client disconnects
-    ping_interval: u64, // seconds
-    ping_timeout: u64, // seconds
-    spawn_timeout: u64, // seconds a new worker may take to connect (a fresh depot precompiles first)
-    memory_pressure: bool, // master switch for pressure-reactive eviction
-    psi_threshold: f64, // PSI some-avg10 % for moderate pressure (when PSI is the active source)
-    memfree_low: MemThreshold, // free-memory enter threshold (when level path is active)
-    memfree_high: MemThreshold, // free-memory exit threshold (must exceed memfree_low)
-    port_range: ?PortRange, // from JULIA_DAEMON_PORTS=low-high
-    host_home: []const u8, // host user's home dir (for sandbox depot access)
-    reserve_worker: bool, // keep a pre-spawned spare worker warm for the next new project (default: true)
-    sandbox_remote_clients: bool, // sandbox remote (non-loopback) TCP clients (default: true)
-    sandbox_max_memory: ?[]const u8, // e.g. "4G", "512M" — per-sandbox cgroup memory limit
-    sandbox_max_cpu: ?u32, // cgroup cpu.max percentage, e.g. 200 = 2 cores
-    sandbox_session_bypass: bool, // allow remote --session=<name> to join local workers
+    // Durations in seconds
+    min_ttl: u64,
+    max_ttl: u64,
+    label_ttl: u64,
+    ping_interval: u64,
+    ping_timeout: u64,
+    spawn_timeout: u64,
+    memory_pressure: bool,
+    psi_threshold: f64, // PSI some-avg10 %
+    memfree_low: MemThreshold,
+    memfree_high: MemThreshold,
+    port_range: ?PortRange,
+    host_home: []const u8,
+    reserve_worker: bool,
+    sandbox_remote_clients: bool,
+    sandbox_max_memory: ?[]const u8, // e.g. "4G"
+    sandbox_max_cpu: ?u32, // percent, 200 = 2 cores
+    sandbox_session_bypass: bool,
 
     pub const PortRange = struct { base: u16, count: u16 };
 
-    /// A free-memory threshold, either a fraction of total or an absolute byte count.
     pub const MemThreshold = union(enum) {
         fraction: f64, // 0..1
         bytes: u64,
@@ -96,13 +95,12 @@ pub const Config = struct {
             .worker_maxclients = parseUint(u32, env.get("JULIA_DAEMON_WORKER_MAXCLIENTS"), 1),
             .reserve_worker = !std.mem.eql(u8, env.get("JULIA_DAEMON_RESERVE_WORKER") orelse "1", "0"),
             .min_ttl = try parseUintStrict(u64, env.get("JULIA_DAEMON_MIN_TTL"), 120),
-            // max_ttl supersedes WORKER_TTL; fall back to it so existing service files keep working.
+            // WORKER_TTL is the deprecated name.
             .max_ttl = try parseUintStrict(u64, env.get("JULIA_DAEMON_MAX_TTL"), parseUint(u64, env.get("JULIA_DAEMON_WORKER_TTL"), 7200)),
             .label_ttl = parseUint(u64, env.get("JULIA_DAEMON_LABEL_TTL"), 90),
             .ping_interval = parseUint(u64, env.get("JULIA_DAEMON_PING_INTERVAL"), 30),
             .ping_timeout = parseUint(u64, env.get("JULIA_DAEMON_PING_TIMEOUT"), 5),
             .spawn_timeout = try parseUintStrict(u64, env.get("JULIA_DAEMON_SPAWN_TIMEOUT"), 600),
-            // On by default; set JULIA_DAEMON_MEMORY_PRESSURE=0 to opt out.
             .memory_pressure = !std.mem.eql(u8, env.get("JULIA_DAEMON_MEMORY_PRESSURE") orelse "1", "0"),
             .psi_threshold = try parseFloatStrict(env.get("JULIA_DAEMON_PSI_THRESHOLD"), 10.0),
             .memfree_low = try parseMemThreshold(env.get("JULIA_DAEMON_MEMFREE_LOW"), .{ .fraction = 0.10 }),
@@ -137,8 +135,7 @@ fn parseUint(comptime T: type, s: ?[]const u8, default: T) T {
     return std.fmt.parseInt(T, str, 10) catch default;
 }
 
-// Strict variants abort on a malformed value (vs parseUint's silent default) —
-// for eviction knobs where a typo shouldn't quietly pass.
+// For eviction knobs, where a typo shouldn't quietly pass.
 fn parseUintStrict(comptime T: type, s: ?[]const u8, default: T) !T {
     const str = s orelse return default;
     return std.fmt.parseInt(T, str, 10) catch {
@@ -155,8 +152,7 @@ fn parseFloatStrict(s: ?[]const u8, default: f64) !f64 {
     };
 }
 
-// A memory threshold is "<n>%" (fraction of total) or a byte count with an
-// optional K/M/G suffix (e.g. "2G", "512M").
+// "<n>%" of total, or bytes with an optional K/M/G suffix.
 fn parseMemThreshold(s: ?[]const u8, default: Config.MemThreshold) !Config.MemThreshold {
     const str = s orelse return default;
     if (std.mem.endsWith(u8, str, "%")) {
@@ -177,8 +173,7 @@ fn parseMemThreshold(s: ?[]const u8, default: Config.MemThreshold) !Config.MemTh
     return .{ .bytes = n * mult };
 }
 
-// low < high; mixed %/bytes units can't be compared without total memory, so
-// they pass (trusted to the operator).
+// Mixed %/bytes can't be compared without total memory, so they pass.
 fn memThresholdBelow(low: Config.MemThreshold, high: Config.MemThreshold) bool {
     return switch (low) {
         .fraction => |lf| switch (high) {

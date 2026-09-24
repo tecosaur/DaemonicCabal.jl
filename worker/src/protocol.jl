@@ -1,19 +1,16 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-# Binary protocol for Conductor ↔ Worker communication
-
 const PROTOCOL_MAGIC = 0x4A445702  # "JDW\x02" little-endian
 const NOTIFICATION_MAGIC = 0x4A444E01  # "JDN\x01" little-endian
 
-# Notification types (sent via main conductor socket)
+# Notifications, over the conductor's main socket
 const NOTIF_TYPE = (
     client_done = 0x01,
     worker_unresponsive = 0x02,
     worker_exit = 0x03,
 )
 
-# Message types
 const MSG_TYPE = (
     ping        = 0x01,
     pong        = 0x02,
@@ -27,12 +24,11 @@ const MSG_TYPE = (
     clients     = 0x33,
     soft_exit   = 0x40,
     ack         = 0x41,
-    sync_clients = 0x50,  # Conductor sends list of active PIDs; worker kills any not in list
-    drop_session = 0x51,  # Conductor: session label expired; tear down its REPL
+    sync_clients = 0x50,
+    drop_session = 0x51,
     error       = 0xFF,
 )
 
-# Error codes
 const ERR_CODE = (
     unknown         = 0x0000,
     invalid_message = 0x0001,
@@ -46,58 +42,50 @@ struct MessageHeader
     payload_len::UInt16
 end
 
-# Verify protocol magic at connection start
 function verify_magic(conn::IO)
     magic = read(conn, UInt32)
     magic == PROTOCOL_MAGIC || error("Invalid protocol magic: $(repr(magic))")
 end
 
-# Read a message header (type + length, 3 bytes)
 function read_header(conn::IO)
     msg_type = read(conn, UInt8)
     payload_len = read(conn, UInt16)
     MessageHeader(msg_type, payload_len)
 end
 
-# Write a message header (type + length, 3 bytes)
 function write_header(conn::IO, msg_type::UInt8, payload_len::Integer)
     write(conn, msg_type)
     write(conn, UInt16(payload_len))
 end
 
-# Read a length-prefixed string (u16 length)
 function read_string(conn::IO)
     len = read(conn, UInt16)
     String(read(conn, len))
 end
 
-# Write a length-prefixed string (u16 length)
 function write_string(conn::IO, s::AbstractString)
     write(conn, UInt16(ncodeunits(s)))
     write(conn, s)
 end
 
-# Send PONG response with active client count
 function send_pong(conn::IO, active_clients::Integer)
     write_header(conn, MSG_TYPE.pong, 2)
     write(conn, UInt16(active_clients))
     flush(conn)
 end
 
-# --- Dual transport (Unix sockets / TCP) ---
+# --- Dual transport ---
 
 is_tcp_address(addr::AbstractString) =
     !startswith(addr, '/') && !startswith(addr, '\\') && !startswith(addr, '.') &&
     !contains(addr, '/') && !contains(addr, '\\') && contains(addr, ':')
 
-# `host:port`, the host bracketed when it is an IPv6 address.
 function split_host_port(address::AbstractString)
     host, port = rsplit(address, ':', limit=2)
     String(strip(host, ('[', ']'))), parse(Int, port)
 end
 
-# The address `host` names: a literal as written, else a name's IPv4 address
-# where it has one, as the conductor prefers when it listens on a name.
+# Prefers IPv4, as the conductor does when it listens on a name.
 function resolve_host(host::AbstractString)
     try
         Sockets.parse(IPAddr, host)
@@ -106,7 +94,6 @@ function resolve_host(host::AbstractString)
     end
 end
 
-# Connect to an address (Unix path or host:port), setting TCP_NODELAY for TCP sockets
 function connect_to(address::AbstractString)
     if is_tcp_address(address)
         host, port = split_host_port(address)
@@ -118,18 +105,16 @@ function connect_to(address::AbstractString)
     end
 end
 
-# Send notification to conductor via main socket
 function send_notification(address::AbstractString, type::UInt8, payload...)
     try
         conn = connect_to(address)
         write(conn, NOTIFICATION_MAGIC, type, payload...)
         close(conn)
     catch
-        # Conductor may have shut down, ignore
+        # The conductor may have shut down.
     end
 end
 
-# Send SOCKETS response with socket paths and active client count
 function send_sockets(conn::IO, stdin_path::AbstractString, stdout_path::AbstractString,
                       stderr_path::AbstractString, signals_path::AbstractString,
                       active_clients::Integer)
@@ -144,7 +129,6 @@ function send_sockets(conn::IO, stdin_path::AbstractString, stdout_path::Abstrac
     flush(conn)
 end
 
-# Send STATE response
 function send_state(conn::IO, active_clients::Integer, last_client_ts::Integer, soft_exit::Bool)
     write_header(conn, MSG_TYPE.state, 13)
     write(conn, UInt32(active_clients))
@@ -153,7 +137,6 @@ function send_state(conn::IO, active_clients::Integer, last_client_ts::Integer, 
     flush(conn)
 end
 
-# Send ERROR response
 function send_error(conn::IO, code::UInt16, message::AbstractString)
     payload_len = 2 + 2 + ncodeunits(message)
     write_header(conn, MSG_TYPE.error, payload_len)
@@ -162,31 +145,28 @@ function send_error(conn::IO, code::UInt16, message::AbstractString)
     flush(conn)
 end
 
-# Client info from CLIENT_RUN message
 struct ClientInfo
     tty::Bool
-    color::Bool  # The client's terminal renders ANSI colour
-    force::Bool  # Bypass capacity check (for labeled sessions)
-    id::Int      # Conductor-assigned; names the client in notifications and syncs
-    pid::Int     # As our kernel reports it on the client's stdio connections (0 = unchecked)
+    color::Bool
+    force::Bool  # bypass capacity (labeled sessions)
+    id::Int      # conductor-assigned
+    pid::Int     # as our kernel reports it; 0 = unchecked
     cwd::String
     env::Vector{Pair{String, String}}
     switches::Vector{Tuple{String, String}}
     programfile::Union{Nothing, String}
     args::Vector{String}
-    port_set::Int  # PortPool index, or 0xFFFF when unmanaged
+    port_set::Int  # 0xFFFF when unmanaged
 end
 
-# Read CLIENT_RUN payload
 function read_client_run(conn::IO)
     flags = read(conn, UInt8)
     tty = (flags & 0x01) != 0
     color = (flags & 0x02) != 0
-    force = (flags & 0x04) != 0  # Bypass capacity check
+    force = (flags & 0x04) != 0
     id = Int(read(conn, UInt32))
     pid = Int(read(conn, UInt32))
     cwd = read_string(conn)
-    # Env
     env_count = read(conn, UInt16)
     env = Vector{Pair{String, String}}(undef, env_count)
     for i in 1:env_count
@@ -194,7 +174,6 @@ function read_client_run(conn::IO)
         val = read_string(conn)
         env[i] = key => val
     end
-    # Switches
     switch_count = read(conn, UInt16)
     switches = Vector{Tuple{String, String}}(undef, switch_count)
     for i in 1:switch_count
@@ -202,14 +181,12 @@ function read_client_run(conn::IO)
         value = read_string(conn)
         switches[i] = (name, value)
     end
-    # Programfile
     has_pf = read(conn, UInt8)
     programfile = if has_pf != 0
         read_string(conn)
     else
         nothing
     end
-    # Args
     arg_count = read(conn, UInt16)
     args = Vector{String}(undef, arg_count)
     for i in 1:arg_count

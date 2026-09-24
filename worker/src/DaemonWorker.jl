@@ -14,7 +14,6 @@ const StreamIO = Union{Base.PipeEndpoint, Sockets.TCPSocket}
 
 include("broadcastio.jl")
 
-# Bytes of recent session output retained for replay to newly attaching clients.
 const SYNC_HISTORY_BYTES = 64 * 1024
 
 struct SyncSession

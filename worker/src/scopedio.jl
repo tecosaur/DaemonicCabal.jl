@@ -94,8 +94,6 @@ function set_redirect!(f::Base.RedirectStdStream, io)
     io
 end
 
-# See `overrides.jl` for terminfo/color functions
-
 const TERMINFOS = Dict{String, Base.TermInfo}()
 
 function Base.get(::Union{ScopedStdout, ScopedStderr}, key::Symbol, default)
@@ -122,7 +120,7 @@ function query_displaysize(signals::StreamIO)
     (if iszero(height) first(DEFAULT_DISPLAYSIZE) else Int(height) end,
      if iszero(width) last(DEFAULT_DISPLAYSIZE) else Int(width) end)
 end
-# In sync mode, query all clients and return component-wise minimum (like tmux).
+# A sync session takes the smallest of its clients' sizes, like tmux.
 function Base.displaysize(::Union{ScopedStdout, ScopedStderr})
     term = ACTIVE_TERM[]
     session = term.sync_session
