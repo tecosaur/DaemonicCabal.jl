@@ -167,8 +167,8 @@ pub const EventLoop = struct {
     }
 
     /// The pong watch and its timer race; whichever packet lands first settles the ping.
-    pub fn queuePing(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
-        w.sendPing();
+    pub fn awaitPong(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
+        w.ping_pending = true;
         self.watchFd(@intFromPtr(w), w.socket);
         self.startPingTimer(w, timeout_ms);
     }
