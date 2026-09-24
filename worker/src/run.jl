@@ -79,14 +79,26 @@ function prepare_module(client::ClientInfo)
     if !isempty(client.args)
         Core.eval(mod, :(ARGS = $(client.args)))
     end
-    if isyes(getval(client.switches, "--revise", get(ENV, "JULIA_DAEMON_REVISE", "no")))
-        # Two evals: a binding `using` creates is invisible to the frame that ran it.
-        if isdefined(Main, :Revise) || !isnothing(Base.locate_package(REVISE_PKG))
-            Core.eval(Main, :(using Revise))
-            Core.eval(Main, :(Revise.revise()))
-        end
-    end
     mod
+end
+
+function revise_code()
+    load_revise() || return
+    # A binding `using` creates is invisible to the frame that ran it, hence the
+    # separate eval. Revise warns of a failed revision only when it first
+    # fails, and later runs would silently run the outdated code.
+    unapplied = Core.eval(Main, quote
+        let failing = !isempty(Revise.queue_errors)
+            Revise.revise()
+            if failing
+                [joinpath(Revise.basedir(pkg), file) for (pkg, file) in keys(Revise.queue_errors)]
+            else
+                String[]
+            end
+        end
+    end)
+    isempty(unapplied) || @warn join(["Running outdated code: Revise could not apply the saved edits to";
+                                      map(f -> "  " * f, unapplied)], '\n') _module=nothing _file=nothing
 end
 
 function Base.display(d::REPL.REPLDisplay, ::MIME"text/plain", exit::DaemonClientExit)
@@ -143,7 +155,6 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     stderrx = IOContext(client_stderr, :color => hascolor)
     exit_code = 0
     try
-        # Inside the try, so a failure (e.g. loading Revise) reaches the client.
         mod = prepare_module(client)
         withenv(client.env...) do
             @static if VERSION < v"1.11"
@@ -222,6 +233,7 @@ end
 # After `exec_options` in base/client.jl.
 function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing)
+    isyes(getval(client.switches, "--revise", get(ENV, "JULIA_DAEMON_REVISE", "no"))) && revise_code()
     set_switches = [s for (s, _) in client.switches]
     runrepl = is_repl_client(client)
     for (switch, value) in client.switches

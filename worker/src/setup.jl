@@ -38,10 +38,20 @@ real_exit(n::Int) = ccall(:jl_exit, Union{}, (Int32,), n)
 const REVISE_PKG =
     Base.PkgId(Base.UUID("295af30f-e4ad-537b-8983-00126c2a3abe"), "Revise")
 
-function try_load_revise()
-    isyes(get(ENV, "JULIA_DAEMON_REVISE", "no")) || return
-    isdefined(Main, :Revise) && return
-    isnothing(Base.locate_package(REVISE_PKG)) || Core.eval(Main, :(using Revise))
+# The warning reaches the logger in scope: the conductor's log at startup, the client in a run.
+function load_revise()
+    isdefined(Main, :Revise) && return true
+    if isnothing(Base.locate_package(REVISE_PKG))
+        @warn "Running without Revise, which is not installed" _module=nothing _file=nothing
+        return false
+    end
+    try
+        Core.eval(Main, :(using Revise))
+        true
+    catch err
+        @warn "Running without Revise, which failed to load" exception=err _module=nothing _file=nothing
+        false
+    end
 end
 
 # Orphan failsafe, for a conductor death pdeathsig misses (non-Linux, unclean crash).
