@@ -10,7 +10,8 @@ using Pkg.Artifacts
     eval(Expr(:public, :install, :uninstall))
 end
 
-const CLIENT_NAME = "juliaclient"
+const EXE = Sys.iswindows() ? ".exe" : ""
+const CLIENT_NAME = "juliaclient$EXE"
 
 const DEFAULTS = (
     worker_maxclients = 1,
@@ -37,6 +38,8 @@ elseif Sys.isapple()
     include("installers/macos.jl")
 elseif Sys.isbsd()
     include("installers/bsd.jl")
+elseif Sys.iswindows()
+    include("installers/windows.jl")
 else
     function install_service(::Dict{String,String})
         @error "Service installation is not implemented for $(Sys.KERNEL).\n" *
@@ -63,6 +66,7 @@ itself.
 - **Linux**: Installs a systemd user service
 - **macOS**: Installs a launchd user agent (logs to `~/Library/Logs/julia-daemon.log`)
 - **FreeBSD/OpenBSD**: Installs the client and provides manual daemon setup instructions
+- **Windows**: Installs the client and adds it to the startup items
 
 # Configuration
 
