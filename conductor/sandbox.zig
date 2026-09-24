@@ -164,10 +164,6 @@ pub fn classifyInstallPrefixed(exe_path: []const u8, host_home: []const u8, pref
     return .unrecognised;
 }
 
-pub fn classifyInstall(exe_path: []const u8, host_home: []const u8) InstallRoot {
-    return classifyInstallPrefixed(exe_path, host_home, "");
-}
-
 pub const SandboxError = error{
     ForkFailed,
     UnshareFailed,

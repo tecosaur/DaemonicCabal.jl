@@ -275,7 +275,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, now: i64) !void
     if (!printed_any) {
         try s.wrap(w, ansi.dim, "No workers running.\n");
     }
-    try renderFooter(c, w, s, now);
+    try renderFooter(c, w, s);
 }
 
 fn writeGroupHeader(w: Writer, s: Style, label: []const u8) !void {
@@ -534,8 +534,7 @@ fn countClients(c: *Conductor, wk: *const Worker) usize {
     return n;
 }
 
-fn renderFooter(c: *Conductor, w: Writer, s: Style, now: i64) !void {
-    _ = now;
+fn renderFooter(c: *Conductor, w: Writer, s: Style) !void {
     var active_workers: usize = 0;
     var total_clients: usize = 0;
     var total_mem: u64 = 0;

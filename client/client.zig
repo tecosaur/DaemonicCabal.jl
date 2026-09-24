@@ -159,8 +159,8 @@ const SignalParser = struct {
                 break :blk .none;
             },
             protocol.signals.nodelay => blk: {
-                protocol.setTcpNodelay(sockets.stdin);
-                protocol.setTcpNodelay(fd);
+                platform.setTcpNodelay(sockets.stdin);
+                platform.setTcpNodelay(fd);
                 break :blk .none;
             },
             else => .none,
@@ -231,7 +231,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (is_tty) platform.setRawMode(true);
     defer platform.setRawMode(false);
     const conductor = try connectToConductor(env);
-    if (transport_mode == .tcp) protocol.setTcpNodelay(conductor);
+    if (transport_mode == .tcp) platform.setTcpNodelay(conductor);
     defer notifyExit();
     var w = SocketWriter{ .handle = conductor };
     // The worker's own terminal knows nothing of ours.
@@ -403,7 +403,7 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
         .stderr = connectToWorkerSocket(stderr_path, "stderr"),
         .signals = connectToWorkerSocket(signals_path, "signals"),
     };
-    if (transport_mode == .tcp) protocol.setTcpNodelay(result.signals);
+    if (transport_mode == .tcp) platform.setTcpNodelay(result.signals);
     return result;
 }
 

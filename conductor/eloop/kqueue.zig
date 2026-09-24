@@ -230,7 +230,6 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
         std.debug.print("Accept error: {}\n", .{err});
         return;
     }
-    if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(client_fd);
     const peer = main.PeerInfo.fromSockaddr(&client_addr);
     conductor.admitConnection(client_fd, &peer);
 }

@@ -65,8 +65,7 @@ pub const dumpChildStderr = shared.dumpChildStderr;
 pub const collectEnviron = shared.collectEnviron;
 pub const requestSocketRecreate = shared.requestSocketRecreate;
 pub const getChildPid = shared.getChildPid;
-pub const WaitPidResult = shared.WaitPidResult;
-pub const waitpidNonBlocking = shared.waitpidNonBlocking;
+pub const reapIfExited = shared.reapIfExited;
 /// Frees what holds a child process of ours, its pid aside.
 pub const releaseChild = if (os == .windows) impl.releaseChild else struct {
     fn f(_: *std.process.Child) void {}
@@ -95,11 +94,9 @@ pub const pidfdSignal = linux_only.pidfdSignal;
 pub const pidfdExited = linux_only.pidfdExited;
 /// Own session, stdio on /dev/null, no inherited fds; fails before forking.
 pub const spawnDetached = linux_only.spawnDetached;
-pub const ProcessStats = shared.ProcessStats;
 pub const getProcessStats = shared.getProcessStats;
 pub const mem_is_reclaimable = shared.mem_is_reclaimable;
 pub const processReclaimable = shared.processReclaimable;
-pub const MemInfo = shared.MemInfo;
 pub const readPsiSomeAvg10 = shared.readPsiSomeAvg10;
 pub const readMemInfo = shared.readMemInfo;
 pub const getParentName = shared.getParentName;
@@ -107,9 +104,8 @@ pub const setRecvTimeout = shared.setRecvTimeout;
 pub const setTcpNodelay = shared.setTcpNodelay;
 pub const getTerminalSize = shared.getTerminalSize;
 pub const isatty = shared.isatty;
-pub const SignalHandler = shared.SignalHandler;
 pub const registerSignalHandlers = shared.registerSignalHandlers;
-pub const setRawMode = shared.setRawModeStdin;
+pub const setRawMode = shared.setRawMode;
 pub const setWorkerRawMode = shared.setWorkerRawMode;
 pub const setWorkerExecuting = shared.setWorkerExecuting;
 pub const setupConsoleIo = if (os == .windows) impl.setupConsoleIo else struct {

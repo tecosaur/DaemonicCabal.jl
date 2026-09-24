@@ -290,7 +290,6 @@ fn handleAccept(conductor: *Conductor, listener: *protocol.Listener) bool {
         std.debug.print("Accept error: {}\n", .{err});
         return err != error.PipeCreateFailed;
     };
-    if (conductor.cfg.transport == .tcp) protocol.setTcpNodelay(accepted.socket);
     const peer = main.PeerInfo{ .address = accepted.peer };
     conductor.admitConnection(accepted.socket, &peer);
     return true;
