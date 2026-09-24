@@ -17,6 +17,10 @@ const MS_NOSUID: u32 = 0x0002;
 const MS_NODEV: u32 = 0x0004;
 const MS_NOEXEC: u32 = 0x0008;
 const MS_REMOUNT: u32 = 0x0020;
+const MS_NOATIME: u32 = 0x0400;
+const MS_NODIRATIME: u32 = 0x0800;
+const MS_RELATIME: u32 = 0x200000;
+const MS_STRICTATIME: u32 = 0x1000000;
 const MS_SILENT: u32 = 0x8000;
 const MS_BIND: u32 = 0x1000;
 const MS_REC: u32 = 0x4000;
@@ -290,7 +294,7 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
         const src = fmtPath(&src_buf, "/oldroot{s}", .{path}) orelse continue;
         const dst = fmtPath(&dst_buf, "/newroot{s}", .{path}) orelse continue;
         mkdirp(dst);
-        robindOptional(src, dst);
+        try robindOptional(src, dst);
     }
     for (config.extra_rw_binds) |path| {
         if (path.len == 0) continue;
@@ -373,17 +377,17 @@ fn mountSystemDirs() SandboxError!void {
     try robind("/oldroot/usr", "/newroot/usr");
     try robind("/oldroot/etc", "/newroot/etc");
     // nss-systemd can leak the host user through the uid mapping.
-    overrideEtcFile("/newroot/etc/passwd",
+    try overrideEtcFile("/newroot/etc/passwd",
         "root:x:0:0:root:/root:/bin/sh\nsandbox:x:0:0:sandbox:/home/sandbox:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n");
-    overrideEtcFile("/newroot/etc/group",
+    try overrideEtcFile("/newroot/etc/group",
         "root:x:0:\nsandbox:x:0:\nnogroup:x:65534:\n");
-    overrideEtcFile("/newroot/etc/nsswitch.conf",
+    try overrideEtcFile("/newroot/etc/nsswitch.conf",
         "passwd: files\ngroup:  files\nshadow: files\nhosts:  files dns\nnetworks: files\nprotocols: files\nservices: files\n");
     // /lib, /lib64 and /bin are often symlinks into /usr.
-    robindOptional("/oldroot/usr/lib", "/newroot/lib");
-    robindOptional("/oldroot/usr/lib64", "/newroot/lib64");
-    robindOptional("/oldroot/usr/bin", "/newroot/bin");
-    robindOptional("/oldroot/opt", "/newroot/opt");
+    try robindOptional("/oldroot/usr/lib", "/newroot/lib");
+    try robindOptional("/oldroot/usr/lib64", "/newroot/lib64");
+    try robindOptional("/oldroot/usr/bin", "/newroot/bin");
+    try robindOptional("/oldroot/opt", "/newroot/opt");
 }
 
 /// A juliaup launcher looks for its home under `$HOME`, which is
@@ -403,12 +407,12 @@ fn mountJuliaInstall(exe_path: []const u8, home: []const u8) SandboxError!void {
         var dst_buf: [512]u8 = undefined;
         if (fmtPath(&dst_buf, "/newroot{s}", .{root})) |dst| {
             mkdirp(dst);
-            robindOptional(src, dst);
+            try robindOptional(src, dst);
         }
     }
     if (install == .launcher_home) {
         mkdirp("/newroot/home/sandbox/.julia/juliaup");
-        robindOptional(src, "/newroot/home/sandbox/.julia/juliaup");
+        try robindOptional(src, "/newroot/home/sandbox/.julia/juliaup");
     }
 }
 
@@ -432,11 +436,11 @@ fn mountHome(config: *const SandboxConfig, home: []const u8) SandboxError!void {
         const dst = fmtPath(&dst_buf, "/newroot{s}", .{depot.path}) orelse continue;
         mkdirp(dst);
         if (depot.writable) {
-            mountDepotOverlay(depot.path, dst);
+            try mountDepotOverlay(depot.path, dst);
         } else {
             var src_buf: [384]u8 = undefined;
             const src = fmtPath(&src_buf, "/oldroot{s}", .{depot.path}) orelse continue;
-            robindOptional(src, dst);
+            try robindOptional(src, dst);
         }
     }
     try linkSandboxDepot(depots.writablePath(), home);
@@ -475,7 +479,7 @@ pub fn isStrictAncestor(ancestor: []const u8, descendant: []const u8) bool {
 
 /// `environments` is bound read-only over the overlay, so named environments
 /// resolve but no manifest can change.
-fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) void {
+fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) SandboxError!void {
     var opts_buf: [512]u8 = undefined;
     const opts = fmtPath(&opts_buf,
         "upperdir=/ovl-upper,workdir=/ovl-work,lowerdir=/oldroot{s},userxattr",
@@ -484,14 +488,14 @@ fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) void {
         std.debug.print("Sandbox: overlay on {s} failed, falling back to bind mount\n", .{depot_src});
         var src_buf: [384]u8 = undefined;
         if (fmtPath(&src_buf, "/oldroot{s}", .{depot_src})) |src|
-            robindOptional(src, depot_dst);
+            try robindOptional(src, depot_dst);
         return;
     };
     var src_buf: [384]u8 = undefined;
     var dst_buf: [384]u8 = undefined;
     const src = fmtPath(&src_buf, "/oldroot{s}/environments", .{depot_src}) orelse return;
     const dst = fmtPath(&dst_buf, "/newroot{s}/environments", .{depot_src}) orelse return;
-    robindOptional(src, dst);
+    try robindOptional(src, dst);
 }
 
 // --- Cgroup v2 resource limits ---
@@ -619,68 +623,108 @@ fn mountTmpfs(target: [*:0]const u8, flags: u32, opts: ?[*:0]const u8) SandboxEr
 }
 
 var etc_override_counter: u8 = 0;
-fn overrideEtcFile(target: [*:0]const u8, content: []const u8) void {
+fn overrideEtcFile(target: [*:0]const u8, content: []const u8) SandboxError!void {
     var src_buf: [64]u8 = undefined;
-    const src = fmtPath(&src_buf, "/etc-override-{d}", .{etc_override_counter}) orelse return;
+    const src = fmtPath(&src_buf, "/etc-override-{d}", .{etc_override_counter}) orelse return SandboxError.PathTooLong;
     etc_override_counter += 1;
-    createFile(src, content) catch return;
-    mountBind(src, target) catch return;
-    remountReadonly(target);
+    createFile(src, content) catch return SandboxError.MountFailed;
+    try mountBind(src, target);
+    try remountTreeReadonly(target);
 }
 
 fn robind(source: [*:0]const u8, target: [*:0]const u8) SandboxError!void {
     try mkdirE(target);
-    mountBind(source, target) catch return SandboxError.MountFailed;
-    remountReadonly(target);
-    remountSubmountsReadonly(target);
+    try mountBind(source, target);
+    try remountTreeReadonly(target);
 }
 
-fn robindOptional(source: [*:0]const u8, target: [*:0]const u8) void {
+/// A source that cannot be bound is skipped; one that is bound ends up read-only.
+fn robindOptional(source: [*:0]const u8, target: [*:0]const u8) SandboxError!void {
     mkdirE(target) catch return;
     mountBind(source, target) catch return;
-    remountReadonly(target);
-    remountSubmountsReadonly(target);
+    try remountTreeReadonly(target);
 }
 
-fn remountReadonly(target: [*:0]const u8) void {
-    _ = linux.mount("none", target, null, MS_RDONLY | MS_NOSUID | MS_NODEV | MS_REMOUNT | MS_BIND | MS_SILENT, 0);
-}
-
-/// Aborts rather than skip a mount, which would leave it writable.
-fn remountSubmountsReadonly(target: [*:0]const u8) void {
+/// Remount `target` and every mount beneath it read-only. In a user namespace a
+/// bind remount must keep the flags its source was locked with, or it fails.
+/// Runs in the staging root, whose own `/proc` is the sandbox's at /newroot/proc.
+fn remountTreeReadonly(target: [*:0]const u8) SandboxError!void {
     const prefix = std.mem.span(target);
     var info_buf: [16384]u8 = undefined;
-    const info_len = readFile("/proc/self/mountinfo", &info_buf) orelse return;
-    if (info_len == info_buf.len)
-        fatalChild("remountSubmountsReadonly", SandboxError.MountFailed);
-    var it = std.mem.splitScalar(u8, info_buf[0..info_len], '\n');
+    const info_len = readFile("/newroot/proc/self/mountinfo", &info_buf) orelse return SandboxError.MountFailed;
+    if (info_len == info_buf.len) return SandboxError.MountFailed;
+    const info = info_buf[0..info_len];
+    var it = std.mem.splitScalar(u8, info, '\n');
     while (it.next()) |line| {
-        if (line.len == 0) continue;
-        const mp = parseMountPoint(line) orelse continue;
-        if (mp.len <= prefix.len or !std.mem.startsWith(u8, mp, prefix) or mp[prefix.len] != '/')
-            continue;
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (mp.len >= buf.len)
-            fatalChild("remountSubmountsReadonly: path too long", SandboxError.PathTooLong);
-        @memcpy(buf[0..mp.len], mp);
-        buf[mp.len] = 0;
-        _ = linux.mount("none", buf[0..mp.len :0], null,
-            MS_RDONLY | MS_NOSUID | MS_NODEV | MS_REMOUNT | MS_BIND | MS_SILENT, 0);
+        const entry = parseMountEntry(line) orelse continue;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = unescapeMountPath(&path_buf, entry.point) orelse return SandboxError.PathTooLong;
+        if (!isWithin(path, prefix)) continue;
+        // Only the topmost mount at a point is reached through its path.
+        if (laterMountAt(it.rest(), entry.point)) continue;
+        const flags = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_REMOUNT | MS_BIND | MS_SILENT | lockedFlags(entry.options);
+        if (errnoFromRc(linux.mount("none", path, null, flags, 0))) |e| {
+            std.debug.print("Sandbox: read-only remount of {s} failed: {s}\n", .{ path, @tagName(e) });
+            return SandboxError.MountFailed;
+        }
     }
 }
 
-/// Field 5 of a mountinfo line.
-fn parseMountPoint(line: []const u8) ?[]const u8 {
-    var pos: usize = 0;
-    var field: u8 = 0;
-    while (field < 4) : (field += 1) {
-        while (pos < line.len and line[pos] != ' ') pos += 1;
-        if (pos >= line.len) return null;
-        pos += 1;
+const MountEntry = struct { point: []const u8, options: []const u8 };
+
+/// Fields 5 and 6 of a mountinfo line.
+fn parseMountEntry(line: []const u8) ?MountEntry {
+    var fields = std.mem.splitScalar(u8, line, ' ');
+    for (0..4) |_| _ = fields.next() orelse return null;
+    const point = fields.next() orelse return null;
+    const options = fields.next() orelse return null;
+    if (point.len == 0) return null;
+    return .{ .point = point, .options = options };
+}
+
+fn laterMountAt(rest: []const u8, point: []const u8) bool {
+    var it = std.mem.splitScalar(u8, rest, '\n');
+    while (it.next()) |line| {
+        const entry = parseMountEntry(line) orelse continue;
+        if (std.mem.eql(u8, entry.point, point)) return true;
     }
-    const start = pos;
-    while (pos < line.len and line[pos] != ' ') pos += 1;
-    return if (pos == start) null else line[start..pos];
+    return false;
+}
+
+/// mountinfo writes space, tab, newline and backslash as `\ooo` octal.
+fn unescapeMountPath(buf: []u8, escaped: []const u8) ?[:0]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < escaped.len) : (n += 1) {
+        if (n + 1 >= buf.len) return null;
+        if (escaped[i] == '\\' and i + 4 <= escaped.len) {
+            buf[n] = std.fmt.parseInt(u8, escaped[i + 1 .. i + 4], 8) catch return null;
+            i += 4;
+        } else {
+            buf[n] = escaped[i];
+            i += 1;
+        }
+    }
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
+const locked_options = [_]struct { name: []const u8, flag: u32 }{
+    .{ .name = "noexec", .flag = MS_NOEXEC },
+    .{ .name = "noatime", .flag = MS_NOATIME },
+    .{ .name = "nodiratime", .flag = MS_NODIRATIME },
+    .{ .name = "relatime", .flag = MS_RELATIME },
+};
+
+fn lockedFlags(options: []const u8) u32 {
+    var flags: u32 = 0;
+    var it = std.mem.splitScalar(u8, options, ',');
+    while (it.next()) |option| for (locked_options) |locked| {
+        if (std.mem.eql(u8, option, locked.name)) flags |= locked.flag;
+    };
+    // Neither noatime nor relatime: strictatime, which is locked too.
+    if (flags & (MS_NOATIME | MS_RELATIME) == 0) flags |= MS_STRICTATIME;
+    return flags;
 }
 
 // --- Low-level helpers ---
