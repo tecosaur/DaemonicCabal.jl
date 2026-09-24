@@ -63,7 +63,7 @@ function warm_repl_path()
             dout = errormonitor(@async try read(cout.out) catch end)
             derr = errormonitor(@async try read(cerr.out) catch end)
             feeder = errormonitor(@async try write(cin.in, "1+1\n"); close(cin.in) catch end)
-            client = ClientInfo(true, false, 0, 0, pwd(),
+            client = ClientInfo(true, true, false, 0, 0, pwd(),
                                 ["TERM" => "xterm-256color", "JULIA_DAEMON_REVISE" => "no"],
                                 [("--history-file", "no")],
                                 nothing, String[], 0xFFFF)
@@ -114,6 +114,10 @@ function clienthascolor(client::ClientInfo)
     cs = getval(client.switches, "--color", nothing)
     if cs !== nothing
         cs ∈ ("yes", "true", "1", "")
+    elseif client.color
+        # The client's own verdict (a tty without NO_COLOR); the terminfo
+        # fallback below misjudges terminals that set no TERM, as on Windows.
+        true
     elseif client.tty
         term = getval(client.env, "TERM", "")
         @static if VERSION >= v"1.11"

@@ -34,11 +34,14 @@ pub const eventLoopImpl = if (builtin.os.tag == .linux)
     @import("eloop/linux.zig")
 else if (builtin.os.tag.isBSD())
     @import("eloop/kqueue.zig")
+else if (builtin.os.tag == .windows)
+    @import("eloop/windows.zig")
 else
     @compileError("unsupported OS");
 
 const readExact = protocol.readExact;
 const EventLocation = protocol.EventLocation;
+
 
 // --- Constants ---
 
@@ -225,6 +228,7 @@ pub const Conductor = struct {
     }
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
+        if (w.exited()) platform.dumpChildStderr(self.io, self.allocator, &w.process, w.id);
         if (w.launch == .sandboxed) self.removeSandboxDir(w.id);
         w.deinit();
         self.allocator.destroy(w);
@@ -648,7 +652,7 @@ pub const Conductor = struct {
         return .{
             .flags = flags,
             .pid = pid,
-            .host_pid = if (platform.peerPid(socket)) |p| @intCast(p) else null,
+            .host_pid = if (platform.peerPid(socket)) |p| platform.pidNumber(p) else null,
             .ppid = ppid,
             .cwd = cwd,
             .env = cached.env,
@@ -736,6 +740,7 @@ pub const Conductor = struct {
         const sandbox_env = if (sandbox == .remote) try self.buildSandboxClientEnv(request.env) else null;
         return .{ .port_set = port_set, .sandbox_env = sandbox_env, .info = .{
             .tty = request.flags.tty,
+            .color = request.flags.color,
             .force = is_labeled_session,
             .id = self.client_counter,
             .pid = request.pid,
@@ -901,6 +906,7 @@ pub const Conductor = struct {
         // Remote client's cwd doesn't exist on the host — use host home
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
+            .color = request.flags.color,
             .force = is_labeled_session,
             .id = self.client_counter,
             .pid = request.pid,

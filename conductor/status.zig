@@ -581,7 +581,7 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64
         try s.wrap(w, ansi.dim, "Client ");
         try w.print("{d}", .{info.pid});
         var name_buf: [64]u8 = undefined;
-        if (platform.getParentName(@intCast(info.pid), &name_buf)) |name| {
+        if (platform.getParentName(info.pid, &name_buf)) |name| {
             try w.print(" ({s})", .{name});
         }
         const attached_s = @divTrunc(now * 1_000_000 - info.start_time_us, 1_000_000);

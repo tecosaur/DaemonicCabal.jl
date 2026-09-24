@@ -87,7 +87,8 @@ end
 # --- Dual transport (Unix sockets / TCP) ---
 
 is_tcp_address(addr::AbstractString) =
-    !startswith(addr, '/') && !startswith(addr, '.') && !contains(addr, '/') && contains(addr, ':')
+    !startswith(addr, '/') && !startswith(addr, '\\') && !startswith(addr, '.') &&
+    !contains(addr, '/') && !contains(addr, '\\') && contains(addr, ':')
 
 # Connect to an address (Unix path or host:port), setting TCP_NODELAY for TCP sockets
 function connect_to(address::AbstractString)
@@ -148,6 +149,7 @@ end
 # Client info from CLIENT_RUN message
 struct ClientInfo
     tty::Bool
+    color::Bool  # The client's terminal renders ANSI colour
     force::Bool  # Bypass capacity check (for labeled sessions)
     id::Int      # Conductor-assigned; names the client in notifications and syncs
     pid::Int     # As our kernel reports it on the client's stdio connections (0 = unchecked)
@@ -163,7 +165,8 @@ end
 function read_client_run(conn::IO)
     flags = read(conn, UInt8)
     tty = (flags & 0x01) != 0
-    force = (flags & 0x02) != 0  # Bypass capacity check
+    color = (flags & 0x02) != 0
+    force = (flags & 0x04) != 0  # Bypass capacity check
     id = Int(read(conn, UInt32))
     pid = Int(read(conn, UInt32))
     cwd = read_string(conn)
@@ -197,6 +200,6 @@ function read_client_run(conn::IO)
         args[i] = read_string(conn)
     end
     port_set = Int(read(conn, UInt16))
-    ClientInfo(tty, force, id, pid, cwd, env, switches, programfile, args, port_set)
+    ClientInfo(tty, color, force, id, pid, cwd, env, switches, programfile, args, port_set)
 end
 
