@@ -231,7 +231,10 @@ pub const Conductor = struct {
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
         if (w.exited()) platform.dumpChildStderr(self.io, self.allocator, &w.process, w.id);
-        if (w.launch == .sandboxed) self.removeSandboxDir(w.id);
+        if (w.launch == .sandboxed) {
+            self.removeSandboxDir(w.id);
+            if (builtin.os.tag == .linux) worker.sandbox.removeCgroup(w.id);
+        }
         w.deinit();
         self.allocator.destroy(w);
     }
@@ -2153,6 +2156,13 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(" - Sandbox memory limit: {s}\n", .{m});
     if (cfg.sandbox_max_cpu) |c|
         std.debug.print(" - Sandbox CPU limit: {d}%\n", .{c});
+    if (builtin.os.tag == .linux and (cfg.sandbox_max_memory != null or cfg.sandbox_max_cpu != null)) {
+        worker.sandbox.delegateCgroups(cfg.sandbox_max_memory, cfg.sandbox_max_cpu) catch |err| {
+            std.debug.print("Sandbox limits need a cgroup delegated to the conductor (systemd Delegate=yes); " ++
+                "unset JULIA_DAEMON_SANDBOX_MAX_MEMORY and _MAX_CPU to run without them.\n", .{});
+            return err;
+        };
+    }
     if (!cfg.sandbox_remote_clients)
         std.debug.print(" - Sandbox remote clients: disabled\n", .{});
     if (cfg.sandbox_session_bypass)

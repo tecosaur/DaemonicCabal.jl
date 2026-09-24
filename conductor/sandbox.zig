@@ -200,8 +200,16 @@ pub fn execInSandbox(
 ) SandboxError!posix.pid_t {
     const orig_uid = linux.getuid();
     const orig_gid = linux.getgid();
-    const pid1 = callFork() orelse return SandboxError.ForkFailed;
+    var cgroup_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cgroup = try createCgroup(&cgroup_buf, config);
+    const pid1 = callFork() orelse {
+        removeCgroup(config.worker_id);
+        return SandboxError.ForkFailed;
+    };
     if (pid1 != 0) return pid1;
+    // Joined while the host's cgroup tree is still in view; the worker inherits it.
+    if (cgroup) |cg| cgroupWrite(cg, "cgroup.procs", "0") catch |err|
+        fatalChild("joining the sandbox cgroup", err);
     // Child 1 holds the signals it relays until there is a worker to take them.
     var relayed = posix.sigemptyset();
     posix.sigaddset(&relayed, .INT);
@@ -230,8 +238,6 @@ pub fn execInSandbox(
     posix.sigprocmask(posix.SIG.UNBLOCK, &relayed, null);
     setupFilesystem(config) catch |err|
         fatalChild("filesystem setup", err);
-    if (config.max_memory != null or config.max_cpu != null)
-        setupCgroup(config) catch {};
     const exe = argv[0].?;
     std.debug.print("Sandbox: execve {s}\n", .{std.mem.span(exe)});
     const rc = linux.execve(exe, argv, envp);
@@ -252,12 +258,6 @@ pub fn envAllowed(key: []const u8) bool {
     for (env_allowlist) |allowed|
         if (std.mem.eql(u8, key, allowed)) return true;
     return false;
-}
-
-pub fn cleanupCgroup(worker_id: u32) void {
-    var buf: [128]u8 = undefined;
-    const path = fmtPath(&buf, "/sys/fs/cgroup/julia-sandbox-{d}", .{worker_id}) orelse return;
-    _ = linux.unlinkat(linux.AT.FDCWD, path, linux.AT.REMOVEDIR);
 }
 
 // --- Namespace setup ---
@@ -500,28 +500,80 @@ fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) SandboxErr
 
 // --- Cgroup v2 resource limits ---
 
-/// Named by worker id: the in-namespace pid is always 1.
-fn setupCgroup(config: *const SandboxConfig) !void {
-    var cg_buf: [128]u8 = undefined;
-    const cg = fmtPath(&cg_buf, "/sys/fs/cgroup/julia-sandbox-{d}", .{config.worker_id}) orelse
-        return SandboxError.CgroupSetupFailed;
-    mkdirE(cg) catch return SandboxError.CgroupSetupFailed;
-    if (config.max_memory) |mem| {
-        var buf: [192]u8 = undefined;
-        const path = fmtPath(&buf, "{s}/memory.max", .{cg}) orelse return SandboxError.CgroupSetupFailed;
-        writeFile(path, mem) catch return SandboxError.CgroupSetupFailed;
-    }
+var cgroup_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+/// The conductor's own cgroup, where each limited sandbox gets `sandbox-N`.
+var cgroup_root: ?[]const u8 = null;
+
+/// Ready the conductor's cgroup to hold limited sandboxes. It must be delegated
+/// to us (systemd `Delegate=yes`), and cgroup v2 hands controllers down only
+/// from a cgroup with no processes of its own, so the conductor first moves
+/// into a `conductor` leaf. Call before any child is spawned.
+pub fn delegateCgroups(max_memory: ?[]const u8, max_cpu: ?u32) SandboxError!void {
+    var self_buf: [1024]u8 = undefined;
+    const self_len = readFile("/proc/self/cgroup", &self_buf) orelse return cgroupFailed("read /proc/self/cgroup");
+    const own = cgroupV2Path(self_buf[0..self_len]) orelse return cgroupFailed("find a cgroup v2 hierarchy");
+    const root = std.fmt.bufPrint(&cgroup_root_buf, "/sys/fs/cgroup{s}", .{std.mem.trimEnd(u8, own, "/")}) catch
+        return SandboxError.PathTooLong;
+    var leaf_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const leaf = fmtPath(&leaf_buf, "{s}/conductor", .{root}) orelse return SandboxError.PathTooLong;
+    try cgroupMkdir(leaf);
+    try cgroupWrite(leaf, "cgroup.procs", "0");
+    const controllers = if (max_cpu == null) "+memory" else if (max_memory == null) "+cpu" else "+memory +cpu";
+    try cgroupWrite(root, "cgroup.subtree_control", controllers);
+    cgroup_root = root;
+}
+
+pub fn removeCgroup(worker_id: u32) void {
+    const root = cgroup_root orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cg = fmtPath(&buf, "{s}/sandbox-{d}", .{ root, worker_id }) orelse return;
+    _ = linux.unlinkat(linux.AT.FDCWD, cg, linux.AT.REMOVEDIR);
+}
+
+/// Null when no limits are configured.
+fn createCgroup(buf: []u8, config: *const SandboxConfig) SandboxError!?[:0]const u8 {
+    const root = cgroup_root orelse return null;
+    const cg = fmtPath(buf, "{s}/sandbox-{d}", .{ root, config.worker_id }) orelse return SandboxError.PathTooLong;
+    try cgroupMkdir(cg);
+    errdefer removeCgroup(config.worker_id);
+    if (config.max_memory) |mem| try cgroupWrite(cg, "memory.max", mem);
     if (config.max_cpu) |cpu| {
-        var path_buf: [192]u8 = undefined;
-        const path = fmtPath(&path_buf, "{s}/cpu.max", .{cg}) orelse return SandboxError.CgroupSetupFailed;
         var val_buf: [32]u8 = undefined;
-        const val = std.fmt.bufPrint(&val_buf, "{d} 100000", .{@as(u64, cpu) * 1000}) catch
-            return SandboxError.CgroupSetupFailed;
-        writeFile(path, val) catch return SandboxError.CgroupSetupFailed;
+        const quota = std.fmt.bufPrint(&val_buf, "{d} 100000", .{@as(u64, cpu) * 1000}) catch return SandboxError.CgroupSetupFailed;
+        try cgroupWrite(cg, "cpu.max", quota);
     }
-    var procs_buf: [192]u8 = undefined;
-    const procs = fmtPath(&procs_buf, "{s}/cgroup.procs", .{cg}) orelse return SandboxError.CgroupSetupFailed;
-    writeFile(procs, "0") catch return SandboxError.CgroupSetupFailed;
+    return cg;
+}
+
+/// The path on the `0::` line of /proc/self/cgroup.
+fn cgroupV2Path(self_cgroup: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, self_cgroup, '\n');
+    while (it.next()) |line| if (std.mem.startsWith(u8, line, "0::")) return line[3..];
+    return null;
+}
+
+fn cgroupMkdir(path: [:0]const u8) SandboxError!void {
+    if (errnoFromRc(linux.mkdir(path, 0o755))) |e| if (e != .EXIST) {
+        std.debug.print("Sandbox: cannot create cgroup {s}: {s}\n", .{ path, @tagName(e) });
+        return SandboxError.CgroupSetupFailed;
+    };
+}
+
+fn cgroupWrite(dir: []const u8, file: []const u8, data: []const u8) SandboxError!void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = fmtPath(&buf, "{s}/{s}", .{ dir, file }) orelse return SandboxError.PathTooLong;
+    const fd_rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0);
+    const e = errnoFromRc(fd_rc) orelse blk: {
+        defer _ = linux.close(@intCast(fd_rc));
+        break :blk errnoFromRc(linux.write(@intCast(fd_rc), data.ptr, data.len)) orelse return;
+    };
+    std.debug.print("Sandbox: cannot write \"{s}\" to {s}: {s}\n", .{ data, path, @tagName(e) });
+    return SandboxError.CgroupSetupFailed;
+}
+
+fn cgroupFailed(step: []const u8) SandboxError {
+    std.debug.print("Sandbox: cannot {s}\n", .{step});
+    return SandboxError.CgroupSetupFailed;
 }
 
 // --- Argv/envp construction ---

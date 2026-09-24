@@ -195,6 +195,10 @@ Sandbox configuration (Linux only, applies to both =--sandbox= and remote client
 | =JULIA_DAEMON_SANDBOX_MAX_CPU=           | /unset/   | Per-sandbox cgroup CPU limit as percentage (e.g. =200= = 2 cores)  |
 | =JULIA_DAEMON_SANDBOX_SESSION_BYPASS=    | =0=       | Allow remote =--session=<label>= to join local unsandboxed workers |
 
+The memory and CPU limits need a cgroup delegated to the conductor. The systemd
+service =install()= writes has one (=Delegate=yes=); without it, a conductor
+given limits refuses to start.
+
 Runtime directory defaults: Linux =/run/user/$UID/julia-daemon=, macOS
 =~/Library/Application Support/julia-daemon=, BSD =/tmp/julia-daemon-$UID=,
 Windows =%LOCALAPPDATA%\julia-daemon=. On Windows the local socket is a named
