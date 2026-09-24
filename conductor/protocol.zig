@@ -32,8 +32,10 @@ pub const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
     .windows =>
         \\Daemon management (Task Scheduler):
         \\
-        \\ schtasks /{run | end | query} /tn "Julia\JuliaDaemon"
-        \\ Get-Process julia-conductor   (status, PowerShell)
+        \\ schtasks /{run | query} /tn "Julia\JuliaDaemon"
+        \\ taskkill /F /IM julia-conductor.exe   (stop: the task does not track it)
+        \\ Get-Process julia-conductor         (status, PowerShell)
+        \\ log: %LOCALAPPDATA%\Programs\julia-daemon\conductor.log
         \\
     ,
     else =>
