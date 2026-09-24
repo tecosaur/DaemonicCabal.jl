@@ -35,7 +35,7 @@ function install_service(env::Dict)
         -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -MultipleInstances IgnoreNew `
         -DontStopOnIdleEnd
-    Register-ScheduledTask -TaskName JuliaDaemon -TaskPath Julia `
+    Register-ScheduledTask -Force -TaskName JuliaDaemon -TaskPath Julia `
         -Action \$action -Trigger \$trigger -Principal \$principal -Settings \$settings
     """)
 
