@@ -49,52 +49,59 @@ pub fn listenLocal(io: Io, path: []const u8) !Listener {
     const ua = try Io.net.UnixAddress.init(path);
     return Listener.fromServer(try ua.listen(io, .{ .kernel_backlog = 128 }), .local, path);
 }
-pub fn connectLocal(io: Io, path: []const u8) !posix.socket_t {
+/// A local connect succeeds or fails at once, so there is no wait to bound.
+pub fn connectLocal(io: Io, path: []const u8, _: u32) !posix.socket_t {
     if (path.len >= max_local_addr) return error.PathTooLong;
     const ua = try Io.net.UnixAddress.init(path);
     return (try ua.connect(io)).socket.handle;
 }
 /// Connect to a single-use local address and retire it, so nothing else can.
 pub fn connectLocalOnce(io: Io, path: []const u8) !posix.socket_t {
-    const fd = try connectLocal(io, path);
+    const fd = try connectLocal(io, path, 0);
     Io.Dir.deleteFileAbsolute(io, path) catch {};
     return fd;
 }
-pub fn connectTcp(io: Io, ip: Io.net.IpAddress) !posix.socket_t {
-    return (try ip.connect(io, .{ .mode = .stream })).socket.handle;
-}
 pub const local_transport_name = "unix socket";
-/// A local connect either succeeds or fails at once, so there is nothing to bound.
-pub fn probeLocal(path: []const u8, _: u32) bool {
-    impl.rawClose(rawConnectLocal(path) orelse return false);
-    return true;
+/// Connect to `ip`, giving up after `timeout_ms` rather than the kernel's
+/// minutes of SYN retries. The socket comes back blocking and close-on-exec.
+pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !posix.socket_t {
+    var storage: Io.Threaded.PosixAddress = undefined;
+    const len = Io.Threaded.addressToPosix(&ip, &storage);
+    const fd = impl.rawSocket(storage.any.family, posix.SOCK.STREAM) orelse return error.SocketCreateFailed;
+    errdefer impl.rawClose(fd);
+    _ = try fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
+    const flags = try fcntl(fd, posix.F.GETFL, 0);
+    const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+    _ = try fcntl(fd, posix.F.SETFL, flags | nonblock);
+    switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
+        .SUCCESS => {},
+        .INPROGRESS => {
+            var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            if (try posix.poll(&pfd, @intCast(timeout_ms)) == 0) return error.ConnectionTimedOut;
+            var err: c_int = 0;
+            var err_len: posix.socklen_t = @sizeOf(c_int);
+            if (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err), &err_len)) != .SUCCESS)
+                return error.Unexpected;
+            if (err != 0) return connectError(@enumFromInt(err));
+        },
+        else => |e| return connectError(e),
+    }
+    _ = try fcntl(fd, posix.F.SETFL, flags);
+    return fd;
 }
-/// Whether something accepts TCP connections at `ip` within `timeout_ms`.
-pub fn probeTcp(ip: Io.net.IpAddress, timeout_ms: u32) bool {
-    return switch (ip) {
-        .ip4 => |a| probeSockaddr(&posix.sockaddr.in{ .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.bytes) }, timeout_ms),
-        .ip6 => |a| probeSockaddr(&posix.sockaddr.in6{ .port = std.mem.nativeToBig(u16, a.port), .flowinfo = a.flow, .addr = a.bytes, .scope_id = a.interface.index }, timeout_ms),
+fn connectError(e: posix.E) anyerror {
+    return switch (e) {
+        .CONNREFUSED => error.ConnectionRefused,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETUNREACH => error.NetworkUnreachable,
+        .HOSTUNREACH => error.HostUnreachable,
+        else => posix.unexpectedErrno(e),
     };
 }
-fn probeSockaddr(sa: anytype, timeout_ms: u32) bool {
-    const fd = impl.rawSocket(sa.family, posix.SOCK.STREAM) orelse return false;
-    defer impl.rawClose(fd);
-    // Non-blocking, so an unanswered SYN is bounded by the poll, not the kernel.
-    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-    if (posix.errno(flags) != .SUCCESS) return false;
-    const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
-    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, @as(usize, @intCast(flags)) | nonblock)) != .SUCCESS) return false;
-    switch (posix.errno(posix.system.connect(fd, @ptrCast(sa), @sizeOf(@TypeOf(sa.*))))) {
-        .SUCCESS => return true,
-        .INPROGRESS => {},
-        else => return false,
-    }
-    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-    if ((posix.poll(&pfd, @intCast(timeout_ms)) catch return false) == 0) return false;
-    var err: c_int = 0;
-    var len: posix.socklen_t = @sizeOf(c_int);
-    if (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err), &len)) != .SUCCESS) return false;
-    return err == 0;
+fn fcntl(fd: posix.fd_t, cmd: anytype, arg: usize) !usize {
+    const rc = posix.system.fcntl(fd, cmd, arg);
+    if (posix.errno(rc) != .SUCCESS) return error.Unexpected;
+    return @intCast(rc);
 }
 /// Connect with raw syscalls only, for use inside a signal handler; null on failure.
 pub fn rawConnectLocal(path: []const u8) ?posix.socket_t {
@@ -129,7 +136,7 @@ pub const Listener = struct {
         return self.server.socket.handle;
     }
     /// Accept the connection an event loop reported waiting.
-    pub fn accept(self: *Listener, io: Io) !protocol.Accepted {
+    pub fn accept(self: *Listener, io: Io) !protocol.Connection {
         const stream = try self.server.accept(io);
         return .{ .socket = stream.socket.handle, .peer = if (self.mode == .tcp) stream.socket.address else null };
     }
@@ -160,8 +167,9 @@ pub fn collectEnviron(allocator: std.mem.Allocator, environ: std.process.Environ
     return entries;
 }
 /// Ask a conductor to recreate its socket (its SIGUSR1 handler).
-pub fn requestSocketRecreate(pid: u32) void {
-    _ = impl.kill(@intCast(pid), posix.SIG.USR1);
+/// Ask the conductor at `pid` to recreate its socket; false when it could not be asked.
+pub fn requestSocketRecreate(pid: u32) bool {
+    return impl.kill(@intCast(pid), posix.SIG.USR1) == 0;
 }
 /// The number a pid prints and travels the wire as.
 pub fn pidNumber(pid: posix.pid_t) u32 {

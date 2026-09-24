@@ -90,11 +90,27 @@ is_tcp_address(addr::AbstractString) =
     !startswith(addr, '/') && !startswith(addr, '\\') && !startswith(addr, '.') &&
     !contains(addr, '/') && !contains(addr, '\\') && contains(addr, ':')
 
+# `host:port`, the host bracketed when it is an IPv6 address.
+function split_host_port(address::AbstractString)
+    host, port = rsplit(address, ':', limit=2)
+    String(strip(host, ('[', ']'))), parse(Int, port)
+end
+
+# The address `host` names: a literal as written, else a name's IPv4 address
+# where it has one, as the conductor prefers when it listens on a name.
+function resolve_host(host::AbstractString)
+    try
+        Sockets.parse(IPAddr, host)
+    catch
+        try Sockets.getaddrinfo(host, IPv4) catch; Sockets.getaddrinfo(host) end
+    end
+end
+
 # Connect to an address (Unix path or host:port), setting TCP_NODELAY for TCP sockets
 function connect_to(address::AbstractString)
     if is_tcp_address(address)
-        host, port = rsplit(address, ':', limit=2)
-        sock = Sockets.connect(Sockets.IPv4(String(host)), parse(Int, port))
+        host, port = split_host_port(address)
+        sock = Sockets.connect(resolve_host(host), port)
         Sockets.nagle(sock, false)
         sock
     else
