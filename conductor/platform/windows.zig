@@ -24,24 +24,24 @@ const FILETIME = win32.FILETIME;
 // Win32 bindings absent from std.os.windows
 // =============================================================================
 
-pub const STD_INPUT_HANDLE: DWORD = @bitCast(@as(i32, -10));
-pub const STD_OUTPUT_HANDLE: DWORD = @bitCast(@as(i32, -11));
-pub const STD_ERROR_HANDLE: DWORD = @bitCast(@as(i32, -12));
+const STD_INPUT_HANDLE: DWORD = @bitCast(@as(i32, -10));
+const STD_OUTPUT_HANDLE: DWORD = @bitCast(@as(i32, -11));
+const STD_ERROR_HANDLE: DWORD = @bitCast(@as(i32, -12));
 
-pub const CTRL_C_EVENT: DWORD = 0;
-pub const CTRL_BREAK_EVENT: DWORD = 1;
-pub const CTRL_CLOSE_EVENT: DWORD = 2;
-pub const CTRL_LOGOFF_EVENT: DWORD = 5;
-pub const CTRL_SHUTDOWN_EVENT: DWORD = 6;
+const CTRL_C_EVENT: DWORD = 0;
+const CTRL_BREAK_EVENT: DWORD = 1;
+const CTRL_CLOSE_EVENT: DWORD = 2;
+const CTRL_LOGOFF_EVENT: DWORD = 5;
+const CTRL_SHUTDOWN_EVENT: DWORD = 6;
 
-pub const FILE_TYPE_CHAR: DWORD = 0x0002;
+const FILE_TYPE_CHAR: DWORD = 0x0002;
 pub const INFINITE: DWORD = 0xFFFFFFFF;
 const WAIT_OBJECT_0: DWORD = 0x00000000;
 const WAIT_TIMEOUT: DWORD = 0x00000102;
 const WAIT_FAILED: DWORD = 0xFFFFFFFF;
 
-pub const HANDLER_ROUTINE = fn (dwCtrlType: DWORD) callconv(.winapi) BOOL;
-pub const PHANDLER_ROUTINE = *const HANDLER_ROUTINE;
+const HANDLER_ROUTINE = fn (dwCtrlType: DWORD) callconv(.winapi) BOOL;
+const PHANDLER_ROUTINE = *const HANDLER_ROUTINE;
 pub const WAITORTIMERCALLBACK = *const fn (lpParameter: ?*anyopaque, timer_or_wait_fired: BOOL) callconv(.winapi) void;
 
 // IO_STATUS_BLOCK and OVERLAPPED share their first two fields, so the iosb
@@ -53,7 +53,7 @@ pub const OVERLAPPED = extern struct {
     hEvent: HANDLE,
 };
 
-pub const MEMORYSTATUSEX = extern struct {
+const MEMORYSTATUSEX = extern struct {
     dwLength: DWORD,
     dwMemoryLoad: DWORD,
     ullTotalPhys: u64,
@@ -65,7 +65,7 @@ pub const MEMORYSTATUSEX = extern struct {
     ullAvailExtendedVirtual: u64,
 };
 
-pub const PROCESS_MEMORY_COUNTERS_EX = extern struct {
+const PROCESS_MEMORY_COUNTERS_EX = extern struct {
     cb: DWORD,
     PageFaultCount: DWORD,
     PeakWorkingSetSize: usize,
@@ -79,9 +79,9 @@ pub const PROCESS_MEMORY_COUNTERS_EX = extern struct {
     PrivateUsage: usize,
 };
 
-pub const SMALL_RECT = extern struct { Left: i16, Top: i16, Right: i16, Bottom: i16 };
+const SMALL_RECT = extern struct { Left: i16, Top: i16, Right: i16, Bottom: i16 };
 
-pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
     dwSize: win32.COORD,
     dwCursorPosition: win32.COORD,
     wAttributes: WORD,
@@ -89,33 +89,33 @@ pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
     dwMaximumWindowSize: win32.COORD,
 };
 
-pub extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) HANDLE;
-pub extern "kernel32" fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *DWORD) BOOL;
-pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) BOOL;
-pub extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) BOOL;
-pub extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) BOOL;
+extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) HANDLE;
+extern "kernel32" fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *DWORD) BOOL;
+extern "kernel32" fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) BOOL;
+extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) BOOL;
+extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) BOOL;
 pub extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) BOOL;
-pub extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) DWORD;
-pub extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) ?HANDLE;
-pub extern "kernel32" fn QueryFullProcessImageNameW(hProcess: HANDLE, dwFlags: DWORD, lpExeName: [*]u16, lpdwSize: *DWORD) BOOL;
-pub extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*OVERLAPPED) BOOL;
-pub extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: *const anyopaque, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*OVERLAPPED) BOOL;
+extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) DWORD;
+extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) ?HANDLE;
+extern "kernel32" fn QueryFullProcessImageNameW(hProcess: HANDLE, dwFlags: DWORD, lpExeName: [*]u16, lpdwSize: *DWORD) BOOL;
+extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*OVERLAPPED) BOOL;
+extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: *const anyopaque, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*OVERLAPPED) BOOL;
 pub extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*OVERLAPPED) BOOL;
-pub extern "kernel32" fn GetFileType(hFile: HANDLE) DWORD;
+extern "kernel32" fn GetFileType(hFile: HANDLE) DWORD;
 pub extern "kernel32" fn SetConsoleCtrlHandler(handler_routine: ?PHANDLER_ROUTINE, add: BOOL) BOOL;
-pub extern "kernel32" fn GetProcessTimes(hProcess: HANDLE, lpCreationTime: *FILETIME, lpExitTime: *FILETIME, lpKernelTime: *FILETIME, lpUserTime: *FILETIME) BOOL;
-pub extern "kernel32" fn GetProcessId(hProcess: HANDLE) DWORD;
-pub extern "kernel32" fn SetConsoleOutputCP(wCodePageID: DWORD) BOOL;
-pub extern "kernel32" fn GetConsoleOutputCP() DWORD;
-pub extern "kernel32" fn SetConsoleCP(wCodePageID: DWORD) BOOL;
-pub extern "kernel32" fn GetConsoleCP() DWORD;
-pub extern "kernel32" fn CreateEventW(lpEventAttributes: ?*anyopaque, bManualReset: DWORD, bInitialState: DWORD, lpName: ?[*:0]const u16) ?HANDLE;
+extern "kernel32" fn GetProcessTimes(hProcess: HANDLE, lpCreationTime: *FILETIME, lpExitTime: *FILETIME, lpKernelTime: *FILETIME, lpUserTime: *FILETIME) BOOL;
+extern "kernel32" fn GetProcessId(hProcess: HANDLE) DWORD;
+extern "kernel32" fn SetConsoleOutputCP(wCodePageID: DWORD) BOOL;
+extern "kernel32" fn GetConsoleOutputCP() DWORD;
+extern "kernel32" fn SetConsoleCP(wCodePageID: DWORD) BOOL;
+extern "kernel32" fn GetConsoleCP() DWORD;
+extern "kernel32" fn CreateEventW(lpEventAttributes: ?*anyopaque, bManualReset: DWORD, bInitialState: DWORD, lpName: ?[*:0]const u16) ?HANDLE;
 pub extern "kernel32" fn CreateIoCompletionPort(FileHandle: HANDLE, ExistingCompletionPort: ?HANDLE, CompletionKey: usize, NumberOfConcurrentThreads: DWORD) ?HANDLE;
 pub extern "kernel32" fn GetQueuedCompletionStatus(CompletionPort: HANDLE, lpNumberOfBytesTransferred: *DWORD, lpCompletionKey: *usize, lpOverlapped: ?*?*OVERLAPPED, dwMilliseconds: DWORD) BOOL;
 pub extern "kernel32" fn PostQueuedCompletionStatus(CompletionPort: HANDLE, dwNumberOfBytesTransferred: DWORD, dwCompletionKey: usize, lpOverlapped: ?*OVERLAPPED) BOOL;
-pub extern "kernel32" fn CreateNamedPipeW(lpName: [*:0]const u16, dwOpenMode: DWORD, dwPipeMode: DWORD, nMaxInstances: DWORD, nOutBufferSize: DWORD, nInBufferSize: DWORD, nDefaultTimeOut: DWORD, lpSecurityAttributes: ?*win32.SECURITY_ATTRIBUTES) ?HANDLE;
-pub extern "kernel32" fn AcquireSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
-pub extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
+extern "kernel32" fn CreateNamedPipeW(lpName: [*:0]const u16, dwOpenMode: DWORD, dwPipeMode: DWORD, nMaxInstances: DWORD, nOutBufferSize: DWORD, nInBufferSize: DWORD, nDefaultTimeOut: DWORD, lpSecurityAttributes: ?*win32.SECURITY_ATTRIBUTES) ?HANDLE;
+extern "kernel32" fn AcquireSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
+extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
 extern "kernel32" fn Sleep(dwMilliseconds: DWORD) void;
 extern "kernel32" fn GetCurrentProcess() HANDLE;
 extern "kernel32" fn DuplicateHandle(hSourceProcessHandle: HANDLE, hSourceHandle: HANDLE, hTargetProcessHandle: HANDLE, lpTargetHandle: *HANDLE, dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwOptions: DWORD) BOOL;
@@ -127,7 +127,7 @@ extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(String
 // Handle registry, shared with the client's helper threads
 // =============================================================================
 
-pub const HandleKind = enum { afd, pipe, pipe_listener };
+const HandleKind = enum { afd, pipe, pipe_listener };
 
 const IoStatusToken = struct { iosb: win32.IO_STATUS_BLOCK };
 
@@ -144,7 +144,7 @@ fn unlockRegistry() void {
     ReleaseSRWLockExclusive(&registry_lock);
 }
 
-pub fn handleKind(fd: HANDLE) HandleKind {
+fn handleKind(fd: HANDLE) HandleKind {
     lockRegistry();
     defer unlockRegistry();
     return handle_kinds.get(@intFromPtr(fd)) orelse .afd;
@@ -156,7 +156,7 @@ fn setKind(fd: HANDLE, kind: HandleKind) void {
     handle_kinds.put(std.heap.page_allocator, @intFromPtr(fd), kind) catch {};
 }
 
-pub fn isAssociated(fd: HANDLE) bool {
+fn isAssociated(fd: HANDLE) bool {
     lockRegistry();
     defer unlockRegistry();
     return associated.contains(@intFromPtr(fd));
@@ -213,7 +213,7 @@ fn waitForApcOrAlert() void {
     _ = ntdll.NtDelayExecution(.TRUE, &forever);
 }
 
-pub fn mapAfdStatus(status: win32.NTSTATUS) anyerror {
+fn mapAfdStatus(status: win32.NTSTATUS) anyerror {
     return switch (status) {
         .IO_TIMEOUT, .TIMEOUT => error.ConnectionTimedOut,
         .CONNECTION_REFUSED => error.ConnectionRefused,
@@ -223,7 +223,7 @@ pub fn mapAfdStatus(status: win32.NTSTATUS) anyerror {
     };
 }
 
-pub fn syncAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: []u8) !usize {
+fn syncAfdControl(h: HANDLE, code: win32.CTL_CODE, in: []const u8, out: []u8) !usize {
     if (isAssociated(h)) return syncViaPort(h, code, in, if (out.len > 0) out.ptr else null, out.len);
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     var done = false;
@@ -424,7 +424,7 @@ fn issueReadEvent(fd: HANDLE, buf: []u8, ev: HANDLE, iosb: *win32.IO_STATUS_BLOC
 }
 
 /// Neither pipes nor AFD handles take a receive timeout, so cancel on expiry.
-pub fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
+fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = ensureEvent() catch return 0;
     defer win32.CloseHandle(ev);
@@ -492,7 +492,7 @@ pub fn writeFile(fd: HANDLE, buf: []const u8) void {
 // AFD sockets
 // =============================================================================
 
-pub fn openAfdEndpoint(family: posix.sa_family_t) !HANDLE {
+fn openAfdEndpoint(family: posix.sa_family_t) !HANDLE {
     const mode_protocol = try Io.Threaded.posixSocketModeProtocol(family, .stream, null);
     var handle: HANDLE = undefined;
     var iosb: win32.IO_STATUS_BLOCK = undefined;
@@ -620,7 +620,7 @@ pub fn setTcpNodelay(fd: HANDLE) void {
 // users from joining or squatting the name.
 // =============================================================================
 
-pub const max_local_addr = 256;
+const max_local_addr = 256;
 const pipe_namespace = "\\\\.\\pipe\\julia-daemon";
 const PIPE_ACCESS_DUPLEX: DWORD = 0x00000003;
 const FILE_FLAG_OVERLAPPED: DWORD = 0x40000000;
@@ -688,7 +688,7 @@ fn createPipeInstance(name: []const u8, first: bool) !HANDLE {
     return handle;
 }
 
-pub fn issuePipeListen(h: HANDLE, iosb: *win32.IO_STATUS_BLOCK) !void {
+fn issuePipeListen(h: HANDLE, iosb: *win32.IO_STATUS_BLOCK) !void {
     switch (ntdll.NtFsControlFile(h, null, null, @ptrCast(iosb), iosb, win32.CTL_CODE.PIPE.LISTEN, null, 0, null, 0)) {
         .SUCCESS, .PENDING, .PIPE_CONNECTED => |status| iosb.u.Status = status,
         // A peer that came and went is readiness; the read sees EOF.
@@ -1043,7 +1043,7 @@ pub fn reapIfExited(pid: posix.pid_t) bool {
     return WaitForSingleObject(pid, 0) != WAIT_TIMEOUT;
 }
 
-pub const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };
+const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };
 
 fn filetimeToU64(ft: FILETIME) u64 {
     return @as(u64, ft.dwHighDateTime) << 32 | @as(u64, ft.dwLowDateTime);
@@ -1068,7 +1068,7 @@ pub fn processReclaimable(_: posix.pid_t) ?u64 {
     return null;
 }
 
-pub const MemInfo = struct { available: u64, total: u64 };
+const MemInfo = struct { available: u64, total: u64 };
 
 pub fn readPsiSomeAvg10() ?f64 {
     return null;
@@ -1203,7 +1203,7 @@ pub fn isatty(fd: HANDLE) bool {
     return GetFileType(fd) == FILE_TYPE_CHAR;
 }
 
-pub const SignalHandler = struct {
+const SignalHandler = struct {
     sockets_ptr: *anyopaque,
     write_fn: *const fn (*anyopaque, []const u8) void,
     notify_exit_fn: *const fn () void,
