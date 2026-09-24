@@ -41,18 +41,12 @@ const TIMER_IDENT_TICK: usize = 0xFFFF_0004;
 // EventLoop
 pub const EventLoop = struct {
     kq: posix.fd_t,
-    ping_interval_ms: isize,
-    ping_timeout_ms: isize,
     tick_armed: bool = false,
 
     pub fn init(_: u13) !EventLoop {
         const kq = c.kqueue();
         if (kq == -1) return error.KqueueCreateFailed;
-        return .{
-            .kq = kq,
-            .ping_interval_ms = 1000,
-            .ping_timeout_ms = 5000,
-        };
+        return .{ .kq = kq };
     }
 
     pub fn deinit(self: *EventLoop) void {
@@ -75,6 +69,16 @@ pub const EventLoop = struct {
             udata_tagged,
         )};
         _ = keventSubmit(self.kq, &changes);
+    }
+
+    /// The pong read and its timeout race; whichever fires first settles the ping.
+    pub fn queuePing(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
+        w.sendPing();
+        var changes = [2]c.Kevent{
+            makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.ADD | c.EV.ONESHOT, 0, 0, @intFromPtr(w)),
+            makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.ADD | c.EV.ONESHOT, 0, @intCast(timeout_ms), @intFromPtr(w)),
+        };
+        if (keventSubmit(self.kq, &changes) < 0) w.ping_pending = false;
     }
 
     pub fn watchFd(self: *EventLoop, tag: usize, fd: posix.fd_t) void {
@@ -120,8 +124,6 @@ pub const EventLoop = struct {
 pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     const kq = conductor.event_loop.kq;
     var server_fd: posix.fd_t = listener.fd();
-    conductor.event_loop.ping_interval_ms = @intCast(conductor.cfg.ping_interval * 1000);
-    conductor.event_loop.ping_timeout_ms = @intCast(conductor.cfg.ping_timeout * 1000);
     var signal_buf: [16]u8 = undefined;
     var init_changes: [3]c.Kevent = .{
         makeKevent(@intCast(server_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT),
@@ -131,7 +133,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
             c.EVFILT.TIMER,
             c.EV.ADD,
             0,
-            conductor.event_loop.ping_interval_ms,
+            @intCast(conductor.cfg.ping_interval * 1000),
             UDATA_PING_TIMER,
         ),
     };
@@ -141,8 +143,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     }
     const pressure_active = conductor.pressure_monitor.active();
     if (pressure_active) {
-        const interval_s: u64 = @min(@as(u64, 5), conductor.cfg.ping_interval);
-        const interval_ms: isize = @intCast(interval_s * 1000);
+        const interval_ms: isize = @intCast(conductor.pressureIntervalS() * 1000);
         var pc = [1]c.Kevent{makeKevent(TIMER_IDENT_PRESSURE, c.EVFILT.TIMER, c.EV.ADD, 0, interval_ms, UDATA_PRESSURE_TIMER)};
         _ = keventSubmit(kq, &pc);
     }
@@ -164,7 +165,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 std.debug.print("kevent error on ident {}: {}\n", .{ ev.ident, ev.data });
                 continue;
             }
-            const udata = udataInt(ev);
+            const udata = ev.udata;
             switch (udata) {
                 UDATA_ACCEPT => {
                     handleAccept(conductor, server_fd);
@@ -175,14 +176,11 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                     pool_changed = true;
                 },
                 UDATA_PING_TIMER => {
-                    if (!pressure_active) conductor.sweepPendingKills();
-                    conductor.enforceMaxTtl();
-                    queueWorkerPings(conductor, kq);
+                    conductor.onPingTimer();
                     pool_changed = true;
                 },
                 UDATA_PRESSURE_TIMER => {
-                    conductor.sweepPendingKills();
-                    conductor.runEvictionEpisode();
+                    conductor.onPressureTimer();
                     pool_changed = true;
                 },
                 UDATA_LIVE_TIMER => conductor.onLiveTimer(),
@@ -201,14 +199,16 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                     const is_health_check = (udata & 1) != 0;
                     const w: *worker.Worker = @ptrFromInt(udata & ~@as(usize, 1));
                     if (!conductor.isLiveWorker(w)) continue;
-                    if (ev.filter == c.EVFILT.TIMER) {
-                        if (is_health_check) {
-                            handleHealthCheck(conductor, kq, w);
-                        } else {
-                            handlePongTimeout(conductor, kq, w);
-                        }
+                    if (is_health_check) {
+                        conductor.onHealthCheck(w);
+                    } else if (ev.filter == c.EVFILT.TIMER) {
+                        var read = [1]c.Kevent{makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
+                        _ = keventSubmit(kq, &read);
+                        conductor.onPongTimeout(w);
                     } else {
-                        handlePongReady(conductor, kq, w);
+                        var timer = [1]c.Kevent{makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
+                        _ = keventSubmit(kq, &timer);
+                        conductor.onPong(w, null);
                     }
                     pool_changed = true;
                 },
@@ -273,94 +273,6 @@ fn handleSignal(
     return false;
 }
 
-// Health checking
-
-fn queueWorkerPings(conductor: *Conductor, kq: posix.fd_t) void {
-    const now = conductor.currentTime();
-    var it = conductor.workers.iterator();
-    while (it.next()) |entry| {
-        for (entry.value_ptr.items) |w| {
-            maybeQueuePing(conductor, kq, w, now);
-        }
-    }
-    if (conductor.reserve) |r| maybeQueuePing(conductor, kq, r, now);
-}
-
-fn maybeQueuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker, now: i64) void {
-    conductor.refreshIdleMemIfStale(w, now);
-    if (!w.shouldPing(now, conductor.cfg.ping_interval)) return;
-    queuePing(conductor, kq, w);
-}
-
-fn queuePing(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
-    w.sendPing();
-    var changes: [2]c.Kevent = .{
-        makeKevent(
-            @intCast(w.socket),
-            c.EVFILT.READ,
-            c.EV.ADD | c.EV.ONESHOT,
-            0,
-            0,
-            @intFromPtr(w),
-        ),
-        makeKevent(
-            @intFromPtr(w),
-            c.EVFILT.TIMER,
-            c.EV.ADD | c.EV.ONESHOT,
-            0,
-            conductor.event_loop.ping_timeout_ms,
-            @intFromPtr(w),
-        ),
-    };
-    if (keventSubmit(kq, &changes) < 0) {
-        w.ping_pending = false;
-    }
-}
-
-fn handleHealthCheck(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
-    const now = conductor.currentTime();
-    conductor.refreshIdleMemIfStale(w, now);
-    if (w.shouldPing(now, conductor.cfg.ping_interval)) {
-        queuePing(conductor, kq, w);
-    }
-}
-
-fn handlePongReady(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
-    // The timeout may fire in the same batch.
-    if (!w.ping_pending) return;
-    w.ping_pending = false;
-    var changes = [1]c.Kevent{makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
-    _ = keventSubmit(kq, &changes);
-    const n = posix.read(w.socket, &w.pong_buf) catch |err| {
-        std.debug.print("Worker {d}: pong read error: {}\n", .{ w.id, err });
-        conductor.retireWorker(w);
-        return;
-    };
-    if (n < 5) {
-        protocol.readExact(w.socket, w.pong_buf[n..]) catch {
-            std.debug.print("Worker {d}: pong short read\n", .{w.id});
-            conductor.retireWorker(w);
-            return;
-        };
-    }
-    conductor.processPong(w, &w.pong_buf);
-}
-
-fn handlePongTimeout(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) void {
-    // The read may fire in the same batch.
-    if (!w.ping_pending) return;
-    w.ping_pending = false;
-    var changes = [1]c.Kevent{makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
-    _ = keventSubmit(kq, &changes);
-    if (w.active_clients > 0) {
-        w.last_pinged = conductor.currentTime();
-        std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
-        return;
-    }
-    std.debug.print("Worker {d}: ping timed out\n", .{w.id});
-    conductor.retireWorker(w);
-}
-
 // Helpers
 
 fn makeKevent(
@@ -379,9 +291,6 @@ fn makeKevent(
         .data = data,
         .udata = udata,
     };
-}
-fn udataInt(ev: c.Kevent) usize {
-    return ev.udata;
 }
 fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent) c_int {
     return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), null);

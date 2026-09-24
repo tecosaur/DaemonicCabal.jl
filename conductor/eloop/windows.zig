@@ -166,6 +166,13 @@ pub const EventLoop = struct {
         w.ping_pending = false;
     }
 
+    /// The pong watch and its timer race; whichever packet lands first settles the ping.
+    pub fn queuePing(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
+        w.sendPing();
+        self.watchFd(@intFromPtr(w), w.socket);
+        self.startPingTimer(w, timeout_ms);
+    }
+
     fn startPingTimer(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
         self.cancelPingTimer(w);
         const ctx = startTimer(self.iocp, @intFromPtr(w), timeout_ms, true) orelse return;
@@ -204,11 +211,8 @@ pub const EventLoop = struct {
 pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     const loop = &conductor.event_loop;
     const iocp = loop.iocp;
-    const ping_timeout_ms = conductor.cfg.ping_timeout * 1000;
     const pressure_active = conductor.pressure_monitor.active();
-    // A plain if: @min would narrow the result to a u3 and overflow on the scale.
-    const pressure_s: u64 = if (conductor.cfg.ping_interval < 5) conductor.cfg.ping_interval else 5;
-    const pressure_ms = pressure_s * 1000;
+    const pressure_ms = conductor.pressureIntervalS() * 1000;
     loop.watchFd(tag_accept, listener.fd());
     scheduleTimer(iocp, @intFromEnum(EventLocation.ping_timer), conductor.cfg.ping_interval * 1000);
     if (pressure_active) scheduleTimer(iocp, @intFromEnum(EventLocation.pressure_timer), pressure_ms);
@@ -237,16 +241,22 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                     conductor.onReadable(w.tag);
                 } else {
                     const wk: *worker.Worker = @ptrFromInt(w.tag);
-                    if (conductor.isLiveWorker(wk)) handlePongReady(conductor, wk);
+                    if (conductor.isLiveWorker(wk)) {
+                        loop.cancelPingTimer(wk);
+                        conductor.onPong(wk, null);
+                    }
                 }
             } else if (key >= 0x1000 and (key & 1) == 0) {
                 const wk: *worker.Worker = @ptrFromInt(key);
                 if (!loop.takePingTimer(wk, o)) continue;
-                if (conductor.isLiveWorker(wk)) handlePongTimeout(conductor, wk);
+                if (conductor.isLiveWorker(wk)) {
+                    loop.unwatchFd(@intFromPtr(wk), wk.socket);
+                    conductor.onPongTimeout(wk);
+                }
             } else continue;
         } else if (key >= 0x1000) {
             const wk: *worker.Worker = @ptrFromInt(key & ~@as(usize, 1));
-            if (conductor.isLiveWorker(wk)) handleHealthCheck(conductor, wk);
+            if (conductor.isLiveWorker(wk)) conductor.onHealthCheck(wk);
         } else switch (@as(EventLocation, @enumFromInt(key))) {
             .signal => {
                 std.debug.print("\nShutdown requested, stopping workers...\n", .{});
@@ -254,14 +264,11 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 return;
             },
             .ping_timer => {
-                if (!pressure_active) conductor.sweepPendingKills();
-                conductor.enforceMaxTtl();
-                queueWorkerPings(conductor, ping_timeout_ms);
+                conductor.onPingTimer();
                 scheduleTimer(iocp, @intFromEnum(EventLocation.ping_timer), conductor.cfg.ping_interval * 1000);
             },
             .pressure_timer => {
-                conductor.sweepPendingKills();
-                conductor.runEvictionEpisode();
+                conductor.onPressureTimer();
                 scheduleTimer(iocp, @intFromEnum(EventLocation.pressure_timer), pressure_ms);
             },
             .live_timer => {
@@ -287,63 +294,4 @@ fn handleAccept(conductor: *Conductor, listener: *protocol.Listener) bool {
     const peer = main.PeerInfo{ .address = accepted.peer };
     conductor.admitConnection(accepted.socket, &peer);
     return true;
-}
-
-// --- Health checking --------------------------------------------------------
-
-fn queueWorkerPings(conductor: *Conductor, timeout_ms: u64) void {
-    const now = conductor.currentTime();
-    var it = conductor.workers.iterator();
-    while (it.next()) |entry| for (entry.value_ptr.items) |w| maybeQueuePing(conductor, w, timeout_ms, now);
-    if (conductor.reserve) |r| maybeQueuePing(conductor, r, timeout_ms, now);
-}
-
-fn maybeQueuePing(conductor: *Conductor, w: *worker.Worker, timeout_ms: u64, now: i64) void {
-    conductor.refreshIdleMemIfStale(w, now);
-    if (!w.shouldPing(now, conductor.cfg.ping_interval)) return;
-    queuePing(conductor, w, timeout_ms);
-}
-
-fn queuePing(conductor: *Conductor, w: *worker.Worker, timeout_ms: u64) void {
-    w.sendPing();
-    conductor.event_loop.watchFd(@intFromPtr(w), w.socket);
-    conductor.event_loop.startPingTimer(w, timeout_ms);
-}
-
-fn handleHealthCheck(conductor: *Conductor, w: *worker.Worker) void {
-    conductor.refreshIdleMemIfStale(w, conductor.currentTime());
-    const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
-    if (w.active_clients == 0 and !w.ping_pending and !recently_pinged)
-        queuePing(conductor, w, conductor.cfg.ping_timeout * 1000);
-}
-
-fn handlePongReady(conductor: *Conductor, w: *worker.Worker) void {
-    if (!w.ping_pending) return;
-    w.ping_pending = false;
-    conductor.event_loop.cancelPingTimer(w);
-    const n = platform.socketRead(w.socket, &w.pong_buf);
-    if (n == 0) {
-        std.debug.print("Worker {d}: connection closed\n", .{w.id});
-        conductor.retireWorker(w);
-        return;
-    }
-    if (n < w.pong_buf.len) protocol.readExact(w.socket, w.pong_buf[n..]) catch {
-        std.debug.print("Worker {d}: pong short read\n", .{w.id});
-        conductor.retireWorker(w);
-        return;
-    };
-    conductor.processPong(w, &w.pong_buf);
-}
-
-fn handlePongTimeout(conductor: *Conductor, w: *worker.Worker) void {
-    if (!w.ping_pending) return;
-    conductor.event_loop.unwatchFd(@intFromPtr(w), w.socket);
-    w.ping_pending = false;
-    if (w.active_clients > 0) {
-        w.last_pinged = conductor.currentTime();
-        std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
-        return;
-    }
-    std.debug.print("Worker {d}: ping timed out\n", .{w.id});
-    conductor.retireWorker(w);
 }
