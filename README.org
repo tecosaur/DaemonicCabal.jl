@@ -48,7 +48,9 @@ Daemon management (systemd):
 #+end_example
 
 Supported platforms: Linux, macOS, FreeBSD, OpenBSD, and Windows. On Windows,
-=install()= registers a logon task, =Julia\JuliaDaemon=, managed with =schtasks=.
+=install()= registers a logon task, =Julia\JuliaDaemon=, started with =schtasks=;
+the task does not track the conductor it launches, so stop it with
+=taskkill /F /IM julia-conductor.exe=.
 
 * Sessions
 
