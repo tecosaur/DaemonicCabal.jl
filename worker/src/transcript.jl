@@ -89,8 +89,8 @@ end
 
 function Watcher(json::Bool, color::Bool)
     plain = if json || !color
-        screen = TerminalText(IOBuffer())
-        PlainScreens(screen, if json TerminalText(IOBuffer()) else screen end, 0, 0.0, false)
+        screen = TerminalText(IOBuffer(); styled=color)
+        PlainScreens(screen, if json TerminalText(IOBuffer(); styled=color) else screen end, 0, 0.0, false)
     end
     Watcher(json, plain, Channel{Vector{UInt8}}(Inf))
 end
@@ -258,15 +258,20 @@ Base.bytesavailable(::RecordedOutput) = 0
 Base.buffer_writes(io::RecordedOutput, args...) = Base.buffer_writes(io.sink, args...)
 
 """
-    watch_session(label, format, out, color; until) -> exit code
+    watch_session(label, format, out; color, terminal, until) -> exit code
 
 Write the transcript of session `label` to `out`, then follow it until
 `until` ends: the watcher's signals socket, which it holds until it exits
 (its stdin may end at once). The comma-separated `format` may hold `once`,
 to stop after the transcript so far, and `json`, for one JSON object per
 line. An unrecorded session is recorded from the first watch on.
+
+`color` is `--color`'s choice, `nothing` when unset: then text is coloured
+when `out` is a colour `terminal`, but JSON is not, as its escaped codes
+show literally there.
 """
-function watch_session(label::String, format::String, out::IO, color::Bool; until::IO)
+function watch_session(label::String, format::String, out::IO;
+                       color::Union{Nothing, Bool}=nothing, terminal::Bool=false, until::IO)
     options = split(format, ',', keepempty=false)
     unknown = setdiff(options, ("json", "once"))
     if !isempty(unknown)
@@ -280,7 +285,7 @@ function watch_session(label::String, format::String, out::IO, color::Bool; unti
         json || println(out, if isempty(label) "This worker's session" else "Session '$label'" end,
                         " was not being recorded; it is from now on.")
     end
-    watcher = Watcher(json, color)
+    watcher = Watcher(json, if json color === true else something(color, terminal) end)
     # Replay and subscription under one lock, so no event falls between them.
     @lock transcript.lock begin
         for event in first(transcript_events(transcript))

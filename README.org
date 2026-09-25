@@ -131,7 +131,9 @@ pipe, or JSON) it is the plain text a terminal would finally have shown:
 progress bars and redrawn lines in their final state, with a full-screen
 program's alternate screen left out. So that redrawn lines settle first, a live
 plain watch passes each line on once it has been left alone for half a second
-to a second, or, from a REPL, once it prompts again.
+to a second, or, from a REPL, once it prompts again. =--color= decides as it
+does for a run, save that JSON is coloured only with =--color=yes=: its escaped
+codes would show literally at a terminal.
 
 The JSON lines are =run= (with its =command=), =input= (=mode= and =code=),
 =output= (=stream= and =data=), and =exit= (=code=) events, each with its =run=
