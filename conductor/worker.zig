@@ -543,6 +543,21 @@ pub const Worker = struct {
         platform.write(self.socket, &.{self.ping_seq});
     }
 
+    /// Whether the worker answers a ping within `timeout_ms`, so its message
+    /// loop is free and a request now is answered at once. An unanswered
+    /// ping's pong comes late, and is skipped as any late pong is.
+    pub fn answersWithin(self: *Worker, timeout_ms: u32) bool {
+        self.sendPing();
+        while (platform.waitReadable(self.socket, timeout_ms)) {
+            const header = self.readHeader() catch return false;
+            if (header.msg_type != .pong) return false;
+            var payload: [protocol.worker.pong_size - 3]u8 = undefined;
+            readExact(self.socket, &payload) catch return false;
+            if (payload[0] == self.ping_seq) return true;
+        }
+        return false;
+    }
+
     /// Julia force-throws past a tight loop from the fifth SIGINT in quick
     /// succession (one more is sent to spare), and a signal still pending when
     /// the next is sent merges with it.

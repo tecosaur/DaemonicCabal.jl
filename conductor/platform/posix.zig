@@ -46,6 +46,23 @@ pub fn sendNonBlocking(fd: posix.socket_t, buf: []const u8) ?usize {
         }
     }
 }
+/// What the socket holds, without waiting: 0 when nothing; null once it has ended.
+pub fn recvNonBlocking(fd: posix.socket_t, buf: []u8) ?usize {
+    while (true) {
+        const rc = posix.system.recvfrom(fd, buf.ptr, buf.len, posix.MSG.DONTWAIT, null, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return if (rc == 0) null else @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return 0,
+            else => return null,
+        }
+    }
+}
+/// Whether `fd` has input, or has ended, within `timeout_ms`.
+pub fn waitReadable(fd: posix.fd_t, timeout_ms: u32) bool {
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    return (posix.poll(&pfd, @intCast(timeout_ms)) catch return true) != 0;
+}
 pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     return posix.read(fd, buf) catch |err| {
         @branchHint(.cold);

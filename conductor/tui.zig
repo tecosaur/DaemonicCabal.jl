@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //
 // The `--status=live` view's pure parts: terminal keys, focus movement, and
-// the framed pane. The conductor owns the state and the I/O (`main.zig`).
+// the framed pane. The conductor owns the state and the I/O (`live.zig`).
 
 const std = @import("std");
 
@@ -95,17 +95,33 @@ pub fn keepFocus(order: []const u32, focus: ?u32, row: usize) ?u32 {
     return if (order.len > 0) order[@min(row, order.len - 1)] else null;
 }
 
+/// The last lines of `text`, at most `out.len`, oldest first; a final
+/// newline ends a line rather than starting one.
+pub fn lastLines(text: []const u8, out: [][]const u8) [][]const u8 {
+    if (text.len == 0) return out[0..0];
+    var rest = if (text[text.len - 1] == '\n') text[0 .. text.len - 1] else text;
+    var n: usize = 0;
+    while (n < out.len) {
+        const cut = std.mem.lastIndexOfScalar(u8, rest, '\n');
+        out[out.len - 1 - n] = if (cut) |i| rest[i + 1 ..] else rest;
+        n += 1;
+        rest = if (cut) |i| rest[0..i] else break;
+    }
+    return out[out.len - n ..];
+}
+
 pub const tab_width = 8;
 
-/// A framed box of `height` rows, borders included, `width` columns wide.
-/// `title` and `footer` sit in the borders; `body` fills the rows between,
-/// from the top, cut to fit. Each character counts as one column, as in
-/// the transcript's `TerminalText`.
+/// A framed box of `height` rows, borders included, `width` columns wide,
+/// each row after a dim `gutter`. `title` and `footer` sit in the borders;
+/// `body` fills the rows between, from the top, cut to fit. Each character
+/// counts as one column, as in the transcript's `TerminalText`.
 pub const Pane = struct {
     title: []const u8,
     footer: []const u8,
     body: []const []const u8,
     dim_body: bool = false,
+    gutter: []const []const u8 = &.{},
 };
 
 pub const min_pane_rows = 5; // three of body
@@ -114,9 +130,11 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
     const inner = width -| 4;
     const dim = if (styled) "\x1b[2m" else "";
     const reset = if (styled) "\x1b[0m" else "";
-    try writeBorder(out, gpa, .{ dim, reset }, "╭─", "╮", pane.title, width);
+    try writeBorder(out, gpa, .{ dim, reset }, pane.gutter, "╭─", "╮", pane.title, width);
     for (0..height -| 2) |row| {
-        try out.print(gpa, "{s}│{s} ", .{ dim, reset });
+        try out.appendSlice(gpa, dim);
+        for (pane.gutter) |part| try out.appendSlice(gpa, part);
+        try out.print(gpa, "│{s} ", .{reset});
         if (pane.dim_body) try out.appendSlice(gpa, dim);
         const text = if (row < pane.body.len) pane.body[row] else "";
         const used = try appendColumns(out, gpa, text, inner);
@@ -124,12 +142,14 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
         try out.appendNTimes(gpa, ' ', inner - used);
         try out.print(gpa, " {s}│{s}\n", .{ dim, reset });
     }
-    try writeBorder(out, gpa, .{ dim, reset }, "╰─", "╯", pane.footer, width);
+    try writeBorder(out, gpa, .{ dim, reset }, pane.gutter, "╰─", "╯", pane.footer, width);
 }
 
 // "╭─ label ────╮", the label cut to fit.
-fn writeBorder(out: *std.ArrayList(u8), gpa: std.mem.Allocator, style: [2][]const u8, left: []const u8, right: []const u8, label: []const u8, width: usize) !void {
-    try out.print(gpa, "{s}{s}", .{ style[0], left });
+fn writeBorder(out: *std.ArrayList(u8), gpa: std.mem.Allocator, style: [2][]const u8, gutter: []const []const u8, left: []const u8, right: []const u8, label: []const u8, width: usize) !void {
+    try out.appendSlice(gpa, style[0]);
+    for (gutter) |part| try out.appendSlice(gpa, part);
+    try out.appendSlice(gpa, left);
     var used: usize = 2;
     if (label.len > 0 and width > 6) {
         try out.append(gpa, ' ');
@@ -207,6 +227,17 @@ test "a vanished focus passes to the client at its row" {
     try std.testing.expectEqual(@as(?u32, null), keepFocus(&order, null, 0));
 }
 
+test "last lines: the tail, blank lines kept" {
+    var buf: [3][]const u8 = undefined;
+    const lines = lastLines("a\nb\n\nc\n", &buf);
+    try std.testing.expectEqual(@as(usize, 3), lines.len);
+    try std.testing.expectEqualStrings("b", lines[0]);
+    try std.testing.expectEqualStrings("", lines[1]);
+    try std.testing.expectEqualStrings("c", lines[2]);
+    try std.testing.expectEqual(@as(usize, 2), lastLines("x\npartial", &buf).len);
+    try std.testing.expectEqual(@as(usize, 0), lastLines("", &buf).len);
+}
+
 test "columns: controls dropped, tabs expanded, cut at the width" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -222,13 +253,13 @@ test "pane: framed to its size, labels in the borders" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    const pane = Pane{ .title = "title", .footer = "a footer too long to fit", .body = &.{ "one", "two", "three" } };
+    const pane = Pane{ .title = "title", .footer = "a footer too long to fit", .body = &.{ "one", "two", "three" }, .gutter = &.{ "│", "  " } };
     try writePane(&out, gpa, false, pane, 20, 4);
     try std.testing.expectEqualStrings(
-        \\╭─ title ──────────╮
-        \\│ one              │
-        \\│ two              │
-        \\╰─ a footer too l ─╯
+        \\│  ╭─ title ──────────╮
+        \\│  │ one              │
+        \\│  │ two              │
+        \\│  ╰─ a footer too l ─╯
         \\
     , out.items);
 }

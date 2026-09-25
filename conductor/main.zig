@@ -1071,7 +1071,7 @@ pub const Conductor = struct {
         return self.tryAssignWorker(chosen, client_info, .recent_worker);
     }
 
-    fn handleRunClientError(self: *Conductor, w: *worker.Worker, err: anyerror) bool {
+    pub fn handleRunClientError(self: *Conductor, w: *worker.Worker, err: anyerror) bool {
         switch (err) {
             error.WorkerBusy => {
                 std.debug.print("Worker {d}: busy (likely has stuck client), syncing\n", .{w.id});
@@ -1751,7 +1751,7 @@ pub const Conductor = struct {
 
     // --- Port pool ---
 
-    fn releasePortSet(self: *Conductor, port_set: u16) void {
+    pub fn releasePortSet(self: *Conductor, port_set: u16) void {
         if (port_set != protocol.PortPool.none) {
             if (self.port_pool) |*pool| pool.release(port_set);
         }

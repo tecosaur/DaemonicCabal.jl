@@ -117,6 +117,7 @@ extern "kernel32" fn CreateNamedPipeW(lpName: [*:0]const u16, dwOpenMode: DWORD,
 extern "kernel32" fn AcquireSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
 extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
 extern "kernel32" fn Sleep(dwMilliseconds: DWORD) void;
+extern "kernel32" fn PeekNamedPipe(hNamedPipe: HANDLE, lpBuffer: ?*anyopaque, nBufferSize: DWORD, lpBytesRead: ?*DWORD, lpTotalBytesAvailable: ?*DWORD, lpBytesLeftThisMessage: ?*DWORD) BOOL;
 extern "kernel32" fn GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: [*]u16) DWORD;
 extern "kernel32" fn GetCurrentProcess() HANDLE;
 extern "kernel32" fn DuplicateHandle(hSourceProcessHandle: HANDLE, hSourceHandle: HANDLE, hTargetProcessHandle: HANDLE, lpTargetHandle: *HANDLE, dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwOptions: DWORD) BOOL;
@@ -393,6 +394,26 @@ pub fn socketWrite(fd: HANDLE, buf: []const u8) void {
 pub fn sendNonBlocking(fd: HANDLE, buf: []const u8) ?usize {
     socketWrite(fd, buf);
     return buf.len;
+}
+
+/// What `fd` holds, without waiting: 0 when nothing; null once it has ended.
+pub fn recvNonBlocking(fd: HANDLE, buf: []u8) ?usize {
+    if (!waitReadable(fd, 0)) return 0;
+    const n = socketRead(fd, buf);
+    return if (n == 0) null else n;
+}
+
+/// Whether `fd` has input, or has ended, within `timeout_ms`. A pipe, which
+/// has no readiness wait, is peeked every 10 ms.
+pub fn waitReadable(fd: HANDLE, timeout_ms: u32) bool {
+    if (handleKind(fd) == .afd) return pollReadable(fd, @intCast(timeout_ms)) catch true;
+    var waited: u32 = 0;
+    while (true) : (waited += 10) {
+        var available: DWORD = 0;
+        if (PeekNamedPipe(fd, null, 0, null, &available, null) == 0 or available > 0) return true;
+        if (waited >= timeout_ms) return false;
+        Sleep(10);
+    }
 }
 
 /// Half-closes a socket, keeping the handle valid; a pipe, which cannot, is closed.

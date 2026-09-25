@@ -94,11 +94,13 @@ const View = struct {
 };
 
 /// `lines` is for the live view's cursor-up redraw; `clients` are the tree's
-/// focusable clients, top to bottom (none for JSON).
+/// focusable clients, top to bottom (none for JSON); `placement` is where
+/// the focused client's row ends, for the live view's pane.
 pub const Report = struct {
     bytes: []u8,
     lines: usize,
     clients: []u32,
+    placement: ?Placement = null,
 
     pub fn deinit(self: Report, gpa: std.mem.Allocator) void {
         gpa.free(self.bytes);
@@ -110,12 +112,21 @@ pub fn render(c: *Conductor, opts: Options) !Report {
     return renderAt(c, opts, c.currentTime());
 }
 
+/// Just after the focused client's row: `at` in `Report.bytes`, and the
+/// tree's lines that continue beneath it, as a gutter of `gutter_cols`.
+pub const Placement = struct {
+    at: usize,
+    gutter: [3][]const u8,
+    gutter_cols: usize,
+};
+
 // For the test harness, which has no live `Io` clock.
 pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(c.allocator);
     var clients: std.ArrayList(u32) = .empty;
     errdefer clients.deinit(c.allocator);
+    var placement: ?Placement = null;
     const w = Writer{ .list = &buf, .gpa = c.allocator };
     const view = try View.init(c.allocator, c, opts.scope);
     defer view.deinit(c.allocator);
@@ -123,13 +134,13 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
         try renderJson(c, w, view, now);
     } else {
         const tints: ?Tints = if (opts.palette) |p| .{ .palette = p } else null;
-        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients };
+        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients, .placement = &placement };
         try renderTree(c, w, Style{ .enabled = opts.tty }, ctx, view, now);
     }
     const lines = std.mem.count(u8, buf.items, "\n");
     const bytes = try buf.toOwnedSlice(c.allocator);
     errdefer c.allocator.free(bytes);
-    return .{ .bytes = bytes, .lines = lines, .clients = try clients.toOwnedSlice(c.allocator) };
+    return .{ .bytes = bytes, .lines = lines, .clients = try clients.toOwnedSlice(c.allocator), .placement = placement };
 }
 
 // --- Styling -----------------------------------------------------------------
@@ -214,6 +225,7 @@ const Ctx = struct {
     mem_ceiling: u64,
     focus: ?u32,
     clients: *std.ArrayList(u32), // focusable, in drawing order
+    placement: *?Placement,
 };
 
 fn gradientTints(s: Style, ctx: Ctx) ?Tints {
@@ -579,6 +591,11 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             try s.close(w);
             if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
             try w.writeByte('\n');
+            if (focused) ctx.placement.* = .{
+                .at = w.list.items.len,
+                .gutter = .{ base, if (worker_last) "   " else "│  ", if (seen == total) "      " else "   │  " },
+                .gutter_cols = base.len + 9,
+            };
         }
     }
 }
