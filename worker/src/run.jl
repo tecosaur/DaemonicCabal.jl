@@ -111,23 +111,11 @@ function getval(pairlist, key, default)
     if isnothing(index) default else last(pairlist[index]) end
 end
 
+# The client judges its own stdout, as terminfo misjudges terminals that set
+# no TERM (as on Windows).
 function clienthascolor(client::ClientInfo)
     cs = getval(client.switches, "--color", nothing)
-    if cs !== nothing
-        isyes(cs)
-    elseif client.color
-        # terminfo misjudges terminals that set no TERM, as on Windows.
-        true
-    elseif client.tty
-        term = getval(client.env, "TERM", "")
-        @static if VERSION >= v"1.11"
-            haskey(Base.load_terminfo(term), :setaf)
-        else
-            startswith(term, "xterm")
-        end
-    else
-        false
-    end
+    if isnothing(cs) client.color else isyes(cs) end
 end
 
 function is_repl_client(client::ClientInfo)
