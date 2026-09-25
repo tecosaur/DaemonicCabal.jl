@@ -40,7 +40,9 @@ Client-specific switches:
  --revise[=yes|no*]         Enable or disable Revise.jl integration
  --restart                  Kill workers for the project and exit
  --sandbox                  Run in an isolated sandbox (Linux only)
- --status[=live|json]       Show the state of the workers, optionally in json
+ --status[=live|json]       Show the state of the workers, as JSON, or live:
+                            ↓ focuses a session, to preview, follow,
+                            show its stacktrace, interrupt or terminate it
  --watch[=json][,once]      Follow the session's transcript (this project's,
                             or --session=<label>'s), as JSON lines, or once
 
@@ -145,6 +147,32 @@ dropping the oldest runs as it fills. =JULIA_DAEMON_RECORD= sets which sessions
 record from their start; any other starts at its first watch. A =--sync=
 session is always recorded, as its one shared screen. Recording other sessions
 needs Julia 1.11 or later.
+
+** Live status (=--status=live=)
+
+=--status=live= keeps the worker report on screen, redrawn as it changes. Press
+=↓= to focus a session: where each worker holds one (the default), the worker's
+row opens into a framed pane beneath it, and otherwise the client's does. The
+pane previews a recorded session's transcript, in colour, and names the keys:
+
+| Key   | Action                                                                  |
+|-------+-------------------------------------------------------------------------|
+| =↑ ↓= | Move the focus; =↑= from the first session, or =Esc=, lets go            |
+| =⏎=   | Follow the session full-screen, as =--watch= would, or, with a          |
+|       | stacktrace in the pane, show the whole of it (=q= to come back)         |
+| =s=   | Show the stacktrace: the worker's stacks at once, then its profile       |
+| =i=   | Interrupt, as the session's own Ctrl-C would                             |
+| =t=   | Terminate the session, once confirmed with =y=                           |
+| =q=   | Quit, leaving the last frame                                             |
+
+A stacktrace asks Julia for a profile peek (SIGUSR1, or SIGINFO on BSD and macOS).
+Its stacks come straight away, even from a loop that never yields; the profile
+follows once the session yields, and =⏎= shows the lot. A session waiting rather
+than running (on I/O, a lock, =sleep=) is shown where it waits, from Julia 1.12
+on. Terminating ends the
+session's run, or a labelled session outright, and retires its worker only when
+the run will not stop, even to a forced interrupt. The preview only reads
+sessions already being recorded; following one records it from then on.
 
 * Sandboxing
 
