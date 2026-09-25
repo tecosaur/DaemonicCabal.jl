@@ -272,7 +272,13 @@ end
 # After `exec_options` in base/client.jl.
 function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing)
-    isyes(getval(client.switches, "--revise", get(ENV, "JULIA_DAEMON_REVISE", "no"))) && revise_code()
+    wants_revise(client) && revise_code()
+    # A session keeps its state, so it is warned rather than moved to a fresh worker.
+    if client.force
+        stale = stale_files(client)
+        isempty(stale) || @warn join(["Running outdated code: these changed on disk after this session loaded them";
+                                      map(f -> "  " * f, stale)], '\n') _module=nothing _file=nothing
+    end
     set_switches = [s for (s, _) in client.switches]
     runrepl = is_repl_client(client)
     for (switch, value) in client.switches

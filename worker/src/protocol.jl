@@ -35,6 +35,7 @@ const ERR_CODE = (
     project_not_found = 0x0002,
     worker_busy     = 0x0003,
     internal_error  = 0x0004,
+    stale_code      = 0x0005,
 )
 
 struct MessageHeader

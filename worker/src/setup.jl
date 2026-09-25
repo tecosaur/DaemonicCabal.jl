@@ -54,6 +54,52 @@ function load_revise()
     end
 end
 
+wants_revise(client::ClientInfo) = isyes(getval(client.switches, "--revise",
+    getval(client.env, "JULIA_DAEMON_REVISE", get(ENV, "JULIA_DAEMON_REVISE", "no"))))
+
+# Staleness: a reused worker must not run code that differs from what is on
+# disk, as a fresh `julia` never would.
+
+const STALENESS = (
+    lock = ReentrantLock(),
+    manifests = Dict{String, Float64}(),  # path => mtime when first loaded from
+    sources = Dict{String, Float64}())    # dev'd packages' files
+
+# A `package_callbacks` hook. Stdlibs ship with Julia, and registered packages
+# sit in a depot's `packages/`, which never changes.
+function record_package_sources(id::Base.PkgId)
+    origin = get(Base.pkgorigins, id, nothing)
+    (isnothing(origin) || isnothing(origin.path)) && return
+    (Base.in_sysimage(id) || startswith(origin.path, Sys.STDLIB)) && return
+    manifests = filter!(!isnothing, [Base.project_file_manifest_path(p) for p in Base.load_path() if isfile(p)])
+    registered = any(d -> startswith(origin.path, joinpath(d, "packages", "")), DEPOT_PATH)
+    files = if registered String[] else package_files(origin) end
+    @lock STALENESS.lock begin
+        for m in manifests get!(() -> mtime(m), STALENESS.manifests, m) end
+        for f in files STALENESS.sources[f] = mtime(f) end
+    end
+end
+
+# The precompile cache lists what the package included; without one, its tree.
+function package_files(origin::Base.PkgOrigin)
+    if !isnothing(origin.cachepath)
+        try
+            return [inc.filename for inc in Base.parse_cache_header(origin.cachepath)[2][1]]
+        catch
+        end
+    end
+    [joinpath(dir, f) for (dir, _, fs) in walkdir(dirname(origin.path)) for f in fs if endswith(f, ".jl")]
+end
+
+# Revise applies source edits itself, but not a changed manifest.
+function stale_files(client::ClientInfo)
+    @lock STALENESS.lock begin
+        changed = [m for (m, t) in STALENESS.manifests if mtime(m) != t]
+        wants_revise(client) || append!(changed, (f for (f, t) in STALENESS.sources if mtime(f) != t))
+        changed
+    end
+end
+
 # Orphan failsafe, for a conductor death pdeathsig misses (non-Linux, unclean crash).
 
 function queue_orphan_check()
@@ -548,8 +594,12 @@ function serve_message(conn::IO, header::MessageHeader)
         end
         active_count, draining = @lock STATE.lock (length(STATE.clients), STATE.soft_exit[])
         # force bypasses capacity (labeled sessions) but never the drain.
+        stale = stale_files(client)
         if draining || (!client.force && MAX_CLIENTS > 0 && active_count >= MAX_CLIENTS)
             send_sockets(conn, "", "", "", "", active_count)  # reject: empty paths + count
+        elseif !isempty(stale) && !client.force
+            # The conductor retires this worker and starts a fresh one.
+            send_error(conn, ERR_CODE.stale_code, "changed on disk since loaded: " * join(stale, ", "))
         else
             replied = Ref(false)
             try

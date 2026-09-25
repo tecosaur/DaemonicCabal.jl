@@ -131,6 +131,7 @@ pub const worker = struct {
         project_not_found = 2,
         worker_busy = 3,
         internal_error = 4,
+        stale_code = 5,
         _,
     };
 
