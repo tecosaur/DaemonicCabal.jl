@@ -79,6 +79,11 @@ Labeled sessions bypass the per-worker client limit, and workers holding idle
 labelled sessions persist for longer, their minimum lifetime is the geometric
 mean of =MIN_TTL= and =MAX_TTL=.
 
+A worker is not reused once its code has changed on disk: a manifest it loaded
+from, or a file of a dev'd package it loaded. The next client gets a fresh
+worker instead. A session stays on its worker with a warning, and a =--revise=
+run leaves source edits to Revise.
+
 ** Collaborative sessions (=--sync=)
 
 Adding =--sync= upgrades a labeled session to a shared terminal --- multiple
@@ -99,6 +104,45 @@ Interactive clients share a merged stdin and broadcast stdout/stderr.
 Non-interactive clients (=-e=, =-E=, programfile) run in the shared =Main= with
 output broadcast to all attached terminals. Ctrl-D detaches without killing the
 session; the REPL exits when the last interactive client disconnects.
+
+** Transcripts (=--watch=)
+
+A session's runs are recorded in its worker: each command, its REPL input, its
+output, and its exit code. =--watch= shows a session's transcript so far, then
+follows it live, from any terminal:
+
+#+begin_example
+# Terminal A: a long job
+~$ juliaclient --session=job train.jl
+
+# Terminal B: catch up, then follow along (Ctrl-C to stop)
+~$ juliaclient --session=job --watch
+
+# Just the transcript so far, as JSON lines
+~$ juliaclient --session=job --watch=json,once > job.jsonl
+#+end_example
+
+Without a label, =--watch= follows this project's unlabelled session, preferring
+one that is running a client. A watcher leaves the session alone: its Ctrl-C
+only stops the watch, and it takes no client's place on the worker.
+
+Output keeps its colour when watched at a terminal. Anywhere else (a file, a
+pipe, or JSON) it is the plain text a terminal would finally have shown:
+progress bars and redrawn lines in their final state, with a full-screen
+program's alternate screen left out. So that redrawn lines settle first, a live
+plain watch passes each line on once it has been left alone for half a second
+to a second, or, from a REPL, once it prompts again.
+
+The JSON lines are =run= (with its =command=), =input= (=mode= and =code=),
+=output= (=stream= and =data=), and =exit= (=code=) events, each with its =run=
+number and =time=. A REPL's input is its lines, in their mode (=julia=, =shell=,
+=help=, =pkg=, …), and its output leaves out the prompt and line editing.
+
+Transcripts are kept in a ring of =JULIA_DAEMON_HISTORY_BYTES= per session,
+dropping the oldest runs as it fills. =JULIA_DAEMON_RECORD= sets which sessions
+record from their start; any other starts at its first watch. A =--sync=
+session is always recorded, as its one shared screen. Recording other sessions
+needs Julia 1.11 or later.
 
 * Sandboxing
 
@@ -158,6 +202,11 @@ Optional cgroup limits can restrict memory and CPU per sandbox.
 Local (loopback) TCP clients are not sandboxed unless =--sandbox= is passed.
 Remote clients on non-Linux platforms are rejected.
 
+Sessions are reachable from the host into a sandbox, never out of one. The host
+can join or =--watch= a =--session=<label>= in a sandbox the daemon built,
+bringing in only the environment the sandbox allows. A sandboxed client never
+reaches a host session, and its =--status= shows only its own sandbox.
+
 * Configuration
 
 Environment variables read at daemon startup:
@@ -180,6 +229,8 @@ Environment variables read at daemon startup:
 | =JULIA_DAEMON_PING_TIMEOUT=      | =5=                            | Ping timeout before killing unresponsive worker (seconds)                                                                        |
 | =JULIA_DAEMON_SPAWN_TIMEOUT=     | =600=                          | Seconds a new worker may take to connect (a fresh depot precompiles DaemonWorker first)                                          |
 | =JULIA_DAEMON_REVISE=            | =no=                           | Enable Revise.jl by default (also settable with =--revise=)                                                                        |
+| =JULIA_DAEMON_RECORD=            | =session=                      | Sessions recorded from their start: =sync= (only =--sync=), =interactive= (also those begun at a terminal REPL), or =session= (all) |
+| =JULIA_DAEMON_HISTORY_BYTES=     | =1M=                           | Transcript ring per session (=K=, =M=, =G= suffixes, up to =4G=)                                                                     |
 
 Memory-pressure eviction:
 
