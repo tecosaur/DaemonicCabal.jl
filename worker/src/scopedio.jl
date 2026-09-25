@@ -69,6 +69,7 @@ const WORKER_TERM = VirtualTerm(
 
 const ACTIVE_TERM = ScopedValue{VirtualTerm}(WORKER_TERM)
 const CLIENT_MODULE = ScopedValue{Module}(Main)
+const CLIENT_INTERACTIVE = ScopedValue(false)
 const CLIENT_REPL = ScopedValue(Ref{REPL.LineEditREPL}())
 const CLIENT_RECORDING = ScopedValue{Union{Nothing, Recording}}(nothing)
 const REPLAY_TARGET = ScopedValue{Union{Nothing, Tuple{StreamIO, SyncSession}}}(nothing)

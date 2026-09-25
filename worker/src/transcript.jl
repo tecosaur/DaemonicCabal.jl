@@ -140,7 +140,7 @@ Recording(t::Transcript, run::Int, started::Float64, command::String) =
 
 const TRANSCRIPTS = (lock = ReentrantLock(), sessions = Dict{String, Transcript}())
 
-# `interactive`: the session's first run is a REPL at a terminal.
+# `interactive`: the session's first run is, as `isinteractive()` tells.
 function session_transcript(label::String; interactive::Bool=false)
     @lock TRANSCRIPTS.lock get!(TRANSCRIPTS.sessions, label) do
         transcript = Transcript()
