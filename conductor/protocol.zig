@@ -75,7 +75,9 @@ pub const CLIENT_HELP =
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
     \\ --restart                  Kill workers for the project and exit
     \\ --sandbox                  Run in an isolated sandbox (Linux only)
-    \\ --status[=live|json]       Show the state of the workers, optionally in json
+    \\ --status[=live|json]       Show the state of the workers, as JSON, or live:
+    \\                            ↓ focuses a session, to preview, follow,
+    \\                            show its stacktrace, interrupt or terminate it
     \\ --watch[=json][,once]      Follow the session's transcript (this project's,
     \\                            or --session=<label>'s), as JSON lines, or once
     \\
