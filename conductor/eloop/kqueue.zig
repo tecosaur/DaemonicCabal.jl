@@ -114,7 +114,7 @@ pub const EventLoop = struct {
             makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0),
         };
         _ = keventSubmit(self.kq, &changes);
-        var buf: [5]u8 = undefined;
+        var buf: [protocol.worker.pong_size]u8 = undefined;
         protocol.readExact(w.socket, &buf) catch {};
         w.ping_pending = false;
     }

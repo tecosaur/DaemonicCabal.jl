@@ -6,7 +6,7 @@ let
     # -- Conductor messages ------------------------------------------------------
     buf = IOBuffer()
     write(buf, UInt32(PROTOCOL_MAGIC))
-    write(buf, UInt8(MSG_TYPE.ping), UInt16(0))
+    write(buf, UInt8(MSG_TYPE.ping), UInt16(1), UInt8(1))
     proj = "/tmp/test"
     write(buf, UInt8(MSG_TYPE.set_project), UInt16(2 + ncodeunits(proj)))
     write_string(buf, proj)
@@ -36,6 +36,7 @@ let
     # -- Protocol reading ------------------------------------------------------
     verify_magic(buf)
     read_header(buf)                              # ping
+    read(buf, UInt8)
     h = read_header(buf)                          # set_project
     read_string(buf)
     read_header(buf)                              # query_state
@@ -46,7 +47,7 @@ let
     read_header(buf)                              # soft_exit
     # -- Protocol writing ------------------------------------------------------
     out = IOBuffer()
-    send_pong(out, 0)
+    send_pong(out, 0x01, 0)
     send_sockets(out, "/a", "/b", "/c", "/d", 1)
     send_state(out, 0, round(Int, time()), false)
     send_state(out, 1, round(Int, time()), true)
@@ -113,7 +114,7 @@ precompile(read_client_run, (Base.PipeEndpoint,))
 precompile(read_string, (Base.PipeEndpoint,))
 precompile(write_header, (Base.PipeEndpoint, UInt8, Int))
 precompile(write_string, (Base.PipeEndpoint, String))
-precompile(send_pong, (Base.PipeEndpoint, Int))
+precompile(send_pong, (Base.PipeEndpoint, UInt8, Int))
 precompile(send_sockets, (Base.PipeEndpoint, String, String, String, String, Int))
 precompile(send_state, (Base.PipeEndpoint, Int, Int, Bool))
 precompile(send_error, (Base.PipeEndpoint, UInt16, String))

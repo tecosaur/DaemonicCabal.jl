@@ -85,7 +85,7 @@ pub const EventLoop = struct {
         if (w.ping_pending) {
             _ = self.ring.cancel(@intFromEnum(EventLocation.ignored), @intFromPtr(w), 0) catch {};
             _ = self.ring.submit() catch {};
-            var buf: [5]u8 = undefined;
+            var buf: [protocol.worker.pong_size]u8 = undefined;
             protocol.readExact(w.socket, &buf) catch {};
             w.ping_pending = false;
         } else {
