@@ -517,10 +517,12 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.sock
         .local => platform.connectLocalOnce(raw),
         .tcp => if (protocol.connectAddress(.tcp, raw, protocol.connect_timeout_ms)) |c| c.socket else |e| e,
     };
-    return connected catch |e| {
+    const socket = connected catch |e| {
         platform.eprint("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ raw, e });
         exitClient(127);
     };
+    if (transport_mode == .tcp) platform.setTcpKeepalive(socket, protocol.tcp_keepalive_idle_s);
+    return socket;
 }
 
 /// Dials the conductor already reached, never resolving a name again, as

@@ -233,6 +233,14 @@ pub fn setRecvTimeout(socket: posix.fd_t, seconds: u32) void {
     )) catch {};
 }
 
+/// Then probes each second, ten times, as libuv does for the worker's end.
+pub fn setTcpKeepalive(socket: posix.fd_t, idle_s: u32) void {
+    _ = posix.system.setsockopt(socket, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int));
+    const options = impl.tcp_keepalive_options orelse return;
+    for (options, [3]c_int{ @intCast(idle_s), 1, 10 }) |option, value|
+        _ = posix.system.setsockopt(socket, 6, option, std.mem.asBytes(&value), @sizeOf(c_int)); // IPPROTO_TCP
+}
+
 pub fn setTcpNodelay(socket: posix.fd_t) void {
     // Raw: std's wrapper treats an already-closed socket as unreachable.
     _ = posix.system.setsockopt(socket, 6, 1, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int)); // IPPROTO_TCP, TCP_NODELAY

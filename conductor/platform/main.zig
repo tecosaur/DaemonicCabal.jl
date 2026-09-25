@@ -103,6 +103,7 @@ pub const readMemInfo = shared.readMemInfo;
 pub const getParentName = shared.getParentName;
 pub const setRecvTimeout = shared.setRecvTimeout;
 pub const setTcpNodelay = shared.setTcpNodelay;
+pub const setTcpKeepalive = shared.setTcpKeepalive;
 pub const getTerminalSize = shared.getTerminalSize;
 pub const isatty = shared.isatty;
 pub const registerSignalHandlers = shared.registerSignalHandlers;

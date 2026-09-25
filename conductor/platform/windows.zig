@@ -608,6 +608,14 @@ pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !HANDLE {
     return fd;
 }
 
+/// Then probes each second, ten times, as libuv does for the worker's end.
+pub fn setTcpKeepalive(fd: HANDLE, idle_s: u32) void {
+    const ws2 = win32.ws2_32;
+    afdSockopt(fd, .set, ws2.SOL.SOCKET, ws2.SO.KEEPALIVE, std.mem.asBytes(&@as(c_int, 1))) catch {};
+    for ([3]u32{ ws2.TCP.KEEPALIVE, ws2.TCP.KEEPINTVL, ws2.TCP.KEEPCNT }, [3]c_int{ @intCast(idle_s), 1, 10 }) |option, value|
+        afdSockopt(fd, .set, ws2.IPPROTO.TCP, option, std.mem.asBytes(&value)) catch {};
+}
+
 pub fn setTcpNodelay(fd: HANDLE) void {
     const one: c_int = 1;
     afdSockopt(fd, .set, win32.ws2_32.IPPROTO.TCP, win32.ws2_32.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
