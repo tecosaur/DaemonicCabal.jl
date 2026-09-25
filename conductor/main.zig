@@ -490,7 +490,8 @@ pub const Conductor = struct {
         if (sandbox == .remote) {
             const session_label = request.parsed.getSwitch("--session");
             if (session_label != null and session_label.?.len > 0 and self.cfg.sandbox_session_bypass) {
-                if (self.findWorkerByLabelGlobal(session_label.?)) |w| {
+                if (self.findWorkerByLabelGlobal(session_label.?, false)) |found| {
+                    const w = found.w;
                     std.debug.print("Client {d}: session bypass — joining local worker {d} (label '{s}')\n", .{
                         self.client_counter, w.id, session_label.?,
                     });
@@ -714,7 +715,7 @@ pub const Conductor = struct {
             .pid = request.pid,
             .host_pid = request.host_pid,
             .ppid = request.ppid,
-            .cwd = if (sandbox == .remote) "/home/sandbox" else request.cwd,
+            .cwd = if (sandbox == .remote) sandbox_home else request.cwd,
             .env = sandbox_env orelse request.env,
             .switches = request.parsed.switches.items,
             .programfile = request.parsed.program_file,
@@ -917,12 +918,21 @@ pub const Conductor = struct {
                 if (std.mem.eql(u8, sw.name, "--project")) break true;
             } else false;
             // A sandboxed client's label stays in its pool: joining a host worker would escape.
-            const found = if (explicit_project or sandbox != .none)
-                findWorkerByLabel(list, session_label.?)
+            const found: ?LabelledWorker = if (explicit_project or sandbox != .none)
+                (if (findWorkerByLabel(list, session_label.?)) |w| .{ .w = w, .pool_key = "" } else null)
             else
-                self.findWorkerByLabelGlobal(session_label.?);
-            if (found) |w| {
-                if (self.tryAssignWorker(w, client_info, .session_label)) |a| return a;
+                self.findWorkerByLabelGlobal(session_label.?, true);
+            if (found) |f| {
+                // A host client carries into a sandbox only what the sandbox itself starts with.
+                var info = client_info.*;
+                const entering = sandbox == .none and f.w.launch == .sandboxed;
+                const env = if (entering) try self.buildSandboxJoinEnv(client_info.env) else null;
+                defer if (env) |e| self.allocator.free(e);
+                if (env) |e| {
+                    info.env = e;
+                    info.cwd = sandboxWorkdir(f.pool_key);
+                }
+                if (self.tryAssignWorker(f.w, &info, .session_label)) |a| return a;
             }
         }
         // Skip ppid/recency reuse for remote clients (isolation) and labeled
@@ -1226,15 +1236,28 @@ pub const Conductor = struct {
         }
     }
 
-    fn findWorkerByLabelGlobal(self: *Conductor, label: []const u8) ?*worker.Worker {
+    const LabelledWorker = struct { w: *worker.Worker, pool_key: []const u8 };
+
+    /// A sandboxed pool never serves a caller from another sandbox, but the host
+    /// may enter one the conductor built. A client-spawned worker's sockets are
+    /// in a mount namespace the host cannot see.
+    fn findWorkerByLabelGlobal(self: *Conductor, label: []const u8, from_host: bool) ?LabelledWorker {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
-            // A sandboxed pool never serves a caller outside its sandbox.
             const pool = entry.value_ptr.items;
-            if (pool.len > 0 and pool[0].launch != .direct) continue;
-            if (findWorkerByLabel(entry.value_ptr, label)) |w| return w;
+            if (pool.len > 0 and pool[0].launch != .direct and !(from_host and pool[0].launch == .sandboxed)) continue;
+            if (findWorkerByLabel(entry.value_ptr, label)) |w| return .{ .w = w, .pool_key = entry.key_ptr.* };
         }
         return null;
+    }
+
+    /// Where a host client works in a conductor-built sandbox: a local
+    /// sandbox's writable directory (its pool key's second field), else the
+    /// remote sandbox's home.
+    fn sandboxWorkdir(pool_key: []const u8) []const u8 {
+        var fields = std.mem.splitScalar(u8, pool_key, 0);
+        if (!std.mem.eql(u8, fields.first(), "__lsandbox__")) return sandbox_home;
+        return fields.next() orelse sandbox_home;
     }
 
     fn trimTrailingSlashes(path: []const u8) []const u8 {
@@ -1638,12 +1661,24 @@ pub const Conductor = struct {
 
     // --- Sandbox env filtering ---
 
+    const sandbox_home = "/home/sandbox";
     const sandbox_identity_keys = [_][]const u8{ "HOME", "USER", "LOGNAME" };
     const sandbox_identity_vars = [_]worker.EnvVar{
-        .{ .key = "HOME", .value = "/home/sandbox" },
+        .{ .key = "HOME", .value = sandbox_home },
         .{ .key = "USER", .value = "sandbox" },
         .{ .key = "LOGNAME", .value = "sandbox" },
     };
+
+    /// Free only the slice, as `buildSandboxClientEnv`.
+    fn buildSandboxJoinEnv(self: *Conductor, env: []const worker.EnvVar) ![]const worker.EnvVar {
+        const result = try self.allocator.alloc(worker.EnvVar, env.len);
+        var n: usize = 0;
+        for (env) |e| if (worker.sandbox.envAllowed(e.key)) {
+            result[n] = e;
+            n += 1;
+        };
+        return self.allocator.realloc(result, n);
+    }
 
     /// Free only the slice: its EnvVars point into `env` or static strings.
     fn buildSandboxClientEnv(self: *Conductor, env: []const worker.EnvVar) ![]const worker.EnvVar {
