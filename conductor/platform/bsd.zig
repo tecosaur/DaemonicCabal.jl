@@ -9,6 +9,13 @@ const c = std.c;
 const posix = std.posix;
 const shared = @import("posix.zig");
 
+/// OpenBSD sets these only system-wide.
+pub const tcp_keepalive_options: ?[3]u32 = switch (builtin.os.tag) {
+    .macos => .{ c.TCP.KEEPALIVE, c.TCP.KEEPINTVL, c.TCP.KEEPCNT },
+    .freebsd => .{ 256, 512, 1024 }, // netinet/tcp.h
+    else => null,
+};
+
 // Constants
 pub const SIG = posix.SIG;
 pub const STDIN_HANDLE: posix.fd_t = posix.STDIN_FILENO;

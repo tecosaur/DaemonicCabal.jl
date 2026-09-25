@@ -8,6 +8,8 @@ const linux = std.os.linux;
 const posix = std.posix;
 const shared = @import("posix.zig");
 
+pub const tcp_keepalive_options: ?[3]u32 = .{ linux.TCP.KEEPIDLE, linux.TCP.KEEPINTVL, linux.TCP.KEEPCNT };
+
 // Constants
 pub const SIG = posix.SIG;
 pub const STDIN_HANDLE: posix.fd_t = posix.STDIN_FILENO;
