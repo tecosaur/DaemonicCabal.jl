@@ -15,6 +15,7 @@ function create_module()::Module
         eval(x) = Core.eval($mod, x)
         end
         import .MainInclude: eval, include
+        using Base.MainInclude: ans, err
     end
     maininclude.head = :toplevel
     Core.eval(mod, maininclude)
@@ -212,15 +213,39 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
 end
 
 # Stock julia's trace ends where it entered user code; ours would run on
-# through the worker, from the inner `runclient` (its kwarg body) outward.
+# through the worker, from the entry point in this file outward.
 function scrub_backtrace(stack::Base.ExceptionStack)
     function scrub(bt)
         bt isa Vector{Base.StackTraces.StackFrame} || return bt
-        entry = findfirst(f -> parentmodule(f) === @__MODULE__() && occursin("runclient", String(f.func)), bt)
+        entry = findfirst(f -> String(f.file) == @__FILE__, bt)
         if isnothing(entry) bt else bt[1:entry-1] end
     end
     Base.ExceptionStack(Any[(; x.exception, backtrace = scrub(x.backtrace))
                             for x in Base.scrub_repl_backtrace(stack)])
+end
+
+# Base's fallback REPL, for input that is not a terminal, evaluates in the
+# process-wide Main; this one evaluates in the client's module.
+function run_piped_repl(mod::Module)
+    while !eof(stdin)
+        try
+            line = ""
+            ex = nothing
+            while !eof(stdin)
+                line *= readline(stdin, keep=true)
+                ex = Base.parse_input_line(line)
+                Meta.isexpr(ex, :incomplete) || break
+            end
+            value = Core.eval(mod, ex)
+            setglobal!(Base.MainInclude, :ans, value)
+            isnothing(value) || Base.invokelatest(display, value)
+        catch err
+            err isa DaemonClientExit && rethrow()
+            stack = scrub_backtrace(current_exceptions())
+            setglobal!(Base.MainInclude, :err, stack)
+            Base.invokelatest(Base.display_error, stderr, stack)
+        end
+    end
 end
 
 # A sync REPL task owns no streams; its clients are cleaned up by stdin_copy_loop.
@@ -277,7 +302,9 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
             runrepl || throw(DaemonClientExit(1))
         end
     end
-    if runrepl
+    if runrepl && !client.tty
+        run_piped_repl(mod)
+    elseif runrepl
         interactiveinput = client.tty
         hascolor = get(stdout, :color, clienthascolor(client))
         quiet = "-q" ∈ set_switches || "--quiet" ∈ set_switches
