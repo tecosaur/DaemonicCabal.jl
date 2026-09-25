@@ -162,6 +162,10 @@ end
 
 # `REPL.repl_backend_loop`, retrying a `take!` interrupted by a Ctrl-C still in flight.
 @eval REPL function repl_backend_loop(backend::REPLBackend, get_module::Function)
+    # Interpolated only where it exists: `@eval` interpolates before `@static`.
+    $(if VERSION >= v"1.11"
+        :($repl_started!(backend))
+    end)
     while true
         tls = task_local_storage()
         tls[:SOURCE_PATH] = nothing
@@ -194,6 +198,24 @@ end
             eval_user_input(ast_or_func, backend, get_module())
         finally
             $signal_executing(false)
+        end
+    end
+end
+
+@static if VERSION >= v"1.13-"
+    # LineEdit's backspace to the main mode finds it through `Base.active_repl`,
+    # which names only one of the worker's REPLs.
+    let backspace = REPL.LineEdit.bracket_insert_keymap['\b']
+        REPL.LineEdit.bracket_insert_keymap['\b'] = function (s::REPL.LineEdit.MIState, o...)
+            LE = REPL.LineEdit
+            if LE.is_region_active(s) || !(isempty(s) || position(LE.buffer(s)) == 0)
+                return backspace(s, o...)
+            end
+            main_mode = s.interface.modes[1]
+            buf = copy(LE.buffer(s))
+            LE.transition(s, main_mode) do
+                LE.state(s, main_mode).input_buffer = buf
+            end
         end
     end
 end

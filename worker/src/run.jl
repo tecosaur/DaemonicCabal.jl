@@ -312,6 +312,34 @@ function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO
 end
 
 # After `exec_options` in base/client.jl.
+@static if VERSION >= v"1.11"
+    # The terminal REPLs running, oldest first. Base's globals name one REPL and
+    # backend, and each `run_main_repl` leaves them as it found them, which may
+    # be a REPL since ended.
+    const LIVE_REPLS = (lock = ReentrantLock(), repls = Pair{REPL.LineEditREPL, REPL.REPLBackend}[])
+
+    function repl_started!(backend::REPL.REPLBackend)
+        repl = CLIENT_REPL[]
+        isassigned(repl) && @lock LIVE_REPLS.lock push!(LIVE_REPLS.repls, repl[] => backend)
+    end
+
+    # After `run_main_repl`, as it resets the globals on its way out.
+    function repl_ended!(ended::Ref{REPL.LineEditREPL})
+        @lock LIVE_REPLS.lock begin
+            isassigned(ended) && filter!(((repl, _),) -> repl !== ended[], LIVE_REPLS.repls)
+            if !isempty(LIVE_REPLS.repls)
+                repl, backend = last(LIVE_REPLS.repls)
+                setglobal!(Base, :active_repl, repl)
+                setglobal!(Base, :active_repl_backend, backend)
+            elseif VERSION >= v"1.12"
+                # Before 1.12 Base takes any assigned global as live, so the last stays.
+                setglobal!(Base, :active_repl, nothing)
+                setglobal!(Base, :active_repl_backend, nothing)
+            end
+        end
+    end
+end
+
 function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing)
     wants_revise(client) && revise_code()
@@ -366,18 +394,15 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
         @static if VERSION < v"1.11"
             setglobal!(Base, :have_color, hascolor)
             Base.run_main_repl(interactiveinput, quiet, banner != :no, histfile, hascolor)
-        elseif VERSION < v"1.12"
-            Base.run_main_repl(interactiveinput, quiet, banner, histfile, hascolor)
         else
-            # run_main_repl restores the backend it installs into a local, and
-            # later runs would take the dead one for a live REPL (Infiltrator
-            # then refuses to infiltrate). Before 1.12 Base takes any assigned
-            # backend as usable, so it has to stay.
-            backend = Base.active_repl_backend
             try
-                Base.run_main_repl(interactiveinput, quiet, banner, histfile)
+                @static if VERSION < v"1.12"
+                    Base.run_main_repl(interactiveinput, quiet, banner, histfile, hascolor)
+                else
+                    Base.run_main_repl(interactiveinput, quiet, banner, histfile)
+                end
             finally
-                setglobal!(Base, :active_repl_backend, backend)
+                repl_ended!(CLIENT_REPL[])
             end
         end
     end
