@@ -307,6 +307,8 @@ pub const default_tcp_port: u16 = 9345;
 
 /// Per address tried.
 pub const connect_timeout_ms: u32 = 5000;
+/// As the worker's `TCP_KEEPALIVE_IDLE_S`.
+pub const tcp_keepalive_idle_s: u32 = 60;
 
 /// Split `host[:port]`, where an IPv6 host with a port must be bracketed.
 pub fn splitHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {

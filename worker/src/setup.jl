@@ -428,6 +428,7 @@ function unregister_client!(client::ClientInfo)
 end
 
 const CLIENT_ACCEPT_TIMEOUT_S = 30.0
+const TCP_KEEPALIVE_IDLE_S = 60
 
 # A bare `accept` would stall pings on a client that died after getting its
 # paths. Only the named client may connect (`pid` as our kernel reports it;
@@ -495,6 +496,10 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         foreach(close, (stdin_srv, stdout_srv, stderr_srv, signals_srv))
     end
     if is_tcp
+        # A client gone without closing would otherwise hold its session forever.
+        for sock in (client_stdin, client_stdout, client_stderr, signals)
+            ccall(:uv_tcp_keepalive, Cint, (Ptr{Cvoid}, Cint, Cuint), sock.handle, 1, TCP_KEEPALIVE_IDLE_S)
+        end
         Sockets.nagle(signals, false)
         if time_ns() - t0 < 40_000_000
             Sockets.nagle(client_stdout, false)
