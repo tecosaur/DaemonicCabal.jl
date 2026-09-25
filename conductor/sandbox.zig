@@ -212,6 +212,7 @@ pub fn execInSandbox(
     var relayed = posix.sigemptyset();
     posix.sigaddset(&relayed, .INT);
     posix.sigaddset(&relayed, .TERM);
+    posix.sigaddset(&relayed, .USR1); // a snapshot's; also replaces the conductor's handler
     posix.sigprocmask(posix.SIG.BLOCK, &relayed, null);
     setupNamespaces(orig_uid, orig_gid) catch |err|
         fatalChild("namespace setup", err);
@@ -222,9 +223,7 @@ pub fn execInSandbox(
         const relay = posix.Sigaction{ .handler = .{ .handler = relaySignal }, .mask = std.mem.zeroes(posix.sigset_t), .flags = 0 };
         posix.sigaction(.INT, &relay, null);
         posix.sigaction(.TERM, &relay, null);
-        // Inherited from the conductor, whose signal pipe it writes into.
-        const ignore = posix.Sigaction{ .handler = .{ .handler = posix.SIG.IGN }, .mask = std.mem.zeroes(posix.sigset_t), .flags = 0 };
-        posix.sigaction(.USR1, &ignore, null);
+        posix.sigaction(.USR1, &relay, null);
         posix.sigprocmask(posix.SIG.UNBLOCK, &relayed, null);
         var status: u32 = 0;
         while (errnoFromRc(linux.waitpid(@intCast(pid2), &status, 0))) |e| {

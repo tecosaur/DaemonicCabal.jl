@@ -18,6 +18,8 @@ pub const tcp_keepalive_options: ?[3]u32 = switch (builtin.os.tag) {
 
 // Constants
 pub const SIG = posix.SIG;
+/// Asks a Julia process for its stacks and a profile (`Profile.peek_report`).
+pub const peek_signal: ?SIG = .INFO;
 pub const STDIN_HANDLE: posix.fd_t = posix.STDIN_FILENO;
 pub const STDOUT_HANDLE: posix.fd_t = posix.STDOUT_FILENO;
 pub const STDERR_HANDLE: posix.fd_t = posix.STDERR_FILENO;

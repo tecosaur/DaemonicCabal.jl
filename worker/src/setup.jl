@@ -681,6 +681,8 @@ function serve_message(conn::IO, header::MessageHeader)
         flush(conn)
     elseif header.msg_type == MSG_TYPE.drop_session
         teardown_session!(read_string(conn))
+    elseif header.msg_type == MSG_TYPE.start_peek
+        start_peek()
     else
         read(conn, header.payload_len)  # skip unknown payload
         send_error(conn, ERR_CODE.invalid_message,
@@ -688,10 +690,12 @@ function serve_message(conn::IO, header::MessageHeader)
     end
 end
 
-function runworker(socketpath::String, conductor_address::String)
+function runworker(socketpath::String, conductor_address::String, worker_id::Integer=0)
     Base.exit_on_sigint(false)
     conn = connect_to(socketpath)
     STATE.conductor_socket[] = conductor_address
+    CONDUCTOR_WORKER_ID[] = worker_id
+    Profile.peek_report[] = send_peek_report
     global RUNTIME_DIR = if is_tcp_address(STATE.conductor_socket[]) "" else dirname(socketpath) end
     global MAX_CLIENTS = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS", "1"))
     max_ttl = parse(Int, get(ENV, "JULIA_DAEMON_MAX_TTL",

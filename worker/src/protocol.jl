@@ -9,6 +9,7 @@ const NOTIF_TYPE = (
     client_done = 0x01,
     worker_unresponsive = 0x02,
     worker_exit = 0x03,
+    peek_report = 0x06,
 )
 
 const MSG_TYPE = (
@@ -26,6 +27,7 @@ const MSG_TYPE = (
     ack         = 0x41,
     sync_clients = 0x50,
     drop_session = 0x51,
+    start_peek  = 0x60,
     error       = 0xFF,
 )
 
