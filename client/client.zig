@@ -173,6 +173,7 @@ var sockets: SocketSet = undefined;
 var conductor_path_buf: [max_socket_path]u8 = undefined;
 var conductor_path: []const u8 = &.{};
 var transport_mode: protocol.TransportMode = .local;
+var watching = false;
 // Kept because a signal handler cannot resolve the conductor's name again.
 var conductor_peer: ?Io.net.IpAddress = null;
 var signal_parser = SignalParser{};
@@ -194,12 +195,18 @@ fn signalNotifyInterrupt() void {
     notifyConductor(.client_interrupt);
 }
 
+// A watcher's Ctrl-C must not reach the session it watches.
+fn signalStopWatching() void {
+    notifyConductor(.client_exit);
+    exitClient(130);
+}
+
 fn registerSignalHandlers() void {
     platform.registerSignalHandlers(.{
         .sockets_ptr = @ptrCast(&sockets),
         .write_fn = &signalWriteStdin,
         .notify_exit_fn = &signalNotifyExit,
-        .notify_interrupt_fn = &signalNotifyInterrupt,
+        .notify_interrupt_fn = if (watching) &signalStopWatching else &signalNotifyInterrupt,
     });
 }
 
@@ -250,6 +257,7 @@ fn run(init: std.process.Init.Minimal) !void {
         });
     };
     const sync = parsed.hasSwitch("--sync");
+    watching = parsed.hasSwitch("--watch");
     const is_tty = platform.isatty(platform.getStdinHandle());
     const console = if (is_tty) platform.setupConsoleIo(platform.getStdoutHandle(), platform.getStderrHandle()) else null;
     defer platform.restoreConsoleIo(console);

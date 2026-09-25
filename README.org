@@ -41,6 +41,8 @@ Client-specific switches:
  --restart                  Kill workers for the project and exit
  --sandbox                  Run in an isolated sandbox (Linux only)
  --status[=live|json]       Show the state of the workers, optionally in json
+ --watch[=json][,once]      Follow the session's transcript (this project's,
+                            or --session=<label>'s), as JSON lines, or once
 
 Daemon management (systemd):
 

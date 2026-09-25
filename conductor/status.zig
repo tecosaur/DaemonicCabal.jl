@@ -158,7 +158,7 @@ fn gradientTints(s: Style, ctx: Ctx) ?Tints {
 const Health = enum { healthy, pinging, unresponsive, inactive };
 
 fn workerHealth(c: *Conductor, wk: *const Worker, now: i64) Health {
-    if (wk.active_clients == 0) return .inactive;
+    if (wk.busyClients() == 0) return .inactive;
     if (wk.ping_pending) {
         const waited: u64 = @intCast(@max(0, now - wk.last_pinged));
         return if (waited >= c.cfg.ping_timeout) .unresponsive else .pinging;
@@ -287,7 +287,7 @@ fn writeGroupHeader(w: Writer, s: Style, label: []const u8) !void {
 // "  basename · parent/", with a pooled RSS for more than one worker.
 fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const *Worker, key: []const u8, now: i64, nested: bool) !void {
     const all_inactive = for (workers) |wk| {
-        if (wk.active_clients > 0) break false;
+        if (wk.busyClients() > 0) break false;
     } else true;
     const path = workers[0].project orelse "";
     const pad = if (nested) indent ++ indent else indent;
@@ -413,7 +413,8 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     if (health == .inactive) try writeIdleState(c, w, s, ctx, wk, key, now, showed_activity);
     if (dim_line) try s.close(w);
     try w.writeByte('\n');
-    if (health != .inactive) try renderClients(c, w, s, wk, now, nested, is_last);
+    // Watchers show under an otherwise idle worker too.
+    if (wk.active_clients > 0) try renderClients(c, w, s, wk, now, nested, is_last);
 }
 
 // Pair with `closeStat`. False when the value just inherits the line's dim.
@@ -501,27 +502,30 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64
     const base = if (nested) indent ++ indent else indent;
     const total = countClients(c, wk);
     var seen: usize = 0;
-    var it = c.active_clients.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.worker != wk) continue;
-        const info = entry.value_ptr;
-        seen += 1;
-        try w.writeAll(base);
-        try s.open(w, ansi.dim);
-        try w.writeAll(if (worker_last) "   " else "│  ");
-        try w.writeAll(if (seen == total) "   ╰─ " else "   ├─ ");
-        try s.wrap(w, ansi.dim, "Client ");
-        try w.print("{d}", .{info.pid});
-        var name_buf: [64]u8 = undefined;
-        if (platform.getParentName(info.pid, &name_buf)) |name| {
-            try w.print(" ({s})", .{name});
+    // Clients first, then watchers.
+    for ([_]bool{ false, true }) |watchers| {
+        var it = c.active_clients.iterator();
+        while (it.next()) |entry| {
+            const info = entry.value_ptr;
+            if (info.worker != wk or info.watcher != watchers) continue;
+            seen += 1;
+            try w.writeAll(base);
+            try s.open(w, ansi.dim);
+            try w.writeAll(if (worker_last) "   " else "│  ");
+            try w.writeAll(if (seen == total) "   ╰─ " else "   ├─ ");
+            try s.wrap(w, ansi.dim, if (info.watcher) "Watcher " else "Client ");
+            try w.print("{d}", .{info.pid});
+            var name_buf: [64]u8 = undefined;
+            if (platform.getParentName(info.pid, &name_buf)) |name| {
+                try w.print(" ({s})", .{name});
+            }
+            const attached_s = @divTrunc(now * 1_000_000 - info.start_time_us, 1_000_000);
+            try s.open(w, ansi.dim);
+            try w.writeAll(" · attached ");
+            try writeDuration(w, attached_s);
+            try s.close(w);
+            try w.writeByte('\n');
         }
-        const attached_s = @divTrunc(now * 1_000_000 - info.start_time_us, 1_000_000);
-        try s.open(w, ansi.dim);
-        try w.writeAll(" · attached ");
-        try writeDuration(w, attached_s);
-        try s.close(w);
-        try w.writeByte('\n');
     }
 }
 
@@ -543,7 +547,7 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style) !void {
     while (it.next()) |entry| {
         for (entry.value_ptr.items) |wk| {
             active_workers += 1;
-            total_clients += wk.active_clients;
+            total_clients += wk.busyClients();
             total_mem += wk.mem;
         }
     }
@@ -646,7 +650,7 @@ fn renderJson(c: *Conductor, w: Writer, now: i64) !void {
             if (!first) try w.writeByte(',');
             first = false;
             worker_count += 1;
-            total_clients += wk.active_clients;
+            total_clients += wk.busyClients();
             total_mem += try writeWorkerJson(c, w, wk, entry.key_ptr.*, now);
         }
     }
@@ -682,7 +686,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     try writeJsonStringOrNull(w, threads_str);
     try w.print(",\"interactive\":{},\"launch\":\"{s}\"", .{ wk.interactive, @tagName(wk.launch) });
     try w.print(",\"created_at\":{d},\"last_active\":{d},\"last_pinged\":{d}", .{ wk.created_at, wk.last_active, wk.last_pinged });
-    try w.print(",\"ping_pending\":{},\"active_clients\":{d}", .{ wk.ping_pending, wk.active_clients });
+    try w.print(",\"ping_pending\":{},\"active_clients\":{d},\"watchers\":{d}", .{ wk.ping_pending, wk.busyClients(), wk.watchers });
     try w.print(",\"activity\":{d:.4},\"cull_budget_s\":{d}", .{ c.workerActivity(wk, key, now), c.idleBudget(wk, key orelse "") });
     if (stats) |st| {
         try w.print(",\"mem_bytes\":{d},\"cpu_seconds\":{d:.3}", .{ st.mem_bytes, st.cpu_seconds });
@@ -697,8 +701,8 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
         if (!first) try w.writeByte(',');
         first = false;
         const attached_s = @divTrunc(now * 1_000_000 - entry.value_ptr.start_time_us, 1_000_000);
-        try w.print("{{\"id\":{d},\"pid\":{d},\"attached_seconds\":{d}}}", .{
-            entry.key_ptr.*, entry.value_ptr.pid, attached_s,
+        try w.print("{{\"id\":{d},\"pid\":{d},\"watcher\":{},\"attached_seconds\":{d}}}", .{
+            entry.key_ptr.*, entry.value_ptr.pid, entry.value_ptr.watcher, attached_s,
         });
     }
     try w.writeAll("]}");
