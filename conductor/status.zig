@@ -112,10 +112,17 @@ pub fn render(c: *Conductor, opts: Options) !Report {
     return renderAt(c, opts, c.currentTime());
 }
 
-/// Just after the focused client's row: `at` in `Report.bytes`, and the
-/// tree's lines that continue beneath it, as a gutter of `gutter_cols`.
+/// The focused client's row, for the live view to draw as its pane's top:
+/// in `Report.bytes`, the row spans `start..end` and its label (the text
+/// after the tree's branch) `label_start..label_end`. `branch` is the tree
+/// up to and including the row's own branch; `gutter` continues the tree's
+/// lines beneath it, `gutter_cols` wide.
 pub const Placement = struct {
-    at: usize,
+    start: usize,
+    label_start: usize,
+    label_end: usize,
+    end: usize,
+    branch: [3][]const u8,
     gutter: [3][]const u8,
     gutter_cols: usize,
 };
@@ -574,10 +581,14 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             seen += 1;
             const focused = ctx.focus == entry.key_ptr.*;
             if (!watchers) try ctx.clients.append(w.gpa, entry.key_ptr.*);
+            const start = w.list.items.len;
+            const trunk = if (worker_last) "   " else "│  ";
+            const last = seen == total;
             try w.writeAll(base);
             try s.open(w, ansi.dim);
-            try w.writeAll(if (worker_last) "   " else "│  ");
-            try w.writeAll(if (seen == total) "   ╰─ " else "   ├─ ");
+            try w.writeAll(trunk);
+            try w.writeAll(if (last) "   ╰─ " else "   ├─ ");
+            const label_start = w.list.items.len;
             try s.wrap(w, ansi.dim, if (info.watcher) "Watcher " else "Client ");
             try w.print("{d}", .{info.pid});
             var name_buf: [64]u8 = undefined;
@@ -586,15 +597,21 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             }
             const attached_s = @divTrunc(now * 1_000_000 - info.start_time_us, 1_000_000);
             try s.open(w, ansi.dim);
+            if (info.session) try w.writeAll(if (info.sync) " · sync session" else " · session");
             try w.writeAll(" · attached ");
             try writeDuration(w, attached_s);
             try s.close(w);
+            const label_end = w.list.items.len;
             if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
             try w.writeByte('\n');
             if (focused) ctx.placement.* = .{
-                .at = w.list.items.len,
-                .gutter = .{ base, if (worker_last) "   " else "│  ", if (seen == total) "      " else "   │  " },
-                .gutter_cols = base.len + 9,
+                .start = start,
+                .label_start = label_start,
+                .label_end = label_end,
+                .end = w.list.items.len,
+                .branch = .{ base, trunk, if (last) "   ╰" else "   ├" },
+                .gutter = .{ base, trunk, if (last) "    " else "   │" },
+                .gutter_cols = base.len + 3 + 4,
             };
         }
     }
