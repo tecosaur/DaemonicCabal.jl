@@ -23,6 +23,29 @@ RUNTIME_DIR::String = ""
 MAX_CLIENTS::Int = 1
 PORT_BASE::Int = 0
 ORPHAN_FAILSAFE::Int = 0  # seconds; 0 = off
+HISTORY_BYTES::Int = 1 << 20  # per session transcript
+# Which sessions record from their start; --sync ones always do, and any from its first watch.
+@enum RecordLevel record_sync record_interactive record_session
+RECORD_LEVEL::RecordLevel = record_session
+
+# "64K", "1M" and the like, or plain bytes; at most 4G, as records carry a UInt32 length.
+function history_bytes(value::AbstractString)
+    scale = if isempty(value) nothing else findfirst(==(uppercase(last(value))), "KMG") end
+    n = tryparse(Int, if isnothing(scale) value else chop(value) end)
+    if isnothing(n) || n < 0
+        @warn "Ignoring JULIA_DAEMON_HISTORY_BYTES=$value, which should be bytes, optionally with K, M or G"
+        return HISTORY_BYTES
+    end
+    min(n << (10 * something(scale, 0)), typemax(UInt32))
+end
+
+function record_level(value::AbstractString)
+    for level in instances(RecordLevel)
+        value == chopprefix(string(level), "record_") && return level
+    end
+    @warn "Ignoring JULIA_DAEMON_RECORD=$value, which should be sync, interactive or session"
+    RECORD_LEVEL
+end
 
 # A switch or variable given with no value counts as yes.
 isyes(value::AbstractString) = value ∈ ("yes", "true", "1", "")
@@ -283,6 +306,7 @@ end
 
 # Closing the merged input ends the session's REPL.
 function teardown_session!(label::String)
+    drop_transcript!(label)
     session = @lock STATE.lock get(STATE.sync_sessions, label, nothing)
     isnothing(session) && return
     try close(session.writesink) catch end
@@ -326,7 +350,7 @@ end
 function get_or_create_session(label::String, client_stdout::StreamIO,
                                client_stderr::StreamIO, signals::StreamIO; attach::Bool)::SyncSession
     # Build outside the lock (link_pipe! can yield); install only if we won the race.
-    fresh = build_sync_session(client_stdout, client_stderr, signals; attach)
+    fresh = build_sync_session(label, client_stdout, client_stderr, signals; attach)
     @lock STATE.lock begin
         session = get(STATE.sync_sessions, label, nothing)
         if isnothing(session)
@@ -345,20 +369,22 @@ function get_or_create_session(label::String, client_stdout::StreamIO,
     end
 end
 
-function build_sync_session(client_stdout::StreamIO, client_stderr::StreamIO,
+# A sync session is always recorded: a joiner is replayed its screen.
+function build_sync_session(label::String, client_stdout::StreamIO, client_stderr::StreamIO,
                             signals::StreamIO; attach::Bool)::SyncSession
     pipe = Pipe()
     Base.link_pipe!(pipe; reader_supports_async=true, writer_supports_async=true)
-    history = OutputHistory(SYNC_HISTORY_BYTES)
-    out = BroadcastWriter(StreamIO[], history)
-    err = BroadcastWriter(StreamIO[], history)
+    start_recording!(session_transcript(label))
+    screen = begin_run(label, "--sync")
+    out = BroadcastWriter(StreamIO[], screen, :stdout)
+    err = BroadcastWriter(StreamIO[], screen, :stderr)
     sigs = StreamIO[]
     if attach
         push!(out.writers, client_stdout)
         push!(err.writers, client_stderr)
         push!(sigs, signals)
     end
-    SyncSession(pipe.out, pipe.in, out, err, sigs, history, Ref{REPL.LineEditREPL}())
+    SyncSession(pipe.out, pipe.in, out, err, sigs, screen, Ref{REPL.LineEditREPL}())
 end
 
 # REPL-style without a repl object, which an -E-created session may lack.
@@ -393,7 +419,7 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
         # Reposition the cursor so the REPL's refresh lands right on a fresh terminal.
         height = first(query_displaysize(signals))
         maxlines = 3 * height
-        replay_history(client_stdout, session.history; maxlines)
+        replay_history(client_stdout, session.screen; maxlines)
         send_signal(signals, SIGNAL_RAW_MODE, UInt8[true])
         read(signals, 2)
         if session.repl[].mistate !== nothing
@@ -592,10 +618,15 @@ function serve_message(conn::IO, header::MessageHeader)
         @static if VERSION >= v"1.11"
             WORKER_TERM.have_color = client.color  # our own stdio is piped
         end
-        active_count, draining = @lock STATE.lock (length(STATE.clients), STATE.soft_exit[])
-        # force bypasses capacity (labeled sessions) but never the drain.
+        # A watcher takes no capacity, but the reply's count, which the conductor
+        # keeps, includes them.
+        active_count, working, draining = @lock STATE.lock (
+            length(STATE.clients),
+            count(c -> isnothing(getval(c.switches, "--watch", nothing)), STATE.clients),
+            STATE.soft_exit[])
+        # force bypasses capacity (labelled sessions, watchers) but never the drain.
         stale = stale_files(client)
-        if draining || (!client.force && MAX_CLIENTS > 0 && active_count >= MAX_CLIENTS)
+        if draining || (!client.force && MAX_CLIENTS > 0 && working >= MAX_CLIENTS)
             send_sockets(conn, "", "", "", "", active_count)  # reject: empty paths + count
         elseif !isempty(stale) && !client.force
             # The conductor retires this worker and starts a fresh one.
@@ -664,6 +695,8 @@ function runworker(socketpath::String, conductor_address::String)
     max_ttl = parse(Int, get(ENV, "JULIA_DAEMON_MAX_TTL",
                              get(ENV, "JULIA_DAEMON_WORKER_TTL", "7200")))
     global ORPHAN_FAILSAFE = max_ttl > 0 ? max_ttl * 4 : 0
+    global HISTORY_BYTES = history_bytes(get(ENV, "JULIA_DAEMON_HISTORY_BYTES", "1M"))
+    global RECORD_LEVEL = record_level(get(ENV, "JULIA_DAEMON_RECORD", "session"))
     global PORT_BASE = if haskey(ENV, "JULIA_DAEMON_PORTS")
         parse(Int, split(ENV["JULIA_DAEMON_PORTS"], '-')[1])
     else 0 end

@@ -76,6 +76,8 @@ pub const CLIENT_HELP =
     \\ --restart                  Kill workers for the project and exit
     \\ --sandbox                  Run in an isolated sandbox (Linux only)
     \\ --status[=json]            Show the state of the workers, optionally in json
+    \\ --watch[=json][,once]      Follow the session's transcript (this project's,
+    \\                            or --session=<label>'s), as JSON lines, or once
     \\
     \\
 ++ DAEMON_MANAGEMENT_HELP;

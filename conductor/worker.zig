@@ -155,7 +155,8 @@ pub const Worker = struct {
     /// Echoed in the pong, which tells a late pong for an earlier ping from this one's.
     ping_seq: u8 = 0,
     pong_buf: [protocol.worker.pong_size]u8 = undefined,
-    active_clients: u32,
+    active_clients: u32, // as the worker counts them, watchers included
+    watchers: u32 = 0,
     occupancy: Occupancies = .{},
     cpu: CpuMeter = .{},
     mem: u64 = 0, // bytes: RSS on Linux, phys_footprint on macOS
@@ -523,11 +524,16 @@ pub const Worker = struct {
         if (payload[0] != self.ping_seq) return error.UnexpectedResponse;
     }
 
+    /// Clients in use of the worker: a watcher only reads a session's transcript.
+    pub fn busyClients(self: *const Worker) u32 {
+        return self.active_clients -| self.watchers;
+    }
+
     // A busy worker's ping only reconciles counts, so it runs slower.
     const busy_ping_factor = 4;
     pub fn shouldPing(self: *const Worker, now: i64, ping_interval: u64) bool {
         if (self.ping_pending) return false;
-        const interval: u64 = if (self.active_clients == 0) ping_interval else ping_interval * busy_ping_factor;
+        const interval: u64 = if (self.busyClients() == 0) ping_interval else ping_interval * busy_ping_factor;
         return now - self.last_pinged >= @as(i64, @intCast(interval));
     }
 

@@ -93,6 +93,7 @@ pub const ActiveClientInfo = struct {
 
     start_time_us: i64,
     port_set: u16, // PortPool index, or PortPool.none when unmanaged
+    watcher: bool = false, // `--watch`, which is no use of the session
 };
 
 pub const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
@@ -510,6 +511,7 @@ pub const Conductor = struct {
             .local => |rw| try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw, trimTrailingSlashes(project_path), ch, tkey }),
         };
         defer self.allocator.free(worker_key);
+        if (request.parsed.hasSwitch("--watch")) return self.serveWatch(socket, &request, worker_key, sandbox);
         if (request.parsed.hasSwitch("--sync")) {
             const session = request.parsed.getSwitch("--session");
             if (session == null or session.?.len == 0) {
@@ -538,6 +540,40 @@ pub const Conductor = struct {
         };
         request_held = outcome == .held;
         return outcome;
+    }
+
+    /// With a label, that session; without, the one a `--session` run of the
+    /// caller's would join: in its pool, on the worker running a client, else the
+    /// one used last. A labelled worker holds a session of its own.
+    fn serveWatch(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandbox: SandboxKind) !Outcome {
+        const pool: []const *worker.Worker = if (self.workers.getPtr(worker_key)) |list| list.items else &.{};
+        const label = labelOf(request);
+        const found: ?*worker.Worker = if (label) |l|
+            (if (sandbox != .none) findWorkerByLabel(pool, l) else if (self.findWorkerByLabelGlobal(l, true)) |f| f.w else null)
+        else blk: {
+            var best: ?*worker.Worker = null;
+            for (pool) |w| if (w.session_label == null) {
+                const b = best orelse {
+                    best = w;
+                    continue;
+                };
+                const busy = w.busyClients() > 0;
+                if (if (busy != (b.busyClients() > 0)) busy else w.last_active > b.last_active) best = w;
+            };
+            break :blk best;
+        };
+        const w = found orelse {
+            const msg = if (label) |l|
+                try std.fmt.allocPrint(self.allocator, "No session '{s}' is running.\n", .{l})
+            else
+                try self.allocator.dupe(u8, "No worker is running for this project to watch.\n");
+            defer self.allocator.free(msg);
+            try self.serveString(socket, msg, 1);
+            return .done;
+        };
+        if (!try self.assignClientToExistingWorker(socket, request, w))
+            try self.serveString(socket, "The session's worker could not take a watcher.\n", 1);
+        return .done;
     }
 
     fn reportNoWorker(self: *Conductor, socket: posix.socket_t, err: anyerror, sandbox: SandboxKind) void {
@@ -780,7 +816,7 @@ pub const Conductor = struct {
         const now = self.currentTime();
         assignment.w.last_pinged = now;
         assignment.w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        self.registerClient(self.client_counter, request.host_pid orelse request.pid, assignment.w, port_set) catch |err| {
+        self.registerClient(self.client_counter, request.host_pid orelse request.pid, assignment.w, port_set, false) catch |err| {
             std.debug.print("Client {d}: cannot track: {}\n", .{ self.client_counter, err });
         };
         self.bumpCrf(worker_key, now); // count the summons only once the client is tracked
@@ -852,6 +888,9 @@ pub const Conductor = struct {
 
     /// False when the worker already died; the caller falls back to selection.
     fn assignClientToExistingWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, w: *worker.Worker) !bool {
+        // A watch runs no code, so it carries no environment: whatever reaches a
+        // worker is readable by the session's own code.
+        const watcher = request.parsed.hasSwitch("--watch");
         const port_set = if (self.port_pool) |*pool| blk: {
             break :blk pool.allocate() orelse {
                 std.debug.print("Client {d}: port pool exhausted\n", .{self.client_counter});
@@ -865,13 +904,13 @@ pub const Conductor = struct {
         const client_info = worker.ClientInfo{
             .tty = request.flags.tty,
             .color = request.flags.color,
-            .force = is_labeled_session,
+            .force = is_labeled_session or watcher,
             .id = self.client_counter,
             .pid = request.pid,
             .host_pid = request.host_pid,
             .ppid = request.ppid,
             .cwd = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/",
-            .env = request.env,
+            .env = if (watcher) &.{} else request.env,
             .switches = request.parsed.switches.items,
             .programfile = request.parsed.program_file,
             .args = request.parsed.program_args,
@@ -890,7 +929,7 @@ pub const Conductor = struct {
         const now = self.currentTime();
         w.last_pinged = now;
         w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        try self.registerClient(self.client_counter, request.host_pid orelse request.pid, w, port_set);
+        try self.registerClient(self.client_counter, request.host_pid orelse request.pid, w, port_set, watcher);
         self.sendSocketPaths(socket, paths);
         return true;
     }
@@ -919,7 +958,7 @@ pub const Conductor = struct {
             } else false;
             // A sandboxed client's label stays in its pool: joining a host worker would escape.
             const found: ?LabelledWorker = if (explicit_project or sandbox != .none)
-                (if (findWorkerByLabel(list, session_label.?)) |w| .{ .w = w, .pool_key = "" } else null)
+                (if (findWorkerByLabel(list.items, session_label.?)) |w| .{ .w = w, .pool_key = "" } else null)
             else
                 self.findWorkerByLabelGlobal(session_label.?, true);
             if (found) |f| {
@@ -964,7 +1003,7 @@ pub const Conductor = struct {
 
     fn isWorkerAvailable(self: *Conductor, w: *worker.Worker, interactive: bool, now: i64) bool {
         const max = self.cfg.worker_maxclients;
-        if (max != 0 and w.active_clients >= max) return false;
+        if (max != 0 and w.busyClients() >= max) return false;
         if (w.unresponsive_interrupted) return false;
         if (w.session_label != null and !self.isLabelExpired(w, now)) return false;
         if (w.interactive != interactive) return false;
@@ -991,8 +1030,8 @@ pub const Conductor = struct {
         return null;
     }
 
-    fn findWorkerByLabel(list: *WorkerList, label: []const u8) ?*worker.Worker {
-        for (list.items) |w| {
+    fn findWorkerByLabel(pool: []const *worker.Worker, label: []const u8) ?*worker.Worker {
+        for (pool) |w| {
             if (w.session_label) |wl| {
                 if (std.mem.eql(u8, wl, label)) return w;
             }
@@ -1004,7 +1043,7 @@ pub const Conductor = struct {
     fn findClaimableWorker(self: *Conductor, list: *WorkerList, interactive: bool, now: i64) ?*worker.Worker {
         var best: ?*worker.Worker = null;
         for (list.items) |w| {
-            if (w.active_clients != 0) continue;
+            if (w.busyClients() != 0) continue;
             if (w.session_label != null and !self.isLabelExpired(w, now)) continue;
             if (w.interactive != interactive) continue;
             if (best == null or w.last_active > best.?.last_active) best = w;
@@ -1246,7 +1285,7 @@ pub const Conductor = struct {
         while (it.next()) |entry| {
             const pool = entry.value_ptr.items;
             if (pool.len > 0 and pool[0].launch != .direct and !(from_host and pool[0].launch == .sandboxed)) continue;
-            if (findWorkerByLabel(entry.value_ptr, label)) |w| return .{ .w = w, .pool_key = entry.key_ptr.* };
+            if (findWorkerByLabel(pool, label)) |w| return .{ .w = w, .pool_key = entry.key_ptr.* };
         }
         return null;
     }
@@ -1395,7 +1434,7 @@ pub const Conductor = struct {
 
     // Once per ping interval, so sizing tracks idle drift without an extra wakeup.
     pub fn refreshIdleMemIfStale(self: *Conductor, w: *worker.Worker, now_s: i64) void {
-        if (w.active_clients != 0) return;
+        if (w.busyClients() != 0) return;
         if (now_s - w.mem_at < @as(i64, @intCast(self.cfg.ping_interval))) return;
         refreshOne(w, self.nowNs(), null);
     }
@@ -1517,7 +1556,7 @@ pub const Conductor = struct {
     }
 
     fn cullableAge(self: *Conductor, w: *worker.Worker, now: i64) ?u64 {
-        if (w.active_clients > 0) return null;
+        if (w.busyClients() > 0) return null;
         if (w.session_label != null and !self.isLabelExpired(w, now)) return null;
         return @intCast(@max(0, now - w.last_active));
     }
@@ -1645,7 +1684,7 @@ pub const Conductor = struct {
     // --- Session labels ---
 
     fn isLabelExpired(self: *Conductor, w: *worker.Worker, now: i64) bool {
-        if (w.session_label == null or w.active_clients > 0) return false;
+        if (w.session_label == null or w.busyClients() > 0) return false;
         const idle_time: u64 = @intCast(@max(0, now - w.last_active));
         return idle_time >= self.cfg.label_ttl;
     }
@@ -1706,11 +1745,15 @@ pub const Conductor = struct {
 
     // --- Client tracking ---
 
-    fn registerClient(self: *Conductor, id: u32, pid: u32, w: *worker.Worker, port_set: u16) !void {
+    fn registerClient(self: *Conductor, id: u32, pid: u32, w: *worker.Worker, port_set: u16, watcher: bool) !void {
         const now_us = @divTrunc(self.nowNs(), 1000);
         const now_s = @divTrunc(now_us, 1_000_000);
-        if (!w.occupancy.fast.busy) w.occupancy.attach(now_s, self.activityHalfLife(), self.budgetOccHalfLife());
-        try self.active_clients.put(id, .{ .worker = w, .pid = pid, .start_time_us = now_us, .port_set = port_set });
+        try self.active_clients.put(id, .{ .worker = w, .pid = pid, .start_time_us = now_us, .port_set = port_set, .watcher = watcher });
+        if (watcher) {
+            w.watchers += 1;
+        } else if (!w.occupancy.fast.busy) {
+            w.occupancy.attach(now_s, self.activityHalfLife(), self.budgetOccHalfLife());
+        }
     }
 
     fn clientDone(self: *Conductor, id: u32) ?*worker.Worker {
@@ -1722,11 +1765,12 @@ pub const Conductor = struct {
             } else {
                 std.debug.print("Worker {d}: clientDone underflow (map/count drift)\n", .{info.worker.id});
             }
+            if (info.watcher) info.worker.watchers -|= 1;
             const now_ns = self.nowNs();
             const now_us = @divTrunc(now_ns, 1000);
             const now_s = @divTrunc(now_us, 1_000_000);
-            info.worker.last_active = now_s;
-            if (info.worker.active_clients == 0) {
+            if (!info.watcher) info.worker.last_active = now_s;
+            if (!info.watcher and info.worker.busyClients() == 0) {
                 info.worker.occupancy.detach(now_s, self.activityHalfLife(), self.budgetOccHalfLife());
                 refreshOne(info.worker, now_ns, null);
             }
@@ -1739,7 +1783,7 @@ pub const Conductor = struct {
                 duration_s,
                 duration_ms,
             });
-            if (info.worker.active_clients == 0) return info.worker;
+            if (info.worker.busyClients() == 0) return info.worker;
         }
         return null;
     }
@@ -1763,29 +1807,34 @@ pub const Conductor = struct {
             return;
         };
         self.reconcileClientMap(w);
-        const remaining = self.countMapClients(w);
+        const counted = self.countMapClients(w);
+        const remaining = counted.clients;
+        w.active_clients = remaining;
+        w.watchers = counted.watchers;
+        const busy = w.busyClients();
         // The worker's surplus is departed clients' code it could not stop.
-        if (worker_count > remaining and remaining == 0) {
+        if (worker_count > remaining and busy == 0) {
             std.debug.print("Worker {d}: {d} departed client(s) still running, retiring\n", .{ w.id, worker_count });
             return self.retireWorker(w);
         }
-        w.active_clients = remaining;
         const now = self.currentTime();
-        if (remaining == 0 and w.occupancy.fast.busy) {
+        if (busy == 0 and w.occupancy.fast.busy) {
             w.occupancy.detach(now, self.activityHalfLife(), self.budgetOccHalfLife());
-        } else if (remaining > 0 and !w.occupancy.fast.busy) {
+        } else if (busy > 0 and !w.occupancy.fast.busy) {
             w.occupancy.attach(now, self.activityHalfLife(), self.budgetOccHalfLife());
         }
         std.debug.print("Worker {d}: sync complete, {d} active clients\n", .{ w.id, remaining });
     }
 
-    fn countMapClients(self: *Conductor, w: *worker.Worker) u32 {
-        var count: u32 = 0;
+    fn countMapClients(self: *Conductor, w: *worker.Worker) struct { clients: u32, watchers: u32 } {
+        var clients: u32 = 0;
+        var watchers: u32 = 0;
         var it = self.active_clients.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.worker == w) count += 1;
-        }
-        return count;
+        while (it.next()) |entry| if (entry.value_ptr.worker == w) {
+            clients += 1;
+            if (entry.value_ptr.watcher) watchers += 1;
+        };
+        return .{ .clients = clients, .watchers = watchers };
     }
 
     // Repairs a lost client_done, which the count-only sync can't.
@@ -1883,7 +1932,7 @@ pub const Conductor = struct {
     pub fn onHealthCheck(self: *Conductor, w: *worker.Worker) void {
         const now = self.currentTime();
         self.refreshIdleMemIfStale(w, now);
-        if (w.active_clients == 0 and !w.ping_pending and now - w.last_pinged >= 2)
+        if (w.busyClients() == 0 and !w.ping_pending and now - w.last_pinged >= 2)
             self.queuePing(w);
     }
 
@@ -1910,7 +1959,7 @@ pub const Conductor = struct {
     pub fn onPongTimeout(self: *Conductor, w: *worker.Worker) void {
         if (!w.ping_pending) return;
         w.ping_pending = false;
-        if (w.active_clients > 0) {
+        if (w.busyClients() > 0) {
             w.last_pinged = self.currentTime(); // hold the slow cadence
             std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
             return;

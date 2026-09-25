@@ -135,6 +135,18 @@ function is_repl_client(client::ClientInfo)
     "-i" ∈ switches || (isnothing(client.programfile) && "--eval" ∉ switches && "--print" ∉ switches)
 end
 
+function command_line(client::ClientInfo)
+    words = String[]
+    for (name, value) in client.switches
+        name ∈ ("--session", "--watch") && continue
+        push!(words, name)
+        isempty(value) || push!(words, value)
+    end
+    isnothing(client.programfile) || push!(words, client.programfile)
+    append!(words, client.args)
+    Base.shell_escape(words...)
+end
+
 function runclient(client::ClientInfo, client_stdin::StreamIO,
                    client_stdout::IO, client_stderr::IO,
                    signals::StreamIO;
@@ -143,17 +155,44 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                    repl_ref::Base.RefValue{REPL.LineEditREPL}=Ref{REPL.LineEditREPL}(),
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing,
                    replay::Union{Nothing, Tuple{StreamIO, SyncSession}}=nothing)
+    watch = getval(client.switches, "--watch", nothing)
+    if !isnothing(watch)
+        exit_code = try
+            @static if VERSION >= v"1.11"
+                watch_session(getval(client.switches, "--session", ""), watch, client_stdout, client.color; until=signals)
+            else
+                println(client_stderr, "--watch needs the session's worker to run Julia 1.11 or later.")
+                1
+            end
+        catch
+            isopen(client_stderr) && Base.invokelatest(Base.display_error, client_stderr, current_exceptions())
+            1
+        end
+        return Base.disable_sigint() do
+            teardown_client(client, client_stdin, client_stdout, client_stderr, signals, owned_streams, exit_code)
+        end
+    end
     hascolor = clienthascolor(client)
+    # Pre-1.11 output goes through redirected fds, which cannot be copied. A
+    # sync session's broadcast writers record its screen as one shared run.
+    session = getval(client.switches, "--session", nothing)  # "" when unlabelled
+    own_run = if VERSION >= v"1.11" && isnothing(sync_session) && isnothing(broadcast) && !isnothing(session)
+        begin_run(session, command_line(client); interactive = client.tty && is_repl_client(client))
+    end
+    recording = if isnothing(sync_session) own_run else sync_session.screen end
+    recorded(io, stream) = if isnothing(own_run) io else RecordedOutput(io, own_run, stream) end
+    run_stderr = recorded(client_stderr, :stderr)
     # Buffering would strand a REPL prompt written just before the frontend
     # blocks on stdin. Pre-1.11 `redirect_stdio` needs a stream owning an fd.
-    client_stdout_b, owned_streams = if VERSION >= v"1.11" && !is_repl_client(client) && client_stdout isa StreamIO
-        buffered = BufferedOutput(client_stdout)
+    # Recording sits under the buffer, so it copies whole chunks.
+    run_stdout, owned_streams = if VERSION >= v"1.11" && !is_repl_client(client) && client_stdout isa StreamIO
+        buffered = BufferedOutput(recorded(client_stdout, :stdout))
         buffered, map(s -> if s === client_stdout; buffered else s end, owned_streams)
     else
-        client_stdout, owned_streams
+        recorded(client_stdout, :stdout), owned_streams
     end
-    stdoutx = IOContext(client_stdout_b, :color => hascolor)
-    stderrx = IOContext(client_stderr, :color => hascolor)
+    stdoutx = IOContext(run_stdout, :color => hascolor)
+    stderrx = IOContext(run_stderr, :color => hascolor)
     exit_code = 0
     try
         mod = prepare_module(client)
@@ -184,12 +223,13 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     hascolor
                 end
                 client_vterm = VirtualTerm(
-                    client_stdin, client_stdout_b, client_stderr, signals,
+                    client_stdin, run_stdout, run_stderr, signals,
                     term, sync_session,
                     get(TERMINFOS, term, nothing), color, nothing)
                 with(ACTIVE_TERM => client_vterm,
                      CLIENT_MODULE => mod,
                      CLIENT_REPL => repl_ref,
+                     CLIENT_RECORDING => recording,
                      REPLAY_TARGET => replay) do
                     runclient(mod, client; stdout=stdoutx, broadcast)
                 end
@@ -203,10 +243,15 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
             exit_code = 1
         end
     finally
+        # After the run's last output, which may still be buffered.
+        if !isnothing(recording)
+            try flush(run_stdout) catch end
+            record!(recording, :exit, string(exit_code))
+        end
         # A force-thrown SIGINT mid uv_write would siglongjmp out of libuv and
         # corrupt the task fiber.
         Base.disable_sigint() do
-            teardown_client(client, client_stdin, client_stdout_b, client_stderr,
+            teardown_client(client, client_stdin, run_stdout, client_stderr,
                             signals, owned_streams, exit_code)
         end
     end
@@ -235,6 +280,10 @@ function run_piped_repl(mod::Module)
                 line *= readline(stdin, keep=true)
                 ex = Base.parse_input_line(line)
                 Meta.isexpr(ex, :incomplete) || break
+            end
+            @static if VERSION >= v"1.11"
+                recording = CLIENT_RECORDING[]
+                isnothing(recording) || record!(recording, :input, "julia\n" * chomp(line))
             end
             value = Core.eval(mod, ex)
             setglobal!(Base.MainInclude, :ans, value)
