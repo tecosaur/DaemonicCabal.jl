@@ -388,6 +388,13 @@ pub fn socketWrite(fd: HANDLE, buf: []const u8) void {
     }
 }
 
+/// Waits, unlike POSIX's: a pipe write cannot be bounded without an overlapped
+/// write left outstanding.
+pub fn sendNonBlocking(fd: HANDLE, buf: []const u8) ?usize {
+    socketWrite(fd, buf);
+    return buf.len;
+}
+
 /// Half-closes a socket, keeping the handle valid; a pipe, which cannot, is closed.
 pub fn sendEof(fd: HANDLE) void {
     if (handleKind(fd) == .afd) shutdownWrite(fd) else close(fd);

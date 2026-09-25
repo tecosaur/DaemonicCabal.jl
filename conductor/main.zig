@@ -14,6 +14,7 @@ const args = @import("args.zig");
 const project = @import("project.zig");
 const env_cache = @import("env_cache.zig");
 const status = @import("status.zig");
+const live = @import("live.zig");
 const pal = @import("palette.zig");
 const pressure = @import("pressure.zig");
 pub const worker = @import("worker.zig");
@@ -91,9 +92,12 @@ pub const ActiveClientInfo = struct {
     worker: *worker.Worker,
     pid: u32, // host-view where peer credentials exist, else self-reported; for display
 
-    start_time_us: i64,
+    start_time_us: i64 = 0, // set when tracked
     port_set: u16, // PortPool index, or PortPool.none when unmanaged
     watcher: bool = false, // `--watch`, which is no use of the session
+    internal: bool = false, // the conductor's own watcher, for a live view
+    session: bool = false, // `--session`: its runs are the session's
+    sync: bool = false,
 };
 
 pub const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
@@ -144,18 +148,7 @@ pub const Conductor = struct {
     crf: std.StringHashMap(worker.Crf),
     pressure_monitor: pressure.Monitor,
     event_loop: eventLoopImpl.EventLoop,
-    live_clients: std.ArrayList(LiveClient),
-    live_armed: bool,
-    dirty: bool,
-
-    const LiveClient = struct {
-        streams: ClientStreams, // held open across repaints
-        palette: ?pal.Palette, // probed once at subscribe
-        id: u32, // matched for teardown on exit/interrupt
-        lines_last_printed: usize, // for the cursor-up redraw
-        oneshot: bool, // draw one CPU-resolved frame, then disconnect
-        scope: status.Scope,
-    };
+    live: live.Subscribers,
 
     // --- Lifecycle ---
 
@@ -178,9 +171,7 @@ pub const Conductor = struct {
             .crf = std.StringHashMap(worker.Crf).init(allocator),
             .pressure_monitor = pressure.Monitor.init(&cfg),
             .event_loop = try eventLoopImpl.EventLoop.init(64),
-            .live_clients = .empty,
-            .live_armed = false,
-            .dirty = false,
+            .live = .{},
         };
     }
 
@@ -192,12 +183,8 @@ pub const Conductor = struct {
             self.allocator.destroy(pc);
         }
         self.pending_connections.deinit(self.allocator);
+        live.deinit(self);
         self.event_loop.deinit();
-        for (self.live_clients.items) |*lc| {
-            platform.write(lc.streams.fd(.stdout), "\r\n" ++ live_cursor_show);
-            lc.streams.deinit();
-        }
-        self.live_clients.deinit(self.allocator);
         self.cache.deinit();
         self.active_clients.deinit();
         for (self.pending_kills.items) |pk| {
@@ -312,7 +299,9 @@ pub const Conductor = struct {
 
     /// A tag whose record is no longer pending is stale.
     pub fn onReadable(self: *Conductor, tag: usize) void {
-        if (tag & tag_connection != 0) {
+        if (tag & 7 == live.tag) {
+            live.onReadable(self, @ptrFromInt(tag & ~@as(usize, 7)));
+        } else if (tag & 7 == tag_connection) {
             const pc: *PendingConnection = @ptrFromInt(tag & ~@as(usize, 7));
             if (!removePending(&self.pending_connections, pc)) return;
             defer self.allocator.destroy(pc);
@@ -413,7 +402,7 @@ pub const Conductor = struct {
         const subject = std.mem.readInt(u32, buf[1..5], .little); // client id, or worker pid/id
         const ntype = @as(protocol.notification.Type, @enumFromInt(buf[0]));
         // A live-status subscriber was never assigned a worker.
-        if ((ntype == .client_exit or ntype == .client_interrupt) and self.dropLiveClient(subject)) return;
+        if ((ntype == .client_exit or ntype == .client_interrupt) and live.dropById(self, subject)) return;
         switch (ntype) {
             .client_done => _ = self.clientDone(subject),
             .client_exit => {
@@ -822,7 +811,7 @@ pub const Conductor = struct {
         const now = self.currentTime();
         assignment.w.last_pinged = now;
         assignment.w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        self.registerClient(self.client_counter, request.host_pid orelse request.pid, assignment.w, port_set, false) catch |err| {
+        self.registerClient(self.client_counter, request, assignment.w, port_set) catch |err| {
             std.debug.print("Client {d}: cannot track: {}\n", .{ self.client_counter, err });
         };
         self.bumpCrf(worker_key, now); // count the summons only once the client is tracked
@@ -935,7 +924,7 @@ pub const Conductor = struct {
         const now = self.currentTime();
         w.last_pinged = now;
         w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        try self.registerClient(self.client_counter, request.host_pid orelse request.pid, w, port_set, watcher);
+        try self.registerClient(self.client_counter, request, w, port_set);
         self.sendSocketPaths(socket, paths);
         return true;
     }
@@ -1770,11 +1759,25 @@ pub const Conductor = struct {
 
     // --- Client tracking ---
 
-    fn registerClient(self: *Conductor, id: u32, pid: u32, w: *worker.Worker, port_set: u16, watcher: bool) !void {
+    fn registerClient(self: *Conductor, id: u32, request: *const ClientRequest, w: *worker.Worker, port_set: u16) !void {
+        try self.trackClient(id, .{
+            .worker = w,
+            .pid = request.host_pid orelse request.pid,
+            .port_set = port_set,
+            .watcher = request.parsed.hasSwitch("--watch"),
+            .session = request.parsed.hasSwitch("--session"),
+            .sync = request.parsed.hasSwitch("--sync"),
+        });
+    }
+
+    pub fn trackClient(self: *Conductor, id: u32, info: ActiveClientInfo) !void {
         const now_us = @divTrunc(self.nowNs(), 1000);
         const now_s = @divTrunc(now_us, 1_000_000);
-        try self.active_clients.put(id, .{ .worker = w, .pid = pid, .start_time_us = now_us, .port_set = port_set, .watcher = watcher });
-        if (watcher) {
+        var entry = info;
+        entry.start_time_us = now_us;
+        try self.active_clients.put(id, entry);
+        const w = info.worker;
+        if (info.watcher) {
             w.watchers += 1;
         } else if (!w.occupancy.fast.busy) {
             w.occupancy.attach(now_s, self.activityHalfLife(), self.budgetOccHalfLife());
@@ -1864,8 +1867,8 @@ pub const Conductor = struct {
 
     // Repairs a lost client_done, which the count-only sync can't.
     fn reconcileClientMap(self: *Conductor, w: *worker.Worker) void {
-        var live_buf: [max_tracked_clients]u32 = undefined;
-        const live = w.queryClients(&live_buf) catch |err| {
+        var running_buf: [max_tracked_clients]u32 = undefined;
+        const running = w.queryClients(&running_buf) catch |err| {
             std.debug.print("Worker {d}: queryClients failed: {}\n", .{ w.id, err });
             return;
         };
@@ -1874,7 +1877,7 @@ pub const Conductor = struct {
         var it = self.active_clients.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.worker != w) continue;
-            if (std.mem.indexOfScalar(u32, live, entry.key_ptr.*) != null) continue;
+            if (std.mem.indexOfScalar(u32, running, entry.key_ptr.*) != null) continue;
             if (n < stale.len) {
                 stale[n] = entry.key_ptr.*;
                 n += 1;
@@ -2049,17 +2052,17 @@ pub const Conductor = struct {
         };
     }
 
-    const Stream = enum(usize) { stdin, stdout, stderr, signals };
+    pub const Stream = enum(usize) { stdin, stdout, stderr, signals };
     const reply_accept_timeout_ms = 5000;
     const request_timeout_s = 10; // a client sends its whole request at once
 
-    const ClientStreams = struct {
+    pub const ClientStreams = struct {
         c: *Conductor,
         listeners: [4]protocol.Listener,
         conns: [4]posix.socket_t,
         port_set_idx: u16,
 
-        fn fd(self: *const ClientStreams, s: Stream) posix.socket_t {
+        pub fn fd(self: *const ClientStreams, s: Stream) posix.socket_t {
             return self.conns[@intFromEnum(s)];
         }
 
@@ -2070,11 +2073,11 @@ pub const Conductor = struct {
 
         // `deinit` closes right after, which is the EOF; a half-close first would
         // wait, on Windows, on this client, itself waiting for that EOF.
-        fn closeForExit(self: *const ClientStreams, exit_code: u8) void {
+        pub fn closeForExit(self: *const ClientStreams, exit_code: u8) void {
             platform.write(self.fd(.signals), &[_]u8{ protocol.signals.exit, 0x01, exit_code });
         }
 
-        fn deinit(self: *ClientStreams) void {
+        pub fn deinit(self: *ClientStreams) void {
             for (self.conns) |conn| platform.close(conn);
             for (&self.listeners) |*l| l.close(self.c.io);
             self.c.releasePortSet(self.port_set_idx);
@@ -2131,151 +2134,45 @@ pub const Conductor = struct {
     }
 
     // A TTY client is colour-probed first; a non-answering terminal gets the flat report.
+    // A styled TTY one-shot waits a beat so its CPU meter resolves.
     fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool, scope: status.Scope) !void {
         var streams = try self.openClientStreams(client_socket);
         var held = false;
         defer if (!held) streams.deinit();
-        const live = tty and isLiveStatus(format);
-        const palette: ?pal.Palette = if (tty and (format == null or live)) probePalette(&streams) else null;
-        // A styled TTY one-shot waits a beat so its CPU meter resolves.
-        if (tty and format == null) {
-            try self.subscribeOneshot(streams, palette, scope);
+        const is_live = tty and isLiveStatus(format);
+        const palette: ?pal.Palette = if (tty and (format == null or is_live)) probePalette(&streams) else null;
+        if (is_live or (tty and format == null)) {
+            try live.subscribe(self, streams, palette, scope, !is_live);
             held = true;
             return;
         }
-        const report = self.renderStatus(format, tty, palette, scope) catch |err| {
+        const report = self.renderStatus(format, tty, palette, scope, null) catch |err| {
             std.debug.print("Status: render failed: {}\n", .{err});
             streams.finish("Failed to generate status report.\n", 1);
             return;
         };
-        defer self.allocator.free(report.bytes);
-        platform.write(streams.fd(.stdout), report.bytes);
-        if (live) {
-            try self.subscribeLive(streams, palette, report.lines, scope);
-            held = true; // ownership moved into live_clients
-        } else {
-            streams.closeForExit(0);
-        }
+        defer report.deinit(self.allocator);
+        streams.finish(report.bytes, 0);
     }
 
-    fn renderStatus(self: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette, scope: status.Scope) !status.Report {
+    pub fn renderStatus(self: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette, scope: status.Scope, focus: ?u32) !status.Report {
         return status.render(self, .{
             .format = format,
             .tty = tty,
             .scope = scope,
             .palette = if (palette) |*p| p else null,
+            .focus = focus,
         });
     }
 
-    // --- Live repaint scheduling ---
-    //
-    // A change with no timer armed repaints at once; a burst only sets `dirty`.
-    // Each fire re-arms fast if dirty, else at the heartbeat, until no clients remain.
-    const live_debounce_ms = 100;
-    const live_heartbeat_ms = 1000;
-    const live_cursor_hide = "\x1b[?25l";
-    const live_cursor_show = "\x1b[?25h";
-    // ~1.4s tracks the 1s heartbeat.
-    const live_cpu_half_life: f64 = 1.4;
     const palette_probe_timeout_s = 2;
 
-    // serveStatus sent the first frame, so `dirty` stays false.
-    fn subscribeLive(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, lines: usize, scope: status.Scope) !void {
-        try self.live_clients.append(self.allocator, .{
-            .streams = streams,
-            .palette = palette,
-            .id = self.client_counter,
-            .lines_last_printed = lines,
-            .oneshot = false,
-            .scope = scope,
-        });
-        // Cooked (the probe left it raw) so ^C/^D become SIGINT/EOF and tear down.
-        platform.write(streams.fd(.signals), &[_]u8{ protocol.signals.raw_mode, 0x01, 0x00 });
-        platform.write(streams.fd(.stdout), live_cursor_hide);
-        if (!self.live_armed) {
-            self.event_loop.armLiveTimer(live_heartbeat_ms);
-            self.live_armed = true;
-        }
-    }
-
-    // fireLive's refreshStats takes the second reading, so util is the busy-cores
-    // rate over the beat. The cursor is left alone: the frame is a static report.
-    fn subscribeOneshot(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, scope: status.Scope) !void {
-        self.refreshStats(null); // first reading; the deferred fire takes the second
-        try self.live_clients.append(self.allocator, .{
-            .streams = streams,
-            .palette = palette,
-            .id = self.client_counter,
-            .lines_last_printed = 0,
-            .oneshot = true,
-            .scope = scope,
-        });
-        self.event_loop.armLiveTimer(live_debounce_ms);
-        self.live_armed = true;
-    }
-
     pub fn noteLiveChange(self: *Conductor) void {
-        if (self.live_clients.items.len == 0) return;
-        self.dirty = true;
-        if (!self.live_armed) self.fireLive();
+        live.noteChange(self);
     }
 
     pub fn onLiveTimer(self: *Conductor) void {
-        self.live_armed = false;
-        self.fireLive();
-    }
-
-    // A one-shot disconnects itself after its frame, so an all-one-shot fire stops the timer.
-    fn fireLive(self: *Conductor) void {
-        if (self.live_clients.items.len == 0) return;
-        const had_change = self.dirty;
-        self.dirty = false;
-        // Pure one-shots set util to the raw rate; any live watcher uses the EWMA.
-        const all_oneshot = for (self.live_clients.items) |lc| {
-            if (!lc.oneshot) break false;
-        } else true;
-        self.refreshStats(if (all_oneshot) null else live_cpu_half_life);
-        var i: usize = 0;
-        while (i < self.live_clients.items.len) {
-            if (self.repaintOne(&self.live_clients.items[i])) i += 1 else _ = self.live_clients.swapRemove(i);
-        }
-        if (self.live_clients.items.len == 0) return;
-        self.event_loop.armLiveTimer(if (had_change) live_debounce_ms else live_heartbeat_ms);
-        self.live_armed = true;
-    }
-
-    // Returns whether the client stays subscribed.
-    fn repaintOne(self: *Conductor, lc: *LiveClient) bool {
-        const report = self.renderStatus("live", true, lc.palette, lc.scope) catch return !lc.oneshot;
-        defer self.allocator.free(report.bytes);
-        const fd = lc.streams.fd(.stdout);
-        // DEC 2026 synchronized update, so no tearing; ESC[<n>F returns to the frame's
-        // top and ESC[0J clears any tail.
-        var hdr: [32]u8 = undefined;
-        const prefix = if (lc.lines_last_printed > 0)
-            std.fmt.bufPrint(&hdr, "\x1b[?2026h\x1b[{d}F\x1b[0J", .{lc.lines_last_printed}) catch unreachable
-        else
-            "\x1b[?2026h";
-        platform.write(fd, prefix);
-        platform.write(fd, report.bytes);
-        platform.write(fd, "\x1b[?2026l");
-        lc.lines_last_printed = report.lines;
-        if (!lc.oneshot) return true;
-        lc.streams.closeForExit(0);
-        lc.streams.deinit();
-        return false;
-    }
-
-    fn dropLiveClient(self: *Conductor, id: u32) bool {
-        for (self.live_clients.items, 0..) |*lc, i| {
-            if (lc.id != id) continue;
-            var removed = self.live_clients.swapRemove(i);
-            // So the shell prompt lands under the frozen snapshot.
-            platform.write(removed.streams.fd(.stdout), "\r\n" ++ live_cursor_show);
-            removed.streams.deinit();
-            return true;
-        }
-        return false;
+        live.onTimer(self);
     }
 
     // Read raw until the CSI 5n sentinel or a byte cap; the client's exit restores
