@@ -33,12 +33,63 @@ const Writer = struct {
     }
 };
 
+/// Who asks: the host sees everything, a sandboxed client only its sandbox
+/// (see `Conductor.isVisible`).
+pub const Scope = union(enum) { host, remote_sandbox, mount_ns: u64 };
+
 /// `format` is the `--status=<value>` argument; `palette` is set when the
 /// client answered the colour probe.
 pub const Options = struct {
     format: ?[]const u8 = null,
     tty: bool = false,
     palette: ?*const pal.Palette = null,
+    scope: Scope = .host,
+};
+
+/// What one request sees, gathered once: the host every worker, a sandboxed
+/// caller only its own sandbox's (`Conductor.isVisible`). The reserve is the host's.
+const View = struct {
+    workers: []const Placed, // pool by pool
+    projects: []const Project, // the host's pools, as the tree groups them
+    reserve: ?*Worker,
+    starting: usize,
+
+    const Placed = struct { key: []const u8, wk: *Worker };
+    const Project = struct { key: []const u8, workers: []const *Worker };
+
+    fn init(gpa: std.mem.Allocator, c: *Conductor, scope: Scope) !View {
+        var workers: std.ArrayList(Placed) = .empty;
+        errdefer workers.deinit(gpa);
+        var projects: std.ArrayList(Project) = .empty;
+        errdefer projects.deinit(gpa);
+        var it = c.workers.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const pool = entry.value_ptr.items;
+            for (pool) |wk| if (Conductor.isVisible(scope, key, wk)) try workers.append(gpa, .{ .key = key, .wk = wk });
+            if (pool.len > 0 and pool[0].launch == .direct and scope == .host)
+                try projects.append(gpa, .{ .key = key, .workers = pool });
+        }
+        var starting: usize = 0;
+        for (c.pending_spawns.items) |p| {
+            const visible = switch (p.purpose) {
+                .reserve => scope == .host,
+                .client => |hold| Conductor.isVisible(scope, hold.worker_key, &p.spawn.worker),
+            };
+            if (visible) starting += 1;
+        }
+        return .{
+            .workers = try workers.toOwnedSlice(gpa),
+            .projects = try projects.toOwnedSlice(gpa),
+            .reserve = if (scope == .host) c.reserve else null,
+            .starting = starting,
+        };
+    }
+
+    fn deinit(self: View, gpa: std.mem.Allocator) void {
+        gpa.free(self.workers);
+        gpa.free(self.projects);
+    }
 };
 
 /// `lines` is for the live view's cursor-up redraw.
@@ -57,11 +108,13 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(c.allocator);
     const w = Writer{ .list = &buf, .gpa = c.allocator };
+    const view = try View.init(c.allocator, c, opts.scope);
+    defer view.deinit(c.allocator);
     if (opts.format != null and std.mem.eql(u8, opts.format.?, "json")) {
-        try renderJson(c, w, now);
+        try renderJson(c, w, view, now);
     } else {
         const tints: ?Tints = if (opts.palette) |p| .{ .palette = p } else null;
-        try renderTree(c, w, Style{ .enabled = opts.tty }, tints, now);
+        try renderTree(c, w, Style{ .enabled = opts.tty }, tints, view, now);
     }
     const lines = std.mem.count(u8, buf.items, "\n");
     return .{ .bytes = try buf.toOwnedSlice(c.allocator), .lines = lines };
@@ -192,41 +245,35 @@ fn writeBytes(w: Writer, bytes: u64) !void {
 // "8s", "41m", "2h14m", "3d2h".
 fn writeDuration(w: Writer, total_seconds: i64) !void {
     var buf: [16]u8 = undefined;
-    try w.writeAll(formatDuration(&buf, total_seconds));
+    try w.writeAll(try formatDuration(&buf, total_seconds));
 }
 
 fn writeDurationPadded(w: Writer, total_seconds: i64, width: usize) !void {
     var buf: [16]u8 = undefined;
-    const d = formatDuration(&buf, total_seconds);
+    const d = try formatDuration(&buf, total_seconds);
     if (d.len < width) try w.writeByteNTimes(' ', width - d.len);
     try w.writeAll(d);
 }
 
 // Second-precise under 10min, where a countdown is worth watching tick.
-fn formatCountdown(buf: *[16]u8, total_seconds: i64) []const u8 {
+fn formatCountdown(buf: *[16]u8, total_seconds: i64) ![]const u8 {
     const s: u64 = @intCast(@max(0, total_seconds));
     if (s >= 600) return formatDuration(buf, total_seconds);
-    return if (s < 60)
-        std.fmt.bufPrint(buf, "{d}s", .{s}) catch unreachable
-    else
-        std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ s / 60, s % 60 }) catch unreachable;
+    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s});
+    return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ s / 60, s % 60 });
 }
 
-fn formatDuration(buf: *[16]u8, total_seconds: i64) []const u8 {
+// The two largest units, the smaller left off when zero.
+fn formatDuration(buf: *[16]u8, total_seconds: i64) ![]const u8 {
     const s: u64 = @intCast(@max(0, total_seconds));
-    return if (s < 60)
-        std.fmt.bufPrint(buf, "{d}s", .{s}) catch unreachable
-    else if (s < 3600)
-        std.fmt.bufPrint(buf, "{d}m", .{s / 60}) catch unreachable
-    else if (s < 86400) blk: {
-        const h = s / 3600;
-        const m = (s % 3600) / 60;
-        break :blk if (m == 0) std.fmt.bufPrint(buf, "{d}h", .{h}) catch unreachable else std.fmt.bufPrint(buf, "{d}h{d}m", .{ h, m }) catch unreachable;
-    } else blk: {
-        const d = s / 86400;
-        const h = (s % 86400) / 3600;
-        break :blk if (h == 0) std.fmt.bufPrint(buf, "{d}d", .{d}) catch unreachable else std.fmt.bufPrint(buf, "{d}d{d}h", .{ d, h }) catch unreachable;
-    };
+    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s});
+    if (s < 3600) return std.fmt.bufPrint(buf, "{d}m", .{s / 60});
+    const big, const small, const units: [2]u8 = if (s < 86400)
+        .{ s / 3600, s % 3600 / 60, .{ 'h', 'm' } }
+    else
+        .{ s / 86400, s % 86400 / 3600, .{ 'd', 'h' } };
+    if (small == 0) return std.fmt.bufPrint(buf, "{d}{c}", .{ big, units[0] });
+    return std.fmt.bufPrint(buf, "{d}{c}{d}{c}", .{ big, units[0], small, units[1] });
 }
 
 fn contractHome(path: []const u8, home: []const u8) []const u8 {
@@ -238,44 +285,35 @@ fn contractHome(path: []const u8, home: []const u8) []const u8 {
 
 const indent = "  ";
 
-fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, now: i64) !void {
-    const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(c) };
-    const have_sandboxed = anySandboxed(c);
-    var printed_any = false;
-    if (have_sandboxed) try writeGroupHeader(w, s, "host");
-    var it = c.workers.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.items.len == 0) continue;
-        if (entry.value_ptr.items[0].launch != .direct) continue;
-        if (printed_any) try w.writeByte('\n');
-        try renderProject(c, w, s, ctx, entry.value_ptr.items, entry.key_ptr.*, now, have_sandboxed);
-        printed_any = true;
+fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, view: View, now: i64) !void {
+    const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view) };
+    var sandboxed: usize = 0;
+    for (view.workers) |p| {
+        if (p.wk.launch != .direct) sandboxed += 1;
     }
-    if (have_sandboxed) {
-        try w.writeByte('\n');
+    for (view.projects, 0..) |project, i| {
+        if (i == 0 and sandboxed > 0) try writeGroupHeader(w, s, "host");
+        if (i > 0) try w.writeByte('\n');
+        try renderProject(c, w, s, ctx, project.workers, project.key, now, sandboxed > 0);
+    }
+    if (sandboxed > 0) {
+        if (view.projects.len > 0) try w.writeByte('\n');
         try writeGroupHeader(w, s, "◆ sandboxed");
-        const total = countSandboxed(c);
         var seen: usize = 0;
-        var sit = c.workers.iterator();
-        while (sit.next()) |entry| {
-            for (entry.value_ptr.items) |wk| {
-                if (wk.launch == .direct) continue;
-                seen += 1;
-                try renderWorker(c, w, s, ctx, wk, entry.key_ptr.*, now, false, seen == total);
-                printed_any = true;
-            }
-        }
+        for (view.workers) |p| if (p.wk.launch != .direct) {
+            seen += 1;
+            try renderWorker(c, w, s, ctx, p.wk, p.key, now, false, seen == sandboxed);
+        };
     }
-    if (c.reserve) |r| {
+    if (view.reserve) |r| {
         try w.writeByte('\n');
         try writeGroupHeader(w, s, "◇ reserve");
         try renderWorker(c, w, s, ctx, r, null, now, false, true);
-        printed_any = true;
     }
-    if (!printed_any) {
+    if (view.workers.len == 0 and view.reserve == null) {
         try s.wrap(w, ansi.dim, "No workers running.\n");
     }
-    try renderFooter(c, w, s);
+    try renderFooter(c, w, s, view);
 }
 
 fn writeGroupHeader(w: Writer, s: Style, label: []const u8) !void {
@@ -474,7 +512,7 @@ fn writeActivity(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
 // across workers.
 fn writeCullCountdown(w: Writer, s: Style, ctx: Ctx, remaining: i64, color_budget: i64) !void {
     var buf: [16]u8 = undefined;
-    const text = formatCountdown(&buf, remaining);
+    const text = try formatCountdown(&buf, remaining);
     const imminent = remaining <= 60;
     if (gradientTints(s, ctx)) |t| {
         const frac = 1.0 - @as(f64, @floatFromInt(@max(0, remaining))) / @as(f64, @floatFromInt(@max(1, color_budget)));
@@ -538,30 +576,20 @@ fn countClients(c: *Conductor, wk: *const Worker) usize {
     return n;
 }
 
-fn renderFooter(c: *Conductor, w: Writer, s: Style) !void {
-    var active_workers: usize = 0;
+fn renderFooter(c: *Conductor, w: Writer, s: Style, view: View) !void {
     var total_clients: usize = 0;
-    var total_mem: u64 = 0;
-    var has_reserve = false;
-    var it = c.workers.iterator();
-    while (it.next()) |entry| {
-        for (entry.value_ptr.items) |wk| {
-            active_workers += 1;
-            total_clients += wk.busyClients();
-            total_mem += wk.mem;
-        }
-    }
-    if (c.reserve) |r| {
-        has_reserve = true;
-        total_mem += r.mem;
+    var total_mem: u64 = if (view.reserve) |r| r.mem else 0;
+    for (view.workers) |p| {
+        total_clients += p.wk.busyClients();
+        total_mem += p.wk.mem;
     }
     try w.writeByte('\n');
     try s.open(w, ansi.dim);
     try w.writeAll(indent ++ ("─" ** 58) ++ "\n");
     try w.writeAll(indent);
-    try w.print("{d} workers", .{active_workers});
-    if (has_reserve) try w.writeAll(" · 1 reserve");
-    if (c.pending_spawns.items.len > 0) try w.print(" · {d} starting", .{c.pending_spawns.items.len});
+    try w.print("{d} workers", .{view.workers.len});
+    if (view.reserve != null) try w.writeAll(" · 1 reserve");
+    if (view.starting > 0) try w.print(" · {d} starting", .{view.starting});
     try w.print(" · {d} clients", .{total_clients});
     if (total_mem > 0) {
         try w.writeAll(" · ");
@@ -575,25 +603,6 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style) !void {
 
 // --- Helpers -----------------------------------------------------------------
 
-fn anySandboxed(c: *Conductor) bool {
-    var it = c.workers.iterator();
-    while (it.next()) |entry| {
-        for (entry.value_ptr.items) |wk| if (wk.launch != .direct) return true;
-    }
-    return false;
-}
-
-fn countSandboxed(c: *Conductor) usize {
-    var n: usize = 0;
-    var it = c.workers.iterator();
-    while (it.next()) |entry| {
-        for (entry.value_ptr.items) |wk| if (wk.launch != .direct) {
-            n += 1;
-        };
-    }
-    return n;
-}
-
 fn groupMem(workers: []const *Worker) u64 {
     var total: u64 = 0;
     for (workers) |wk| total += wk.mem;
@@ -602,20 +611,10 @@ fn groupMem(workers: []const *Worker) u64 {
 
 // The RSS painted fully hot: the heaviest worker, or a padded fair share of
 // memory, total / (n + 8), so a pool of light workers doesn't all peg red.
-fn memCeiling(c: *Conductor) u64 {
-    var max_mem: u64 = 0;
-    var n: u64 = 0;
-    var it = c.workers.iterator();
-    while (it.next()) |entry| {
-        for (entry.value_ptr.items) |wk| {
-            n += 1;
-            max_mem = @max(max_mem, wk.mem);
-        }
-    }
-    if (c.reserve) |r| {
-        n += 1;
-        max_mem = @max(max_mem, r.mem);
-    }
+fn memCeiling(view: View) u64 {
+    var max_mem: u64 = if (view.reserve) |r| r.mem else 0;
+    for (view.workers) |p| max_mem = @max(max_mem, p.wk.mem);
+    const n: u64 = view.workers.len + @intFromBool(view.reserve != null);
     const fair_share: u64 = if (platform.readMemInfo()) |m| m.total / (n + 8) else 0;
     return @max(max_mem, fair_share);
 }
@@ -638,30 +637,23 @@ fn idStr(id: u32) []const u8 {
 
 // --- JSON --------------------------------------------------------------------
 
-fn renderJson(c: *Conductor, w: Writer, now: i64) !void {
+fn renderJson(c: *Conductor, w: Writer, view: View, now: i64) !void {
     var total_clients: usize = 0;
     var total_mem: u64 = 0;
-    var worker_count: usize = 0;
     try w.writeAll("{\"workers\":[");
-    var first = true;
-    var it = c.workers.iterator();
-    while (it.next()) |entry| {
-        for (entry.value_ptr.items) |wk| {
-            if (!first) try w.writeByte(',');
-            first = false;
-            worker_count += 1;
-            total_clients += wk.busyClients();
-            total_mem += try writeWorkerJson(c, w, wk, entry.key_ptr.*, now);
-        }
+    for (view.workers, 0..) |p, i| {
+        if (i > 0) try w.writeByte(',');
+        total_clients += p.wk.busyClients();
+        total_mem += try writeWorkerJson(c, w, p.wk, p.key, now);
     }
     try w.writeAll("],\"reserve\":");
-    if (c.reserve) |r| {
+    if (view.reserve) |r| {
         total_mem += try writeWorkerJson(c, w, r, null, now);
     } else {
         try w.writeAll("null");
     }
     try w.print(",\"totals\":{{\"workers\":{d},\"reserve\":{d},\"starting\":{d},\"clients\":{d},\"mem_bytes\":{d}}}", .{
-        worker_count, @as(u8, if (c.reserve != null) 1 else 0), c.pending_spawns.items.len, total_clients, total_mem,
+        view.workers.len, @intFromBool(view.reserve != null), view.starting, total_clients, total_mem,
     });
     try w.print(",\"max_ttl\":{d},\"min_ttl\":{d},\"label_ttl\":{d},\"worker_args\":", .{ c.cfg.max_ttl, c.cfg.min_ttl, c.cfg.label_ttl });
     try writeJsonString(w, c.cfg.worker_args);
