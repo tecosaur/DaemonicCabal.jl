@@ -520,8 +520,9 @@ end
 # Clients are interrupted by the conductor's SIGINT alone; there is no message.
 function serve_message(conn::IO, header::MessageHeader)
     if header.msg_type == MSG_TYPE.ping
+        seq = read(conn, UInt8)
         active = @lock STATE.lock length(STATE.clients)
-        send_pong(conn, active)
+        send_pong(conn, seq, active)
     elseif header.msg_type == MSG_TYPE.set_project
         project = read_string(conn)
         try

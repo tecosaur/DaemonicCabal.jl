@@ -148,7 +148,9 @@ pub const Worker = struct {
     ping_pending: bool = false,
     /// Set once an unanswered ping has been met with `forceInterrupt`.
     unresponsive_interrupted: bool = false,
-    pong_buf: [5]u8 = undefined,
+    /// Echoed in the pong, which tells a late pong for an earlier ping from this one's.
+    ping_seq: u8 = 0,
+    pong_buf: [protocol.worker.pong_size]u8 = undefined,
     active_clients: u32,
     occupancy: Occupancies = .{},
     cpu: CpuMeter = .{},
@@ -498,13 +500,13 @@ pub const Worker = struct {
         while (true) {
             const header = try self.readHeader();
             if (header.msg_type != .pong) return header;
-            var payload: [2]u8 = undefined;
+            var payload: [protocol.worker.pong_size - 3]u8 = undefined;
             try readExact(self.socket, &payload);
         }
     }
 
     pub fn ping(self: *Worker) !void {
-        self.writeHeader(.ping, 0);
+        self.sendPing();
         const header = try self.readHeader();
         if (header.msg_type != .pong) {
             std.debug.print("Worker {d}: ping expected pong, got {s} ({s})\n", .{
@@ -512,8 +514,9 @@ pub const Worker = struct {
             });
             return error.UnexpectedResponse;
         }
-        var payload: [2]u8 = undefined;
+        var payload: [protocol.worker.pong_size - 3]u8 = undefined;
         try readExact(self.socket, &payload);
+        if (payload[0] != self.ping_seq) return error.UnexpectedResponse;
     }
 
     // A busy worker's ping only reconciles counts, so it runs slower.
@@ -525,7 +528,9 @@ pub const Worker = struct {
     }
 
     pub fn sendPing(self: *Worker) void {
-        self.writeHeader(.ping, 0);
+        self.ping_seq +%= 1;
+        self.writeHeader(.ping, 1);
+        platform.write(self.socket, &.{self.ping_seq});
     }
 
     /// Julia force-throws past a tight loop from the fifth SIGINT in quick

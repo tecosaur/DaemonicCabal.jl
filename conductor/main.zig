@@ -1867,6 +1867,8 @@ pub const Conductor = struct {
             std.debug.print("Worker {d}: pong short read\n", .{w.id});
             return self.retireWorker(w);
         };
+        // Late for a ping whose timeout was let pass; this one's is still to come.
+        if (w.pong_buf[3] != w.ping_seq) return self.event_loop.awaitPong(w, self.cfg.ping_timeout * 1000);
         self.processPong(w, &w.pong_buf);
     }
 
@@ -1899,10 +1901,10 @@ pub const Conductor = struct {
         self.event_loop.awaitPong(w, self.cfg.ping_timeout * 1000);
     }
 
-    fn processPong(self: *Conductor, w: *worker.Worker, pong_buf: *const [5]u8) void {
+    fn processPong(self: *Conductor, w: *worker.Worker, pong_buf: *const [protocol.worker.pong_size]u8) void {
         w.last_pinged = self.currentTime();
         w.unresponsive_interrupted = false;
-        const worker_count = std.mem.readInt(u16, pong_buf[3..5], .little);
+        const worker_count = std.mem.readInt(u16, pong_buf[4..6], .little);
         if (worker_count != w.active_clients) {
             std.debug.print("Worker {d}: client count mismatch (worker={d}, conductor={d}), syncing\n", .{
                 w.id, worker_count, w.active_clients,
