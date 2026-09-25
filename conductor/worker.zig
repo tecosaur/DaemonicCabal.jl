@@ -492,6 +492,17 @@ pub const Worker = struct {
         };
     }
 
+    /// The reply to a request, past any pong still owed for a ping whose
+    /// timeout was let pass (a busy worker answers late).
+    fn readReply(self: *Worker) !Header {
+        while (true) {
+            const header = try self.readHeader();
+            if (header.msg_type != .pong) return header;
+            var payload: [2]u8 = undefined;
+            try readExact(self.socket, &payload);
+        }
+    }
+
     pub fn ping(self: *Worker) !void {
         self.writeHeader(.ping, 0);
         const header = try self.readHeader();
@@ -534,7 +545,7 @@ pub const Worker = struct {
         std.mem.writeInt(u16, &len_buf, @intCast(project.len), .little);
         platform.write(self.socket, &len_buf);
         platform.write(self.socket, project);
-        const header = try self.readHeader();
+        const header = try self.readReply();
         if (header.msg_type == .err) {
             std.debug.print("Worker {d}: setProject got {s} ({s})\n", .{
                 self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
@@ -575,7 +586,7 @@ pub const Worker = struct {
             std.mem.writeInt(u32, &id_buf, id, .little);
             platform.write(self.socket, &id_buf);
         }
-        const header = try self.readHeader();
+        const header = try self.readReply();
         if (header.msg_type != .ack) {
             std.debug.print("Worker {d}: syncClients expected ack, got {s} ({s})\n", .{
                 self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
@@ -591,7 +602,7 @@ pub const Worker = struct {
     /// like exited clients.
     pub fn queryClients(self: *Worker, buf: []u32) ![]u32 {
         self.writeHeader(.query_clients, 0);
-        const header = try self.readHeader();
+        const header = try self.readReply();
         if (header.msg_type != .clients) {
             std.debug.print("Worker {d}: queryClients expected clients, got {s} ({s})\n", .{
                 self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
@@ -666,7 +677,7 @@ pub const Worker = struct {
         self.writeHeader(.client_run, @intCast(payload_size));
         platform.write(self.socket, send_buf);
         std.debug.print("Worker {d}: waiting for response...\n", .{self.id});
-        const header = try self.readHeader();
+        const header = try self.readReply();
         std.debug.print("Worker {d}: got response: {s} ({d} bytes payload)\n", .{ self.id, @tagName(header.msg_type), header.payload_len });
         if (header.msg_type == .err) {
             std.debug.print("Worker {d}: runClient got {s} ({s})\n", .{
