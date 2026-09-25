@@ -43,6 +43,7 @@ pub fn getStderrHandle() std.posix.fd_t {
 const shared = if (os != .windows) @import("posix.zig") else impl;
 pub const socketWrite = shared.socketWrite;
 pub const socketRead = shared.socketRead;
+pub const sendNonBlocking = shared.sendNonBlocking;
 pub const close = shared.close;
 pub const shutdownWrite = shared.shutdownWrite;
 pub const eprint = shared.eprint;
