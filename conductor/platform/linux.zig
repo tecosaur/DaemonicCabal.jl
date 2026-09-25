@@ -69,12 +69,12 @@ pub fn peerPid(socket: posix.socket_t) ?posix.pid_t {
 
 var own_mount_ns: ?u64 = null;
 pub fn peerMountNs(socket: posix.socket_t) ?u64 {
-    return mountNsInode(peerPid(socket) orelse return null);
+    return processMountNs(peerPid(socket) orelse return null);
 }
 
 pub fn peerForeignMountNs(socket: posix.socket_t) ?u64 {
     const peer = peerMountNs(socket) orelse return null;
-    const own = own_mount_ns orelse (mountNsInode(linux.getpid()) orelse return null);
+    const own = own_mount_ns orelse (processMountNs(linux.getpid()) orelse return null);
     own_mount_ns = own;
     return if (peer == own) null else peer;
 }
@@ -106,8 +106,12 @@ pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*
     linux.exit_group(127);
 }
 
+pub fn childMountNs(child: std.process.Child) ?u64 {
+    return processMountNs(child.id orelse return null);
+}
+
 // The link reads "mnt:[4026531841]".
-fn mountNsInode(pid: posix.pid_t) ?u64 {
+fn processMountNs(pid: posix.pid_t) ?u64 {
     var path_buf: [64]u8 = undefined;
     var link_buf: [64]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/ns/mnt", .{pid}) catch return null;

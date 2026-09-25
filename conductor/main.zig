@@ -154,6 +154,7 @@ pub const Conductor = struct {
         id: u32, // matched for teardown on exit/interrupt
         lines_last_printed: usize, // for the cursor-up redraw
         oneshot: bool, // draw one CPU-resolved frame, then disconnect
+        scope: status.Scope,
     };
 
     // --- Lifecycle ---
@@ -442,10 +443,6 @@ pub const Conductor = struct {
         var request_held = false; // moved into a HeldClient while its worker starts
         defer if (!request_held) request.deinit(self.allocator);
         self.client_counter += 1;
-        if (request.parsed.hasSwitch("--status")) {
-            try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty);
-            return .done;
-        }
         const project_path = request.project orelse "";
         const julia_channel = request.parsed.julia_channel;
         // Thread count is fixed at worker startup, so it's part of pool identity.
@@ -486,6 +483,15 @@ pub const Conductor = struct {
             std.debug.print("Client {d}: {s} sandbox\n", .{
                 self.client_counter, @tagName(sandbox),
             });
+        }
+        if (request.parsed.hasSwitch("--status")) {
+            const scope: status.Scope = switch (sandbox) {
+                .none, .local => .host, // --sandbox makes no sandbox of a status request
+                .remote => .remote_sandbox,
+                .client => |c| .{ .mount_ns = c.ns },
+            };
+            try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty, scope);
+            return .done;
         }
         // Session bypass
         if (sandbox == .remote) {
@@ -1288,6 +1294,25 @@ pub const Conductor = struct {
             if (findWorkerByLabel(pool, label)) |w| return .{ .w = w, .pool_key = entry.key_ptr.* };
         }
         return null;
+    }
+
+    /// Whether `--status` from `scope` shows the worker. A sandboxed caller sees
+    /// only its sandbox: the remote clients' pool, or the workers in its mount
+    /// namespace, whether spawned there by the client or built by us.
+    pub fn isVisible(scope: status.Scope, pool_key: []const u8, w: *const worker.Worker) bool {
+        return switch (scope) {
+            .host => true,
+            .remote_sandbox => std.mem.startsWith(u8, pool_key, "__sandbox__\x00"),
+            .mount_ns => |ns| switch (w.launch) {
+                .direct => false,
+                .client => blk: {
+                    var buf: [32]u8 = undefined;
+                    const prefix = std.fmt.bufPrint(&buf, "__ns{d}__\x00", .{ns}) catch break :blk false;
+                    break :blk std.mem.startsWith(u8, pool_key, prefix);
+                },
+                .sandboxed => platform.childMountNs(w.process) == ns,
+            },
+        };
     }
 
     /// Where a host client works in a conductor-built sandbox: a local
@@ -2106,7 +2131,7 @@ pub const Conductor = struct {
     }
 
     // A TTY client is colour-probed first; a non-answering terminal gets the flat report.
-    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool) !void {
+    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool, scope: status.Scope) !void {
         var streams = try self.openClientStreams(client_socket);
         var held = false;
         defer if (!held) streams.deinit();
@@ -2114,11 +2139,11 @@ pub const Conductor = struct {
         const palette: ?pal.Palette = if (tty and (format == null or live)) probePalette(&streams) else null;
         // A styled TTY one-shot waits a beat so its CPU meter resolves.
         if (tty and format == null) {
-            try self.subscribeOneshot(streams, palette);
+            try self.subscribeOneshot(streams, palette, scope);
             held = true;
             return;
         }
-        const report = self.renderStatus(format, tty, palette) catch |err| {
+        const report = self.renderStatus(format, tty, palette, scope) catch |err| {
             std.debug.print("Status: render failed: {}\n", .{err});
             streams.finish("Failed to generate status report.\n", 1);
             return;
@@ -2126,17 +2151,18 @@ pub const Conductor = struct {
         defer self.allocator.free(report.bytes);
         platform.write(streams.fd(.stdout), report.bytes);
         if (live) {
-            try self.subscribeLive(streams, palette, report.lines);
+            try self.subscribeLive(streams, palette, report.lines, scope);
             held = true; // ownership moved into live_clients
         } else {
             streams.closeForExit(0);
         }
     }
 
-    fn renderStatus(self: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette) !status.Report {
+    fn renderStatus(self: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette, scope: status.Scope) !status.Report {
         return status.render(self, .{
             .format = format,
             .tty = tty,
+            .scope = scope,
             .palette = if (palette) |*p| p else null,
         });
     }
@@ -2154,13 +2180,14 @@ pub const Conductor = struct {
     const palette_probe_timeout_s = 2;
 
     // serveStatus sent the first frame, so `dirty` stays false.
-    fn subscribeLive(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, lines: usize) !void {
+    fn subscribeLive(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, lines: usize, scope: status.Scope) !void {
         try self.live_clients.append(self.allocator, .{
             .streams = streams,
             .palette = palette,
             .id = self.client_counter,
             .lines_last_printed = lines,
             .oneshot = false,
+            .scope = scope,
         });
         // Cooked (the probe left it raw) so ^C/^D become SIGINT/EOF and tear down.
         platform.write(streams.fd(.signals), &[_]u8{ protocol.signals.raw_mode, 0x01, 0x00 });
@@ -2173,7 +2200,7 @@ pub const Conductor = struct {
 
     // fireLive's refreshStats takes the second reading, so util is the busy-cores
     // rate over the beat. The cursor is left alone: the frame is a static report.
-    fn subscribeOneshot(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette) !void {
+    fn subscribeOneshot(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, scope: status.Scope) !void {
         self.refreshStats(null); // first reading; the deferred fire takes the second
         try self.live_clients.append(self.allocator, .{
             .streams = streams,
@@ -2181,6 +2208,7 @@ pub const Conductor = struct {
             .id = self.client_counter,
             .lines_last_printed = 0,
             .oneshot = true,
+            .scope = scope,
         });
         self.event_loop.armLiveTimer(live_debounce_ms);
         self.live_armed = true;
@@ -2218,7 +2246,7 @@ pub const Conductor = struct {
 
     // Returns whether the client stays subscribed.
     fn repaintOne(self: *Conductor, lc: *LiveClient) bool {
-        const report = self.renderStatus("live", true, lc.palette) catch return !lc.oneshot;
+        const report = self.renderStatus("live", true, lc.palette, lc.scope) catch return !lc.oneshot;
         defer self.allocator.free(report.bytes);
         const fd = lc.streams.fd(.stdout);
         // DEC 2026 synchronized update, so no tearing; ESC[<n>F returns to the frame's

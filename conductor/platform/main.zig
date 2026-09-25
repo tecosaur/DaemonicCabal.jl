@@ -76,6 +76,7 @@ const linux_only = if (os == .linux) impl else struct {
     pub fn peerPid(_: std.posix.socket_t) ?std.posix.pid_t { return null; }
     pub fn peerForeignMountNs(_: std.posix.socket_t) ?u64 { return null; }
     pub fn peerMountNs(_: std.posix.socket_t) ?u64 { return null; }
+    pub fn childMountNs(_: std.process.Child) ?u64 { return null; }
     pub fn parentPid(_: std.posix.pid_t) ?std.posix.pid_t { return null; }
     pub fn pidfdOpen(_: std.posix.pid_t) ?std.posix.fd_t { return null; }
     pub fn pidfdSignal(_: std.posix.fd_t, _: SIG) usize { return 1; }
@@ -87,6 +88,7 @@ pub const peerPid = linux_only.peerPid;
 /// Null when the same as ours, or unknown.
 pub const peerForeignMountNs = linux_only.peerForeignMountNs;
 pub const peerMountNs = linux_only.peerMountNs;
+pub const childMountNs = linux_only.childMountNs;
 pub const parentPid = linux_only.parentPid;
 /// Immune to pid reuse.
 pub const pidfdOpen = linux_only.pidfdOpen;
