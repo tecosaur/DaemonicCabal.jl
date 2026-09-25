@@ -67,14 +67,25 @@ let
     is_tcp_address("/tmp/test.sock")
     sync_session_label(client)
     # create_module/prepare_module/runclient can't run here: Core.eval is forbidden.
-    # -- BroadcastWriter + OutputHistory ---------------------------------------
-    history = OutputHistory(SYNC_HISTORY_BYTES)
-    bw = BroadcastWriter(IO[IOBuffer(), IOBuffer()], history)
+    # -- BroadcastWriter + Transcript ------------------------------------------
+    # Unregistered, so no session is baked into the image.
+    transcript = Transcript()
+    start_recording!(transcript)
+    screen = Recording(transcript, 1, time(), "--sync")
+    bw = BroadcastWriter(IO[IOBuffer(), IOBuffer()], screen, :stdout)
     iswritable(bw); isopen(bw); isreadable(bw); bytesavailable(bw)
     write(bw, UInt8(0x41))
     Base.unsafe_write(bw, pointer("test\n"), UInt(5))
     flush(bw)
-    replay_history(IOBuffer(), history)
+    replay_history(IOBuffer(), screen)
+    for event in first(transcript_events(transcript))
+        json_event(event)
+        render_text(event, false)
+    end
+    let text = TerminalText(IOBuffer())
+        write(text, "\e[1mbold\e[m\r\e[Kplain\n")
+        finish!(text)
+    end
     # -- ScopedIO --------------------------------------------------------------
     @static if VERSION >= v"1.11"
         scoped_out = ScopedStdout()

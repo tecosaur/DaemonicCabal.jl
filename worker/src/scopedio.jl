@@ -3,7 +3,7 @@
 
 using Base.ScopedValues
 
-const OutputIO = Union{Base.PipeEndpoint, Sockets.TCPSocket, BroadcastWriter{StreamIO}, BufferedOutput{Base.PipeEndpoint}, BufferedOutput{Sockets.TCPSocket}}
+const OutputIO = Union{Base.PipeEndpoint, Sockets.TCPSocket, BroadcastWriter{StreamIO}, BufferedOutput{Base.PipeEndpoint}, BufferedOutput{Sockets.TCPSocket}, RecordedOutput, BufferedOutput{RecordedOutput}}
 
 mutable struct VirtualTerm
     const stdin::StreamIO
@@ -70,6 +70,7 @@ const WORKER_TERM = VirtualTerm(
 const ACTIVE_TERM = ScopedValue{VirtualTerm}(WORKER_TERM)
 const CLIENT_MODULE = ScopedValue{Module}(Main)
 const CLIENT_REPL = ScopedValue(Ref{REPL.LineEditREPL}())
+const CLIENT_RECORDING = ScopedValue{Union{Nothing, Recording}}(nothing)
 const REPLAY_TARGET = ScopedValue{Union{Nothing, Tuple{StreamIO, SyncSession}}}(nothing)
 
 struct ScopedStdin <: Base.AbstractPipe end
@@ -79,6 +80,15 @@ struct ScopedStderr <: Base.AbstractPipe end
 Base.pipe_reader(::ScopedStdin) = @something(ACTIVE_TERM[].redirect_in, ACTIVE_TERM[].stdin)
 Base.pipe_writer(::ScopedStdout) = @something(ACTIVE_TERM[].redirect_out, ACTIVE_TERM[].stdout)
 Base.pipe_writer(::ScopedStderr) = @something(ACTIVE_TERM[].redirect_err, ACTIVE_TERM[].stderr)
+
+# A recorded REPL's terminal writes stdout through this, so its line editing
+# can be told from the output of other tasks.
+struct TerminalStdout <: Base.AbstractPipe end
+const TERMINAL_WRITE = ScopedValue(false)
+Base.pipe_writer(::TerminalStdout) = Base.pipe_writer(ScopedStdout())
+Base.unsafe_write(::TerminalStdout, p::Ptr{UInt8}, n::UInt) =
+    with(() -> unsafe_write(ScopedStdout(), p, n), TERMINAL_WRITE => true)
+Base.write(::TerminalStdout, byte::UInt8) = with(() -> write(ScopedStdout(), byte), TERMINAL_WRITE => true)
 
 # A `ScopedStd*` argument is the worker installing its own globals, not a client
 # redirect, so it clears the slot.
@@ -96,7 +106,7 @@ end
 
 const TERMINFOS = Dict{String, Base.TermInfo}()
 
-function Base.get(::Union{ScopedStdout, ScopedStderr}, key::Symbol, default)
+function Base.get(::Union{ScopedStdout, ScopedStderr, TerminalStdout}, key::Symbol, default)
     if key === :color
         @static if VERSION >= v"1.12"
             Base.get_have_color()
@@ -121,7 +131,7 @@ function query_displaysize(signals::StreamIO)
      if iszero(width) last(DEFAULT_DISPLAYSIZE) else Int(width) end)
 end
 # A sync session takes the smallest of its clients' sizes, like tmux.
-function Base.displaysize(::Union{ScopedStdout, ScopedStderr})
+function Base.displaysize(::Union{ScopedStdout, ScopedStderr, TerminalStdout})
     term = ACTIVE_TERM[]
     session = term.sync_session
     if !isnothing(session)

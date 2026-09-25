@@ -12,9 +12,9 @@ using Sockets
 const WORKER_ID = Ref("")
 const StreamIO = Union{Base.PipeEndpoint, Sockets.TCPSocket}
 
+include("terminaltext.jl")
+include("transcript.jl")
 include("broadcastio.jl")
-
-const SYNC_HISTORY_BYTES = 64 * 1024
 
 struct SyncSession
     mergedin::Base.PipeEndpoint
@@ -22,7 +22,7 @@ struct SyncSession
     out::BroadcastWriter{StreamIO}
     err::BroadcastWriter{StreamIO}
     signals::Vector{StreamIO}
-    history::OutputHistory
+    screen::Recording  # the shared run, whose output a joiner is replayed
     repl::Base.RefValue{REPL.LineEditREPL}
 end
 

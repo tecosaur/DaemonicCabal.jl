@@ -1,49 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-# A ring of a sync session's recent stdout and stderr, interleaved as a terminal
-# would show them. `pos` is the 0-based next write slot; `total` counts every
-# byte ever written, so the live and dropped counts derive from it.
-mutable struct OutputHistory
-    const bytes::Vector{UInt8}
-    const lock::SpinLock
-    pos::Int
-    total::Int
-end
-
-OutputHistory(cap::Int) = OutputHistory(Vector{UInt8}(undef, cap), SpinLock(), 0, 0)
-
-function capture!(h::OutputHistory, data)
-    cap = length(h.bytes)
-    iszero(cap) && return
-    nb = length(data)
-    n = min(nb, cap)  # only the last cap bytes of an oversized write survive
-    soff = lastindex(data) - n + 1
-    @lock h.lock begin
-        first_run = min(n, cap - h.pos)
-        copyto!(h.bytes, h.pos + 1, data, soff, first_run)
-        first_run < n && copyto!(h.bytes, 1, data, soff + first_run, n - first_run)
-        h.pos = (h.pos + n) % cap
-        h.total += nb
-    end
-    nothing
-end
-
-# The live bytes oldest-first, plus how many earlier bytes were dropped.
-function linearise(h::OutputHistory)
-    @lock h.lock begin
-        cap = length(h.bytes)
-        len = min(h.total, cap)
-        iszero(len) && return UInt8[], 0
-        out = Vector{UInt8}(undef, len)
-        start = mod(h.pos - len, cap)  # 0-based index of the oldest byte
-        first_run = min(len, cap - start)
-        copyto!(out, 1, h.bytes, start + 1, first_run)
-        first_run < len && copyto!(out, first_run + 1, h.bytes, 1, len - first_run)
-        out, h.total - len
-    end
-end
-
 # Index `maxlines` lines back from the end (or `firstindex` if fewer); 0 = no limit.
 function line_limited_start(bytes::Vector{UInt8}, maxlines::Int)
     maxlines > 0 || return firstindex(bytes)
@@ -79,8 +36,13 @@ function replay_start(bytes::Vector{UInt8}, overflowed::Bool, maxlines::Int)
     start, true
 end
 
-function replay_history(dest::IO, h::OutputHistory; maxlines::Int=0)
-    bytes, dropped = linearise(h)
+# A sync session's screen so far: its shared run's output, from its transcript.
+function replay_history(dest::IO, screen::Recording; maxlines::Int=0)
+    events, dropped = transcript_events(screen.transcript)
+    bytes = UInt8[]
+    for e in events
+        e.run == screen.run && e.kind ∈ (:stdout, :stderr, :prompt) && append!(bytes, e.data)
+    end
     start, truncated = replay_start(bytes, dropped > 0, maxlines)
     if truncated
         omitted = dropped + (start - firstindex(bytes))
@@ -92,7 +54,8 @@ end
 
 struct BroadcastWriter{T} <: IO
     writers::Vector{T}
-    history::OutputHistory
+    screen::Recording  # the sync session's shared run
+    stream::Symbol
 end
 
 Base.iswritable(b::BroadcastWriter) = any(iswritable, b.writers)
@@ -124,13 +87,13 @@ function broadcast_to_writers(op::F, io::BroadcastWriter, args...) where {F}
 end
 
 function Base.write(io::BroadcastWriter, byte::UInt8)
-    capture!(io.history, (byte,))
+    record!(io.screen, io.stream, UInt8[byte])
     broadcast_to_writers(write, io, byte)
     1
 end
 
 function Base.unsafe_write(io::BroadcastWriter, p::Ptr{UInt8}, nb::UInt)
-    capture!(io.history, unsafe_wrap(Array, p, Int(nb)))
+    record!(io.screen, io.stream, unsafe_wrap(Array, p, Int(nb)))
     broadcast_to_writers(Base.unsafe_write, io, p, nb)
     Int(nb)
 end

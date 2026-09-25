@@ -34,6 +34,7 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
 const optional_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },
     .{ "--status", {} },
+    .{ "--watch", {} },
     .{ "--revise", {} },
     .{ "--project", {} },
     .{ "--code-coverage", {} },
@@ -47,6 +48,7 @@ const optional_value_switches = std.StaticStringMap(void).initComptime(.{
 const honoured_switches = std.StaticStringMap(?[]const u8).initComptime(.{
     .{ "--address", null },     .{ "--help", null },     .{ "-h", null },
     .{ "--version", null },     .{ "-v", null },         .{ "--status", null },
+    .{ "--watch", null },
     .{ "--restart", null },     .{ "--sandbox", null },  .{ "--session", null },
     .{ "--sync", null },        .{ "--project", null },  .{ "--threads", null },
     .{ "--revise", null },      .{ "--eval", null },     .{ "--print", null },

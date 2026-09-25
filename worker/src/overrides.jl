@@ -73,6 +73,30 @@ end
             prefix * (prompt isa String ? prompt : prompt())
         end
     end
+    # A recording's line editing runs from a response's end to a line's commit,
+    # which records the line in its mode, as history does.
+    @eval function REPL.prepare_next(repl::REPL.LineEditREPL)
+        recording = CLIENT_RECORDING[]
+        isnothing(recording) || (recording.editing = true)
+        println(REPL.terminal(repl))
+    end
+    @eval function REPL.LineEdit.commit_line(s::REPL.LineEdit.MIState)
+        LE = REPL.LineEdit
+        LE.cancel_beep(s)
+        LE.move_input_end(s)
+        LE.refresh_line(s)
+        println(LE.terminal(s))
+        LE.add_history(s)
+        LE.state(s, LE.mode(s)).ias = LE.InputAreaState(0, 0)
+        recording = CLIENT_RECORDING[]
+        if !isnothing(recording)
+            mode = LE.mode(s)
+            code = rstrip(String(take!(copy(LE.buffer(s)))))
+            isempty(code) || record!(recording, :typed, string(LE.mode_idx(mode.hist, mode), '\n', code))
+            recording.editing = false
+        end
+        nothing
+    end
     # The per-client Main prints as "Main", not "Main.Main".
     @eval function Base.print_fullname(io::IO, m::Module)
         mp = parentmodule(m)
@@ -91,7 +115,12 @@ end
         if target !== nothing
             (stdout, session) = target
             REPL.banner(IOContext(stdout, :color => something(ACTIVE_TERM[].have_color, false)))
-            replay_history(stdout, session.history)
+            replay_history(stdout, session.screen)
+        end
+        recording = CLIENT_RECORDING[]
+        if !isnothing(recording) && repl.t isa REPL.Terminals.TTYTerminal
+            repl.t.out_stream = TerminalStdout()
+            recording.editing = true
         end
     end)
 end
