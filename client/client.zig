@@ -267,8 +267,9 @@ fn run(init: std.process.Init.Minimal) !void {
     if (transport_mode == .tcp) platform.setTcpNodelay(conductor);
     defer notifyConductor(.client_exit);
     var w = SocketWriter{ .handle = conductor };
-    // The worker's own terminal knows nothing of ours.
-    const color = is_tty and !hasNoColor(inputs.env);
+    // The worker's own terminal knows nothing of ours. Colour follows where
+    // output goes, as Julia's does.
+    const color = platform.isatty(platform.getStdoutHandle()) and !hasNoColor(inputs.env);
     try sendClientInfo(&w, env, is_tty, color, try forwardedArgs(arena.allocator(), inputs.args, &parsed));
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers();
