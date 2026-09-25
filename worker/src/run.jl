@@ -161,11 +161,13 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
         end
     end
     hascolor = clienthascolor(client)
+    # As Julia's: -i, or a REPL at a terminal.
+    interactive = any(s -> first(s) == "-i", client.switches) || (client.tty && is_repl_client(client))
     # Pre-1.11 output goes through redirected fds, which cannot be copied. A
     # sync session's broadcast writers record its screen as one shared run.
     session = getval(client.switches, "--session", nothing)  # "" when unlabelled
     own_run = if VERSION >= v"1.11" && isnothing(sync_session) && isnothing(broadcast) && !isnothing(session)
-        begin_run(session, command_line(client); interactive = client.tty && is_repl_client(client))
+        begin_run(session, command_line(client); interactive)
     end
     recording = if isnothing(sync_session) own_run else sync_session.screen end
     recorded(io, stream) = if isnothing(own_run) io else RecordedOutput(io, own_run, stream) end
@@ -187,6 +189,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
         withenv(client.env...) do
             @static if VERSION < v"1.11"
                 CLIENT_SIGNALS[] = signals
+                CLIENT_INTERACTIVE[] = interactive
                 try
                     redirect_stdio(stdin=client_stdin, stdout=stdoutx, stderr=stderrx) do
                         # Base's display holds the stdout the worker started with.
@@ -200,6 +203,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     end
                 finally
                     CLIENT_SIGNALS[] = nothing
+                    CLIENT_INTERACTIVE[] = false
                 end
             else
                 term = get(ENV, "TERM", @static if Sys.iswindows() "" else "dumb" end)
@@ -216,6 +220,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     get(TERMINFOS, term, nothing), color, nothing)
                 with(ACTIVE_TERM => client_vterm,
                      CLIENT_MODULE => mod,
+                     CLIENT_INTERACTIVE => interactive,
                      CLIENT_REPL => repl_ref,
                      CLIENT_RECORDING => recording,
                      REPLAY_TARGET => replay) do

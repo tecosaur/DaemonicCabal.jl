@@ -172,9 +172,11 @@ function register_client!(id::Int, task::Task, streams::StreamIO...)
     @lock STATE.lock STATE.client_tasks[id] = ClientTask(task, streams)
 end
 
-# Pre-1.11 stand-in for ACTIVE_TERM's signals; that path is single-client.
+# Pre-1.11 stand-ins for ACTIVE_TERM's signals and CLIENT_INTERACTIVE; that
+# path is single-client.
 @static if VERSION < v"1.11"
     const CLIENT_SIGNALS = Ref{Union{Nothing, StreamIO}}(nothing)
+    const CLIENT_INTERACTIVE = Ref(false)
 end
 
 # Signal protocol (Worker → Client)
