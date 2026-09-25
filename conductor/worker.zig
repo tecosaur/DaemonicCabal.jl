@@ -10,6 +10,7 @@ const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
 const config = @import("config.zig");
 const args = @import("args.zig");
+const peek = @import("peek.zig");
 pub const sandbox = if (builtin.os.tag == .linux) @import("sandbox.zig") else struct {
     pub fn envAllowed(_: []const u8) bool {
         return false;
@@ -166,6 +167,7 @@ pub const Worker = struct {
     pidfd: ?posix.fd_t = null, // for a client-spawned worker, which is not our child
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
+    stderr_scan: peek.Scanner = .{}, // for the stacks a snapshot writes there
 
     pub const Launch = union(enum) {
         direct,
@@ -204,8 +206,8 @@ pub const Worker = struct {
         errdefer if (channel_copy) |ch| allocator.free(ch);
         const eval_expr = try std.fmt.allocPrint(
             allocator,
-            "using DaemonWorker; DaemonWorker.runworker({f}, {f})",
-            .{ juliaString(setup.addr()), juliaString(cfg.socket_path) },
+            "using DaemonWorker; DaemonWorker.runworker({f}, {f}, {d})",
+            .{ juliaString(setup.addr()), juliaString(cfg.socket_path), id },
         );
         defer allocator.free(eval_expr);
         // Passed after worker_args so a client's request wins.
@@ -474,6 +476,17 @@ pub const Worker = struct {
         if (self.session_label) |l| self.allocator.free(l);
         if (self.pidfd) |fd| platform.close(fd);
         platform.close(self.socket);
+        self.stderr_scan.deinit(self.allocator);
+    }
+
+    /// The pipe the conductor drains, where it holds the worker's stderr.
+    pub fn stderrFd(self: *const Worker) ?posix.fd_t {
+        return if (self.process.stderr) |f| f.handle else null;
+    }
+
+    /// Where Julia takes no signal for a profile: it samples, then reports.
+    pub fn startPeek(self: *Worker) void {
+        self.writeHeader(.start_peek, 0);
     }
 
     fn writeHeader(self: *Worker, msg_type: protocol.worker.MessageType, payload_len: u16) void {

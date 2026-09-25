@@ -24,6 +24,7 @@ const args = @import("args.zig");
 const worker = @import("worker.zig");
 const pal = @import("palette.zig");
 const tui = @import("tui.zig");
+const peek = @import("peek.zig");
 
 const Conductor = main.Conductor;
 const ClientStreams = Conductor.ClientStreams;
@@ -36,6 +37,7 @@ const probe_timeout_ms = 300; // a worker slower to answer is busy on thread 0
 const max_tail_bytes = 64 << 10;
 const max_pane_rows = 16; // a preview: ⏎ shows the whole
 const note_s = 4; // how long an action's outcome stays in the pane's border
+const resample_s = 5; // a snapshot still sampling is not asked for again sooner
 // Without autowrap a row wider than the terminal is cut, not wrapped, so the
 // frame's height is its line count, which the redraw moves back over.
 const view_start = "\x1b[?25l\x1b[?7l";
@@ -57,6 +59,21 @@ pub const Subscribers = struct {
     list: std.ArrayList(*Subscriber) = .empty,
     armed: bool = false,
     dirty: bool = false,
+    snapshots: std.ArrayList(Snapshot) = .empty, // one per worker, the latest
+};
+
+/// A worker's stacks, from its stderr, and profile report, from the worker;
+/// the report comes once the worker yields.
+const Snapshot = struct {
+    worker_id: u32,
+    taken_at: i64,
+    stacks: ?[]u8 = null,
+    report: ?[]u8 = null,
+
+    fn deinit(self: Snapshot, gpa: std.mem.Allocator) void {
+        if (self.stacks) |b| gpa.free(b);
+        if (self.report) |b| gpa.free(b);
+    }
 };
 
 const Size = struct { rows: u16 = 24, cols: u16 = 80 };
@@ -88,6 +105,7 @@ const Subscriber = struct {
     scope: status.Scope,
     oneshot: bool, // draw one CPU-resolved frame, then disconnect
     lines_last_printed: usize = 0, // for the cursor-up redraw
+    drawn: u64 = 0, // the last frame's hash: an identical one isn't sent
     queued: std.ArrayList(u8) = .empty, // output the terminal hasn't taken yet
     gone: bool = false,
     // The live view's:
@@ -105,6 +123,11 @@ const Subscriber = struct {
     attachment: ?*Attachment = null,
     confirming: ?u32 = null, // the client `t` would terminate, awaiting y/n
     note: Note = .{},
+    showing_snapshot: bool = false, // the pane shows its worker's, not the transcript
+    paging: bool = false, // the snapshot, full-screen
+    scroll: usize = 0, // the pager's top line
+    pager_top: ?usize = null, // the top line on screen, once drawn
+    pager_shown: u64 = 0, // `pagerShown` as drawn
 
     fn stdout(self: *const Subscriber) posix.socket_t {
         return self.streams.fd(.stdout);
@@ -197,6 +220,50 @@ pub fn deinit(c: *Conductor) void {
     for (c.live.list.items) |sub| sub.gone = true;
     sweep(c);
     c.live.list.deinit(c.allocator);
+    for (c.live.snapshots.items) |snap| snap.deinit(c.allocator);
+    c.live.snapshots.deinit(c.allocator);
+}
+
+/// The stacks a worker wrote on being asked for a snapshot; takes `stacks`.
+pub fn onStacks(c: *Conductor, w: *const worker.Worker, stacks: []u8) void {
+    const snap = snapshotOf(c, w.id) orelse return c.allocator.free(stacks);
+    if (snap.stacks) |old| c.allocator.free(old);
+    snap.stacks = stacks;
+    noteChange(c);
+}
+
+/// The profile a worker reported; takes `report`.
+pub fn onProfile(c: *Conductor, w: *const worker.Worker, report: []u8) void {
+    const snap = snapshotOf(c, w.id) orelse return c.allocator.free(report);
+    if (snap.report) |old| c.allocator.free(old);
+    snap.report = report;
+    noteChange(c);
+}
+
+// A worker's snapshot, begun here when it was asked for elsewhere.
+fn snapshotOf(c: *Conductor, worker_id: u32) ?*Snapshot {
+    for (c.live.snapshots.items) |*snap| if (snap.worker_id == worker_id) return snap;
+    c.live.snapshots.append(c.allocator, .{ .worker_id = worker_id, .taken_at = c.currentTime() }) catch return null;
+    return &c.live.snapshots.items[c.live.snapshots.items.len - 1];
+}
+
+fn findSnapshot(c: *Conductor, worker_id: u32) ?*Snapshot {
+    for (c.live.snapshots.items) |*snap| if (snap.worker_id == worker_id) return snap;
+    return null;
+}
+
+// Those of workers gone.
+fn pruneSnapshots(c: *Conductor) void {
+    var i: usize = 0;
+    while (i < c.live.snapshots.items.len) {
+        const snap = c.live.snapshots.items[i];
+        if (c.findWorkerById(snap.worker_id) != null) {
+            i += 1;
+            continue;
+        }
+        snap.deinit(c.allocator);
+        _ = c.live.snapshots.swapRemove(i);
+    }
 }
 
 /// Stale watches, of a subscriber or attachment already gone, are ignored.
@@ -239,6 +306,7 @@ fn fire(c: *Conductor) void {
         if (!sub.oneshot) break false;
     } else true;
     c.refreshStats(if (all_oneshot) null else cpu_half_life);
+    pruneSnapshots(c);
     var behind = false;
     for (c.live.list.items) |sub| {
         if (!sub.oneshot) {
@@ -260,14 +328,23 @@ fn fire(c: *Conductor) void {
 fn repaint(c: *Conductor, sub: *Subscriber) void {
     if (sub.queued.items.len > 0) return flushQueued(sub);
     if (sub.following) return;
+    if (sub.paging) return drawPager(c, sub);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(c.allocator);
     const lines = composeFrame(c, sub, &out) catch |err| {
         std.debug.print("Status: render failed: {}\n", .{err});
         return;
     };
-    send(c, sub, out.items);
+    sendFrame(c, sub, out.items);
     sub.lines_last_printed = lines;
+}
+
+// Repainting what is already shown would still clear a selection in it.
+fn sendFrame(c: *Conductor, sub: *Subscriber, frame: []const u8) void {
+    const hash = std.hash.Wyhash.hash(0, frame);
+    if (hash == sub.drawn) return;
+    sub.drawn = hash;
+    send(c, sub, frame);
 }
 
 // DEC 2026 synchronised update, so no tearing; ESC[<n>F returns to the
@@ -294,7 +371,8 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     } else null;
     // The pane encloses the focused row, its top border; the frame stays a
     // row short of the screen, so it never scrolls.
-    const wanted: usize = if (sub.preview == .transcript and sub.tail.items.len > 0) max_pane_rows else tui.min_pane_rows;
+    const full = sub.showing_snapshot or (sub.preview == .transcript and sub.tail.items.len > 0);
+    const wanted: usize = if (full) max_pane_rows else tui.min_pane_rows;
     const rows = @min(wanted, @as(usize, sub.size.rows) -| 1 -| lines +| 1);
     if (placed != null and rows >= tui.min_pane_rows) {
         const at = placed.?;
@@ -317,7 +395,11 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
     const info = c.active_clients.get(focus) orelse return;
     const label = info.worker.session_label;
     var lines_buf: [256][]const u8 = undefined;
-    const body: []const []const u8 = switch (sub.preview) {
+    var snapshot_lines: std.ArrayList([]const u8) = .empty;
+    defer snapshot_lines.deinit(c.allocator);
+    const snap = if (sub.showing_snapshot) findSnapshot(c, info.worker.id) else null;
+    if (snap) |sn| try snapshotLines(c.allocator, sn, focus, &snapshot_lines);
+    const body: []const []const u8 = if (snap != null) snapshot_lines.items else switch (sub.preview) {
         .pending => &.{},
         .unsessioned => &.{"Not a --session client, so nothing of it is recorded."},
         .busy => &.{"Its worker is busy, so the transcript waits until it yields."},
@@ -339,15 +421,17 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
         }) catch "terminate? y/n"
     else if (sub.note.text(c.currentTime())) |note|
         note
+    else if (snap) |sn|
+        if (sn.report == null) "sampling… · ⏎ whole stacktrace · Esc transcript · q quit" else "⏎ whole stacktrace · s again · Esc transcript · q quit"
     else if (info.session)
-        "↑↓ focus · ⏎ follow · i interrupt · t terminate · q quit"
+        "↑↓ focus · ⏎ follow · s stacktrace · i interrupt · t terminate · q quit"
     else
-        "↑↓ focus · i interrupt · t terminate · q quit";
+        "↑↓ focus · s stacktrace · i interrupt · t terminate · q quit";
     try tui.writePane(out, c.allocator, true, .{
         .title = row,
         .footer = footer,
         .body = body,
-        .dim_body = sub.preview != .transcript or sub.tail.items.len == 0,
+        .dim_body = snap == null and (sub.preview != .transcript or sub.tail.items.len == 0),
         .branch = &at.branch,
         .gutter = &at.gutter,
     }, @as(usize, sub.size.cols) -| at.gutter_cols, rows);
@@ -363,6 +447,10 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
         if (sub.following) {
             const leave = key == .escape or (key == .char and key.char == 'q');
             if (leave) leaveFollow(c, sub);
+            continue;
+        }
+        if (sub.paging) {
+            pagerKey(c, sub, key);
             continue;
         }
         if (sub.confirming) |id| {
@@ -382,14 +470,31 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
                     sub.confirming = focus;
                     repaint(c, sub);
                 },
+                's' => if (sub.focus) |focus| takeSnapshot(c, sub, focus),
                 else => {},
             },
-            .up, .down, .escape => {
+            .escape => {
+                if (sub.showing_snapshot) {
+                    sub.showing_snapshot = false;
+                } else {
+                    sub.focus = null;
+                    retarget(c, sub);
+                }
+                repaint(c, sub);
+            },
+            .up, .down => {
                 sub.focus = tui.moveFocus(sub.order, sub.focus, key);
+                sub.showing_snapshot = false;
                 retarget(c, sub);
                 repaint(c, sub);
             },
-            .enter => enterFollow(c, sub),
+            .enter => if (sub.showing_snapshot) {
+                sub.paging = true;
+                sub.scroll = 0;
+                sub.pager_top = null;
+                send(c, sub, alternate_screen ++ "\x1b[?7l");
+                repaint(c, sub);
+            } else enterFollow(c, sub),
             else => {},
         }
     }
@@ -435,6 +540,157 @@ fn terminate(c: *Conductor, sub: *Subscriber, focus: u32) void {
         .retired => sub.note.set(now, "retired worker #{d}: client {d} would not stop", .{ worker_id, info.pid }),
     }
     noteChange(c);
+}
+
+// Julia's runtime writes the stacks to stderr at once and samples a profile,
+// whose report the worker sends once it yields. Where Julia takes no such
+// signal, the worker is asked, and samples itself.
+fn takeSnapshot(c: *Conductor, sub: *Subscriber, focus: u32) void {
+    const w = (c.active_clients.get(focus) orelse return).worker;
+    sub.showing_snapshot = true;
+    const now = c.currentTime();
+    const snap = snapshotOf(c, w.id) orelse return;
+    const sampling = snap.report == null and snap.stacks != null and now - snap.taken_at < resample_s;
+    if (!sampling) {
+        snap.deinit(c.allocator);
+        snap.* = .{ .worker_id = w.id, .taken_at = now };
+        if (platform.peek_signal) |sig| w.signal(sig) else w.startPeek();
+    }
+    repaint(c, sub);
+}
+
+// The focused client's part of the profile, or until it comes, a digest of
+// the stacks; the whole view has both.
+fn snapshotLines(gpa: std.mem.Allocator, snap: *const Snapshot, focus: u32, out: *std.ArrayList([]const u8)) !void {
+    if (snap.report) |report| {
+        var lines = std.mem.splitScalar(u8, clientSection(report, focus), '\n');
+        while (lines.next()) |line| try out.append(gpa, line);
+        return;
+    }
+    if (snap.stacks) |stacks| try peek.digest(gpa, stacks, 8, out) else try out.append(gpa, "Asking for the worker's stacks…");
+    try out.append(gpa, "");
+    try out.append(gpa, "The profile follows once the session yields.");
+}
+
+// The worker heads each client's part `── client <id> ──`; the whole report
+// when this client has none.
+fn clientSection(report: []const u8, client: u32) []const u8 {
+    var buf: [48]u8 = undefined;
+    const head = std.fmt.bufPrint(&buf, "── client {d} ──", .{client}) catch return report;
+    const start = std.mem.indexOf(u8, report, head) orelse return report;
+    const end = std.mem.indexOfPos(u8, report, start + head.len, "\n── ") orelse report.len;
+    return report[start..end];
+}
+
+// The whole snapshot: the report, then the raw stacks. Drawn only when it or
+// the view changes; a scroll of less than a screen moves what is shown (in a
+// scroll region, above the status line) and draws only the lines it brings in.
+fn drawPager(c: *Conductor, sub: *Subscriber) void {
+    const focus = sub.focus orelse return;
+    const info = c.active_clients.get(focus) orelse return;
+    const snap = findSnapshot(c, info.worker.id) orelse return;
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(c.allocator);
+    pagerLines(c.allocator, snap, &lines) catch return;
+    const rows = @as(usize, sub.size.rows) -| 1;
+    sub.scroll = @min(sub.scroll, lines.items.len -| rows);
+    const shown = pagerShown(snap, sub.size);
+    const same = sub.pager_top != null and sub.pager_shown == shown;
+    if (same and sub.pager_top.? == sub.scroll) return;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(c.allocator);
+    const top = sub.scroll;
+    const bottom = @min(lines.items.len, top + rows);
+    writePager(c, sub, &out, lines.items, top, bottom, rows, if (same) sub.pager_top.? else null) catch return;
+    out.print(c.allocator, "\x1b[{d};1H\x1b[2K\x1b[7m worker #{d} · lines {d}–{d} of {d} · ↑↓ PgUp PgDn g G · q back \x1b[0m\x1b[?2026l", .{
+        sub.size.rows, info.worker.id, top + 1, bottom, lines.items.len,
+    }) catch return;
+    send(c, sub, out.items);
+    sub.pager_top = top;
+    sub.pager_shown = shown;
+}
+
+// Lines `top..bottom` on screen: those new since the view's top was `was`,
+// when that is less than a screen away, else all of them.
+fn writePager(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8), lines: []const []const u8, top: usize, bottom: usize, rows: usize, was: ?usize) !void {
+    const gpa = c.allocator;
+    try out.appendSlice(gpa, "\x1b[?2026h");
+    const moved: isize = if (was) |w| @as(isize, @intCast(top)) - @as(isize, @intCast(w)) else 0;
+    const distance: usize = @abs(moved);
+    var first: usize = top;
+    var last: usize = bottom;
+    if (was != null and distance < rows) {
+        // Within the region only, so the status line stays put.
+        try out.print(gpa, "\x1b[1;{d}r", .{rows});
+        // A line feed at the region's foot, or a reverse index at its head,
+        // scrolls it: VT100's own, where not every terminal has SU and SD.
+        if (moved > 0) {
+            try out.print(gpa, "\x1b[{d};1H", .{rows});
+            try out.appendNTimes(gpa, '\n', distance);
+            first = @max(top, bottom -| distance);
+        } else {
+            try out.appendSlice(gpa, "\x1b[1;1H");
+            for (0..distance) |_| try out.appendSlice(gpa, "\x1bM");
+            last = @min(bottom, top + distance);
+        }
+        try out.appendSlice(gpa, "\x1b[r");
+    } else {
+        try out.appendSlice(gpa, "\x1b[H\x1b[2J");
+    }
+    for (first..last) |i| {
+        try out.print(gpa, "\x1b[{d};1H\x1b[2K", .{i - top + 1});
+        _ = try tui.appendColumns(out, gpa, lines[i], sub.size.cols, true);
+    }
+}
+
+// What the pager shows, bar its scroll: its content and the terminal's size.
+fn pagerShown(snap: *const Snapshot, size: Size) u64 {
+    var h = std.hash.Wyhash.init(0);
+    for ([_]?[]const u8{ snap.report, snap.stacks }) |part| {
+        const bytes: []const u8 = part orelse &.{};
+        h.update(std.mem.asBytes(&@intFromPtr(bytes.ptr)));
+        h.update(std.mem.asBytes(&bytes.len));
+    }
+    h.update(std.mem.asBytes(&size));
+    return h.final();
+}
+
+fn pagerLines(gpa: std.mem.Allocator, snap: *const Snapshot, out: *std.ArrayList([]const u8)) !void {
+    if (snap.report) |report| {
+        var it = std.mem.splitScalar(u8, report, '\n');
+        while (it.next()) |line| try out.append(gpa, line);
+    } else try out.append(gpa, "The profile follows once the session yields.");
+    try out.append(gpa, "");
+    var it = std.mem.splitScalar(u8, snap.stacks orelse "", '\n');
+    while (it.next()) |line| try out.append(gpa, line);
+}
+
+fn pagerKey(c: *Conductor, sub: *Subscriber, key: tui.Key) void {
+    const page = @as(usize, sub.size.rows) -| 2;
+    switch (key) {
+        .up => sub.scroll -|= 1,
+        .down => sub.scroll += 1,
+        .page_up => sub.scroll -|= page,
+        .page_down => sub.scroll += page,
+        .home => sub.scroll = 0,
+        .end => sub.scroll = std.math.maxInt(usize) / 2,
+        .char => |ch| switch (ch) {
+            'g' => sub.scroll = 0,
+            'G' => sub.scroll = std.math.maxInt(usize) / 2,
+            'q' => return leavePager(c, sub),
+            else => return,
+        },
+        .escape => return leavePager(c, sub),
+        else => return,
+    }
+    repaint(c, sub);
+}
+
+fn leavePager(c: *Conductor, sub: *Subscriber) void {
+    sub.paging = false;
+    sub.drawn = 0;
+    send(c, sub, main_screen);
+    repaint(c, sub);
 }
 
 // The client's replies: a raw-mode ack, or the terminal's size.
@@ -485,6 +741,7 @@ fn enterFollow(c: *Conductor, sub: *Subscriber) void {
         },
     }
     sub.following = true;
+    sub.drawn = 0;
     send(c, sub, alternate_screen);
 }
 
@@ -492,6 +749,7 @@ fn enterFollow(c: *Conductor, sub: *Subscriber) void {
 fn leaveFollow(c: *Conductor, sub: *Subscriber) void {
     detach(c, sub);
     sub.following = false;
+    sub.drawn = 0;
     send(c, sub, main_screen);
     sub.target = null;
     retarget(c, sub);
@@ -681,7 +939,7 @@ fn sweep(c: *Conductor) void {
             detach(c, sub);
             unwatch(c, &sub.input);
             unwatch(c, &sub.signals);
-            const leaving = if (sub.following) main_screen ++ "\r\n" ++ view_end else "\r\n" ++ view_end;
+            const leaving = if (sub.following or sub.paging) main_screen ++ "\r\n" ++ view_end else "\r\n" ++ view_end;
             _ = platform.sendNonBlocking(sub.stdout(), leaving);
         }
         sub.streams.closeForExit(0);

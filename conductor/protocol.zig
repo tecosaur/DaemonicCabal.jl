@@ -124,6 +124,7 @@ pub const worker = struct {
         ack = 0x41,
         sync_clients = 0x50, // the worker kills any client not listed
         drop_session = 0x51, // payload: label (u16-len + bytes)
+        start_peek = 0x60, // no reply; the report follows as a `peek_report` notification
         err = 0xFF,
     };
 
@@ -156,6 +157,7 @@ pub const notification = struct {
         worker_exit = 0x03, // worker id
         client_exit = 0x04,
         client_interrupt = 0x05,
+        peek_report = 0x06, // worker id, then the report: u32 length + bytes
     };
 };
 

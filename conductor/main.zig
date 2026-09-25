@@ -15,6 +15,7 @@ const project = @import("project.zig");
 const env_cache = @import("env_cache.zig");
 const status = @import("status.zig");
 const live = @import("live.zig");
+const peek = @import("peek.zig");
 const pal = @import("palette.zig");
 const pressure = @import("pressure.zig");
 pub const worker = @import("worker.zig");
@@ -78,6 +79,7 @@ const cadence_mult_divisor: f64 = 2;
 
 /// Per-worker client PIDs a single reconciliation pass can hold.
 const max_tracked_clients = 256;
+const max_peek_report_bytes = 1 << 20;
 /// How long a worker may take to answer as a client is ended, a forced
 /// interrupt included.
 const end_probe_ms = 1000;
@@ -187,7 +189,6 @@ pub const Conductor = struct {
         }
         self.pending_connections.deinit(self.allocator);
         live.deinit(self);
-        self.event_loop.deinit();
         self.cache.deinit();
         self.active_clients.deinit();
         for (self.pending_kills.items) |pk| {
@@ -206,6 +207,7 @@ pub const Conductor = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.workers.deinit();
+        self.event_loop.deinit(); // last: cleaning a worker up unwatches its stderr
         if (g_socket_path.len > 0) self.allocator.free(g_socket_path);
         if (g_pid_path.len > 0) self.allocator.free(g_pid_path);
         self.cfg.deinit();
@@ -223,6 +225,12 @@ pub const Conductor = struct {
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
         if (w.exited()) platform.dumpChildStderr(self.io, self.allocator, &w.process, w.id);
+        if (w.stderrFd()) |fd| {
+            self.event_loop.unwatchFd(@intFromPtr(w) | tag_worker_stderr, fd);
+            _ = self.drainStderr(w.id, &w.process, null);
+            if (w.process.stderr) |f| f.close(self.io);
+            w.process.stderr = null;
+        }
         if (w.launch == .sandboxed) {
             self.removeSandboxDir(w.id);
             if (builtin.os.tag == .linux) worker.sandbox.removeCgroup(w.id);
@@ -287,6 +295,8 @@ pub const Conductor = struct {
     const tag_spawn_listener: usize = 2;
     const tag_spawn_client: usize = 3;
     const tag_connection: usize = 4;
+    const tag_worker_stderr: usize = 6;
+    const tag_spawn_stderr: usize = 7;
 
     /// Read once readable, or dropped after `request_timeout_s`.
     pub fn admitConnection(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) void {
@@ -302,22 +312,71 @@ pub const Conductor = struct {
 
     /// A tag whose record is no longer pending is stale.
     pub fn onReadable(self: *Conductor, tag: usize) void {
-        if (tag & 7 == live.tag) {
-            live.onReadable(self, @ptrFromInt(tag & ~@as(usize, 7)));
-        } else if (tag & 7 == tag_connection) {
-            const pc: *PendingConnection = @ptrFromInt(tag & ~@as(usize, 7));
-            if (!removePending(&self.pending_connections, pc)) return;
-            defer self.allocator.destroy(pc);
-            const outcome = self.handleConnectionFd(pc.socket, &pc.peer) catch |err| blk: {
-                std.debug.print("Client handling failed: {}\n", .{err});
-                break :blk .done;
-            };
-            if (outcome == .done) platform.close(pc.socket);
-        } else {
-            const p: *PendingSpawn = @ptrFromInt(tag & ~@as(usize, 7));
-            if (!isPending(&self.pending_spawns, p)) return;
-            if (tag & 1 == 0) self.onSpawnReadable(p) else self.onSpawnClientGone(p);
+        const addr = tag & ~@as(usize, 7);
+        switch (tag & 7) {
+            live.tag => live.onReadable(self, @ptrFromInt(addr)),
+            tag_connection => {
+                const pc: *PendingConnection = @ptrFromInt(addr);
+                if (!removePending(&self.pending_connections, pc)) return;
+                defer self.allocator.destroy(pc);
+                const outcome = self.handleConnectionFd(pc.socket, &pc.peer) catch |err| blk: {
+                    std.debug.print("Client handling failed: {}\n", .{err});
+                    break :blk .done;
+                };
+                if (outcome == .done) platform.close(pc.socket);
+            },
+            tag_worker_stderr => {
+                const w: *worker.Worker = @ptrFromInt(addr);
+                if (!self.holdsWorker(w)) return;
+                if (self.drainStderr(w.id, &w.process, &w.stderr_scan)) self.event_loop.watchFd(tag, w.stderrFd().?);
+                if (w.stderr_scan.take(self.allocator)) |stacks| live.onStacks(self, w, stacks);
+            },
+            tag_spawn_stderr => {
+                const p: *PendingSpawn = @ptrFromInt(addr);
+                if (!isPending(&self.pending_spawns, p)) return;
+                const w = &p.spawn.worker;
+                if (self.drainStderr(w.id, &w.process, null)) self.event_loop.watchFd(tag, w.stderrFd().?);
+            },
+            else => {
+                const p: *PendingSpawn = @ptrFromInt(addr);
+                if (!isPending(&self.pending_spawns, p)) return;
+                if (tag & 1 == 0) self.onSpawnReadable(p) else self.onSpawnClientGone(p);
+            },
         }
+    }
+
+    /// Passes a worker's stderr to ours, through `scan` when given; returns
+    /// whether there may be more. At its end the pipe is closed.
+    fn drainStderr(self: *Conductor, id: u32, process: *std.process.Child, scan: ?*peek.Scanner) bool {
+        const file = process.stderr orelse return false;
+        var buf: [16 << 10]u8 = undefined;
+        while (true) {
+            const n = platform.readAvailable(file.handle, &buf) orelse {
+                file.close(self.io);
+                process.stderr = null;
+                std.debug.print("Worker {d}: stderr closed\n", .{id});
+                return false;
+            };
+            if (n == 0) return true;
+            platform.writeFile(platform.getStderrHandle(), buf[0..n]);
+            if (scan) |sc| sc.feed(self.allocator, buf[0..n]);
+        }
+    }
+
+    // Pooled, the reserve, or being retired: its record still stands.
+    fn holdsWorker(self: *Conductor, w: *const worker.Worker) bool {
+        if (self.isLiveWorker(w)) return true;
+        for (self.pending_kills.items) |pk| if (pk.w == w) return true;
+        return false;
+    }
+
+    pub fn findWorkerById(self: *Conductor, id: u32) ?*worker.Worker {
+        if (self.reserve) |r| if (r.id == id) return r;
+        var it = self.workers.iterator();
+        while (it.next()) |entry| for (entry.value_ptr.items) |w| {
+            if (w.id == id) return w;
+        };
+        return null;
     }
 
     /// Runs each second while anything is pending; returns whether anything still is.
@@ -418,6 +477,7 @@ pub const Conductor = struct {
                 if (self.active_clients.get(subject)) |info| info.worker.signal(platform.SIG.INT);
             },
             .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{subject}),
+            .peek_report => self.receivePeekReport(socket, subject),
             .worker_exit => {
                 if (self.findWorkerByPid(subject)) |w| {
                     std.debug.print("Worker {d} exiting (TTL expired)\n", .{w.id});
@@ -427,6 +487,26 @@ pub const Conductor = struct {
                 }
             },
         }
+    }
+
+    // The worker writes it whole before closing, but a stalled one must not
+    // hold the conductor: its read is bounded.
+    fn receivePeekReport(self: *Conductor, socket: posix.socket_t, worker_id: u32) void {
+        platform.setRecvTimeout(socket, 1);
+        var len_buf: [4]u8 = undefined;
+        readExact(socket, &len_buf) catch return;
+        const len = std.mem.readInt(u32, &len_buf, .little);
+        if (len > max_peek_report_bytes) {
+            std.debug.print("Worker {d}: a {d}-byte profile report is too large; dropped\n", .{ worker_id, len });
+            return;
+        }
+        const report = self.allocator.alloc(u8, len) catch return;
+        readExact(socket, report) catch |err| {
+            std.debug.print("Worker {d}: profile report cut short: {}\n", .{ worker_id, err });
+            return self.allocator.free(report);
+        };
+        const w = self.findWorkerById(worker_id) orelse return self.allocator.free(report);
+        live.onProfile(self, w, report);
     }
 
     fn handleClient(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) !Outcome {
@@ -1189,6 +1269,7 @@ pub const Conductor = struct {
         try self.pending_spawns.append(self.allocator, p);
         self.next_worker_id += 1;
         self.event_loop.watchFd(@intFromPtr(p) | tag_spawn_listener, p.spawn.listenerFd());
+        if (p.spawn.worker.stderrFd()) |fd| self.event_loop.watchFd(@intFromPtr(p) | tag_spawn_stderr, fd);
         // It sends nothing until it has its paths, so readable means it hung up.
         if (p.purpose == .client) self.event_loop.watchFd(@intFromPtr(p) | tag_spawn_client, p.purpose.client.socket);
         self.event_loop.armTick();
@@ -1220,6 +1301,7 @@ pub const Conductor = struct {
     fn detachSpawn(self: *Conductor, p: *PendingSpawn) void {
         _ = removePending(&self.pending_spawns, p);
         self.event_loop.unwatchFd(@intFromPtr(p) | tag_spawn_listener, p.spawn.listenerFd());
+        if (p.spawn.worker.stderrFd()) |fd| self.event_loop.unwatchFd(@intFromPtr(p) | tag_spawn_stderr, fd);
         if (p.purpose == .client) self.event_loop.unwatchFd(@intFromPtr(p) | tag_spawn_client, p.purpose.client.socket);
     }
 
@@ -1227,6 +1309,7 @@ pub const Conductor = struct {
         if (err != error.ClientGone) std.debug.print("Worker {d}: spawn failed: {}\n", .{ p.spawn.worker.id, err });
         self.detachSpawn(p);
         p.spawn.abandon(self.io);
+        _ = self.drainStderr(p.spawn.worker.id, &p.spawn.worker.process, null);
         self.settleSpawn(p, .{ .refuse = err });
     }
 
@@ -1239,6 +1322,7 @@ pub const Conductor = struct {
             return self.settleSpawn(p, .{ .refuse = err });
         };
         w.* = connected;
+        if (w.stderrFd()) |fd| self.event_loop.watchFd(@intFromPtr(w) | tag_worker_stderr, fd);
         std.debug.print("Worker {d} (pid {d}) connected\n", .{ w.id, platform.getChildPid(w.process) });
         switch (p.purpose) {
             .reserve => if (w.ping()) {

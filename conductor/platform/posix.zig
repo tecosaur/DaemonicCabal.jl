@@ -188,8 +188,27 @@ pub const Listener = struct {
 
 // Process helpers
 /// Own process group, so a terminal SIGINT reaches only the conductor.
+/// Its stderr is a pipe, which the conductor drains (`readAvailable`).
 pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
-    return std.process.spawn(io, .{ .argv = argv, .pgid = 0 });
+    const child = try std.process.spawn(io, .{ .argv = argv, .pgid = 0, .stderr = .pipe });
+    if (child.stderr) |f| {
+        const flags = fcntl(f.handle, posix.F.GETFL, 0) catch return child;
+        const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+        _ = fcntl(f.handle, posix.F.SETFL, flags | nonblock) catch {};
+    }
+    return child;
+}
+/// What a non-blocking descriptor holds: 0 when nothing; null once it has ended.
+pub fn readAvailable(fd: posix.fd_t, buf: []u8) ?usize {
+    while (true) {
+        const rc = posix.system.read(fd, buf.ptr, buf.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return if (rc == 0) null else @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return 0,
+            else => return null,
+        }
+    }
 }
 pub fn dumpChildStderr(_: Io, _: std.mem.Allocator, _: *std.process.Child, _: u32) void {}
 pub fn collectEnviron(allocator: std.mem.Allocator, environ: std.process.Environ) ![]const []const u8 {

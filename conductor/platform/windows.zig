@@ -410,7 +410,7 @@ pub fn waitReadable(fd: HANDLE, timeout_ms: u32) bool {
     var waited: u32 = 0;
     while (true) : (waited += 10) {
         var available: DWORD = 0;
-        if (PeekNamedPipe(fd, null, 0, null, &available, null) == 0 or available > 0) return true;
+        if (!PeekNamedPipe(fd, null, 0, null, &available, null).toBool() or available > 0) return true;
         if (waited >= timeout_ms) return false;
         Sleep(10);
     }
@@ -1021,6 +1021,8 @@ pub fn issueRecv(h: HANDLE, buf: []u8) ?*RecvCtx {
 
 /// TERM and KILL both terminate; USR1 is a no-op.
 pub const SIG = enum { INT, TERM, KILL, USR1 };
+/// Julia takes no signal for a profile here; the worker is asked instead.
+pub const peek_signal: ?SIG = null;
 
 pub fn getpid() DWORD {
     return win32.GetCurrentProcessId();
@@ -1045,6 +1047,11 @@ pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
     if (child.stdout) |f| f.close(io);
     child.stdout = null;
     return child;
+}
+
+/// Never, as a worker's stderr is read once it has exited (`dumpChildStderr`).
+pub fn readAvailable(_: HANDLE, _: []u8) ?usize {
+    return null;
 }
 
 /// The worker must have exited: the read runs to EOF.
