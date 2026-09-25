@@ -113,9 +113,12 @@ end
 
 # The client judges its own stdout, as terminfo misjudges terminals that set
 # no TERM (as on Windows).
-function clienthascolor(client::ClientInfo)
-    cs = getval(client.switches, "--color", nothing)
-    if isnothing(cs) client.color else isyes(cs) end
+clienthascolor(client::ClientInfo) = something(color_choice(client), client.color)
+
+# `--color`'s, or `nothing` when left to the terminal.
+function color_choice(client::ClientInfo)
+    choice = getval(client.switches, "--color", nothing)
+    if isnothing(choice) nothing else isyes(choice) end
 end
 
 function is_repl_client(client::ClientInfo)
@@ -147,7 +150,8 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     if !isnothing(watch)
         exit_code = try
             @static if VERSION >= v"1.11"
-                watch_session(getval(client.switches, "--session", ""), watch, client_stdout, client.color; until=signals)
+                watch_session(getval(client.switches, "--session", ""), watch, client_stdout;
+                              color=color_choice(client), terminal=client.color, until=signals)
             else
                 println(client_stderr, "--watch needs the session's worker to run Julia 1.11 or later.")
                 1
@@ -208,9 +212,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
             else
                 term = get(ENV, "TERM", @static if Sys.iswindows() "" else "dumb" end)
                 color = @static if VERSION < v"1.12"
-                    let color_switch = getval(client.switches, "--color", nothing)
-                        if isnothing(color_switch) nothing else isyes(color_switch) end
-                    end
+                    color_choice(client)
                 else
                     hascolor
                 end

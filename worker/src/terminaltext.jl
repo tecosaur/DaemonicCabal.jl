@@ -3,6 +3,19 @@
 
 const TERMINAL_WINDOW = 32  # rows kept editable before they reach the sink
 
+# A colour is 0 for the default, `PALETTE | n` for palette entry `n`, or
+# `DIRECT | rgb`. Attribute bit `n` is SGR `n`, 1 to 9.
+const PALETTE = UInt32(1) << 24
+const DIRECT = UInt32(2) << 24
+
+const Style = @NamedTuple{foreground::UInt32, background::UInt32, attributes::UInt16}
+const UNSTYLED = Style((0, 0, 0))
+
+struct Cell
+    char::Char
+    style::Style
+end
+
 """
     TerminalText(sink::IO) <: IO
 
@@ -16,22 +29,28 @@ kept. Escape sequences leave no text, save those moving the cursor, erasing,
 or saving and restoring the cursor; absolute positions count from the
 window's top, and the cursor never moves past its last row but by a line feed.
 What is drawn on the alternate screen, which a terminal discards, is dropped.
+
+When `styled`, each character keeps the colours and attributes (SGR) it was
+drawn with, and a released row sets each change of them and ends unstyled.
 """
 mutable struct TerminalText{S <: IO} <: IO
     const sink::S
+    const styled::Bool
     state::Symbol  # :ground, :escape, :escape_intermediate, :csi, :csi_private, :csi_ignore, :string
     alternate::Bool  # on the alternate screen
     const params::Vector{Int}  # a CSI sequence's parameters
-    const rows::Vector{Vector{Char}}  # the window, oldest first
+    const rows::Vector{Vector{Cell}}  # the window, oldest first
     row::Int  # the cursor's, in `rows`
     column::Int  # the cursor's, 0-based
     released::Int  # rows already sent to `sink`, so saved rows stay absolute
     saved::Tuple{Int, Int}  # absolute row and column
     edited_top::Int  # the topmost absolute row edited since `release_quiet!`
+    style::Style  # what a character is drawn with
     const utf8::Vector{UInt8}  # a character's bytes so far
 end
 
-TerminalText(sink::IO) = TerminalText(sink, :ground, false, Int[], [Char[]], 1, 0, 0, (1, 0), typemax(Int), UInt8[])
+TerminalText(sink::IO; styled::Bool=false) =
+    TerminalText(sink, styled, :ground, false, Int[], [Cell[]], 1, 0, 0, (1, 0), typemax(Int), UNSTYLED, UInt8[])
 
 function Base.unsafe_write(t::TerminalText, p::Ptr{UInt8}, n::UInt)
     transform!(t, unsafe_wrap(Array, p, Int(n)))
@@ -58,6 +77,7 @@ function finish!(t::TerminalText)
     t.state = :ground
     t.alternate = false
     t.edited_top = typemax(Int)
+    t.style = UNSTYLED
 end
 
 """
@@ -68,30 +88,30 @@ output that has settled need not wait to scroll out of the window.
 """
 function release_quiet!(t::TerminalText)
     n = max(0, min(t.row, t.edited_top - t.released) - 1)
-    foreach(row -> print(t.sink, String(row), '\n'), view(t.rows, 1:n))
+    foreach(row -> write_row(t, row), view(t.rows, 1:n))
     deleteat!(t.rows, 1:n)
     t.released += n
     t.row -= n
     t.edited_top = typemax(Int)
 end
 
-# Only valid text appended at the window's end moves as it is, bar the rows
-# staying editable.
+# Only valid, unstyled text appended at the window's end moves as it is, bar
+# the rows staying editable.
 function transform!(t::TerminalText, data)
     appending = t.state === :ground && !t.alternate && isempty(t.utf8) && t.row == length(t.rows) &&
-        t.column == length(t.rows[end])
+        t.column == length(t.rows[end]) && (!t.styled || t.style == UNSTYLED)
     if appending && all(b -> b >= 0x20 && b != 0x7f || b == UInt8('\n') || b == UInt8('\t'), data) &&
             isvalid(String, data)
         newlines = findall(==(UInt8('\n')), data)
         if length(newlines) > TERMINAL_WINDOW
             # Everything to this newline scrolls out beyond reach.
             cut = newlines[end - TERMINAL_WINDOW]
-            foreach(row -> print(t.sink, String(row), '\n'), view(t.rows, 1:length(t.rows)-1))
-            print(t.sink, String(t.rows[end]))
+            foreach(row -> write_row(t, row), view(t.rows, 1:length(t.rows)-1))
+            write_row(t, t.rows[end]; newline=false)
             write(t.sink, view(data, 1:cut))
             t.released += length(t.rows) - 1 + (length(newlines) - TERMINAL_WINDOW)
             empty!(t.rows)
-            push!(t.rows, Char[])
+            push!(t.rows, Cell[])
             t.row, t.column = 1, 0
             data = view(data, cut+1:lastindex(data))
         end
@@ -208,10 +228,10 @@ function put_char!(t::TerminalText, c::Char)
     t.edited_top = min(t.edited_top, t.released + t.row)
     line = t.rows[t.row]
     if t.column < length(line)
-        line[t.column + 1] = c
+        line[t.column + 1] = Cell(c, t.style)
     else
-        append!(line, fill(' ', t.column - length(line)))
-        push!(line, c)
+        append!(line, fill(Cell(' ', UNSTYLED), t.column - length(line)))
+        push!(line, Cell(c, t.style))
     end
     t.column += 1
 end
@@ -220,9 +240,9 @@ end
 function line_feed!(t::TerminalText)
     t.row += 1
     t.row <= length(t.rows) && return
-    push!(t.rows, Char[])
+    push!(t.rows, Cell[])
     length(t.rows) > TERMINAL_WINDOW || return
-    print(t.sink, String(popfirst!(t.rows)), '\n')
+    write_row(t, popfirst!(t.rows))
     t.released += 1
     t.row -= 1
 end
@@ -230,10 +250,10 @@ end
 # Every row to the sink but a last empty one, the cursor's row becoming the first.
 function release_window!(t::TerminalText)
     last_row = if isempty(t.rows[end]) length(t.rows) - 1 else length(t.rows) end
-    foreach(row -> print(t.sink, String(row), '\n'), view(t.rows, 1:last_row))
+    foreach(row -> write_row(t, row), view(t.rows, 1:last_row))
     t.released += length(t.rows)
     empty!(t.rows)
-    push!(t.rows, Char[])
+    push!(t.rows, Cell[])
     t.row = 1
 end
 
@@ -255,7 +275,7 @@ function csi!(t::TerminalText, final::Char)
         if n == 0
             resize!(line, min(length(line), t.column))
         elseif n == 1
-            line[1:min(t.column + 1, length(line))] .= ' '
+            fill!(view(line, 1:min(t.column + 1, length(line))), Cell(' ', UNSTYLED))
         else
             empty!(line)
         end
@@ -281,9 +301,97 @@ function csi!(t::TerminalText, final::Char)
     elseif final == 'H' || final == 'f'
         t.row = min(length(t.rows), count)
         t.column = max(get(t.params, 2, 0), 1) - 1
+    elseif final == 'm'
+        sgr!(t)
     elseif final == 's'
         save_cursor!(t)
     elseif final == 'u'
         restore_cursor!(t)
     end
+end
+
+# Select Graphic Rendition: its parameters, in order, change the style.
+function sgr!(t::TerminalText)
+    (; foreground, background, attributes) = t.style
+    params = if isempty(t.params)
+        [0]
+    else
+        t.params
+    end
+    # The colour an extended (38, 48) one names from `i`, and the parameters it spans.
+    function extended(i)
+        mode = get(params, i + 1, 0)
+        if mode == 5
+            PALETTE | get(params, i + 2, 0) & 0xff, 3
+        elseif mode == 2
+            r, g, b = (get(params, i + k, 0) & 0xff for k in 2:4)
+            DIRECT | r << 16 | g << 8 | b, 5
+        else
+            nothing, 2
+        end
+    end
+    i = 1
+    while i <= length(params)
+        n = params[i]
+        span = 1
+        if n == 0
+            foreground, background, attributes = UNSTYLED.foreground, UNSTYLED.background, UNSTYLED.attributes
+        elseif 1 <= n <= 9
+            attributes |= UInt16(1) << n
+        elseif n == 21  # double underline
+            attributes |= UInt16(1) << 4
+        elseif n == 22  # neither bold nor dim
+            attributes &= ~(UInt16(1) << 1 | UInt16(1) << 2)
+        elseif 23 <= n <= 29
+            attributes &= ~(UInt16(1) << (n - 20))
+        elseif 30 <= n <= 37 || 90 <= n <= 97
+            foreground = PALETTE | n % 10 + 8 * (n >= 90)
+        elseif 40 <= n <= 47 || 100 <= n <= 107
+            background = PALETTE | n % 10 + 8 * (n >= 100)
+        elseif n == 38 || n == 48
+            colour, span = extended(i)
+            if n == 38
+                foreground = something(colour, foreground)
+            else
+                background = something(colour, background)
+            end
+        elseif n == 39
+            foreground = UNSTYLED.foreground
+        elseif n == 49
+            background = UNSTYLED.background
+        end
+        i += span
+    end
+    t.style = (; foreground, background, attributes)
+end
+
+# A row to the sink: its text, and when styled, each change of style.
+function write_row(t::TerminalText, row::Vector{Cell}; newline::Bool=true)
+    style = UNSTYLED
+    for cell in row
+        if t.styled && cell.style != style
+            style = cell.style
+            write_sgr(t.sink, style)
+        end
+        print(t.sink, cell.char)
+    end
+    style == UNSTYLED || print(t.sink, "\e[0m")
+    newline && print(t.sink, '\n')
+end
+
+# The whole style, from a reset: so a row can start anywhere.
+function write_sgr(io::IO, style::Style)
+    print(io, "\e[0")
+    foreach(n -> style.attributes >> n & 1 == 1 && print(io, ';', n), 1:9)
+    for (colour, base) in ((style.foreground, 30), (style.background, 40))
+        kind, value = colour & ~0xffffff, colour & 0xffffff
+        if kind == PALETTE && value < 16
+            print(io, ';', base + value % 8 + 60 * (value >= 8))
+        elseif kind == PALETTE
+            print(io, ';', base + 8, ";5;", value)
+        elseif kind == DIRECT
+            print(io, ';', base + 8, ";2;", value >> 16, ';', value >> 8 & 0xff, ';', value & 0xff)
+        end
+    end
+    print(io, 'm')
 end
