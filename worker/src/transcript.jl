@@ -263,8 +263,10 @@ Base.buffer_writes(io::RecordedOutput, args...) = Base.buffer_writes(io.sink, ar
 Write the transcript of session `label` to `out`, then follow it until
 `until` ends: the watcher's signals socket, which it holds until it exits
 (its stdin may end at once). The comma-separated `format` may hold `once`,
-to stop after the transcript so far, and `json`, for one JSON object per
-line. An unrecorded session is recorded from the first watch on.
+to stop after the transcript so far, `json`, for one JSON object per
+line, and `recorded`, to watch only a session already recorded. An
+unrecorded session is otherwise recorded from the first watch on; with
+`recorded` it is left alone, and the exit code is 2.
 
 `color` is `--color`'s choice, `nothing` when unset: then text is coloured
 when `out` is a colour `terminal`, but JSON is not, as its escaped codes
@@ -273,14 +275,19 @@ show literally there.
 function watch_session(label::String, format::String, out::IO;
                        color::Union{Nothing, Bool}=nothing, terminal::Bool=false, until::IO)
     options = split(format, ',', keepempty=false)
-    unknown = setdiff(options, ("json", "once"))
+    unknown = setdiff(options, ("json", "once", "recorded"))
     if !isempty(unknown)
-        println(out, "--watch: unknown option ", join(unknown, ", "), "; expected json and/or once")
+        println(out, "--watch: unknown option ", join(unknown, ", "), "; expected json, once or recorded")
         return 1
     end
     json = "json" ∈ options
-    transcript = session_transcript(label)
-    if !isrecording(transcript)
+    transcript = if "recorded" ∈ options
+        @lock TRANSCRIPTS.lock get(TRANSCRIPTS.sessions, label, nothing)
+    else
+        session_transcript(label)
+    end
+    if isnothing(transcript) || !isrecording(transcript)
+        "recorded" ∈ options && return 2
         start_recording!(transcript)
         json || println(out, if isempty(label) "This worker's session" else "Session '$label'" end,
                         " was not being recorded; it is from now on.")
