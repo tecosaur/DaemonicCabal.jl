@@ -413,21 +413,24 @@ function restore_repl_prompt(session::SyncSession, has_repl::Bool)
 end
 
 function unregister_client!(client::ClientInfo)
-    exiting = @lock STATE.lock begin
+    idle = @lock STATE.lock begin
         idx = findfirst(c -> c === client, STATE.clients)
         !isnothing(idx) && deleteat!(STATE.clients, idx)
         delete!(STATE.client_tasks, client.id)
         STATE.lastclient[] = time()
-        STATE.soft_exit[] && isempty(STATE.clients)
+        isempty(STATE.clients)
     end
     send_notification(STATE.conductor_socket[], NOTIF_TYPE.client_done,
                       UInt32(client.id))
-    exiting && real_exit(0)
+    idle && STATE.soft_exit[] && real_exit(0)
     ensure_standby_sockets()
     ensure_standby_module()
+    # An idle worker allocates nothing, so no collection would free the run's garbage.
+    idle && Timer(_ -> (@lock STATE.lock isempty(STATE.clients)) && GC.gc(true), IDLE_COLLECT_DELAY_S)
 end
 
 const CLIENT_ACCEPT_TIMEOUT_S = 30.0
+const IDLE_COLLECT_DELAY_S = 0.5
 const TCP_KEEPALIVE_IDLE_S = 60
 
 # A bare `accept` would stall pings on a client that died after getting its
