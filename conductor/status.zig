@@ -44,6 +44,7 @@ pub const Options = struct {
     tty: bool = false,
     palette: ?*const pal.Palette = null,
     scope: Scope = .host,
+    focus: ?u32 = null, // a client id, marked in the tree
 };
 
 /// What one request sees, gathered once: the host every worker, a sandboxed
@@ -92,13 +93,19 @@ const View = struct {
     }
 };
 
-/// `lines` is for the live view's cursor-up redraw.
+/// `lines` is for the live view's cursor-up redraw; `clients` are the tree's
+/// focusable clients, top to bottom (none for JSON).
 pub const Report = struct {
     bytes: []u8,
     lines: usize,
+    clients: []u32,
+
+    pub fn deinit(self: Report, gpa: std.mem.Allocator) void {
+        gpa.free(self.bytes);
+        gpa.free(self.clients);
+    }
 };
 
-/// Caller owns `Report.bytes`.
 pub fn render(c: *Conductor, opts: Options) !Report {
     return renderAt(c, opts, c.currentTime());
 }
@@ -107,6 +114,8 @@ pub fn render(c: *Conductor, opts: Options) !Report {
 pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(c.allocator);
+    var clients: std.ArrayList(u32) = .empty;
+    errdefer clients.deinit(c.allocator);
     const w = Writer{ .list = &buf, .gpa = c.allocator };
     const view = try View.init(c.allocator, c, opts.scope);
     defer view.deinit(c.allocator);
@@ -114,10 +123,13 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
         try renderJson(c, w, view, now);
     } else {
         const tints: ?Tints = if (opts.palette) |p| .{ .palette = p } else null;
-        try renderTree(c, w, Style{ .enabled = opts.tty }, tints, view, now);
+        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients };
+        try renderTree(c, w, Style{ .enabled = opts.tty }, ctx, view, now);
     }
     const lines = std.mem.count(u8, buf.items, "\n");
-    return .{ .bytes = try buf.toOwnedSlice(c.allocator), .lines = lines };
+    const bytes = try buf.toOwnedSlice(c.allocator);
+    errdefer c.allocator.free(bytes);
+    return .{ .bytes = bytes, .lines = lines, .clients = try clients.toOwnedSlice(c.allocator) };
 }
 
 // --- Styling -----------------------------------------------------------------
@@ -200,6 +212,8 @@ const Tints = struct {
 const Ctx = struct {
     tints: ?Tints,
     mem_ceiling: u64,
+    focus: ?u32,
+    clients: *std.ArrayList(u32), // focusable, in drawing order
 };
 
 fn gradientTints(s: Style, ctx: Ctx) ?Tints {
@@ -285,8 +299,7 @@ fn contractHome(path: []const u8, home: []const u8) []const u8 {
 
 const indent = "  ";
 
-fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, view: View, now: i64) !void {
-    const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view) };
+fn renderTree(c: *Conductor, w: Writer, s: Style, ctx: Ctx, view: View, now: i64) !void {
     var sandboxed: usize = 0;
     for (view.workers) |p| {
         if (p.wk.launch != .direct) sandboxed += 1;
@@ -452,7 +465,7 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     if (dim_line) try s.close(w);
     try w.writeByte('\n');
     // Watchers show under an otherwise idle worker too.
-    if (wk.active_clients > 0) try renderClients(c, w, s, wk, now, nested, is_last);
+    if (wk.active_clients > 0) try renderClients(c, w, s, ctx, wk, now, nested, is_last);
 }
 
 // Pair with `closeStat`. False when the value just inherits the line's dim.
@@ -536,7 +549,7 @@ fn writeCullCountdown(w: Writer, s: Style, ctx: Ctx, remaining: i64, color_budge
     }
 }
 
-fn renderClients(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64, nested: bool, worker_last: bool) !void {
+fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, now: i64, nested: bool, worker_last: bool) !void {
     const base = if (nested) indent ++ indent else indent;
     const total = countClients(c, wk);
     var seen: usize = 0;
@@ -545,8 +558,10 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64
         var it = c.active_clients.iterator();
         while (it.next()) |entry| {
             const info = entry.value_ptr;
-            if (info.worker != wk or info.watcher != watchers) continue;
+            if (info.worker != wk or info.watcher != watchers or info.internal) continue;
             seen += 1;
+            const focused = ctx.focus == entry.key_ptr.*;
+            if (!watchers) try ctx.clients.append(w.gpa, entry.key_ptr.*);
             try w.writeAll(base);
             try s.open(w, ansi.dim);
             try w.writeAll(if (worker_last) "   " else "│  ");
@@ -562,6 +577,7 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64
             try w.writeAll(" · attached ");
             try writeDuration(w, attached_s);
             try s.close(w);
+            if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
             try w.writeByte('\n');
         }
     }
@@ -571,7 +587,7 @@ fn countClients(c: *Conductor, wk: *const Worker) usize {
     var n: usize = 0;
     var it = c.active_clients.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.worker == wk) n += 1;
+        if (entry.value_ptr.worker == wk and !entry.value_ptr.internal) n += 1;
     }
     return n;
 }
@@ -678,7 +694,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     try writeJsonStringOrNull(w, threads_str);
     try w.print(",\"interactive\":{},\"launch\":\"{s}\"", .{ wk.interactive, @tagName(wk.launch) });
     try w.print(",\"created_at\":{d},\"last_active\":{d},\"last_pinged\":{d}", .{ wk.created_at, wk.last_active, wk.last_pinged });
-    try w.print(",\"ping_pending\":{},\"active_clients\":{d},\"watchers\":{d}", .{ wk.ping_pending, wk.busyClients(), wk.watchers });
+    try w.print(",\"ping_pending\":{},\"active_clients\":{d},\"watchers\":{d}", .{ wk.ping_pending, wk.busyClients(), countClients(c, wk) - wk.busyClients() });
     try w.print(",\"activity\":{d:.4},\"cull_budget_s\":{d}", .{ c.workerActivity(wk, key, now), c.idleBudget(wk, key orelse "") });
     if (stats) |st| {
         try w.print(",\"mem_bytes\":{d},\"cpu_seconds\":{d:.3}", .{ st.mem_bytes, st.cpu_seconds });
@@ -689,7 +705,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     var first = true;
     var it = c.active_clients.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.worker != wk) continue;
+        if (entry.value_ptr.worker != wk or entry.value_ptr.internal) continue;
         if (!first) try w.writeByte(',');
         first = false;
         const attached_s = @divTrunc(now * 1_000_000 - entry.value_ptr.start_time_us, 1_000_000);

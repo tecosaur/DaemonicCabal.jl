@@ -33,6 +33,19 @@ pub fn close(fd: posix.fd_t) void { impl.rawClose(fd); }
 pub fn shutdownWrite(fd: posix.socket_t) void {
     _ = posix.system.shutdown(fd, posix.system.SHUT.WR);
 }
+/// What the socket takes without waiting, 0 when full; null once its peer is gone.
+pub fn sendNonBlocking(fd: posix.socket_t, buf: []const u8) ?usize {
+    if (buf.len == 0) return 0;
+    while (true) {
+        const rc = posix.system.sendto(fd, buf.ptr, buf.len, posix.MSG.DONTWAIT, null, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return 0,
+            else => return null,
+        }
+    }
+}
 pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     return posix.read(fd, buf) catch |err| {
         @branchHint(.cold);
