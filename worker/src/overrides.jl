@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
+@eval Base.isinteractive() = CLIENT_INTERACTIVE[]
+
 @static if VERSION >= v"1.12"
     @eval function Base.current_terminfo()
         term = ACTIVE_TERM[]
