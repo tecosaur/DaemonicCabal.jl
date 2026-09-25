@@ -6,10 +6,12 @@ module DaemonWorker
 using Base.Threads
 using InteractiveUtils
 using Logging
+using Profile
 using REPL
 using Sockets
 
 const WORKER_ID = Ref("")
+const CONDUCTOR_WORKER_ID = Ref(0)  # as the conductor numbers its workers
 const StreamIO = Union{Base.PipeEndpoint, Sockets.TCPSocket}
 
 include("terminaltext.jl")
@@ -30,6 +32,7 @@ include("bufferedio.jl")
 @static VERSION >= v"1.11" && include("scopedio.jl")
 include("protocol.jl")
 include("setup.jl")
+include("peek.jl")
 include("run.jl")
 
 function __init__()
