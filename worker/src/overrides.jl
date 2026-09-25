@@ -26,12 +26,18 @@
         term.have_truecolor = has_truecolor
     end
 
+end
+
+@static if VERSION >= v"1.11"
     @eval function Base.display_error(io::IO, stack::Base.ExceptionStack)
         if !isempty(stack) && first(stack).exception isa DaemonClientExit
             exit = first(stack).exception
             term = ACTIVE_TERM[]
             try close(term.stdout) catch end
             try close(term.stderr) catch end
+            # The REPL still prints its next prompt, which the closed streams would fail.
+            term.redirect_out = devnull
+            term.redirect_err = devnull
             session = term.sync_session
             if !isnothing(session)
                 for sig in session.signals
@@ -51,9 +57,6 @@
             end
         end
     end
-end
-
-@static if VERSION >= v"1.11"
     # The display stack is process-wide, but a REPL's display belongs to its
     # own session: not to a concurrent run, nor to the REPL pre-warm.
     @eval Base.Multimedia.xdisplayable(d::REPL.REPLDisplay, @nospecialize args...) =
