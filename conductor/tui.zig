@@ -113,14 +113,17 @@ pub fn lastLines(text: []const u8, out: [][]const u8) [][]const u8 {
 pub const tab_width = 8;
 
 /// A framed box of `height` rows, borders included, `width` columns wide,
-/// each row after a dim `gutter`. `title` and `footer` sit in the borders;
-/// `body` fills the rows between, from the top, cut to fit. Each character
-/// counts as one column, as in the transcript's `TerminalText`.
+/// each row after a dim `gutter` (the top one after `branch`, as long).
+/// `title` and `footer` sit in the borders; `body` fills the rows between,
+/// from the top, cut to fit. Text keeps its colour (SGR) and loses other
+/// escape sequences; each character counts as one column, as in the
+/// transcript's `TerminalText`.
 pub const Pane = struct {
     title: []const u8,
     footer: []const u8,
     body: []const []const u8,
     dim_body: bool = false,
+    branch: []const []const u8 = &.{},
     gutter: []const []const u8 = &.{},
 };
 
@@ -130,15 +133,15 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
     const inner = width -| 4;
     const dim = if (styled) "\x1b[2m" else "";
     const reset = if (styled) "\x1b[0m" else "";
-    try writeBorder(out, gpa, .{ dim, reset }, pane.gutter, "╭─", "╮", pane.title, width);
+    try writeBorder(out, gpa, .{ dim, reset }, if (pane.branch.len > 0) pane.branch else pane.gutter, "╭─", "╮", pane.title, width);
     for (0..height -| 2) |row| {
         try out.appendSlice(gpa, dim);
         for (pane.gutter) |part| try out.appendSlice(gpa, part);
         try out.print(gpa, "│{s} ", .{reset});
         if (pane.dim_body) try out.appendSlice(gpa, dim);
         const text = if (row < pane.body.len) pane.body[row] else "";
-        const used = try appendColumns(out, gpa, text, inner);
-        if (pane.dim_body) try out.appendSlice(gpa, reset);
+        const used = try appendColumns(out, gpa, text, inner, styled);
+        if (styled) try out.appendSlice(gpa, reset);
         try out.appendNTimes(gpa, ' ', inner - used);
         try out.print(gpa, " {s}│{s}\n", .{ dim, reset });
     }
@@ -153,41 +156,165 @@ fn writeBorder(out: *std.ArrayList(u8), gpa: std.mem.Allocator, style: [2][]cons
     var used: usize = 2;
     if (label.len > 0 and width > 6) {
         try out.append(gpa, ' ');
-        used += 2 + try appendColumns(out, gpa, label, width - 6);
-        try out.append(gpa, ' ');
+        used += 2 + try appendColumns(out, gpa, label, width - 6, style[0].len > 0);
+        try out.print(gpa, "{s}{s} ", .{ style[1], style[0] });
     }
     for (used..width -| 1) |_| try out.appendSlice(gpa, "─");
     try out.print(gpa, "{s}{s}\n", .{ right, style[1] });
 }
 
-/// Appends `text` as at most `max` columns, controls dropped and tabs
-/// expanded; returns the columns used. Invalid UTF-8 shows as U+FFFD.
-pub fn appendColumns(out: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8, max: usize) !usize {
-    var col: usize = 0;
-    var i: usize = 0;
-    while (i < text.len and col < max) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
-        const decoded: ?u21 = if (len > 0 and i + len <= text.len)
-            std.unicode.utf8Decode(text[i .. i + len]) catch null
-        else
-            null;
-        const cp = decoded orelse {
-            try out.appendSlice(gpa, "\u{fffd}");
-            col += 1;
-            i += 1;
-            continue;
-        };
-        if (cp == '\t') {
-            const stop = @min(max, (col / tab_width + 1) * tab_width);
-            try out.appendNTimes(gpa, ' ', stop - col);
-            col = stop;
-        } else if (cp >= 0x20 and !(cp >= 0x7f and cp < 0xa0)) {
-            try out.appendSlice(gpa, text[i .. i + len]);
-            col += 1;
+/// Appends one line of terminal output as the terminal would have drawn it,
+/// at most `max` columns; returns the columns used. The line's own editing
+/// is replayed: carriage return, backspace, tabs, cursor moves along the row
+/// (CSI C, D, G) and erasing (CSI K, X). Colour (SGR) is kept when `colour`,
+/// and other escape sequences leave nothing. Invalid UTF-8 shows as U+FFFD.
+pub fn appendColumns(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool) !usize {
+    var row = Row{};
+    row.draw(line, @min(max, Row.max_cols));
+    var style: u8 = 0;
+    for (row.cells[0..row.len]) |cell| {
+        if (colour and cell.style != style) {
+            try out.appendSlice(gpa, "\x1b[0m");
+            try out.appendSlice(gpa, row.styles.get(cell.style));
+            style = cell.style;
         }
-        i += len;
+        try out.appendSlice(gpa, cell.bytes[0..cell.n]);
     }
-    return col;
+    if (style != 0) try out.appendSlice(gpa, "\x1b[0m");
+    return row.len;
+}
+
+/// A terminal row being drawn: cells with the colour each was drawn in.
+const Row = struct {
+    const max_cols = 512;
+    const Cell = struct { bytes: [4]u8 = .{ ' ', 0, 0, 0 }, n: u3 = 1, style: u8 = 0 };
+
+    cells: [max_cols]Cell = undefined,
+    len: usize = 0, // columns drawn
+    col: usize = 0,
+    styles: Styles = .{},
+    style: u8 = 0,
+
+    fn draw(self: *Row, text: []const u8, max: usize) void {
+        var i: usize = 0;
+        while (i < text.len) {
+            const byte = text[i];
+            if (byte == 0x1b) {
+                const len = escapeLength(text[i..]);
+                if (len > 2 and text[i + 1] == '[') self.csi(text[i + 2 .. i + len], max);
+                i += len;
+                continue;
+            }
+            switch (byte) {
+                '\r' => self.col = 0,
+                0x08 => self.col -|= 1,
+                '\t' => self.col = @min(max, (self.col / tab_width + 1) * tab_width),
+                0...0x07, 0x0a...0x0c, 0x0e...0x1a, 0x1c...0x1f, 0x7f => {},
+                else => {
+                    const len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+                    const whole = len > 0 and i + len <= text.len and
+                        if (std.unicode.utf8Decode(text[i .. i + len])) |cp| !(cp >= 0x80 and cp < 0xa0) else |_| false;
+                    self.put(if (whole) text[i .. i + len] else "\u{fffd}", max);
+                    i += if (whole) len else 1;
+                    continue;
+                },
+            }
+            i += 1;
+        }
+    }
+
+    fn put(self: *Row, bytes: []const u8, max: usize) void {
+        if (self.col >= max) return;
+        if (self.col > self.len) @memset(self.cells[self.len..self.col], .{});
+        var cell = Cell{ .n = @intCast(bytes.len), .style = self.style };
+        @memcpy(cell.bytes[0..bytes.len], bytes);
+        self.cells[self.col] = cell;
+        self.col += 1;
+        self.len = @max(self.len, self.col);
+    }
+
+    // `seq` is the sequence after `ESC [`, its final byte last.
+    fn csi(self: *Row, seq: []const u8, max: usize) void {
+        const final = seq[seq.len - 1];
+        const params = seq[0 .. seq.len - 1];
+        const n: usize = std.fmt.parseInt(usize, params, 10) catch 0;
+        switch (final) {
+            'm' => self.style = self.styles.apply(self.style, params),
+            'C' => self.col = @min(max, self.col + @max(n, 1)),
+            'D' => self.col -|= @max(n, 1),
+            'G' => self.col = @min(max, @max(n, 1) - 1),
+            'K' => switch (n) {
+                0 => self.len = @min(self.len, self.col),
+                1 => for (0..@min(self.col + 1, self.len)) |c| {
+                    self.cells[c] = .{};
+                },
+                else => self.len = 0,
+            },
+            'X' => for (self.col..@min(self.col + @max(n, 1), self.len)) |c| {
+                self.cells[c] = .{};
+            },
+            else => {},
+        }
+    }
+};
+
+/// The distinct colours of a row, as the SGR sequences that set them from a
+/// reset; 0 is none. A row with more than fit keeps drawing in the last.
+const Styles = struct {
+    const max_styles = 32;
+    const max_bytes = 48;
+
+    bytes: [max_styles][max_bytes]u8 = undefined,
+    lens: [max_styles]u8 = .{0} ** max_styles,
+    count: u8 = 1,
+
+    fn get(self: *const Styles, id: u8) []const u8 {
+        return self.bytes[id][0..self.lens[id]];
+    }
+
+    // The style after `ESC [ params m` in style `from`.
+    fn apply(self: *Styles, from: u8, params: []const u8) u8 {
+        var reset = params.len == 0;
+        var it = std.mem.splitAny(u8, params, ";:");
+        while (it.next()) |p| {
+            if (p.len == 0 or std.mem.eql(u8, p, "0")) reset = true;
+        }
+        var buf: [max_bytes]u8 = undefined;
+        const base = if (reset) "" else self.get(from);
+        const next = std.fmt.bufPrint(&buf, "{s}\x1b[{s}m", .{ base, params }) catch return from;
+        const state = if (reset and std.mem.eql(u8, params, "0") or params.len == 0) "" else next;
+        for (0..self.count) |id| {
+            if (std.mem.eql(u8, self.get(@intCast(id)), state)) return @intCast(id);
+        }
+        if (self.count == max_styles) return from;
+        const id = self.count;
+        @memcpy(self.bytes[id][0..state.len], state);
+        self.lens[id] = @intCast(state.len);
+        self.count += 1;
+        return id;
+    }
+};
+
+// Of the escape sequence `text` starts with: CSI to its final byte, a string
+// (OSC and the like) to its BEL or ST, else ESC and one byte.
+fn escapeLength(text: []const u8) usize {
+    if (text.len < 2) return text.len;
+    switch (text[1]) {
+        '[' => {
+            var i: usize = 2;
+            while (i < text.len and (text[i] < 0x40 or text[i] > 0x7e)) : (i += 1) {}
+            return @min(i + 1, text.len);
+        },
+        ']', 'P', '_', '^', 'X' => {
+            var i: usize = 2;
+            while (i < text.len) : (i += 1) {
+                if (text[i] == 0x07) return i + 1;
+                if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '\\') return i + 2;
+            }
+            return text.len;
+        },
+        else => return 2,
+    }
 }
 
 test "keys: arrows, pages, enter, escape and characters" {
@@ -242,21 +369,49 @@ test "columns: controls dropped, tabs expanded, cut at the width" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 14), try appendColumns(&out, gpa, "a\tb\x1b[1mé\xff", 20));
-    try std.testing.expectEqualStrings("a       b[1mé\u{fffd}", out.items);
+    try std.testing.expectEqual(@as(usize, 11), try appendColumns(&out, gpa, "a\tb\x1b[1mé\xff\x07", 20, false));
+    try std.testing.expectEqualStrings("a       bé\u{fffd}", out.items);
     out.clearRetainingCapacity();
-    try std.testing.expectEqual(@as(usize, 3), try appendColumns(&out, gpa, "abcdef", 3));
+    try std.testing.expectEqual(@as(usize, 1), try appendColumns(&out, gpa, "a\x1b[5Cb", 3, false));
+    try std.testing.expectEqualStrings("a", out.items);
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 3), try appendColumns(&out, gpa, "abcdef", 3, false));
     try std.testing.expectEqualStrings("abc", out.items);
+}
+
+test "columns: colour kept, other sequences dropped, redrawn lines last" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 7), try appendColumns(&out, gpa, "\x1b]0;title\x07\x1b[31mred\x1b[0m ok!\x1b[?25l", 20, true));
+    try std.testing.expectEqualStrings("\x1b[0m\x1b[31mred\x1b[0m ok!", out.items);
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 4), try appendColumns(&out, gpa, "50%...\r100%\x1b[K", 20, true));
+    try std.testing.expectEqualStrings("100%", out.items);
+}
+
+test "columns: a REPL's line editing draws its prompt and input" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    // As Julia's LineEdit redraws `julia> 1+1` a keystroke at a time.
+    const drawn = "\r\x1b[0K\x1b[32m\x1b[1mjulia> \x1b[0m\r\x1b[7C1+\r\x1b[9C" ++
+        "\r\x1b[0K\x1b[32m\x1b[1mjulia> \x1b[0m\r\x1b[7C1+1\r\x1b[10C";
+    try std.testing.expectEqual(@as(usize, 10), try appendColumns(&out, gpa, drawn, 40, false));
+    try std.testing.expectEqualStrings("julia> 1+1", out.items);
+    out.clearRetainingCapacity();
+    _ = try appendColumns(&out, gpa, drawn, 40, true);
+    try std.testing.expectEqualStrings("\x1b[0m\x1b[32m\x1b[1mjulia> \x1b[0m1+1", out.items);
 }
 
 test "pane: framed to its size, labels in the borders" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    const pane = Pane{ .title = "title", .footer = "a footer too long to fit", .body = &.{ "one", "two", "three" }, .gutter = &.{ "│", "  " } };
+    const pane = Pane{ .title = "title", .footer = "a footer too long to fit", .body = &.{ "one", "two", "three" }, .branch = &.{ "╰", "─ " }, .gutter = &.{ "│", "  " } };
     try writePane(&out, gpa, false, pane, 20, 4);
     try std.testing.expectEqualStrings(
-        \\│  ╭─ title ──────────╮
+        \\╰─ ╭─ title ──────────╮
         \\│  │ one              │
         \\│  │ two              │
         \\│  ╰─ a footer too l ─╯

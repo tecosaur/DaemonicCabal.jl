@@ -11,8 +11,8 @@
 // doesn't take is queued, and a subscriber too far behind is dropped.
 //
 // The focused client's transcript comes from the conductor watching its
-// session, as `--watch` does: a plain watch of a recorded session for the
-// pane, a colour one relayed whole for following it full-screen.
+// session, as `--watch` does, in colour: of a session already recorded for
+// the pane, relayed whole for following it full-screen.
 
 const std = @import("std");
 const posix = std.posix;
@@ -35,10 +35,13 @@ const max_queued_bytes = 1 << 20;
 const probe_timeout_ms = 300; // a worker slower to answer is busy on thread 0
 const max_tail_bytes = 64 << 10;
 const max_pane_rows = 16; // a preview: ⏎ shows the whole
-const cursor_hide = "\x1b[?25l";
-const cursor_show = "\x1b[?25h";
-const alternate_screen = "\x1b[?1049h\x1b[H\x1b[2J";
-const main_screen = "\x1b[0m\x1b[?1049l";
+const note_s = 4; // how long an action's outcome stays in the pane's border
+// Without autowrap a row wider than the terminal is cut, not wrapped, so the
+// frame's height is its line count, which the redraw moves back over.
+const view_start = "\x1b[?25l\x1b[?7l";
+const view_end = "\x1b[?7h\x1b[?25h";
+const alternate_screen = "\x1b[?7h\x1b[?1049h\x1b[H\x1b[2J";
+const main_screen = "\x1b[0m\x1b[?1049l\x1b[?7l";
 
 /// The low bits of an event-loop tag for a `Watch`, whose address it carries.
 pub const tag: usize = 5;
@@ -100,9 +103,27 @@ const Subscriber = struct {
     preview: Preview = .pending,
     tail: std.ArrayList(u8) = .empty,
     attachment: ?*Attachment = null,
+    confirming: ?u32 = null, // the client `t` would terminate, awaiting y/n
+    note: Note = .{},
 
     fn stdout(self: *const Subscriber) posix.socket_t {
         return self.streams.fd(.stdout);
+    }
+};
+
+/// An action's outcome, shown in the pane's border for `note_s`.
+const Note = struct {
+    bytes: [160]u8 = undefined,
+    len: usize = 0,
+    until: i64 = 0,
+
+    fn set(self: *Note, now: i64, comptime fmt: []const u8, fmt_args: anytype) void {
+        self.len = if (std.fmt.bufPrint(&self.bytes, fmt, fmt_args)) |t| t.len else |_| 0;
+        self.until = now + note_s;
+    }
+
+    fn text(self: *const Note, now: i64) ?[]const u8 {
+        return if (now < self.until) self.bytes[0..self.len] else null;
     }
 };
 
@@ -143,7 +164,7 @@ pub fn subscribe(c: *Conductor, streams: ClientStreams, palette: ?pal.Palette, s
     sub.signals = .{ .kind = .signals, .fd = signals };
     watch(c, &sub.input);
     watch(c, &sub.signals);
-    send(c, sub, cursor_hide);
+    send(c, sub, view_start);
     repaint(c, sub);
     if (!c.live.armed) {
         c.event_loop.armLiveTimer(heartbeat_ms);
@@ -271,15 +292,16 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
         sub.focus_row = std.mem.indexOfScalar(u32, report.clients, focus) orelse 0;
         break :placed report.placement;
     } else null;
-    // The pane goes under the focused row; the frame stays a row short of
-    // the screen, so it never scrolls.
-    const rows = @min(max_pane_rows, @as(usize, sub.size.rows) -| 1 -| lines);
+    // The pane encloses the focused row, its top border; the frame stays a
+    // row short of the screen, so it never scrolls.
+    const wanted: usize = if (sub.preview == .transcript and sub.tail.items.len > 0) max_pane_rows else tui.min_pane_rows;
+    const rows = @min(wanted, @as(usize, sub.size.rows) -| 1 -| lines +| 1);
     if (placed != null and rows >= tui.min_pane_rows) {
         const at = placed.?;
-        try out.appendSlice(c.allocator, report.bytes[0..at.at]);
-        try writePane(c, sub, sub.focus.?, out, at, rows);
-        try out.appendSlice(c.allocator, report.bytes[at.at..]);
-        lines += rows;
+        try out.appendSlice(c.allocator, report.bytes[0..at.start]);
+        try writePane(c, sub, sub.focus.?, out, at, report.bytes[at.label_start..at.label_end], rows);
+        try out.appendSlice(c.allocator, report.bytes[at.end..]);
+        lines += rows - 1;
     } else {
         try out.appendSlice(c.allocator, report.bytes);
     }
@@ -290,18 +312,10 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     return lines;
 }
 
-fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8), at: status.Placement, rows: usize) !void {
+// `row` is the focused client's, as the tree drew it: the pane's title.
+fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8), at: status.Placement, row: []const u8, rows: usize) !void {
     const info = c.active_clients.get(focus) orelse return;
     const label = info.worker.session_label;
-    var title_buf: [256]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "Client {d}{s}{s}{s}{s}{s}", .{
-        info.pid,
-        if (!info.session) "" else if (info.sync) " · sync session" else " · session",
-        if (label != null and info.session) " \"" else "",
-        if (info.session) label orelse "" else "",
-        if (label != null and info.session) "\"" else "",
-        if (sub.preview == .transcript) " · transcript" else "",
-    }) catch "Client";
     var lines_buf: [256][]const u8 = undefined;
     const body: []const []const u8 = switch (sub.preview) {
         .pending => &.{},
@@ -317,11 +331,24 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
         else
             tui.lastLines(sub.tail.items, lines_buf[0..@min(lines_buf.len, rows - 2)]),
     };
+    var footer_buf: [160]u8 = undefined;
+    const footer = if (sub.confirming) |id|
+        std.fmt.bufPrint(&footer_buf, "terminate client {d}{s}? y/n", .{
+            if (c.active_clients.get(id)) |target| target.pid else id,
+            if (info.session and (info.sync or label != null)) " and its session" else "",
+        }) catch "terminate? y/n"
+    else if (sub.note.text(c.currentTime())) |note|
+        note
+    else if (info.session)
+        "↑↓ focus · ⏎ follow · i interrupt · t terminate · q quit"
+    else
+        "↑↓ focus · i interrupt · t terminate · q quit";
     try tui.writePane(out, c.allocator, true, .{
-        .title = title,
-        .footer = if (info.session) "↑↓ focus · ⏎ follow · q quit" else "↑↓ focus · q quit",
+        .title = row,
+        .footer = footer,
         .body = body,
         .dim_body = sub.preview != .transcript or sub.tail.items.len == 0,
+        .branch = &at.branch,
         .gutter = &at.gutter,
     }, @as(usize, sub.size.cols) -| at.gutter_cols, rows);
 }
@@ -338,10 +365,24 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
             if (leave) leaveFollow(c, sub);
             continue;
         }
+        if (sub.confirming) |id| {
+            sub.confirming = null;
+            if (key == .char and key.char == 'y') terminate(c, sub, id);
+            repaint(c, sub);
+            continue;
+        }
         switch (key) {
-            .char => |ch| if (ch == 'q') {
-                sub.gone = true;
-                return;
+            .char => |ch| switch (ch) {
+                'q' => {
+                    sub.gone = true;
+                    return;
+                },
+                'i' => if (sub.focus) |focus| interrupt(c, sub, focus),
+                't' => if (sub.focus) |focus| {
+                    sub.confirming = focus;
+                    repaint(c, sub);
+                },
+                else => {},
             },
             .up, .down, .escape => {
                 sub.focus = tui.moveFocus(sub.order, sub.focus, key);
@@ -352,6 +393,48 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
             else => {},
         }
     }
+}
+
+// As a client's Ctrl-C: SIGINT to the worker, which reaches whichever of its
+// clients is running.
+fn interrupt(c: *Conductor, sub: *Subscriber, focus: u32) void {
+    const w = (c.active_clients.get(focus) orelse return).worker;
+    w.signal(platform.SIG.INT);
+    const now = c.currentTime();
+    if (w.busyClients() > 1)
+        sub.note.set(now, "interrupted worker #{d}, reaching whichever of its {d} clients runs", .{ w.id, w.busyClients() })
+    else
+        sub.note.set(now, "interrupted client {d}", .{(c.active_clients.get(focus) orelse return).pid});
+    repaint(c, sub);
+}
+
+// The focused client's run, or its whole session when the session is the
+// worker's own (labelled or `--sync`), which then goes with its label.
+fn terminate(c: *Conductor, sub: *Subscriber, focus: u32) void {
+    const info = c.active_clients.get(focus) orelse return;
+    const w = info.worker;
+    const whole = info.session and (info.sync or w.session_label != null);
+    var ids: [256]u32 = undefined;
+    var n: usize = 0;
+    var it = c.active_clients.iterator();
+    while (it.next()) |entry| {
+        const other = entry.value_ptr;
+        const included = if (whole) other.worker == w and !other.internal else entry.key_ptr.* == focus;
+        if (!included or n == ids.len) continue;
+        ids[n] = entry.key_ptr.*;
+        n += 1;
+    }
+    const worker_id = w.id;
+    const labelled = whole and w.session_label != null;
+    const ending = c.endClients(w, ids[0..n]);
+    if (labelled and ending != .retired) c.clearLabel(w);
+    const now = c.currentTime();
+    switch (ending) {
+        .ended => sub.note.set(now, "ended client {d}{s}", .{ info.pid, if (whole) " and its session" else "" }),
+        .interrupted => sub.note.set(now, "ended client {d}, with a forced interrupt", .{info.pid}),
+        .retired => sub.note.set(now, "retired worker #{d}: client {d} would not stop", .{ worker_id, info.pid }),
+    }
+    noteChange(c);
 }
 
 // The client's replies: a raw-mode ack, or the terminal's size.
@@ -368,7 +451,7 @@ fn onClientSignals(sub: *Subscriber, bytes: []const u8) void {
 // --- The focused client's session ---
 
 /// Brings the pane's attachment in line with the focus: none without one, a
-/// plain watch of a session client's session, asked again after a beat when
+/// watch of a session client's session, asked again after a beat when
 /// its worker was busy or its session unrecorded.
 fn retarget(c: *Conductor, sub: *Subscriber) void {
     if (sub.following) return;
@@ -409,7 +492,7 @@ fn enterFollow(c: *Conductor, sub: *Subscriber) void {
 fn leaveFollow(c: *Conductor, sub: *Subscriber) void {
     detach(c, sub);
     sub.following = false;
-    send(c, sub, main_screen ++ cursor_hide);
+    send(c, sub, main_screen);
     sub.target = null;
     retarget(c, sub);
     repaint(c, sub);
@@ -440,8 +523,8 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
         .{ .name = "--session", .value = w.session_label orelse "", .index = 1, .words = 1 },
     };
     const info = worker.ClientInfo{
-        .tty = follow,
-        .color = follow,
+        .tty = true,
+        .color = true,
         .force = true,
         .id = id,
         .pid = pid,
@@ -598,7 +681,7 @@ fn sweep(c: *Conductor) void {
             detach(c, sub);
             unwatch(c, &sub.input);
             unwatch(c, &sub.signals);
-            const leaving = if (sub.following) main_screen ++ "\r\n" ++ cursor_show else "\r\n" ++ cursor_show;
+            const leaving = if (sub.following) main_screen ++ "\r\n" ++ view_end else "\r\n" ++ view_end;
             _ = platform.sendNonBlocking(sub.stdout(), leaving);
         }
         sub.streams.closeForExit(0);

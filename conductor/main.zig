@@ -78,6 +78,9 @@ const cadence_mult_divisor: f64 = 2;
 
 /// Per-worker client PIDs a single reconciliation pass can hold.
 const max_tracked_clients = 256;
+/// How long a worker may take to answer as a client is ended, a forced
+/// interrupt included.
+const end_probe_ms = 1000;
 
 // --- Global state for cleanup ---
 
@@ -1703,7 +1706,7 @@ pub const Conductor = struct {
         return idle_time >= self.cfg.label_ttl;
     }
 
-    fn clearLabel(self: *Conductor, w: *worker.Worker) void {
+    pub fn clearLabel(self: *Conductor, w: *worker.Worker) void {
         if (w.session_label) |label| {
             std.debug.print("Worker {d}: clearing label '{s}'\n", .{ w.id, label });
             w.dropSession(label); // tear down the now-orphaned session REPL before reuse
@@ -1817,32 +1820,12 @@ pub const Conductor = struct {
     }
 
     pub fn syncWorkerClients(self: *Conductor, w: *worker.Worker) void {
-        // The worker kills every client not listed, so a partial list is never sent.
-        var ids: [max_tracked_clients]u32 = undefined;
-        var count: usize = 0;
-        var it = self.active_clients.iterator();
-        while (it.next()) |entry| if (entry.value_ptr.worker == w) {
-            if (count == ids.len) {
-                std.debug.print("Worker {d}: over {d} clients, skipping sync\n", .{ w.id, ids.len });
-                return;
-            }
-            ids[count] = entry.key_ptr.*;
-            count += 1;
-        };
-        const worker_count = w.syncClients(ids[0..count]) catch |err| {
-            std.debug.print("Worker {d}: sync_clients failed: {}\n", .{ w.id, err });
-            self.retireWorker(w);
-            return;
-        };
-        self.reconcileClientMap(w);
-        const counted = self.countMapClients(w);
-        const remaining = counted.clients;
-        w.active_clients = remaining;
-        w.watchers = counted.watchers;
+        const synced = self.syncCounts(w) catch return;
+        const remaining = synced.listed;
         const busy = w.busyClients();
         // The worker's surplus is departed clients' code it could not stop.
-        if (worker_count > remaining and busy == 0) {
-            std.debug.print("Worker {d}: {d} departed client(s) still running, retiring\n", .{ w.id, worker_count });
+        if (synced.running > remaining and busy == 0) {
+            std.debug.print("Worker {d}: {d} departed client(s) still running, retiring\n", .{ w.id, synced.running });
             return self.retireWorker(w);
         }
         const now = self.currentTime();
@@ -1852,6 +1835,61 @@ pub const Conductor = struct {
             w.occupancy.attach(now, self.activityHalfLife(), self.budgetOccHalfLife());
         }
         std.debug.print("Worker {d}: sync complete, {d} active clients\n", .{ w.id, remaining });
+    }
+
+    /// Tells the worker the clients it has, and it stops any other; returns
+    /// how many it still runs, and how many were listed. A worker that fails
+    /// to answer is retired (`error.SyncFailed`).
+    fn syncCounts(self: *Conductor, w: *worker.Worker) !struct { running: u16, listed: u32 } {
+        // The worker kills every client not listed, so a partial list is never sent.
+        var ids: [max_tracked_clients]u32 = undefined;
+        var count: usize = 0;
+        var it = self.active_clients.iterator();
+        while (it.next()) |entry| if (entry.value_ptr.worker == w) {
+            if (count == ids.len) {
+                std.debug.print("Worker {d}: over {d} clients, skipping sync\n", .{ w.id, ids.len });
+                return error.TooManyClients;
+            }
+            ids[count] = entry.key_ptr.*;
+            count += 1;
+        };
+        const running = w.syncClients(ids[0..count]) catch |err| {
+            std.debug.print("Worker {d}: sync_clients failed: {}\n", .{ w.id, err });
+            self.retireWorker(w);
+            return error.SyncFailed;
+        };
+        self.reconcileClientMap(w);
+        const counted = self.countMapClients(w);
+        w.active_clients = counted.clients;
+        w.watchers = counted.watchers;
+        return .{ .running = running, .listed = counted.clients };
+    }
+
+    pub const Ending = enum { ended, interrupted, retired };
+
+    /// Ends `ids`, clients of `w`: they are dropped here and the worker stops
+    /// their tasks. One that won't stop, a CPU-bound loop, is force-interrupted
+    /// (thread 0 runs it, so the interrupt lands there), and the worker retired
+    /// if it still runs one, or stops answering.
+    pub fn endClients(self: *Conductor, w: *worker.Worker, ids: []const u32) Ending {
+        for (ids) |id| _ = self.clientDone(id);
+        var ending: Ending = .ended;
+        while (true) {
+            self.event_loop.cancelPendingPing(w);
+            if (w.answersWithin(end_probe_ms)) {
+                const synced = self.syncCounts(w) catch |err| switch (err) {
+                    error.SyncFailed => return .retired,
+                    else => return ending,
+                };
+                if (synced.running <= synced.listed) return ending;
+            }
+            if (ending == .interrupted) break;
+            w.forceInterrupt();
+            ending = .interrupted;
+        }
+        std.debug.print("Worker {d}: an ended client would not stop, retiring\n", .{w.id});
+        self.retireWorker(w);
+        return .retired;
     }
 
     fn countMapClients(self: *Conductor, w: *worker.Worker) struct { clients: u32, watchers: u32 } {
