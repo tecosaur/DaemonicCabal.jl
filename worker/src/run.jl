@@ -161,7 +161,14 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                 CLIENT_SIGNALS[] = signals
                 try
                     redirect_stdio(stdin=client_stdin, stdout=stdoutx, stderr=stderrx) do
-                        runclient(mod, client; stdout=stdoutx, broadcast)
+                        # Base's display holds the stdout the worker started with.
+                        client_display = TextDisplay(stdoutx)
+                        pushdisplay(client_display)
+                        try
+                            runclient(mod, client; stdout=stdoutx, broadcast)
+                        finally
+                            popdisplay(client_display)
+                        end
                     end
                 finally
                     CLIENT_SIGNALS[] = nothing
