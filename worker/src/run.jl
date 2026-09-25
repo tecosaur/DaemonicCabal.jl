@@ -355,7 +355,7 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
         banner = if VERSION >= v"1.11" && REPLAY_TARGET[] !== nothing
             :no
         else
-            Symbol(getval(client.switches, "--banner", ifelse(interactiveinput, "yes", "no")))
+            Symbol(getval(client.switches, "--banner", if interactiveinput && !quiet "yes" else "no" end))
         end
         histfile = getval(client.switches, "--history-file", "yes") != "no"
         @static if VERSION < v"1.11"
