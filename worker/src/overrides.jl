@@ -54,6 +54,10 @@
 end
 
 @static if VERSION >= v"1.11"
+    # The display stack is process-wide, but a REPL's display belongs to its
+    # own session: not to a concurrent run, nor to the REPL pre-warm.
+    @eval Base.Multimedia.xdisplayable(d::REPL.REPLDisplay, @nospecialize args...) =
+        isassigned(CLIENT_REPL[]) && d.repl === CLIENT_REPL[][] && applicable(display, d, args...)
     @eval function Base.active_module((; mistate)::REPL.LineEditREPL)
         if mistate !== nothing && mistate.active_module !== Main
             mistate.active_module

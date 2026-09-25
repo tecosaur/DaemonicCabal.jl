@@ -49,8 +49,9 @@ function __init__()
         setglobal!(Base, :stdin, ScopedStdin())
         setglobal!(Base, :stdout, ScopedStdout())
         setglobal!(Base, :stderr, ScopedStderr())
-        # The default logger still holds the stderr object whose handle moved.
+        # The default logger and display still hold the objects whose handles moved.
         global_logger(ConsoleLogger(Base.stderr))
+        Base.Multimedia.reinit_displays()
     end
 end
 
