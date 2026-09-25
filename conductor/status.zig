@@ -47,6 +47,13 @@ pub const Options = struct {
     focus: ?u32 = null, // a client id, marked in the tree
 };
 
+/// Whether the live view focuses workers rather than clients: where each
+/// holds one session, the worker is the session. Its focus then names the
+/// worker's first client.
+pub fn focusesWorkers(c: *const Conductor) bool {
+    return c.cfg.worker_maxclients == 1;
+}
+
 /// What one request sees, gathered once: the host every worker, a sandboxed
 /// caller only its own sandbox's (`Conductor.isVisible`). The reserve is the host's.
 const View = struct {
@@ -409,8 +416,12 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     const health = workerHealth(c, wk, now);
     const dim_line = health == .inactive;
     const pad = if (nested) indent ++ indent else indent;
+    const start = w.list.items.len;
+    const session = if (focusesWorkers(c)) firstClient(c, wk) else null;
+    if (session) |id| try ctx.clients.append(w.gpa, id);
     try w.writeAll(pad);
     try s.wrap(w, ansi.dim, if (is_last) "╰─ " else "├─ ");
+    const label_start = w.list.items.len;
     try writeHealthDot(s, w, health);
     try w.writeByte(' ');
     const id_text = idStr(wk.id);
@@ -482,7 +493,19 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     if (showed_activity) try writeActivity(c, w, s, ctx, wk, key, now, dim_line);
     if (health == .inactive) try writeIdleState(c, w, s, ctx, wk, key, now, showed_activity);
     if (dim_line) try s.close(w);
+    const label_end = w.list.items.len;
+    const focused = session != null and ctx.focus == session;
+    if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
     try w.writeByte('\n');
+    if (focused) ctx.placement.* = .{
+        .start = start,
+        .label_start = label_start,
+        .label_end = label_end,
+        .end = w.list.items.len,
+        .branch = .{ pad, if (is_last) "╰" else "├", "" },
+        .gutter = .{ pad, if (is_last) " " else "│", "" },
+        .gutter_cols = pad.len + 1,
+    };
     // Watchers show under an otherwise idle worker too.
     if (wk.active_clients > 0) try renderClients(c, w, s, ctx, wk, now, nested, is_last);
 }
@@ -579,8 +602,8 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             const info = entry.value_ptr;
             if (info.worker != wk or info.watcher != watchers or info.internal) continue;
             seen += 1;
-            const focused = ctx.focus == entry.key_ptr.*;
-            if (!watchers) try ctx.clients.append(w.gpa, entry.key_ptr.*);
+            const focused = !focusesWorkers(c) and ctx.focus == entry.key_ptr.*;
+            if (!watchers and !focusesWorkers(c)) try ctx.clients.append(w.gpa, entry.key_ptr.*);
             const start = w.list.items.len;
             const trunk = if (worker_last) "   " else "│  ";
             const last = seen == total;
@@ -615,6 +638,18 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             };
         }
     }
+}
+
+// The worker's client of lowest id, watchers aside: the session it holds.
+fn firstClient(c: *Conductor, wk: *const Worker) ?u32 {
+    var first: ?u32 = null;
+    var it = c.active_clients.iterator();
+    while (it.next()) |entry| {
+        const info = entry.value_ptr;
+        if (info.worker != wk or info.watcher or info.internal) continue;
+        if (first == null or entry.key_ptr.* < first.?) first = entry.key_ptr.*;
+    }
+    return first;
 }
 
 fn countClients(c: *Conductor, wk: *const Worker) usize {
