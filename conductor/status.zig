@@ -46,6 +46,7 @@ pub const Options = struct {
     scope: Scope = .host,
     focus: ?u32 = null, // a client id, marked in the tree
     trend: ?*const Trend = null, // the focused worker's, charted beside its row
+    hint: bool = false, // "↓ to inspect" on the first focusable row
 };
 
 /// A worker's recent memory and CPU, sampled each second, as chart bars of
@@ -219,7 +220,7 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
         try renderJson(c, w, view, now);
     } else {
         const tints: ?Tints = if (opts.palette) |p| .{ .palette = p } else null;
-        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients, .placement = &placement, .trend = opts.trend, .aside = &aside };
+        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients, .placement = &placement, .trend = opts.trend, .aside = &aside, .hint = opts.hint };
         try renderTree(c, w, Style{ .enabled = opts.tty }, ctx, view, now);
     }
     const lines = std.mem.count(u8, buf.items, "\n");
@@ -316,6 +317,7 @@ const Ctx = struct {
     placement: *?Placement,
     trend: ?*const Trend,
     aside: *std.ArrayList(u8),
+    hint: bool,
 };
 
 fn gradientTints(s: Style, ctx: Ctx) ?Tints {
@@ -575,6 +577,7 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     if (dim_line) try s.close(w);
     const label_end = w.list.items.len;
     if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
+    if (session != null) try writeHint(ctx, s, w);
     try w.writeByte('\n');
     if (focused) ctx.placement.* = .{
         .start = start,
@@ -651,6 +654,14 @@ fn openTrendTint(ctx: Ctx, s: Style, w: Writer, tint: Tint, frac: f64) !void {
     try w.writeAll(if (tint == .mem)
         (if (frac < 0.5) ansi.green else if (frac < 0.8) ansi.yellow else ansi.red)
     else if (frac < 0.5) ansi.blue else ansi.magenta);
+}
+
+// After the first focusable row, just added to `ctx.clients`.
+fn writeHint(ctx: Ctx, s: Style, w: Writer) !void {
+    if (!ctx.hint or ctx.clients.items.len != 1) return;
+    try s.wrap(w, ansi.dim, " · ");
+    try s.wrap(w, ansi.bold, "↓");
+    try s.wrap(w, ansi.dim, " to inspect");
 }
 
 // Pair with `closeStat`. False when the value just inherits the line's dim.
@@ -769,6 +780,7 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             try s.close(w);
             const label_end = w.list.items.len;
             if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
+            if (!watchers and !focusesWorkers(c)) try writeHint(ctx, s, w);
             try w.writeByte('\n');
             if (focused) ctx.placement.* = .{
                 .start = start,
