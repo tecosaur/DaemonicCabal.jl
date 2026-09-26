@@ -45,6 +45,70 @@ pub const Options = struct {
     palette: ?*const pal.Palette = null,
     scope: Scope = .host,
     focus: ?u32 = null, // a client id, marked in the tree
+    trend: ?*const Trend = null, // the focused worker's, charted beside its row
+};
+
+/// A worker's recent memory and CPU, sampled each second, as chart bars of
+/// `per_bar` seconds each, counted from the first sample: a bar is done
+/// once it has its samples, and never changes after. Memory's scale holds
+/// while the bars fit it, so it moves only when they don't.
+pub const Trend = struct {
+    pub const bar_count = 15;
+    pub const per_bar = 2; // seconds
+    const Bar = struct { mem: f64 = 0, cpu: f64 = 0, samples: usize = 0 }; // sums
+    const Sample = struct { mem: f64, cpu: f64 };
+    const Scale = struct { centre: f64, half: f64 };
+
+    bars: [bar_count]Bar = undefined, // a ring, `next` after the newest
+    count: usize = 0,
+    next: usize = 0,
+    mem_scale: ?Scale = null,
+
+    pub fn record(self: *Trend, mem: u64, cpu: f64) void {
+        if (self.count == 0 or self.newest().samples == per_bar) {
+            self.bars[self.next] = .{};
+            self.next = (self.next + 1) % bar_count;
+            self.count = @min(self.count + 1, bar_count);
+        }
+        const bar = self.newest();
+        bar.mem += @floatFromInt(mem);
+        bar.cpu += cpu;
+        bar.samples += 1;
+        self.rescale();
+    }
+
+    fn newest(self: *Trend) *Bar {
+        return &self.bars[(self.next + bar_count - 1) % bar_count];
+    }
+
+    /// The `i`th bar kept, oldest first, as its samples' mean.
+    pub fn at(self: *const Trend, i: usize) Sample {
+        const bar = self.bars[(self.next + bar_count - self.count + i) % bar_count];
+        const samples: f64 = @floatFromInt(bar.samples);
+        return .{ .mem = bar.mem / samples, .cpu = bar.cpu / samples };
+    }
+
+    // Anew, with headroom, once a bar falls outside the scale, it is thrice
+    // what the bars need, or they have settled a bar's step off its centre;
+    // at least `mem_trend_floor` of the level either side, so steady memory
+    // stands at half height.
+    fn rescale(self: *Trend) void {
+        var low: f64 = std.math.inf(f64);
+        var high: f64 = 0;
+        for (0..self.count) |i| {
+            low = @min(low, self.at(i).mem);
+            high = @max(high, self.at(i).mem);
+        }
+        const centre = (low + high) / 2;
+        const needed = @max((high - low) / 2, mem_trend_floor * centre, 1);
+        if (self.mem_scale) |scale| {
+            const fits = low >= scale.centre - scale.half and high <= scale.centre + scale.half;
+            const settled = (high - low) / 2 <= mem_trend_floor * centre;
+            const centred = !settled or @abs(centre - scale.centre) <= scale.half / 4;
+            if (fits and centred and scale.half <= 3 * needed) return;
+        }
+        self.mem_scale = .{ .centre = centre, .half = needed * mem_trend_headroom };
+    }
 };
 
 /// Whether the live view focuses workers rather than clients: where each
@@ -102,16 +166,19 @@ const View = struct {
 
 /// `lines` is for the live view's cursor-up redraw; `clients` are the tree's
 /// focusable clients, top to bottom (none for JSON); `placement` is where
-/// the focused client's row ends, for the live view's pane.
+/// the focused row is, for the live view's pane; `aside` charts the focused
+/// worker's `trend`, to stand for the row's `stats`.
 pub const Report = struct {
     bytes: []u8,
     lines: usize,
     clients: []u32,
     placement: ?Placement = null,
+    aside: []u8 = &.{},
 
     pub fn deinit(self: Report, gpa: std.mem.Allocator) void {
         gpa.free(self.bytes);
         gpa.free(self.clients);
+        gpa.free(self.aside);
     }
 };
 
@@ -119,15 +186,17 @@ pub fn render(c: *Conductor, opts: Options) !Report {
     return renderAt(c, opts, c.currentTime());
 }
 
-/// The focused client's row, for the live view to draw as its pane's top:
-/// in `Report.bytes`, the row spans `start..end` and its label (the text
-/// after the tree's branch) `label_start..label_end`. `branch` is the tree
-/// up to and including the row's own branch; `gutter` continues the tree's
-/// lines beneath it, `gutter_cols` wide.
+/// The focused row, for the live view to draw as its pane's top: in
+/// `Report.bytes`, the row spans `start..end`, its label (the text after the
+/// tree's branch) `label_start..label_end`, and within that its memory and
+/// CPU `stats`, empty on a client's row. `branch` is the tree up to and
+/// including the row's own branch; `gutter` continues the tree's lines
+/// beneath it, `gutter_cols` wide.
 pub const Placement = struct {
     start: usize,
     label_start: usize,
     label_end: usize,
+    stats: [2]usize = .{ 0, 0 },
     end: usize,
     branch: [3][]const u8,
     gutter: [3][]const u8,
@@ -141,6 +210,8 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
     var clients: std.ArrayList(u32) = .empty;
     errdefer clients.deinit(c.allocator);
     var placement: ?Placement = null;
+    var aside: std.ArrayList(u8) = .empty;
+    errdefer aside.deinit(c.allocator);
     const w = Writer{ .list = &buf, .gpa = c.allocator };
     const view = try View.init(c.allocator, c, opts.scope);
     defer view.deinit(c.allocator);
@@ -148,13 +219,15 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
         try renderJson(c, w, view, now);
     } else {
         const tints: ?Tints = if (opts.palette) |p| .{ .palette = p } else null;
-        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients, .placement = &placement };
+        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients, .placement = &placement, .trend = opts.trend, .aside = &aside };
         try renderTree(c, w, Style{ .enabled = opts.tty }, ctx, view, now);
     }
     const lines = std.mem.count(u8, buf.items, "\n");
     const bytes = try buf.toOwnedSlice(c.allocator);
     errdefer c.allocator.free(bytes);
-    return .{ .bytes = bytes, .lines = lines, .clients = try clients.toOwnedSlice(c.allocator), .placement = placement };
+    const owned_clients = try clients.toOwnedSlice(c.allocator);
+    errdefer c.allocator.free(owned_clients);
+    return .{ .bytes = bytes, .lines = lines, .clients = owned_clients, .placement = placement, .aside = try aside.toOwnedSlice(c.allocator) };
 }
 
 // --- Styling -----------------------------------------------------------------
@@ -168,6 +241,7 @@ const ansi = struct {
     const green = "\x1b[32m";
     const yellow = "\x1b[33m";
     const blue = "\x1b[34m";
+    const magenta = "\x1b[35m";
     const cyan = "\x1b[36m";
 };
 
@@ -240,6 +314,8 @@ const Ctx = struct {
     focus: ?u32,
     clients: *std.ArrayList(u32), // focusable, in drawing order
     placement: *?Placement,
+    trend: ?*const Trend,
+    aside: *std.ArrayList(u8),
 };
 
 fn gradientTints(s: Style, ctx: Ctx) ?Tints {
@@ -419,6 +495,7 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     const start = w.list.items.len;
     const session = if (focusesWorkers(c)) firstClient(c, wk) else null;
     if (session) |id| try ctx.clients.append(w.gpa, id);
+    const focused = session != null and ctx.focus == session;
     try w.writeAll(pad);
     try s.wrap(w, ansi.dim, if (is_last) "╰─ " else "├─ ");
     const label_start = w.list.items.len;
@@ -474,6 +551,7 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     if (!dim_line) try s.close(w);
     try writeDurationPadded(w, now - wk.created_at, 5);
     // mem == 0 means unmeasured.
+    const stats_start = w.list.items.len;
     if (wk.mem > 0) {
         try w.writeAll("  ");
         const t = if (ctx.mem_ceiling > 0)
@@ -489,18 +567,20 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
         try w.print("{d:.0}%", .{pct});
         try closeStat(w, s, dim_line, cpu_styled);
     }
+    const stats_end = w.list.items.len;
+    if (focused) if (ctx.trend) |trend| try writeTrend(ctx, s, Writer{ .list = ctx.aside, .gpa = w.gpa }, wk, trend);
     const showed_activity = c.pressure_monitor.active();
     if (showed_activity) try writeActivity(c, w, s, ctx, wk, key, now, dim_line);
     if (health == .inactive) try writeIdleState(c, w, s, ctx, wk, key, now, showed_activity);
     if (dim_line) try s.close(w);
     const label_end = w.list.items.len;
-    const focused = session != null and ctx.focus == session;
     if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
     try w.writeByte('\n');
     if (focused) ctx.placement.* = .{
         .start = start,
         .label_start = label_start,
         .label_end = label_end,
+        .stats = .{ stats_start, stats_end },
         .end = w.list.items.len,
         .branch = .{ pad, if (is_last) "╰" else "├", "" },
         .gutter = .{ pad, if (is_last) " " else "│", "" },
@@ -508,6 +588,69 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     };
     // Watchers show under an otherwise idle worker too.
     if (wk.active_clients > 0) try renderClients(c, w, s, ctx, wk, now, nested, is_last);
+}
+
+const trend_bars = [_][]const u8{ "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+const mem_trend_floor = 0.05; // of the level: the least a memory chart's half-range spans
+const mem_trend_headroom = 1.5; // beyond what the bars need, so a small rise keeps the scale
+
+// "mem ▃▃▄▅▅ 822M ── cpu ▁▁█▇▅ 37%": each bar tinted as the row tints its
+// value, memory on the trend's held scale, CPU spanning a core, or its peak
+// where busier. Not yet sampled, a slot is a dim `░`.
+fn writeTrend(ctx: Ctx, s: Style, w: Writer, wk: *const Worker, trend: *const Trend) !void {
+    var cpu_peak: f64 = 1;
+    for (0..trend.count) |i| cpu_peak = @max(cpu_peak, trend.at(i).cpu);
+    const scale = trend.mem_scale orelse Trend.Scale{ .centre = 0, .half = 1 };
+    const ceiling: f64 = @floatFromInt(@max(ctx.mem_ceiling, 1));
+    const mem_frac = @min(1.0, @as(f64, @floatFromInt(wk.mem)) / ceiling);
+    const cpu_frac = @min(1.0, wk.cpu.util);
+    try w.writeAll("mem ");
+    try writeUnsampled(ctx, s, w, .mem, mem_frac, Trend.bar_count - trend.count);
+    for (0..trend.count) |i| {
+        const mem = trend.at(i).mem;
+        try writeBar(ctx, s, w, .mem, @min(1.0, mem / ceiling), 0.5 + (mem - scale.centre) / (2 * scale.half));
+    }
+    try w.writeByte(' ');
+    try openTrendTint(ctx, s, w, .mem, mem_frac);
+    try writeBytes(w, wk.mem);
+    try s.close(w);
+    try s.wrap(w, ansi.dim, " ── ");
+    try w.writeAll("cpu ");
+    try writeUnsampled(ctx, s, w, .cpu, cpu_frac, Trend.bar_count - trend.count);
+    for (0..trend.count) |i| {
+        const cpu = trend.at(i).cpu;
+        try writeBar(ctx, s, w, .cpu, @min(1.0, cpu), cpu / cpu_peak);
+    }
+    try w.writeByte(' ');
+    try openTrendTint(ctx, s, w, .cpu, cpu_frac);
+    try w.print("{d:.0}%", .{wk.cpu.util * 100});
+    try s.close(w);
+}
+
+// The slots a new chart has yet to fill, dim in its figure's colour.
+fn writeUnsampled(ctx: Ctx, s: Style, w: Writer, tint: Tint, frac: f64, slots: usize) !void {
+    if (slots == 0) return;
+    try openTrendTint(ctx, s, w, tint, frac);
+    try s.open(w, ansi.dim);
+    for (0..slots) |_| try w.writeAll("░");
+    try s.close(w);
+}
+
+fn writeBar(ctx: Ctx, s: Style, w: Writer, tint: Tint, colour_frac: f64, height: f64) !void {
+    const level: usize = @intFromFloat(@round(std.math.clamp(height, 0, 1) * (trend_bars.len - 1)));
+    try openTrendTint(ctx, s, w, tint, colour_frac);
+    try w.writeAll(trend_bars[level]);
+    try s.close(w);
+}
+
+// As the row tints its figures; without the terminal's palette, the
+// 8-colour steps of the same scale. Caller closes.
+fn openTrendTint(ctx: Ctx, s: Style, w: Writer, tint: Tint, frac: f64) !void {
+    if (gradientTints(s, ctx)) |t| return t.open(w, tint, frac);
+    if (!s.enabled) return;
+    try w.writeAll(if (tint == .mem)
+        (if (frac < 0.5) ansi.green else if (frac < 0.8) ansi.yellow else ansi.red)
+    else if (frac < 0.5) ansi.blue else ansi.magenta);
 }
 
 // Pair with `closeStat`. False when the value just inherits the line's dim.

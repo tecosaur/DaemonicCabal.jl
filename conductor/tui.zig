@@ -114,12 +114,14 @@ pub const tab_width = 8;
 
 /// A framed box of `height` rows, borders included, `width` columns wide,
 /// each row after a dim `gutter` (the top one after `branch`, as long).
-/// `title` and `footer` sit in the borders; `body` fills the rows between,
+/// `title` and `footer` sit in the borders, and `aside` at the top border's
+/// end, its title cut first to make room; `body` fills the rows between,
 /// from the top, cut to fit. Text keeps its colour (SGR) and loses other
 /// escape sequences; each character counts as one column, as in the
 /// transcript's `TerminalText`.
 pub const Pane = struct {
     title: []const u8,
+    aside: []const u8 = "",
     footer: []const u8,
     body: []const []const u8,
     dim_body: bool = false,
@@ -133,7 +135,7 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
     const inner = width -| 4;
     const dim = if (styled) "\x1b[2m" else "";
     const reset = if (styled) "\x1b[0m" else "";
-    try writeBorder(out, gpa, .{ dim, reset }, if (pane.branch.len > 0) pane.branch else pane.gutter, "╭─", "╮", pane.title, width);
+    try writeBorder(out, gpa, .{ dim, reset }, if (pane.branch.len > 0) pane.branch else pane.gutter, "╭─", "╮", pane.title, pane.aside, width);
     for (0..height -| 2) |row| {
         try out.appendSlice(gpa, dim);
         for (pane.gutter) |part| try out.appendSlice(gpa, part);
@@ -145,21 +147,28 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
         try out.appendNTimes(gpa, ' ', inner - used);
         try out.print(gpa, " {s}│{s}\n", .{ dim, reset });
     }
-    try writeBorder(out, gpa, .{ dim, reset }, pane.gutter, "╰─", "╯", pane.footer, width);
+    try writeBorder(out, gpa, .{ dim, reset }, pane.gutter, "╰─", "╯", pane.footer, "", width);
 }
 
-// "╭─ label ────╮", the label cut to fit.
-fn writeBorder(out: *std.ArrayList(u8), gpa: std.mem.Allocator, style: [2][]const u8, gutter: []const []const u8, left: []const u8, right: []const u8, label: []const u8, width: usize) !void {
+// "╭─ label ──── aside ─╮", the label cut to fit.
+fn writeBorder(out: *std.ArrayList(u8), gpa: std.mem.Allocator, style: [2][]const u8, gutter: []const []const u8, left: []const u8, right: []const u8, label: []const u8, aside: []const u8, width: usize) !void {
+    const colour = style[0].len > 0;
+    var drawn_aside: std.ArrayList(u8) = .empty;
+    defer drawn_aside.deinit(gpa);
+    const aside_cols = if (aside.len > 0) try appendColumns(&drawn_aside, gpa, aside, width -| 12, colour) else 0;
     try out.appendSlice(gpa, style[0]);
     for (gutter) |part| try out.appendSlice(gpa, part);
     try out.appendSlice(gpa, left);
     var used: usize = 2;
     if (label.len > 0 and width > 6) {
         try out.append(gpa, ' ');
-        used += 2 + try appendColumns(out, gpa, label, width - 6, style[0].len > 0);
+        const room = width - 6 -| if (aside_cols > 0) aside_cols + 4 else 0;
+        used += 2 + try appendColumns(out, gpa, label, room, colour);
         try out.print(gpa, "{s}{s} ", .{ style[1], style[0] });
     }
-    for (used..width -| 1) |_| try out.appendSlice(gpa, "─");
+    const fill = width -| 1 -| used -| if (aside_cols > 0) aside_cols + 3 else 0;
+    for (0..fill) |_| try out.appendSlice(gpa, "─");
+    if (aside_cols > 0) try out.print(gpa, " {s}{s}{s} ─", .{ style[1], drawn_aside.items, style[0] });
     try out.print(gpa, "{s}{s}\n", .{ right, style[1] });
 }
 
@@ -295,6 +304,21 @@ const Styles = struct {
     }
 };
 
+/// Appends `text` with each run of spaces as one, escape sequences between
+/// them kept but not breaking the run: a tree row's column alignment, as a
+/// title.
+pub fn appendCollapsed(out: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void {
+    var spaced = false;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = if (text[i] == 0x1b) escapeLength(text[i..]) else 1;
+        const space = len == 1 and text[i] == ' ';
+        if (!(space and spaced)) try out.appendSlice(gpa, text[i .. i + len]);
+        if (len == 1) spaced = space;
+        i += len;
+    }
+}
+
 // Of the escape sequence `text` starts with: CSI to its final byte, a string
 // (OSC and the like) to its BEL or ST, else ESC and one byte.
 fn escapeLength(text: []const u8) usize {
@@ -315,6 +339,14 @@ fn escapeLength(text: []const u8) usize {
         },
         else => return 2,
     }
+}
+
+test "collapsed: runs of spaces as one, escapes kept" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try appendCollapsed(&out, gpa, "#2 (t)   \x1b[2m up \x1b[0m   1m");
+    try std.testing.expectEqualStrings("#2 (t) \x1b[2mup \x1b[0m1m", out.items);
 }
 
 test "keys: arrows, pages, enter, escape and characters" {
@@ -402,6 +434,19 @@ test "columns: a REPL's line editing draws its prompt and input" {
     out.clearRetainingCapacity();
     _ = try appendColumns(&out, gpa, drawn, 40, true);
     try std.testing.expectEqualStrings("\x1b[0m\x1b[32m\x1b[1mjulia> \x1b[0m1+1", out.items);
+}
+
+test "pane: an aside at the top border's end, the title cut for it" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const pane = Pane{ .title = "a long title", .aside = "mem ▃▅", .footer = "", .body = &.{} };
+    try writePane(&out, gpa, false, pane, 24, 2);
+    try std.testing.expectEqualStrings(
+        \\╭─ a long t ── mem ▃▅ ─╮
+        \\╰──────────────────────╯
+        \\
+    , out.items);
 }
 
 test "pane: framed to its size, labels in the borders" {

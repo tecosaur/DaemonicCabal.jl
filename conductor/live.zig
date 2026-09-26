@@ -60,6 +60,8 @@ pub const Subscribers = struct {
     armed: bool = false,
     dirty: bool = false,
     snapshots: std.ArrayList(Snapshot) = .empty, // one per worker, the latest
+    trends: std.AutoHashMapUnmanaged(u32, status.Trend) = .empty, // by worker id, while a live view is open
+    trend_at: i64 = 0, // the second last sampled
 };
 
 /// A worker's stacks, from its stderr, and profile report, from the worker;
@@ -220,6 +222,7 @@ pub fn deinit(c: *Conductor) void {
     for (c.live.list.items) |sub| sub.gone = true;
     sweep(c);
     c.live.list.deinit(c.allocator);
+    c.live.trends.deinit(c.allocator);
     for (c.live.snapshots.items) |snap| snap.deinit(c.allocator);
     c.live.snapshots.deinit(c.allocator);
 }
@@ -307,6 +310,7 @@ fn fire(c: *Conductor) void {
     } else true;
     c.refreshStats(if (all_oneshot) null else cpu_half_life);
     pruneSnapshots(c);
+    if (!all_oneshot) recordTrends(c);
     var behind = false;
     for (c.live.list.items) |sub| {
         if (!sub.oneshot) {
@@ -350,11 +354,11 @@ fn sendFrame(c: *Conductor, sub: *Subscriber, frame: []const u8) void {
 // DEC 2026 synchronised update, so no tearing; ESC[<n>F returns to the
 // frame's top and ESC[0J clears any tail. Returns the frame's lines.
 fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize {
-    var report = try c.renderStatus("live", true, sub.palette, sub.scope, sub.focus);
+    var report = try c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub));
     const kept = tui.keepFocus(report.clients, sub.focus, sub.focus_row);
     if (kept != sub.focus) {
         sub.focus = kept;
-        const again = c.renderStatus("live", true, sub.palette, sub.scope, sub.focus) catch |err| {
+        const again = c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub)) catch |err| {
             report.deinit(c.allocator);
             return err;
         };
@@ -377,7 +381,7 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     if (placed != null and rows >= tui.min_pane_rows) {
         const at = placed.?;
         try out.appendSlice(c.allocator, report.bytes[0..at.start]);
-        try writePane(c, sub, sub.focus.?, out, at, report.bytes[at.label_start..at.label_end], rows);
+        try writePane(c, sub, sub.focus.?, out, at, report, rows);
         try out.appendSlice(c.allocator, report.bytes[at.end..]);
         lines += rows - 1;
     } else {
@@ -391,8 +395,24 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
 }
 
 // `row` is the focused client's, as the tree drew it: the pane's title.
-fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8), at: status.Placement, row: []const u8, rows: usize) !void {
+// The focused row is the pane's title; a worker's charts, where they fit,
+// stand at its end for the row's own memory and CPU.
+fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8), at: status.Placement, report: status.Report, rows: usize) !void {
     const info = c.active_clients.get(focus) orelse return;
+    // The tree's column alignment is no use in a title.
+    var row: std.ArrayList(u8) = .empty;
+    defer row.deinit(c.allocator);
+    try tui.appendCollapsed(&row, c.allocator, report.bytes[at.label_start..at.label_end]);
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(c.allocator);
+    try joined.appendSlice(c.allocator, report.bytes[at.label_start..at.stats[0]]);
+    try joined.appendSlice(c.allocator, report.bytes[at.stats[1]..at.label_end]);
+    var charted: std.ArrayList(u8) = .empty;
+    defer charted.deinit(c.allocator);
+    try tui.appendCollapsed(&charted, c.allocator, joined.items);
+    const width = @as(usize, sub.size.cols) -| at.gutter_cols;
+    const fits = report.aside.len > 0 and
+        try columnsOf(c.allocator, charted.items) + try columnsOf(c.allocator, report.aside) + 10 <= width;
     const label = info.worker.session_label;
     var lines_buf: [256][]const u8 = undefined;
     var snapshot_lines: std.ArrayList([]const u8) = .empty;
@@ -428,7 +448,8 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
     else
         "↑↓ focus · s stacktrace · i interrupt · t terminate · q quit";
     try tui.writePane(out, c.allocator, true, .{
-        .title = row,
+        .title = if (fits) charted.items else row.items,
+        .aside = if (fits) report.aside else "",
         .footer = footer,
         .body = body,
         .dim_body = snap == null and (sub.preview != .transcript or sub.tail.items.len == 0),
@@ -704,6 +725,40 @@ fn onClientSignals(sub: *Subscriber, bytes: []const u8) void {
     }
 }
 
+// Sampled a second apart, only while a live view is open; a worker gone
+// takes its trend with it.
+fn recordTrends(c: *Conductor) void {
+    const now = c.currentTime();
+    if (now == c.live.trend_at) return;
+    c.live.trend_at = now;
+    var gone: [64]u32 = undefined;
+    var n: usize = 0;
+    var it = c.live.trends.keyIterator();
+    while (it.next()) |id| if (n < gone.len and c.findWorkerById(id.*) == null) {
+        gone[n] = id.*;
+        n += 1;
+    };
+    for (gone[0..n]) |id| _ = c.live.trends.remove(id);
+    var workers = c.workers.iterator();
+    while (workers.next()) |entry| for (entry.value_ptr.items) |w| {
+        const trend = c.live.trends.getOrPut(c.allocator, w.id) catch continue;
+        if (!trend.found_existing) trend.value_ptr.* = .{};
+        trend.value_ptr.record(w.mem, w.cpu.util);
+    };
+}
+
+fn focusedTrend(c: *Conductor, sub: *const Subscriber) ?*const status.Trend {
+    const focus = sub.focus orelse return null;
+    const info = c.active_clients.get(focus) orelse return null;
+    return c.live.trends.getPtr(info.worker.id);
+}
+
+fn columnsOf(gpa: std.mem.Allocator, text: []const u8) !usize {
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+    return tui.appendColumns(&scratch, gpa, text, std.math.maxInt(usize), false);
+}
+
 // --- The focused client's session ---
 
 /// Brings the pane's attachment in line with the focus: none without one, a
@@ -949,4 +1004,9 @@ fn sweep(c: *Conductor) void {
         c.allocator.free(sub.order);
         c.allocator.destroy(sub);
     }
+    // The trends are kept only while a live view is open.
+    const viewing = for (c.live.list.items) |sub| {
+        if (!sub.oneshot) break true;
+    } else false;
+    if (!viewing) c.live.trends.clearAndFree(c.allocator);
 }

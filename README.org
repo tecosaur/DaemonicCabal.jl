@@ -152,8 +152,10 @@ needs Julia 1.11 or later.
 
 =--status=live= keeps the worker report on screen, redrawn as it changes. Press
 =↓= to focus a session: where each worker holds one (the default), the worker's
-row opens into a framed pane beneath it, and otherwise the client's does. The
-pane previews a recorded session's transcript, in colour, and names the keys:
+row opens into a framed pane beneath it, and otherwise the client's does. A
+framed worker charts its memory and CPU over the last 30 seconds in the pane's
+top border. The pane previews a recorded session's transcript, in colour, and
+names the keys:
 
 | Key   | Action                                                                  |
 |-------+-------------------------------------------------------------------------|
