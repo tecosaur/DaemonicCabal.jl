@@ -614,6 +614,10 @@ pub const Conductor = struct {
             std.debug.print("Client {d}: sync mode, session='{s}'\n", .{ self.client_counter, session.? });
         }
         if (request.parsed.hasSwitch("--restart")) {
+            if (labelOf(&request)) |label| {
+                try self.restartSession(socket, &request, worker_key, label, sandbox);
+                return .done;
+            }
             const nkilled = self.killWorkersForProject(worker_key);
             std.debug.print("Restart: killed {d} worker(s) for {s}{s}{s}\n", .{
                 nkilled,
@@ -1048,12 +1052,7 @@ pub const Conductor = struct {
             const explicit_project = for (client_info.switches) |sw| {
                 if (std.mem.eql(u8, sw.name, "--project")) break true;
             } else false;
-            // A sandboxed client's label stays in its pool: joining a host worker would escape.
-            const found: ?LabelledWorker = if (explicit_project or sandbox != .none)
-                (if (findWorkerByLabel(list.items, session_label.?)) |w| .{ .w = w, .pool_key = "" } else null)
-            else
-                self.findWorkerByLabelGlobal(session_label.?, true);
-            if (found) |f| {
+            if (self.findSession(list.items, session_label.?, explicit_project or sandbox != .none)) |f| {
                 // A host client carries into a sandbox only what the sandbox itself starts with.
                 var info = client_info.*;
                 const entering = sandbox == .none and f.w.launch == .sandboxed;
@@ -1388,6 +1387,14 @@ pub const Conductor = struct {
         return null;
     }
 
+    /// The worker holding session `label` that a client would join: in its own
+    /// pool when `scoped` (it names its project, or is sandboxed: joining a host
+    /// worker would escape), else wherever the host may enter.
+    fn findSession(self: *Conductor, pool: []const *worker.Worker, label: []const u8, scoped: bool) ?LabelledWorker {
+        if (!scoped) return self.findWorkerByLabelGlobal(label, true);
+        return .{ .w = findWorkerByLabel(pool, label) orelse return null, .pool_key = "" };
+    }
+
     /// Whether `--status` from `scope` shows the worker. A sandboxed caller sees
     /// only its sandbox: the remote clients' pool, or the workers in its mount
     /// namespace, whether spawned there by the client or built by us.
@@ -1432,6 +1439,29 @@ pub const Conductor = struct {
                 p[d.len] == '/') return true;
         }
         return false;
+    }
+
+    /// Ends session `label` wherever a client of `request`'s would join it,
+    /// and a worker still starting for it; the rest of the pool is left alone.
+    fn restartSession(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, label: []const u8, sandbox: SandboxKind) !void {
+        const pool: []const *worker.Worker = if (self.workers.getPtr(worker_key)) |list| list.items else &.{};
+        const scoped = request.parsed.hasSwitch("--project") or sandbox != .none;
+        const running = self.findSession(pool, label, scoped);
+        if (running) |f| {
+            f.w.log("retired: --restart of session '{s}'", .{label});
+            self.retireWorker(f.w);
+        }
+        const starting = for (self.pending_spawns.items) |p| switch (p.purpose) {
+            .reserve => {},
+            .client => |hold| if (std.mem.eql(u8, labelOf(&hold.request) orelse "", label) and
+                (if (scoped) std.mem.eql(u8, hold.worker_key, worker_key) else hold.sandbox != .client)) break p,
+        } else null;
+        if (starting) |p| self.failSpawn(p, error.Restarted);
+        const ended = running != null or starting != null;
+        std.debug.print("Restart: session '{s}' {s}\n", .{ label, if (ended) "ended" else "not running" });
+        const msg = try std.fmt.allocPrint(self.allocator, "Reset: {s} session '{s}'\n", .{ if (ended) "ended" else "no running", label });
+        defer self.allocator.free(msg);
+        try self.serveString(socket, msg, 0);
     }
 
     fn killWorkersForProject(self: *Conductor, proj: []const u8) usize {
