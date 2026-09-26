@@ -193,6 +193,8 @@ pub const Worker = struct {
         threads: args.Threads,
         interactive: bool,
         launch: Launch,
+        /// The conductor's own, which a direct worker inherits.
+        environ_map: *const std.process.Environ.Map,
     ) !Spawn {
         // A sandbox binds only this subdirectory; the worker puts its stdio
         // sockets beside its setup socket.
@@ -295,7 +297,7 @@ pub const Worker = struct {
                         try sendSpawnRequest(c.socket, argv.items, c.environ);
                         break :handed platform.no_child;
                     },
-                    else => try platform.spawnWorker(io, argv.items),
+                    else => try platform.spawnWorker(io, argv.items, environ_map),
                 };
             },
         };
