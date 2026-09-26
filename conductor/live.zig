@@ -452,20 +452,23 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
     };
     var footer_buf: [160]u8 = undefined;
     const footer = if (sub.confirming) |id|
-        std.fmt.bufPrint(&footer_buf, "terminate client {d}{s}? y/n", .{
+        std.fmt.bufPrint(&footer_buf, "terminate client {d}{s}? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } }), .{
             if (c.active_clients.get(id)) |target| target.pid else id,
             if (info.session and (info.sync or label != null)) " and its session" else "",
-        }) catch "terminate? y/n"
+        }) catch "terminate? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } })
     else if (sub.note.text(c.currentTime())) |note|
         note
     else if (snap) |sn|
-        if (sn.report == null) "sampling… · ⏎ whole stacktrace · Esc transcript · q quit" else "⏎ whole stacktrace · s again · Esc transcript · q quit"
+        if (sn.report == null)
+            "sampling… · " ++ comptime hints(&.{ .{ "⏎", "whole stacktrace" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
+        else
+            comptime hints(&.{ .{ "⏎", "whole stacktrace" }, .{ "s", "again" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
     else if (sub.view == .log)
-        "⏎ whole log · Esc transcript · q quit"
+        comptime hints(&.{ .{ "⏎", "whole log" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
     else if (info.session)
-        "↑↓ focus · ⏎ follow · s stacktrace · l log · i interrupt · t terminate · q quit"
+        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "follow" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } })
     else
-        "↑↓ focus · s stacktrace · l log · i interrupt · t terminate · q quit";
+        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } });
     var cursor_sgr: [24]u8 = undefined;
     // Output mid-line, such as a prompt, leaves the cursor on its last.
     sub.cursor_drawn = sub.view == .transcript and sub.preview == .transcript and
@@ -664,7 +667,7 @@ fn drawPager(c: *Conductor, sub: *Subscriber) void {
     const top = sub.scroll;
     const bottom = @min(lines.items.len, top + rows);
     writePager(c, sub, &out, lines.items, top, bottom, rows, if (same) sub.pager_top.? else null) catch return;
-    out.print(c.allocator, "\x1b[{d};1H\x1b[2K\x1b[7m worker #{d} · lines {d}–{d} of {d} · ↑↓ PgUp PgDn g G · q back \x1b[0m\x1b[?2026l", .{
+    out.print(c.allocator, "\x1b[{d};1H\x1b[2K\x1b[7m worker #{d} · lines {d}–{d} of {d} · \x1b[1m↑↓ PgUp PgDn g G\x1b[22m · \x1b[1mq\x1b[22m back \x1b[0m\x1b[?2026l", .{
         sub.size.rows, info.worker.id, top + 1, bottom, lines.items.len,
     }) catch return;
     send(c, sub, out.items);
@@ -808,6 +811,17 @@ fn leavePager(c: *Conductor, sub: *Subscriber) void {
     sub.drawn = 0;
     send(c, sub, main_screen);
     repaint(c, sub);
+}
+
+/// "↑↓ focus · q quit" with the keys bold, the rest dim as the border it
+/// sits in; a key without a description stands alone, "y/n" as "y · n".
+fn hints(comptime pairs: []const [2][]const u8) []const u8 {
+    comptime var text: []const u8 = "";
+    inline for (pairs, 0..) |pair, i| {
+        if (i > 0) text = text ++ if (pair[1].len == 0 and pairs[i - 1][1].len == 0) "/" else " · ";
+        text = text ++ "\x1b[0;1m" ++ pair[0] ++ "\x1b[0;2m" ++ (if (pair[1].len > 0) " " ++ pair[1] else "");
+    }
+    return text;
 }
 
 // The client's replies: a raw-mode ack, or the terminal's size.
