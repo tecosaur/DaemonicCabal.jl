@@ -189,8 +189,8 @@ pub const Listener = struct {
 // Process helpers
 /// Own process group, so a terminal SIGINT reaches only the conductor.
 /// Its stderr is a pipe, which the conductor drains (`readAvailable`).
-pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
-    const child = try std.process.spawn(io, .{ .argv = argv, .pgid = 0, .stderr = .pipe });
+pub fn spawnWorker(io: Io, argv: []const []const u8, environ_map: *const std.process.Environ.Map) !std.process.Child {
+    const child = try std.process.spawn(io, .{ .argv = argv, .environ_map = environ_map, .pgid = 0, .stderr = .pipe });
     if (child.stderr) |f| {
         const flags = fcntl(f.handle, posix.F.GETFL, 0) catch return child;
         const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });

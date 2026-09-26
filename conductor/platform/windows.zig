@@ -1040,8 +1040,8 @@ pub fn kill(pid: posix.pid_t, sig: SIG) usize {
 
 /// libuv rejects the file-backed stdio a headless conductor would pass on.
 /// stdout is closed so a stray write fails rather than fills an undrained pipe.
-pub fn spawnWorker(io: Io, argv: []const []const u8) !std.process.Child {
-    var child = try std.process.spawn(io, .{ .argv = argv, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe });
+pub fn spawnWorker(io: Io, argv: []const []const u8, environ_map: *const std.process.Environ.Map) !std.process.Child {
+    var child = try std.process.spawn(io, .{ .argv = argv, .environ_map = environ_map, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe });
     if (child.stdin) |f| f.close(io);
     child.stdin = null;
     if (child.stdout) |f| f.close(io);

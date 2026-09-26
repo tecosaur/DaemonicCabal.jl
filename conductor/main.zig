@@ -1261,7 +1261,7 @@ pub const Conductor = struct {
         const p = try self.allocator.create(PendingSpawn);
         errdefer self.allocator.destroy(p);
         p.* = .{
-            .spawn = try worker.Worker.begin(self.allocator, self.io, &self.cfg, self.next_worker_id, julia_channel, threads, interactive, launch),
+            .spawn = try worker.Worker.begin(self.allocator, self.io, &self.cfg, self.next_worker_id, julia_channel, threads, interactive, launch, self.environ_map),
             .purpose = purpose,
         };
         errdefer p.spawn.abandon(self.io);
