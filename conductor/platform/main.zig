@@ -76,6 +76,7 @@ pub const currentDir = shared.currentDir;
 pub const lookupHost = shared.lookupHost;
 pub const getChildPid = shared.getChildPid;
 pub const reapIfExited = shared.reapIfExited;
+pub const pollExit = shared.pollExit;
 pub const waitForExit = shared.waitForExit;
 /// Frees what holds a child process of ours, its pid aside.
 pub const releaseChild = if (os == .windows) impl.releaseChild else struct {

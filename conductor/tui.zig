@@ -9,6 +9,12 @@ const std = @import("std");
 pub const Key = union(enum) {
     up,
     down,
+    left,
+    right,
+    tab,
+    back_tab,
+    backspace,
+    delete,
     page_up,
     page_down,
     home,
@@ -17,6 +23,7 @@ pub const Key = union(enum) {
     escape,
     interrupt, // ^C, which a raw client sends as a byte
     char: u8,
+    text: []const u8, // a character past ASCII, as its UTF-8
 };
 
 /// The keys in one chunk of terminal input. An ESC ending its chunk is the
@@ -33,7 +40,18 @@ pub const KeyIterator = struct {
                 0x1b => return self.escape(),
                 0x03 => return .interrupt,
                 '\r', '\n' => return .enter,
+                '\t' => return .tab,
+                0x7f, 0x08 => return .backspace,
                 0x20...0x7e => return .{ .char = byte },
+                0xc2...0xf4 => {
+                    const len = std.unicode.utf8ByteSequenceLength(byte) catch continue;
+                    const start = self.pos - 1;
+                    if (start + len > self.bytes.len) return null; // cut short
+                    const seq = self.bytes[start .. start + len];
+                    if (!std.unicode.utf8ValidateSlice(seq)) continue;
+                    self.pos = start + len;
+                    return .{ .text = seq };
+                },
                 else => {},
             }
         }
@@ -46,21 +64,28 @@ pub const KeyIterator = struct {
         if (rest.len == 0 or (rest[0] != '[' and rest[0] != 'O')) return .escape;
         var i: usize = 1;
         var param: u16 = 0;
+        var modified = false; // as with Ctrl, which nothing here takes
         while (i < rest.len and rest[i] >= 0x20 and rest[i] < 0x40) : (i += 1) {
             if (std.ascii.isDigit(rest[i])) param = param *| 10 +| (rest[i] - '0');
+            if (rest[i] == ';') modified = true;
         }
         if (i == rest.len) {
             self.pos = self.bytes.len; // cut short: nothing to act on
             return self.next();
         }
         self.pos += i + 1;
+        if (modified) return self.next();
         return switch (rest[i]) {
             'A' => .up,
             'B' => .down,
+            'C' => .right,
+            'D' => .left,
+            'Z' => .back_tab,
             'H' => .home,
             'F' => .end,
             '~' => switch (param) {
                 1, 7 => .home,
+                3 => .delete,
                 4, 8 => .end,
                 5 => .page_up,
                 6 => .page_down,
@@ -374,6 +399,21 @@ test "keys: arrows, pages, enter, escape and characters" {
     var it = KeyIterator{ .bytes = "\x1b[A\x1bOB\x1b[5~\x1b[6~\rq\x03\x1b" };
     const expected = [_]Key{ .up, .down, .page_up, .page_down, .enter, .{ .char = 'q' }, .interrupt, .escape };
     for (expected) |key| try std.testing.expectEqual(key, it.next().?);
+    try std.testing.expectEqual(@as(?Key, null), it.next());
+}
+
+test "keys: editing a line" {
+    var it = KeyIterator{ .bytes = "\x1b[D\x1b[C\t\x1b[Z\x7f\x08\x1b[3~" };
+    const expected = [_]Key{ .left, .right, .tab, .back_tab, .backspace, .backspace, .delete };
+    for (expected) |key| try std.testing.expectEqual(key, it.next().?);
+    try std.testing.expectEqual(@as(?Key, null), it.next());
+}
+
+test "keys: characters past ASCII come whole, invalid ones not at all" {
+    var it = KeyIterator{ .bytes = "é\xe2\x94x世\xf0\x9f" };
+    try std.testing.expectEqualStrings("é", it.next().?.text);
+    try std.testing.expectEqual(Key{ .char = 'x' }, it.next().?);
+    try std.testing.expectEqualStrings("世", it.next().?.text);
     try std.testing.expectEqual(@as(?Key, null), it.next());
 }
 
