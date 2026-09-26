@@ -50,12 +50,16 @@ end
             end
             display(exit)
         else
-            # Relayed Ctrl-Cs keep landing after the loop breaks, and would cut
-            # short the render of the interrupt that prompted them.
-            Base.disable_sigint() do
-                printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
-                Base.show_exception_stack(IOContext(io, :limit => true), stack)
-                println(io)
+            # Relayed Ctrl-Cs keep landing after the loop breaks: held off while
+            # the interrupt they asked for renders, then dropped, being answered.
+            try
+                Base.disable_sigint() do
+                    printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
+                    Base.show_exception_stack(IOContext(io, :limit => true), stack)
+                    println(io)
+                end
+            catch err
+                err isa InterruptException || rethrow()
             end
         end
     end
