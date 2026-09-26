@@ -32,6 +32,7 @@ const ClientStreams = Conductor.ClientStreams;
 
 const debounce_ms = 100;
 const heartbeat_ms = 1000;
+const blink_ms = 500; // the redraw's pace while a cursor blinks, so its phase is kept
 const cpu_half_life: f64 = 1.4; // tracks the 1s heartbeat
 const max_queued_bytes = 1 << 20;
 const probe_timeout_ms = 300; // a worker slower to answer is busy on thread 0
@@ -127,6 +128,8 @@ const Subscriber = struct {
     confirming: ?u32 = null, // the client `t` would terminate, awaiting y/n
     note: Note = .{},
     view: View = .transcript, // what the pane shows of the focus
+    output_ns: i64 = 0, // when the preview's session last wrote: its cursor blinks from then
+    cursor_drawn: bool = false, // the last frame's pane marked a cursor
     paging: bool = false, // the view, full-screen
     scroll: usize = 0, // the pager's top line
     pager_top: ?usize = null, // the top line on screen, once drawn
@@ -317,6 +320,7 @@ fn fire(c: *Conductor) void {
     pruneSnapshots(c);
     if (!all_oneshot) recordTrends(c);
     var behind = false;
+    var blinking = false;
     for (c.live.list.items) |sub| {
         if (!sub.oneshot) {
             platform.write(sub.streams.fd(.signals), &[_]u8{ protocol.signals.query_size, 0x00 });
@@ -325,10 +329,11 @@ fn fire(c: *Conductor) void {
         repaint(c, sub);
         if (sub.oneshot) sub.gone = true;
         behind = behind or sub.queued.items.len > 0;
+        blinking = blinking or sub.cursor_drawn;
     }
     sweep(c);
     if (c.live.list.items.len == 0) return;
-    c.event_loop.armLiveTimer(if (had_change or behind) debounce_ms else heartbeat_ms);
+    c.event_loop.armLiveTimer(if (had_change or behind) debounce_ms else if (blinking) blink_ms else heartbeat_ms);
     c.live.armed = true;
 }
 
@@ -359,6 +364,7 @@ fn sendFrame(c: *Conductor, sub: *Subscriber, frame: []const u8) void {
 // DEC 2026 synchronised update, so no tearing; ESC[<n>F returns to the
 // frame's top and ESC[0J clears any tail. Returns the frame's lines.
 fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize {
+    sub.cursor_drawn = false; // until a pane marks one
     var report = try c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub));
     const kept = tui.keepFocus(report.clients, sub.focus, sub.focus_row);
     if (kept != sub.focus) {
@@ -460,12 +466,20 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
         "↑↓ focus · ⏎ follow · s stacktrace · l log · i interrupt · t terminate · q quit"
     else
         "↑↓ focus · s stacktrace · l log · i interrupt · t terminate · q quit";
+    var cursor_sgr: [24]u8 = undefined;
+    // Output mid-line, such as a prompt, leaves the cursor on its last.
+    sub.cursor_drawn = sub.view == .transcript and sub.preview == .transcript and
+        sub.tail.items.len > 0 and sub.tail.items[sub.tail.items.len - 1] != '\n';
     try tui.writePane(out, c.allocator, true, .{
         .title = if (fits) charted.items else row.items,
         .aside = if (fits) report.aside else "",
         .footer = footer,
         .body = body,
         .dim_body = sub.view == .transcript and (sub.preview != .transcript or sub.tail.items.len == 0),
+        .cursor_last = sub.cursor_drawn,
+        // Steady while the session writes, then a second off, a second on.
+        .cursor_shown = @mod(@divTrunc(c.nowNs() - sub.output_ns, std.time.ns_per_s), 2) == 0,
+        .cursor_sgr = mutedSgr(sub.palette, &cursor_sgr),
         .branch = &at.branch,
         .gutter = &at.gutter,
     }, @as(usize, sub.size.cols) -| at.gutter_cols, rows);
@@ -835,6 +849,16 @@ fn focusedTrend(c: *Conductor, sub: *const Subscriber) ?*const status.Trend {
     return c.live.trends.getPtr(info.worker.id);
 }
 
+// The grey the tree dims with, the terminal's text blended toward its
+// background, as SGR parameters; its 8-colour grey without the palette.
+fn mutedSgr(palette: ?pal.Palette, buf: *[24]u8) []const u8 {
+    const p = palette orelse return "90";
+    const fg = p.foreground orelse return "90";
+    const bg = p.background orelse return "90";
+    const grey = pal.blend(fg, bg, status.MUTED_TOWARD_BG);
+    return std.fmt.bufPrint(buf, "38;2;{d};{d};{d}", .{ grey.r, grey.g, grey.b }) catch "90";
+}
+
 fn columnsOf(gpa: std.mem.Allocator, text: []const u8) !usize {
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);
@@ -986,6 +1010,7 @@ fn detach(c: *Conductor, sub: *Subscriber) void {
 
 fn onWatchOutput(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     if (sub.following) return send(c, sub, bytes);
+    sub.output_ns = c.nowNs();
     sub.tail.appendSlice(c.allocator, bytes) catch return;
     if (sub.tail.items.len > max_tail_bytes) {
         const over = sub.tail.items.len - max_tail_bytes;
