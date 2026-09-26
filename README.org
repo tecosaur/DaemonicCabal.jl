@@ -2,353 +2,37 @@
 
 /Run a script many times, compile it once./
 
-*Quickstart*
+Each =julia script.jl= loads and compiles everything anew, then throws that work
+away. =juliaclient= is a drop-in replacement for =julia= that runs your script in a
+warm, long-lived Julia process (a /worker/) for your project, so only the first
+run pays for loading and compiling.
+
+* Getting started
+
+Add the package and run ~DaemonicCabal.install()~ to set up the daemon and put
+=juliaclient= on your path:
 
 #+begin_src shell
 julia --project=temp -e 'using Pkg; Pkg.add(url="https://github.com/tecosaur/DaemonicCabal.jl.git"); using DaemonicCabal; DaemonicCabal.install()'
 #+end_src
 
-Once installed, =DaemonicCabal.jl= provides =juliaclient=, which serves as a
-drop-in replacement for a subset of =julia=, with a few extra tricks.
+Then use =juliaclient= wherever you would use =julia=:
 
 #+begin_example
-~$ juliaclient --help
-
-    juliaclient [switches] -- [programfile] [args...]
-
-Switches (a '*' marks the default value, if applicable):
-
- -v, --version              Display version information
- -h, --help                 Print this message
- -P, --project[=<dir>|@.]    Set <dir> as the home project/environment
- -e, --eval <expr>          Evaluate <expr>
- -E, --print <expr>         Evaluate <expr> and display the result
- -L, --load <file>          Load <file> immediately on all processors
- -i                         Interactive mode; REPL runs and `isinteractive()` is true
- -t, --threads <N|auto>[,<M|auto>]  Launch N threads (and M interactive threads)
- -q, --quiet                Quiet startup: no banner, suppress REPL warnings
- --banner={yes|no|auto*}    Enable or disable startup banner
- --color={yes|no|auto*}     Enable or disable color text
- --history-file={yes*|no}   Load or save history
-
-Client-specific switches:
-
- -a, --address <addr>       Connect to conductor at <addr> instead of default
- --session[=<label>]        Reuse worker state in Main module. With a label,
-                            multiple clients can share the same session.
- --sync                     Attach to shared REPL (requires --session=<label>)
- --revise[=yes|no*]         Enable or disable Revise.jl integration
- --restart                  Kill workers for the project and exit
- --sandbox                  Run in an isolated sandbox (Linux only)
- --status[=live|json]       Show the state of the workers, as JSON, or live:
-                            ↓ focuses a session, to preview, follow,
-                            show its stacktrace, interrupt or terminate it
- --watch[=json][,once]      Follow the session's transcript (this project's,
-                            or --session=<label>'s), as JSON lines, or once
-
-Daemon management (systemd):
-
- systemctl --user {start | stop | restart | status} julia-daemon
+~$ juliaclient script.jl arg1 arg2
+~$ juliaclient --project=. -e 'using MyPackage; MyPackage.main()'
+~$ juliaclient  # a REPL
 #+end_example
 
-Supported platforms: Linux, macOS, FreeBSD, OpenBSD, and Windows. On Windows,
-=install()= registers a logon task, =Julia\JuliaDaemon=, started with =schtasks=;
-the task does not track the conductor it launches, so stop it with
-=taskkill /F /IM julia-conductor.exe=.
+Most of =julia='s everyday switches carry over; =juliaclient --help= lists
+them, along with the extras below. To see or change the daemon's settings, live
+and in its service, run =juliaclient --reconfigure=.
 
-* Sessions
+DaemonicCabal runs on Linux (as a systemd user service), macOS (a launchd
+agent), and Windows (a logon task), as well as FreeBSD and OpenBSD, where
+=install()= prints the service setup for you to do by hand.
 
-By default, each =juliaclient= invocation runs in a fresh module. Use
-=--session= to persist state in =Main= across invocations:
-
-#+begin_example
-~$ juliaclient --session -e 'x = 42'
-~$ juliaclient --session -e 'println(x)'  # prints 42
-#+end_example
-
-Without a label, session affinity is based on the parent process (shell).
-With a label, multiple clients share the same session:
-
-#+begin_example
-# Terminal A
-~$ juliaclient --session=shared -e 'data = [1,2,3]'
-
-# Terminal B (different shell, same label)
-~$ juliaclient --session=shared -e 'push!(data, 4); data'  # [1, 2, 3, 4]
-#+end_example
-
-Labeled sessions bypass the per-worker client limit, and workers holding idle
-labelled sessions persist for longer, their minimum lifetime is the geometric
-mean of =MIN_TTL= and =MAX_TTL=.
-
-A worker is not reused once its code has changed on disk: a manifest it loaded
-from, or a file of a dev'd package it loaded. The next client gets a fresh
-worker instead. A session stays on its worker with a warning, and a =--revise=
-run leaves source edits to Revise.
-
-** Collaborative sessions (=--sync=)
-
-Adding =--sync= upgrades a labeled session to a shared terminal --- multiple
-terminals attach to the same live REPL.
-
-#+begin_example
-# Terminal A: start a shared REPL
-~$ juliaclient --sync --session=work
-
-# Terminal B: attach to the same REPL
-~$ juliaclient --sync --session=work
-
-# Terminal C: inject code (output appears in both REPLs)
-~$ juliaclient --sync --session=work -e 'x = 42'
-#+end_example
-
-Interactive clients share a merged stdin and broadcast stdout/stderr.
-Non-interactive clients (=-e=, =-E=, programfile) run in the shared =Main= with
-output broadcast to all attached terminals. Ctrl-D detaches without killing the
-session; the REPL exits when the last interactive client disconnects.
-
-** Transcripts (=--watch=)
-
-A session's runs are recorded in its worker: each command, its REPL input, its
-output, and its exit code. =--watch= shows a session's transcript so far, then
-follows it live, from any terminal:
-
-#+begin_example
-# Terminal A: a long job
-~$ juliaclient --session=job train.jl
-
-# Terminal B: catch up, then follow along (Ctrl-C to stop)
-~$ juliaclient --session=job --watch
-
-# Just the transcript so far, as JSON lines
-~$ juliaclient --session=job --watch=json,once > job.jsonl
-#+end_example
-
-Without a label, =--watch= follows this project's unlabelled session, preferring
-one that is running a client. A watcher leaves the session alone: its Ctrl-C
-only stops the watch, and it takes no client's place on the worker.
-
-Output keeps its colour when watched at a terminal. Anywhere else (a file, a
-pipe, or JSON) it is the plain text a terminal would finally have shown:
-progress bars and redrawn lines in their final state, with a full-screen
-program's alternate screen left out. So that redrawn lines settle first, a live
-plain watch passes each line on once it has been left alone for half a second
-to a second, or, from a REPL, once it prompts again. =--color= decides as it
-does for a run, save that JSON is coloured only with =--color=yes=: its escaped
-codes would show literally at a terminal.
-
-The JSON lines are =run= (with its =command=), =input= (=mode= and =code=),
-=output= (=stream= and =data=), and =exit= (=code=) events, each with its =run=
-number and =time=. A REPL's input is its lines, in their mode (=julia=, =shell=,
-=help=, =pkg=, …), and its output leaves out the prompt and line editing.
-
-Transcripts are kept in a ring of =JULIA_DAEMON_HISTORY_BYTES= per session,
-dropping the oldest runs as it fills. =JULIA_DAEMON_RECORD= sets which sessions
-record from their start; any other starts at its first watch. A =--sync=
-session is always recorded, as its one shared screen. Recording other sessions
-needs Julia 1.11 or later.
-
-** Live status (=--status=live=)
-
-=--status=live= keeps the worker report on screen, redrawn as it changes. Press
-=↓= to focus a session: where each worker holds one (the default), the worker's
-row opens into a framed pane beneath it, and otherwise the client's does. A
-framed worker charts its memory and CPU over the last 30 seconds in the pane's
-top border. The pane previews a recorded session's transcript, in colour, and
-names the keys:
-
-| Key   | Action                                                                  |
-|-------+-------------------------------------------------------------------------|
-| =↑ ↓= | Move the focus; =↑= from the first session, or =Esc=, lets go            |
-| =⏎=   | Follow the session full-screen, as =--watch= would, or, with a          |
-|       | stacktrace in the pane, show the whole of it (=q= to come back)         |
-| =s=   | Show the stacktrace: the worker's stacks at once, then its profile       |
-| =l=   | Show the worker's recent log: its stderr, and the daemon's lines on it   |
-| =i=   | Interrupt, as the session's own Ctrl-C would                             |
-| =t=   | Terminate the session, once confirmed with =y=                           |
-| =q=   | Quit, leaving the last frame                                             |
-
-A stacktrace asks Julia for a profile peek (SIGUSR1, or SIGINFO on BSD and macOS).
-Its stacks come straight away, even from a loop that never yields; the profile
-follows once the session yields, and =⏎= shows the lot. A session waiting rather
-than running (on I/O, a lock, =sleep=) is shown where it waits, from Julia 1.12
-on. Terminating ends the
-session's run, or a labelled session outright, and retires its worker only when
-the run will not stop, even to a forced interrupt. The preview only reads
-sessions already being recorded; following one records it from then on.
-
-* Sandboxing
-
-Sandboxed workers run inside Linux user namespaces (no root required) with a
-minimal root filesystem, providing isolation without containers.
-
-** Local sandboxing (=--sandbox=)
-
-Pass =--sandbox= to run in an isolated environment with write access only to the
-working directory:
-
-#+begin_example
-~$ cd ~/myproject
-~$ juliaclient --sandbox -e 'println(pwd()); touch("ok")'  # works
-~$ juliaclient --sandbox -e 'rm("/etc/passwd")'             # permission denied
-#+end_example
-
-The sandbox gives read-write access to:
-- The *project directory* when the working directory is inside it (the project
-  mount subsumes the working directory)
-- Just the *working directory* otherwise (the project is mounted read-only)
-
-Named environments (=@v1.11=, =@debug=, …) resolve as usual but are read-only:
-their packages load, their manifests cannot change.
-
-** Clients already in a sandbox
-
-A client running inside a sandbox of its own (bubblewrap, say) sees a filesystem
-the daemon cannot: the conductor notices the differing mount namespace and asks
-the client to start its worker itself, inside that sandbox, so Julia sees exactly
-what the client sees and writes land where the sandbox says they should. Such
-workers are pooled per sandbox and never serve the host or another sandbox, and
-they die with the sandbox when it has a pid namespace of its own (bubblewrap's
-=--unshare-pid=); without one they linger until their idle TTL.
-
-Since the worker runs inside the sandbox, the sandbox must see everything it
-needs: the daemon's runtime directory at its host path
-(=/run/user/$UID/julia-daemon=, for the sockets), the Julia install, the
-DaemonWorker project the daemon was installed with, and the Julia depot
-(=~/.julia= or =JULIA_DEPOT_PATH=; writable if DaemonWorker still has to
-precompile there). A Julia the sandbox cannot run is reported by the client at
-once; a Julia that starts but cannot load its worker package shows up as a
-timeout after =JULIA_DAEMON_SPAWN_TIMEOUT=, with the details in the daemon log.
-Such a client is refused =--sandbox=, since the sandbox it is in is the one that
-counts and the daemon cannot nest another inside it. The daemon itself must
-share the host's mount namespace for the comparison to mean anything: a service
-hardened with =PrivateTmp= or =ProtectHome= would see every client as
-sandboxed.
-
-** Remote sandboxing
-
-When listening on TCP (=JULIA_DAEMON_SERVER=tcp://...=), non-loopback connections
-are automatically sandboxed. Each remote client gets a fresh, isolated worker
-with a read-only view of the host depot and no access to the host home directory.
-Optional cgroup limits can restrict memory and CPU per sandbox.
-
-Local (loopback) TCP clients are not sandboxed unless =--sandbox= is passed.
-Remote clients on non-Linux platforms are rejected.
-
-Sessions are reachable from the host into a sandbox, never out of one. The host
-can join or =--watch= a =--session=<label>= in a sandbox the daemon built,
-bringing in only the environment the sandbox allows. A sandboxed client never
-reaches a host session, and its =--status= shows only its own sandbox.
-
-* Configuration
-
-Environment variables read at daemon startup, which =juliaclient --reconfigure=
-shows and changes (see below):
-
-| Variable                       | Default                      | Description                                                                                                                      |
-|--------------------------------+------------------------------+----------------------------------------------------------------------------------------------------------------------------------|
-| =JULIA_DAEMON_RUNTIME=           | /(platform-specific)/          | Runtime directory for sockets and PID file                                                                                       |
-| =JULIA_DAEMON_SERVER=            | =<runtime_dir>/conductor.sock= | Local socket path, or =tcp://host:port= for TCP mode (a name or address; IPv6 in brackets)                                         |
-| =JULIA_DAEMON_BIND=              | /(server address host)/        | TCP bind address for the conductor and its workers (e.g. =0.0.0.0=)                                                                |
-| =JULIA_DAEMON_PORTS=             | /unset/                        | Worker port range in TCP mode (e.g. =10000-10100=)                                                                                 |
-| =JULIA_DAEMON_WORKER_EXECUTABLE= | =julia=                        | Julia binary for workers                                                                                                         |
-| =JULIA_DAEMON_WORKER_ARGS=       | =--startup-file=no=            | Arguments passed to worker processes (split on whitespace)                                                                       |
-| =JULIA_DAEMON_WORKER_PROJECT=    | /(required)/                   | Project for the worker itself (not client projects)                                                                              |
-| =JULIA_DAEMON_WORKER_MAXCLIENTS= | =1=                            | Max clients per worker (0 = unlimited)                                                                                           |
-| =JULIA_DAEMON_RESERVE_WORKER=    | =1=                            | Keep a pre-spawned spare worker warm for the next new project (=0= to disable, e.g. in memory-constrained containers)             |
-| =JULIA_DAEMON_MAX_TTL=           | =7200=                         | Idle worker deadline in seconds; always culled past this (2h). Supersedes =JULIA_DAEMON_WORKER_TTL=, falling back to it when unset |
-| =JULIA_DAEMON_MIN_TTL=           | =120=                          | Protected floor: idle workers younger than this are never evicted under memory pressure                                          |
-| =JULIA_DAEMON_LABEL_TTL=         | =90=                           | Session label retention after last client disconnects (seconds)                                                                  |
-| =JULIA_DAEMON_PING_INTERVAL=     | =30=                           | Health check interval (seconds)                                                                                                  |
-| =JULIA_DAEMON_PING_TIMEOUT=      | =5=                            | Ping timeout before killing unresponsive worker (seconds)                                                                        |
-| =JULIA_DAEMON_SPAWN_TIMEOUT=     | =600=                          | Seconds a new worker may take to connect (a fresh depot precompiles DaemonWorker first)                                          |
-| =JULIA_DAEMON_REVISE=            | =no=                           | Enable Revise.jl by default (also settable with =--revise=)                                                                        |
-| =JULIA_DAEMON_RECORD=            | =session=                      | Sessions recorded from their start: =sync= (only =--sync=), =interactive= (also those begun at a terminal REPL), or =session= (all) |
-| =JULIA_DAEMON_HISTORY_BYTES=     | =1M=                           | Transcript ring per session (=K=, =M=, =G= suffixes, up to =4G=)                                                                     |
-
-Memory-pressure eviction:
-
-| Variable                     | Default | Description                                                                 |
-|------------------------------+---------+-----------------------------------------------------------------------------|
-| =JULIA_DAEMON_MEMORY_PRESSURE= | =1=       | Shed idle workers under host memory pressure (=0= to disable)                 |
-| =JULIA_DAEMON_PSI_THRESHOLD=   | =10.0=    | PSI =some avg10= % that counts as pressure (when PSI is the active source)    |
-| =JULIA_DAEMON_MEMFREE_LOW=     | =10%=     | Enter pressure below this free memory; =%= of total or absolute (=2G=)          |
-| =JULIA_DAEMON_MEMFREE_HIGH=    | =15%=     | Leave pressure above this free memory (hysteresis; must exceed =MEMFREE_LOW=) |
-
-Sandbox configuration (Linux only, applies to both =--sandbox= and remote clients):
-
-| Variable                               | Default | Description                                                      |
-|----------------------------------------+---------+------------------------------------------------------------------|
-| =JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS=    | =1=       | Sandbox remote (non-loopback) TCP clients (=0= to disable)         |
-| =JULIA_DAEMON_SANDBOX_MAX_MEMORY=        | /unset/   | Per-sandbox cgroup memory limit (e.g. =4G=, =512M=)                  |
-| =JULIA_DAEMON_SANDBOX_MAX_CPU=           | /unset/   | Per-sandbox cgroup CPU limit as percentage (e.g. =200= = 2 cores)  |
-| =JULIA_DAEMON_SANDBOX_SESSION_BYPASS=    | =0=       | Allow remote =--session=<label>= to join local unsandboxed workers |
-
-The memory and CPU limits need a cgroup delegated to the conductor. The systemd
-service =install()= writes has one (=Delegate=yes=); without it, a conductor
-given limits refuses to start.
-
-Runtime directory defaults: Linux =/run/user/$UID/julia-daemon=, macOS
-=~/Library/Application Support/julia-daemon=, BSD =/tmp/julia-daemon-$UID=,
-Windows =%LOCALAPPDATA%\julia-daemon=. On Windows the local socket is a named
-pipe, =\\.\pipe\julia-daemon\<user>\conductor.sock=, open only to its owner.
-
-The client reads =JULIA_DAEMON_SERVER= and =JULIA_DAEMON_RUNTIME= to locate the
-conductor socket.
-
-** Changing them (=--reconfigure=)
-
-=juliaclient --reconfigure= shows the settings in tabs (Workers, Sessions,
-Lifetime, Memory, Network, Sandbox), each with its default and, focused, what
-it does. ⏎ edits the focused one: a choice cycles, anything
-else is typed, a duration as =90s=, =2m= or =1h30m=, and ↑↓ step a number,
-duration or size to the next round value. An edit is staged, then:
-
-| Key | Action                                                                                                |
-|-----+-------------------------------------------------------------------------------------------------------|
-| =a= | Apply the staged changes to the running daemon, checked together                                      |
-| =w= | Apply, then save to the service's configuration                                                       |
-| =u= | Drop a staged change, or stage an unsaved one's saved value                                           |
-| =d= | Stage the default                                                                                     |
-| =r= | Retire idle workers started before a worker setting changed                                           |
-| =q= | Quit (as does Esc), asking first to apply and save what's pending, and leaving a line on what changed |
-
-A tab starred (=*=) in yellow holds staged changes, in cyan applied ones not
-yet saved.
-Most settings apply at once; those workers read as they start reach new
-workers, and those the conductor reads as it starts wait for its restart, as
-each row notes. Saving writes a systemd drop-in (=julia-daemon.service.d/reconfigure.conf=,
-then =daemon-reload=), the launchd plist, or the Windows task's script, as
-named in =JULIA_DAEMON_SERVICE= by =install()=; without one, it shows what to
-set. launchd reads the plist as it loads the agent, so on macOS a saved
-change takes effect at the next login, or after =launchctl unload= and =load=. Reinstalling starts again from =install()='s settings. Only a local,
-unsandboxed client can reconfigure; given no terminal, it prints the settings
-as =KEY=value= lines.
-
-* Memory pressure
-
-Idle workers are large (a warmed Julia process is hundreds of MB), so on a busy
-or shared host the conductor treats them as a memory-pressure-reactive cache:
-when the host runs low on memory it sheds the least valuable idle workers,
-leaving them alone while RAM is plentiful. This is on by default; set
-=JULIA_DAEMON_MEMORY_PRESSURE=0= for TTL-only behaviour.
-
-A worker is eligible for eviction only once it has been idle past =MIN_TTL= (a
-recently-used worker is never culled), and the conductor evicts the
-lowest-value-per-byte first --- a worker kept warm by frequent or long-running
-use ranks above a cold one, and a large worker yields before a small one of
-equal warmth. Eviction never touches a worker with a connected client. An
-evicted worker simply cold-starts on its next invocation, exactly as it would
-after its idle =MAX_TTL= deadline.
-
-Pressure is read from the kernel's PSI stall information where available, else
-from the free-memory level (=MemAvailable=). On FreeBSD only the pressure trigger
-is implemented (workers are ranked without a size term); OpenBSD is TTL-only.
-Windows reads the free-memory level and sizes workers by their resident set.
-=juliaclient --status= shows each idle worker's eviction warmth while pressure
-handling is active.
-
-* Architecture
+* How it works
 
 #+begin_example
 ┌─────────────────┐      ┌──────────────────┐      ┌──────────────────────┐
@@ -358,14 +42,105 @@ handling is active.
          └────────────────── stdio ─────────────────────────┘
 #+end_example
 
-- *Client*: Zig binary users invoke. Connects to the conductor, then proxies
-  stdio/signals directly with the assigned worker.
-- *Conductor*: Zig daemon managing the worker pool. Spawns workers per-project
-  and routes client requests.
-- *Worker*: Julia process serving client sessions for a single project.
+=juliaclient= is a small Zig binary that asks the /conductor/, a Zig daemon,
+for a worker, then talks to that worker directly. The conductor keeps one
+worker per project, plus a spare already started, so even a project's first
+run skips Julia's own startup.
 
-Platform-specific I/O: =io_uring= on Linux, =kqueue= on macOS/BSD, IOCP on Windows.
+When a worker's manifest or =dev='d package source changes on disk, the next
+run gets a fresh worker.
 
-* Caveats
+* Live monitoring
 
-+ Workers are per-project, so different projects incur separate startup costs.
+To see what the daemon is up to, run =juliaclient --status=: it lists the
+workers, the project each one serves, and their sessions and clients. With
+=--status=live=, the list updates as things change, and you can select a
+session to preview its output, see where it's stuck (even in a loop that never
+yields), or interrupt or terminate it.
+
+* Sessions
+
+Each run normally starts with an empty =Main=, as it would in a new =julia=
+process. =--session= keeps =Main= between runs from the same shell:
+
+#+begin_example
+~$ juliaclient --session -e 'x = 42'
+~$ juliaclient --session -e 'println(x)'  # prints 42
+#+end_example
+
+Give the session a label, and any terminal can use it:
+
+#+begin_example
+# Terminal A
+~$ juliaclient --session=shared -e 'data = [1,2,3]'
+
+# Terminal B
+~$ juliaclient --session=shared -e 'push!(data, 4); data'  # [1, 2, 3, 4]
+#+end_example
+
+A session keeps its worker when its code changes, with a warning; add =--revise=
+to have Revise.jl pick up your edits.
+
+** Sharing a REPL
+
+=--sync= shares one REPL between terminals, much like =tmux=:
+
+#+begin_example
+# Terminal A: start a shared REPL
+~$ juliaclient --sync --session=work
+
+# Terminal B: attach to it
+~$ juliaclient --sync --session=work
+
+# Terminal C: run something in it, with the output shown in both REPLs
+~$ juliaclient --sync --session=work -e 'x = 42'
+#+end_example
+
+Ctrl-D detaches just your terminal; the REPL ends once the last one leaves.
+
+** Following a session
+
+Sessions keep a transcript of their runs, which =--watch= shows from any
+terminal: first what you missed, then the rest as it happens.
+
+#+begin_example
+# Terminal A: a long job
+~$ juliaclient --session=job train.jl
+
+# Terminal B: catch up, then follow along (Ctrl-C stops watching, not the job)
+~$ juliaclient --session=job --watch
+
+# Just the transcript so far, as JSON lines
+~$ juliaclient --session=job --watch=json,once > job.jsonl
+#+end_example
+
+Sent to a file or pipe, the transcript shows each progress bar once, finished,
+rather than as a thousand redraws.
+
+* Sandboxing
+
+On Linux, =--sandbox= runs your code in a user namespace (no root needed),
+where it can only write to the project, or to the working directory outside a
+project:
+
+#+begin_example
+~$ cd ~/myproject
+~$ juliaclient --sandbox -e 'touch("ok")'           # works
+~$ juliaclient --sandbox -e 'rm("/etc/passwd")'     # permission denied
+#+end_example
+
+The daemon can also serve other machines over TCP, sandboxing each remote
+client in a worker of its own with a read-only depot, no view of your home
+directory, and optional memory and CPU limits. Platforms other than Linux
+refuse remote clients.
+
+A client already in a sandbox of its own (bubblewrap, say) gets a worker started
+inside it, so Julia sees the same filesystem the client does. The sandbox just
+needs the daemon's runtime directory (where its sockets live) mounted.
+
+* Memory usage
+
+To avoid filling up system memory with idle workers, system memory usage is
+monitored and idle workers reaped based to avoid being responsible for an OOM.
+More actively and recently used workers are kept for longer, and the particular
+behaviour is configurable.
