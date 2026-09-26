@@ -2170,7 +2170,7 @@ pub const Conductor = struct {
         return platform.timeSeconds(self.io);
     }
 
-    fn nowNs(self: *Conductor) i64 {
+    pub fn nowNs(self: *Conductor) i64 {
         return @intCast(Io.Clock.now(.awake, self.io).nanoseconds);
     }
 
