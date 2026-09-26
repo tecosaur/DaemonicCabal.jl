@@ -2271,7 +2271,7 @@ pub const Conductor = struct {
             held = true;
             return;
         }
-        const report = self.renderStatus(format, tty, palette, scope, null, null) catch |err| {
+        const report = self.renderStatus(format, tty, palette, scope, null, null, false) catch |err| {
             std.debug.print("Status: render failed: {}\n", .{err});
             streams.finish("Failed to generate status report.\n", 1);
             return;
@@ -2280,7 +2280,7 @@ pub const Conductor = struct {
         streams.finish(report.bytes, 0);
     }
 
-    pub fn renderStatus(self: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette, scope: status.Scope, focus: ?u32, trend: ?*const status.Trend) !status.Report {
+    pub fn renderStatus(self: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette, scope: status.Scope, focus: ?u32, trend: ?*const status.Trend, hint: bool) !status.Report {
         return status.render(self, .{
             .format = format,
             .tty = tty,
@@ -2288,6 +2288,7 @@ pub const Conductor = struct {
             .palette = if (palette) |*p| p else null,
             .focus = focus,
             .trend = trend,
+            .hint = hint,
         });
     }
 

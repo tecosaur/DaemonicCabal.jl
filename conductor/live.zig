@@ -365,11 +365,11 @@ fn sendFrame(c: *Conductor, sub: *Subscriber, frame: []const u8) void {
 // frame's top and ESC[0J clears any tail. Returns the frame's lines.
 fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize {
     sub.cursor_drawn = false; // until a pane marks one
-    var report = try c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub));
+    var report = try c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub), !sub.oneshot and sub.focus == null);
     const kept = tui.keepFocus(report.clients, sub.focus, sub.focus_row);
     if (kept != sub.focus) {
         sub.focus = kept;
-        const again = c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub)) catch |err| {
+        const again = c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub), !sub.oneshot and sub.focus == null) catch |err| {
             report.deinit(c.allocator);
             return err;
         };
