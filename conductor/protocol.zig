@@ -73,7 +73,8 @@ pub const CLIENT_HELP =
     \\                            multiple clients can share the same session.
     \\ --sync                     Attach to shared REPL (requires --session=<label>)
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
-    \\ --restart                  Kill workers for the project and exit
+    \\ --restart                  Kill workers for the project (or just the
+    \\                            --session=<label>'s) and exit
     \\ --sandbox                  Run in an isolated sandbox (Linux only)
     \\ --status[=live|json]       Show the state of the workers, as JSON, or live:
     \\                            ↓ focuses a session, to preview, follow,
