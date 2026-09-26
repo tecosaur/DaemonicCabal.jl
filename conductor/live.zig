@@ -442,7 +442,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
         .busy => &.{ "Its worker is busy, so the transcript waits until it yields.", hint },
         .unrecorded => &.{
             "This session isn't being recorded.",
-            "⏎ follows it, recording from then on; JULIA_DAEMON_RECORD records sessions from their start.",
+            "⏎ expands it, recording it from then on; JULIA_DAEMON_RECORD records sessions from their start.",
         },
         .failed => &.{ "The transcript's watch ended in error; trying again.", hint },
         .transcript => if (sub.tail.items.len == 0)
@@ -460,13 +460,13 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
         note
     else if (snap) |sn|
         if (sn.report == null)
-            "sampling… · " ++ comptime hints(&.{ .{ "⏎", "whole stacktrace" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
+            "sampling… · " ++ comptime hints(&.{ .{ "⏎", "expand" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
         else
-            comptime hints(&.{ .{ "⏎", "whole stacktrace" }, .{ "s", "again" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
+            comptime hints(&.{ .{ "⏎", "expand" }, .{ "s", "again" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
     else if (sub.view == .log)
-        comptime hints(&.{ .{ "⏎", "whole log" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
+        comptime hints(&.{ .{ "⏎", "expand" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
     else if (info.session)
-        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "follow" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } })
+        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "expand" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } })
     else
         comptime hints(&.{ .{ "↑↓", "focus" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } });
     var cursor_sgr: [24]u8 = undefined;
