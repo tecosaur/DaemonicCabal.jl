@@ -163,6 +163,7 @@ names the keys:
 | =⏎=   | Follow the session full-screen, as =--watch= would, or, with a          |
 |       | stacktrace in the pane, show the whole of it (=q= to come back)         |
 | =s=   | Show the stacktrace: the worker's stacks at once, then its profile       |
+| =l=   | Show the worker's recent log: its stderr, and the daemon's lines on it   |
 | =i=   | Interrupt, as the session's own Ctrl-C would                             |
 | =t=   | Terminate the session, once confirmed with =y=                           |
 | =q=   | Quit, leaving the last frame                                             |
