@@ -4,6 +4,7 @@
 const std = @import("std");
 const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
+const settings = @import("settings.zig");
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
@@ -37,24 +38,26 @@ pub const Config = struct {
 
     pub const PortRange = struct { base: u16, count: u16 };
 
-    pub const MemThreshold = union(enum) {
-        fraction: f64, // 0..1
-        bytes: u64,
-        pub fn satisfied(self: MemThreshold, avail: u64, total: u64) bool {
-            return switch (self) {
-                .fraction => |f| @as(f64, @floatFromInt(avail)) < f * @as(f64, @floatFromInt(total)),
-                .bytes => |b| avail < b,
-            };
-        }
-    };
+    pub const MemThreshold = settings.Share;
 
     pub fn load(allocator: std.mem.Allocator, env: *std.process.Environ.Map) !Config {
-        const worker_project = env.get("JULIA_DAEMON_WORKER_PROJECT") orelse {
+        const values = settings.fromEnv(env);
+        if (values[settings.Setting.index("JULIA_DAEMON_WORKER_PROJECT")] == null) {
             std.debug.print("Error: JULIA_DAEMON_WORKER_PROJECT environment variable is not set.\n", .{});
             std.debug.print("This should point to the DaemonWorker project directory.\n", .{});
             std.debug.print("Run DaemonicCabal.install() to set up the daemon correctly.\n", .{});
             return error.MissingWorkerProject;
-        };
+        }
+        if (settings.conflict(&values)) |c| {
+            switch (c) {
+                .positive => |i| std.debug.print("Error: {s} must be above 0.\n", .{settings.all[i].key}),
+                .ordered => |o| std.debug.print("Error: {s} ({s}) must be below {s} ({s}).\n", .{
+                    settings.all[o.below].key, settings.resolved(&values, o.below),
+                    settings.all[o.above].key, settings.resolved(&values, o.above),
+                }),
+            }
+            return error.InvalidConfig;
+        }
         const runtime_dir = if (env.get("JULIA_DAEMON_RUNTIME")) |r|
             try allocator.dupe(u8, r)
         else
@@ -82,45 +85,49 @@ pub const Config = struct {
             }).host
         else
             "";
-        const cfg: Config = .{
+        const port_range = if (transport == .tcp) try parsePortRange(env.get("JULIA_DAEMON_PORTS")) else null;
+        // Those `settings` has no field for; `read` sets the rest.
+        const own = .{
             .allocator = allocator,
             .socket_path = socket_path,
             .runtime_dir = runtime_dir,
             .socket_dir = socket_dir,
             .transport = transport,
             .bind_address = bind_address,
-            .worker_executable = env.get("JULIA_DAEMON_WORKER_EXECUTABLE") orelse "julia",
-            .worker_args = env.get("JULIA_DAEMON_WORKER_ARGS") orelse "--startup-file=no",
-            .worker_project = worker_project,
-            .worker_maxclients = parseUint(u32, env.get("JULIA_DAEMON_WORKER_MAXCLIENTS"), 1),
-            .reserve_worker = !std.mem.eql(u8, env.get("JULIA_DAEMON_RESERVE_WORKER") orelse "1", "0"),
-            .min_ttl = try parseUintStrict(u64, env.get("JULIA_DAEMON_MIN_TTL"), 120),
-            // WORKER_TTL is the deprecated name.
-            .max_ttl = try parseUintStrict(u64, env.get("JULIA_DAEMON_MAX_TTL"), parseUint(u64, env.get("JULIA_DAEMON_WORKER_TTL"), 7200)),
-            .label_ttl = parseUint(u64, env.get("JULIA_DAEMON_LABEL_TTL"), 90),
-            .ping_interval = parseUint(u64, env.get("JULIA_DAEMON_PING_INTERVAL"), 30),
-            .ping_timeout = parseUint(u64, env.get("JULIA_DAEMON_PING_TIMEOUT"), 5),
-            .spawn_timeout = try parseUintStrict(u64, env.get("JULIA_DAEMON_SPAWN_TIMEOUT"), 600),
-            .memory_pressure = !std.mem.eql(u8, env.get("JULIA_DAEMON_MEMORY_PRESSURE") orelse "1", "0"),
-            .psi_threshold = try parseFloatStrict(env.get("JULIA_DAEMON_PSI_THRESHOLD"), 10.0),
-            .memfree_low = try parseMemThreshold(env.get("JULIA_DAEMON_MEMFREE_LOW"), .{ .fraction = 0.10 }),
-            .memfree_high = try parseMemThreshold(env.get("JULIA_DAEMON_MEMFREE_HIGH"), .{ .fraction = 0.15 }),
-            .port_range = if (transport == .tcp) parsePortRange(env.get("JULIA_DAEMON_PORTS")) else null,
+            .port_range = port_range,
             .host_home = env.get("HOME") orelse "",
-            .sandbox_remote_clients = !std.mem.eql(u8, env.get("JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS") orelse "1", "0"),
-            .sandbox_max_memory = env.get("JULIA_DAEMON_SANDBOX_MAX_MEMORY"),
-            .sandbox_max_cpu = parseOptionalUint(u32, env.get("JULIA_DAEMON_SANDBOX_MAX_CPU")),
-            .sandbox_session_bypass = std.mem.eql(u8, env.get("JULIA_DAEMON_SANDBOX_SESSION_BYPASS") orelse "0", "1"),
         };
-        if (cfg.min_ttl == 0 or cfg.min_ttl >= cfg.max_ttl) {
-            std.debug.print("Error: JULIA_DAEMON_MIN_TTL ({d}) must be > 0 and < MAX_TTL ({d}).\n", .{ cfg.min_ttl, cfg.max_ttl });
-            return error.InvalidConfig;
+        var cfg: Config = undefined;
+        inline for (@typeInfo(Config).@"struct".fields) |f| {
+            if (comptime @hasField(@TypeOf(own), f.name))
+                @field(cfg, f.name) = @field(own, f.name)
+            else if (comptime !settings.hasField(f.name))
+                @compileError("nothing sets Config." ++ f.name);
         }
-        if (!memThresholdBelow(cfg.memfree_low, cfg.memfree_high)) {
-            std.debug.print("Error: JULIA_DAEMON_MEMFREE_LOW must be < MEMFREE_HIGH.\n", .{});
-            return error.InvalidConfig;
-        }
+        try cfg.read(env, .all);
         return cfg;
+    }
+
+    /// Rereads the settings that take effect at once, or for new workers,
+    /// from `env`; their text is `env`'s.
+    pub fn reload(self: *Config, env: *const std.process.Environ.Map) !void {
+        try self.read(env, .live);
+    }
+
+    fn read(self: *Config, env: *const std.process.Environ.Map, comptime which: enum { all, live }) !void {
+        const values = settings.fromEnv(env);
+        inline for (settings.all, 0..) |s, i| {
+            const skip = s.field == null or (which == .live and (s.effect == .restart or s.effect == .fixed));
+            if (comptime !skip) {
+                const field = &@field(self, s.field.?);
+                field.* = typed(@TypeOf(field.*), values[i] orelse s.default) catch {
+                    // The deprecated name, when it's that the value came by.
+                    const key = if (env.get(s.key) == null) s.alias orelse s.key else s.key;
+                    std.debug.print("Error: {s}={s} isn't {s}.\n", .{ key, values[i].?, settings.expected(s.kind) });
+                    return error.InvalidConfig;
+                };
+            }
+        }
     }
 
     pub fn deinit(self: *const Config) void {
@@ -130,75 +137,26 @@ pub const Config = struct {
     }
 };
 
-fn parseUint(comptime T: type, s: ?[]const u8, default: T) T {
-    const str = s orelse return default;
-    return std.fmt.parseInt(T, str, 10) catch default;
-}
-
-// For eviction knobs, where a typo shouldn't quietly pass.
-fn parseUintStrict(comptime T: type, s: ?[]const u8, default: T) !T {
-    const str = s orelse return default;
-    return std.fmt.parseInt(T, str, 10) catch {
-        std.debug.print("Error: invalid integer config value '{s}'.\n", .{str});
-        return error.InvalidConfig;
+// A value in its variable's form, as the field's type holds it.
+fn typed(comptime T: type, text: ?[]const u8) !T {
+    return switch (T) {
+        []const u8 => text orelse "",
+        ?[]const u8 => text,
+        u32, u64 => std.fmt.parseInt(T, text.?, 10),
+        ?u32 => if (text) |t| try std.fmt.parseInt(u32, t, 10) else null,
+        f64 => std.fmt.parseFloat(f64, text.?),
+        bool => settings.parseFlag(text.?) orelse error.Invalid,
+        Config.MemThreshold => settings.parseShare(text.?),
+        else => @compileError("no setting of type " ++ @typeName(T)),
     };
 }
 
-fn parseFloatStrict(s: ?[]const u8, default: f64) !f64 {
-    const str = s orelse return default;
-    return std.fmt.parseFloat(f64, str) catch {
-        std.debug.print("Error: invalid float config value '{s}'.\n", .{str});
-        return error.InvalidConfig;
-    };
-}
-
-// "<n>%" of total, or bytes with an optional K/M/G suffix.
-fn parseMemThreshold(s: ?[]const u8, default: Config.MemThreshold) !Config.MemThreshold {
-    const str = s orelse return default;
-    if (std.mem.endsWith(u8, str, "%")) {
-        const pct = std.fmt.parseFloat(f64, str[0 .. str.len - 1]) catch return error.InvalidConfig;
-        return .{ .fraction = pct / 100.0 };
-    }
-    const mult: u64 = switch (str[str.len - 1]) {
-        'G', 'g' => 1 << 30,
-        'M', 'm' => 1 << 20,
-        'K', 'k' => 1 << 10,
-        else => 1,
-    };
-    const num_str = if (mult == 1) str else str[0 .. str.len - 1];
-    const n = std.fmt.parseInt(u64, num_str, 10) catch {
-        std.debug.print("Error: invalid memory threshold '{s}'.\n", .{str});
-        return error.InvalidConfig;
-    };
-    return .{ .bytes = n * mult };
-}
-
-// Mixed %/bytes can't be compared without total memory, so they pass.
-fn memThresholdBelow(low: Config.MemThreshold, high: Config.MemThreshold) bool {
-    return switch (low) {
-        .fraction => |lf| switch (high) {
-            .fraction => |hf| lf < hf,
-            .bytes => true,
-        },
-        .bytes => |lb| switch (high) {
-            .bytes => |hb| lb < hb,
-            .fraction => true,
-        },
-    };
-}
-
-fn parseOptionalUint(comptime T: type, s: ?[]const u8) ?T {
+fn parsePortRange(s: ?[]const u8) !?Config.PortRange {
     const str = s orelse return null;
-    return std.fmt.parseInt(T, str, 10) catch null;
-}
-
-fn parsePortRange(s: ?[]const u8) ?Config.PortRange {
-    const str = s orelse return null;
-    const dash = std.mem.indexOfScalar(u8, str, '-') orelse return null;
-    const low = std.fmt.parseInt(u16, str[0..dash], 10) catch return null;
-    const high = std.fmt.parseInt(u16, str[dash + 1 ..], 10) catch return null;
-    if (high <= low) return null;
-    const count = @min((high - low + 1) / 4, protocol.PortPool.max_port_sets);
-    if (count == 0) return null;
-    return .{ .base = low, .count = count };
+    const range = settings.parsePorts(str) orelse {
+        std.debug.print("Error: JULIA_DAEMON_PORTS={s} isn't {s}.\n", .{ str, settings.expected(.ports) });
+        return error.InvalidConfig;
+    };
+    const count = @min((range[1] - range[0] + 1) / 4, protocol.PortPool.max_port_sets);
+    return .{ .base = range[0], .count = count };
 }
