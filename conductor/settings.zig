@@ -54,7 +54,15 @@ pub const Kind = union(enum) {
     choice: []const []const u8,
     threads, // as JULIA_NUM_THREADS
     ports, // "low-high"
+    path: Path,
     text,
+};
+
+/// What a path names, as far as checking it goes.
+pub const Path = enum {
+    executable, // or a bare name, found on PATH
+    directory, // made if missing
+    socket, // made by the conductor; a TCP address isn't a path
 };
 
 pub const Setting = struct {
@@ -99,7 +107,7 @@ pub const Values = []const ?[]const u8;
 pub const all = [_]Setting{
     .{ .key = "JULIA_DAEMON_WORKER_MAXCLIENTS", .label = "Clients per worker", .tab = .workers, .kind = .count, .default = "1", .effect = .restart, .field = "worker_maxclients", .about = "How many clients a worker serves at once, 0 for no limit. Above 1, Ctrl-C can't be aimed at one client." },
     .{ .key = "JULIA_DAEMON_RESERVE_WORKER", .label = "Reserve worker", .tab = .workers, .kind = .flag, .default = "1", .effect = .now, .field = "reserve_worker", .about = "Keep a spare worker started, ready for the next new project." },
-    .{ .key = "JULIA_DAEMON_WORKER_EXECUTABLE", .label = "executable", .tab = .workers, .depth = 1, .heading = "Julia", .kind = .text, .default = "julia", .effect = .new_workers, .field = "worker_executable", .about = "The Julia binary workers run, found on the daemon's PATH unless absolute." },
+    .{ .key = "JULIA_DAEMON_WORKER_EXECUTABLE", .label = "executable", .tab = .workers, .depth = 1, .heading = "Julia", .kind = .{ .path = .executable }, .default = "julia", .effect = .new_workers, .field = "worker_executable", .about = "The Julia binary workers run, found on the daemon's PATH unless absolute." },
     .{ .key = "JULIA_DAEMON_WORKER_ARGS", .label = "arguments", .tab = .workers, .depth = 1, .kind = .text, .default = "--startup-file=no", .effect = .new_workers, .field = "worker_args", .about = "Julia's arguments for each worker, split at spaces." },
     .{ .key = "JULIA_NUM_THREADS", .label = "threads", .tab = .workers, .depth = 1, .kind = .threads, .default = null, .unset = "Julia's default", .effect = .new_workers, .about = "Workers' threads, as JULIA_NUM_THREADS: a count, auto, or with interactive threads, 4,1. A client's --threads wins." },
     .{ .key = "JULIA_DAEMON_WORKER_PROJECT", .label = "DaemonWorker", .tab = .workers, .kind = .text, .default = null, .effect = .fixed, .field = "worker_project", .about = "Where the worker's package is installed; DaemonicCabal.install() sets it." },
@@ -116,10 +124,10 @@ pub const all = [_]Setting{
     .{ .key = "JULIA_DAEMON_PSI_THRESHOLD", .label = "PSI threshold", .tab = .memory, .depth = 1, .kind = .percent, .default = "10.0", .effect = .now, .field = "psi_threshold", .used = pressure_on, .about = "The PSI \"some avg10\" level taken as memory pressure, on Linux where it's available." },
     .{ .key = "JULIA_DAEMON_MEMFREE_LOW", .label = "pressure below", .tab = .memory, .depth = 2, .heading = "Free memory", .kind = .share, .default = "10%", .effect = .now, .field = "memfree_low", .used = pressure_on, .about = "Below this much free memory (bytes, or a percentage of it all), memory is under pressure." },
     .{ .key = "JULIA_DAEMON_MEMFREE_HIGH", .label = "eased above", .tab = .memory, .depth = 2, .kind = .share, .default = "15%", .effect = .now, .field = "memfree_high", .used = pressure_on, .about = "Above this much free memory, the pressure has eased." },
-    .{ .key = "JULIA_DAEMON_SERVER", .label = "Server", .tab = .network, .kind = .text, .default = null, .unset = "a local socket", .effect = .restart, .about = "Where clients reach the conductor: a local socket's path, or tcp://host:port." },
+    .{ .key = "JULIA_DAEMON_SERVER", .label = "Server", .tab = .network, .kind = .{ .path = .socket }, .default = null, .unset = "a local socket", .effect = .restart, .about = "Where clients reach the conductor: a local socket's path, or tcp://host:port." },
     .{ .key = "JULIA_DAEMON_BIND", .label = "bind address", .tab = .network, .depth = 1, .kind = .text, .default = null, .unset = "the server's host", .effect = .restart, .used = tcp, .about = "The address the conductor and its workers listen on, such as 0.0.0.0." },
     .{ .key = "JULIA_DAEMON_PORTS", .label = "worker ports", .tab = .network, .depth = 1, .kind = .ports, .default = null, .unset = "any free", .effect = .restart, .used = tcp, .about = "The ports workers listen on for their clients, such as 10000-10100." },
-    .{ .key = "JULIA_DAEMON_RUNTIME", .label = "Runtime directory", .tab = .network, .kind = .text, .default = null, .unset = "the platform's", .effect = .restart, .about = "Where the conductor keeps its sockets and pid file." },
+    .{ .key = "JULIA_DAEMON_RUNTIME", .label = "Runtime directory", .tab = .network, .kind = .{ .path = .directory }, .default = null, .unset = "the platform's", .effect = .restart, .about = "Where the conductor keeps its sockets and pid file." },
     .{ .key = "JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS", .label = "Sandbox remote clients", .tab = .sandbox, .kind = .flag, .default = "1", .effect = .now, .field = "sandbox_remote_clients", .about = "Run the clients of other hosts in a sandbox of their own." },
     .{ .key = "JULIA_DAEMON_SANDBOX_MAX_MEMORY", .label = "memory limit", .tab = .sandbox, .depth = 1, .kind = .bytes, .default = null, .unset = "none", .effect = .restart, .field = "sandbox_max_memory", .used = sandboxing, .about = "Each sandbox's memory limit. Limits need a delegated cgroup, as the installed service has." },
     .{ .key = "JULIA_DAEMON_SANDBOX_MAX_CPU", .label = "CPU limit", .tab = .sandbox, .depth = 1, .kind = .count, .default = null, .unset = "none", .effect = .restart, .field = "sandbox_max_cpu", .used = sandboxing, .about = "Each sandbox's CPU limit, as a percentage: 200 is two cores." },
@@ -138,7 +146,7 @@ const tcp: Use = .{ .check = struct {
         const address = protocol.parseAddress(server) catch return false;
         return address.mode == .tcp;
     }
-}.check, .reason = "unused but by a TCP server" };
+}.check, .reason = "only used by a TCP server" };
 
 const sandboxing: Use = .{ .check = struct {
     fn check(values: Values) bool {
@@ -188,7 +196,7 @@ fn formOf(kind: Kind, text: []const u8, buf: []u8) Invalid![]const u8 {
             const range = parsePorts(text) orelse return error.Invalid;
             break :blk printed(buf, "{d}-{d}", .{ range[0], range[1] });
         },
-        .text => printed(buf, "{s}", .{text}),
+        .path, .text => printed(buf, "{s}", .{text}),
     };
 }
 
@@ -204,8 +212,118 @@ pub fn expected(kind: Kind) []const u8 {
         .choice => "one of its choices",
         .threads => "a count, auto, or two such as 4,1",
         .ports => "a range of at least four ports, such as 10000-10100, within 1024-65535",
+        .path => "a path",
         .text => "some text",
     };
+}
+
+/// `input` (as typed, else its default) a step up or down, as `display`
+/// shows it: a duration or size to the next round value, anything else
+/// numeric by one. A step past `origin`, the value stepping began from,
+/// stops there instead, so one between round values can be stepped back to.
+/// Null when `input` doesn't parse, or its kind doesn't step.
+pub fn step(s: *const Setting, input: []const u8, up: bool, origin: ?[]const u8, buf: []u8) ?[]const u8 {
+    const next = stepOnce(s, input, up, buf) orelse return null;
+    const from = magnitude(s, input) orelse return next;
+    const to = magnitude(s, next) orelse return next;
+    const back = magnitude(s, origin orelse return next) orelse return next;
+    const passed = from.percent == back.percent and to.percent == back.percent and
+        (if (up) from.n < back.n and back.n < to.n else to.n < back.n and back.n < from.n);
+    if (!passed) return next;
+    const text = std.mem.trim(u8, origin.?, " \t");
+    if (text.len > buf.len) return next;
+    @memcpy(buf[0..text.len], text);
+    return buf[0..text.len];
+}
+
+// A numeric value's size, a percentage apart from the rest.
+fn magnitude(s: *const Setting, input: []const u8) ?struct { percent: bool, n: f64 } {
+    var form_buf: [64]u8 = undefined;
+    const form = (normalise(s, input, &form_buf) catch return null) orelse return null;
+    const percent = s.kind == .percent or std.mem.endsWith(u8, form, "%");
+    const number = std.mem.trimEnd(u8, form, "%");
+    const n: f64 = switch (s.kind) {
+        .bytes, .share => if (percent)
+            std.fmt.parseFloat(f64, number) catch return null
+        else
+            @floatFromInt((parseBytes(number) catch return null).total()),
+        .count, .seconds, .threads, .percent => std.fmt.parseFloat(f64, number) catch return null,
+        .flag, .choice, .ports, .path, .text => return null,
+    };
+    return .{ .percent = percent, .n = n };
+}
+
+fn stepOnce(s: *const Setting, input: []const u8, up: bool, buf: []u8) ?[]const u8 {
+    const typed = std.mem.trim(u8, input, " \t");
+    const text = if (typed.len > 0) typed else s.default orelse return null;
+    var form_buf: [64]u8 = undefined;
+    const form = (normalise(s, text, &form_buf) catch return null).?;
+    return switch (s.kind) {
+        .count => printed(buf, "{d}", .{byOne(u64, std.fmt.parseInt(u64, form, 10) catch return null, up, 0)}) catch null,
+        .seconds => display(s, printed(&form_buf, "{d}", .{
+            ladderStep(&seconds_ladder, std.fmt.parseInt(u64, form, 10) catch return null, up),
+        }) catch return null, buf),
+        .bytes => sizeText(ladderStep(&bytes_ladder, (parseBytes(form) catch return null).total(), up), buf),
+        .percent => printed(buf, "{d}%", .{percentStep(form, up) orelse return null}) catch null,
+        .share => if (std.mem.endsWith(u8, form, "%"))
+            printed(buf, "{d}%", .{percentStep(form[0 .. form.len - 1], up) orelse return null}) catch null
+        else
+            sizeText(ladderStep(&bytes_ladder, (parseBytes(form) catch return null).total(), up), buf),
+        .threads => printed(buf, "{d}", .{byOne(u16, std.fmt.parseInt(u16, form, 10) catch return null, up, 1)}) catch null,
+        .flag, .choice, .ports, .path, .text => null,
+    };
+}
+
+/// Whether `step` can change a value of `kind`.
+pub fn steps(kind: Kind) bool {
+    return switch (kind) {
+        .flag, .choice, .ports, .path, .text => false,
+        else => true,
+    };
+}
+
+const seconds_ladder = [_]u64{
+    1,    2,    5,    10,   15,   20,   30,    45,    60,    90,    120,   180,   300,    600,    900,
+    1200, 1800, 2700, 3600, 5400, 7200, 10800, 14400, 21600, 28800, 43200, 86400, 172800, 259200, 604800,
+};
+
+const bytes_ladder = blk: {
+    var ladder: [27]u64 = undefined;
+    for (&ladder, 0..) |*b, i| b.* = @as(u64, 1) << (10 + i); // 1K to 64G
+    break :blk ladder;
+};
+
+// The next rung past `n` either way; beyond the ladder, its end, or 0.
+fn ladderStep(ladder: []const u64, n: u64, up: bool) u64 {
+    if (up) {
+        for (ladder) |rung| if (rung > n) return rung;
+        return @max(n, ladder[ladder.len - 1]);
+    }
+    var i = ladder.len;
+    while (i > 0) {
+        i -= 1;
+        if (ladder[i] < n) return ladder[i];
+    }
+    return 0;
+}
+
+fn byOne(comptime T: type, n: T, up: bool, floor: T) T {
+    return if (up) n +| 1 else @max(floor, n -| 1);
+}
+
+// A percentage a whole point on, within 0 to 100: a fraction first rounds.
+fn percentStep(text: []const u8, up: bool) ?f64 {
+    const pct = std.fmt.parseFloat(f64, text) catch return null;
+    const next = if (up) @floor(pct) + 1 else @ceil(pct) - 1;
+    return std.math.clamp(next, 0, 100);
+}
+
+// Bytes in the largest unit that holds them whole.
+fn sizeText(bytes: u64, buf: []u8) ?[]const u8 {
+    const units = [_]struct { u64, []const u8 }{ .{ 1 << 30, "G" }, .{ 1 << 20, "M" }, .{ 1 << 10, "K" } };
+    for (units) |unit| if (bytes > 0 and bytes % unit[0] == 0)
+        return printed(buf, "{d}{s}", .{ bytes / unit[0], unit[1] }) catch null;
+    return printed(buf, "{d}", .{bytes}) catch null;
 }
 
 /// A value as shown: a duration in its largest whole unit, a flag as on or
@@ -294,8 +412,7 @@ pub fn parseShare(text: []const u8) Invalid!Share {
         if (!(pct >= 0 and pct <= 100)) return error.Invalid;
         return .{ .fraction = pct / 100.0 };
     }
-    const b = try parseBytes(text);
-    return .{ .bytes = b.count * b.scale };
+    return .{ .bytes = (try parseBytes(text)).total() };
 }
 
 pub fn parseFlag(text: []const u8) ?bool {
@@ -313,7 +430,15 @@ pub fn parsePorts(text: []const u8) ?[2]u16 {
     return .{ low, high };
 }
 
-const Bytes = struct { count: u64, suffix: []const u8, scale: u64 };
+const Bytes = struct {
+    count: u64,
+    suffix: []const u8,
+    scale: u64,
+
+    fn total(self: Bytes) u64 {
+        return self.count *| self.scale;
+    }
+};
 
 fn parseBytes(text: []const u8) Invalid!Bytes {
     if (text.len == 0) return error.Invalid;
@@ -468,4 +593,70 @@ test "rows are used as the settings they hang on allow" {
     values[Setting.index("JULIA_DAEMON_SERVER")] = "tcp://localhost:9345";
     try std.testing.expect(!psi.check(&values));
     try std.testing.expect(ports.check(&values));
+}
+
+test "numeric values step: durations and sizes by round values, the rest by one" {
+    var buf: [32]u8 = undefined;
+    const cases = [_]struct { []const u8, []const u8, bool, ?[]const u8 }{
+        .{ "JULIA_DAEMON_MAX_TTL", "2h", true, "3h" },
+        .{ "JULIA_DAEMON_MAX_TTL", "2h", false, "90m" },
+        .{ "JULIA_DAEMON_MAX_TTL", "100s", true, "2m" },
+        .{ "JULIA_DAEMON_MAX_TTL", "100s", false, "90s" },
+        .{ "JULIA_DAEMON_MAX_TTL", "1s", false, "0s" },
+        .{ "JULIA_DAEMON_MAX_TTL", "7d", true, "7d" },
+        .{ "JULIA_DAEMON_MAX_TTL", "", true, "3h" }, // from the default
+        .{ "JULIA_DAEMON_HISTORY_BYTES", "1M", true, "2M" },
+        .{ "JULIA_DAEMON_HISTORY_BYTES", "1M", false, "512K" },
+        .{ "JULIA_DAEMON_HISTORY_BYTES", "1500K", true, "2M" },
+        .{ "JULIA_DAEMON_MEMFREE_LOW", "10%", true, "11%" },
+        .{ "JULIA_DAEMON_MEMFREE_LOW", "0%", false, "0%" },
+        .{ "JULIA_DAEMON_MEMFREE_LOW", "2G", false, "1G" },
+        .{ "JULIA_DAEMON_PSI_THRESHOLD", "12.5", true, "13%" },
+        .{ "JULIA_DAEMON_PSI_THRESHOLD", "12.5%", false, "12%" },
+        .{ "JULIA_DAEMON_PSI_THRESHOLD", "100", true, "100%" },
+        .{ "JULIA_DAEMON_WORKER_MAXCLIENTS", "0", false, "0" },
+        .{ "JULIA_DAEMON_WORKER_MAXCLIENTS", "1", true, "2" },
+        .{ "JULIA_NUM_THREADS", "1", false, "1" },
+        .{ "JULIA_NUM_THREADS", "4,1", true, null },
+        .{ "JULIA_DAEMON_MAX_TTL", "soon", true, null },
+        .{ "JULIA_DAEMON_RECORD", "sync", true, null },
+        .{ "JULIA_DAEMON_PORTS", "10000-10100", true, null },
+    };
+    inline for (cases) |case| {
+        const got = step(&all[Setting.index(case[0])], case[1], case[2], null, &buf);
+        if (case[3]) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);
+    }
+}
+
+test "a stepped value is one the setting takes" {
+    var buf: [32]u8 = undefined;
+    var form: [64]u8 = undefined;
+    for (&all) |*s| {
+        const start = s.default orelse continue;
+        var text: []const u8 = display(s, start, &buf);
+        for (0..40) |n| {
+            var next: [32]u8 = undefined;
+            text = step(s, text, n % 3 != 0, start, &next) orelse break;
+            _ = try normalise(s, text, &form);
+            @memcpy(buf[0..text.len], text);
+            text = buf[0..text.len];
+        }
+    }
+}
+
+test "stepping back past where it began stops there" {
+    const ttl = &all[Setting.index("JULIA_DAEMON_MAX_TTL")];
+    var buf: [32]u8 = undefined;
+    // 100s lies between 90s and 2m.
+    try std.testing.expectEqualStrings("2m", step(ttl, "100s", true, "100s", &buf).?);
+    try std.testing.expectEqualStrings("100s", step(ttl, "2m", false, "100s", &buf).?);
+    try std.testing.expectEqualStrings("90s", step(ttl, "100s", false, "100s", &buf).?);
+    try std.testing.expectEqualStrings("100s", step(ttl, "90s", true, "100s", &buf).?);
+    try std.testing.expectEqualStrings("2m", step(ttl, "3m", false, "100s", &buf).?);
+    // An origin on a round value changes nothing.
+    try std.testing.expectEqualStrings("90s", step(ttl, "2m", false, "2m", &buf).?);
+    const low = &all[Setting.index("JULIA_DAEMON_MEMFREE_LOW")];
+    try std.testing.expectEqualStrings("1500K", step(low, "2M", false, "1500K", &buf).?);
+    try std.testing.expectEqualStrings("12.5%", step(low, "12%", true, "12.5%", &buf).?);
+    try std.testing.expectEqualStrings("1M", step(low, "2M", false, "12.5%", &buf).?); // not comparable
 }

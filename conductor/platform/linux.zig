@@ -126,7 +126,10 @@ fn processMountNs(pid: posix.pid_t) ?u64 {
 }
 pub fn rawWaitpid(pid: posix.pid_t, block: bool) posix.pid_t {
     var status: u32 = 0;
-    const ret = linux.waitpid(pid, &status, if (block) 0 else linux.W.NOHANG);
+    return rawWaitpidStatus(pid, block, &status);
+}
+pub fn rawWaitpidStatus(pid: posix.pid_t, block: bool, status: *u32) posix.pid_t {
+    const ret = linux.waitpid(pid, status, if (block) 0 else linux.W.NOHANG);
     return @intCast(@as(isize, @bitCast(ret)));
 }
 pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {

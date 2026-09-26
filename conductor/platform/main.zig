@@ -75,6 +75,7 @@ pub const currentDir = shared.currentDir;
 pub const lookupHost = shared.lookupHost;
 pub const getChildPid = shared.getChildPid;
 pub const reapIfExited = shared.reapIfExited;
+pub const pollExit = shared.pollExit;
 pub const waitForExit = shared.waitForExit;
 // Linux-only; elsewhere "unavailable", so no peer is ever refused.
 const linux_only = if (os == .linux) impl else struct {

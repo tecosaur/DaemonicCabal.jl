@@ -96,6 +96,7 @@ extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: HANDLE, lpConsol
 extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) BOOL;
 pub extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) BOOL;
 extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) DWORD;
+extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) BOOL;
 extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) ?HANDLE;
 extern "kernel32" fn QueryFullProcessImageNameW(hProcess: HANDLE, dwFlags: DWORD, lpExeName: [*]u16, lpdwSize: *DWORD) BOOL;
 extern "kernel32" fn CancelIoEx(hFile: HANDLE, lpOverlapped: ?*OVERLAPPED) BOOL;
@@ -1078,6 +1079,13 @@ pub fn getChildPid(child: anytype) DWORD {
 
 pub fn reapIfExited(pid: posix.pid_t) bool {
     return WaitForSingleObject(pid, 0) != WAIT_TIMEOUT;
+}
+
+/// Null while it runs; once it has ended, whether it exited with 0.
+pub fn pollExit(pid: posix.pid_t) ?bool {
+    if (WaitForSingleObject(pid, 0) == WAIT_TIMEOUT) return null;
+    var code: DWORD = 1;
+    return GetExitCodeProcess(pid, &code).toBool() and code == 0;
 }
 
 /// Blocks, so only for a child already killed.

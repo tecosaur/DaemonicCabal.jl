@@ -246,6 +246,15 @@ pub fn reapIfExited(pid: posix.pid_t) bool {
     // < 0 is ECHILD: already gone.
     return impl.rawWaitpid(pid, false) != 0;
 }
+/// Null while it runs; once it has ended (and is reaped), whether it
+/// exited with 0.
+pub fn pollExit(pid: posix.pid_t) ?bool {
+    var status: u32 = 0;
+    const ret = impl.rawWaitpidStatus(pid, false, &status);
+    if (ret == 0) return null;
+    if (ret < 0) return false; // ECHILD: reaped elsewhere, its status lost
+    return status & 0x7f == 0 and (status >> 8) & 0xff == 0;
+}
 /// Blocks, so only for a child already killed.
 pub fn waitForExit(pid: posix.pid_t) void {
     _ = impl.rawWaitpid(pid, true);

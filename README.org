@@ -242,7 +242,8 @@ reaches a host session, and its =--status= shows only its own sandbox.
 
 * Configuration
 
-Environment variables read at daemon startup:
+Environment variables read at daemon startup, which =juliaclient --reconfigure=
+shows and changes (see below):
 
 | Variable                       | Default                      | Description                                                                                                                      |
 |--------------------------------+------------------------------+----------------------------------------------------------------------------------------------------------------------------------|
@@ -294,6 +295,35 @@ pipe, =\\.\pipe\julia-daemon\<user>\conductor.sock=, open only to its owner.
 
 The client reads =JULIA_DAEMON_SERVER= and =JULIA_DAEMON_RUNTIME= to locate the
 conductor socket.
+
+** Changing them (=--reconfigure=)
+
+=juliaclient --reconfigure= shows the settings in tabs (Workers, Sessions,
+Lifetime, Memory, Network, Sandbox), each with its default and, focused, what
+it does. ⏎ edits the focused one: a choice cycles, anything
+else is typed, a duration as =90s=, =2m= or =1h30m=, and ↑↓ step a number,
+duration or size to the next round value. An edit is staged, then:
+
+| Key | Action                                                                                                |
+|-----+-------------------------------------------------------------------------------------------------------|
+| =a= | Apply the staged changes to the running daemon, checked together                                      |
+| =w= | Apply, then save to the service's configuration                                                       |
+| =u= | Drop a staged change, or stage an unsaved one's saved value                                           |
+| =d= | Stage the default                                                                                     |
+| =r= | Retire idle workers started before a worker setting changed                                           |
+| =q= | Quit (as does Esc), asking first to apply and save what's pending, and leaving a line on what changed |
+
+A tab starred (=*=) in yellow holds staged changes, in cyan applied ones not
+yet saved.
+Most settings apply at once; those workers read as they start reach new
+workers, and those the conductor reads as it starts wait for its restart, as
+each row notes. Saving writes a systemd drop-in (=julia-daemon.service.d/reconfigure.conf=,
+then =daemon-reload=), the launchd plist, or the Windows task's script, as
+named in =JULIA_DAEMON_SERVICE= by =install()=; without one, it shows what to
+set. launchd reads the plist as it loads the agent, so on macOS a saved
+change takes effect at the next login, or after =launchctl unload= and =load=. Reinstalling starts again from =install()='s settings. Only a local,
+unsandboxed client can reconfigure; given no terminal, it prints the settings
+as =KEY=value= lines.
 
 * Memory pressure
 

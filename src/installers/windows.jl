@@ -8,6 +8,7 @@ silent_launch_script() = joinpath(install_dir(), "silent_launch.vbs")
 
 function install_service(env::Dict)
     stop_service()
+    env = merge(env, Dict("JULIA_DAEMON_SERVICE" => "powershell:" * ps1_wrapper()))
     open(ps1_wrapper(), "w") do io
         envs = join(["\$env:$k = '$v'" for (k, v) in env], "\n")
 

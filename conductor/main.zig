@@ -15,6 +15,8 @@ const project = @import("project.zig");
 const env_cache = @import("env_cache.zig");
 const status = @import("status.zig");
 const live = @import("live.zig");
+const reconfigure = @import("reconfigure.zig");
+const terminal = @import("terminal.zig");
 const peek = @import("peek.zig");
 const pal = @import("palette.zig");
 const pressure = @import("pressure.zig");
@@ -154,6 +156,7 @@ pub const Conductor = struct {
     pressure_monitor: pressure.Monitor,
     event_loop: eventLoopImpl.EventLoop,
     live: live.Subscribers,
+    settings: reconfigure.Settings,
 
     // --- Lifecycle ---
 
@@ -177,6 +180,7 @@ pub const Conductor = struct {
             .pressure_monitor = pressure.Monitor.init(&cfg),
             .event_loop = try eventLoopImpl.EventLoop.init(64),
             .live = .{},
+            .settings = try reconfigure.Settings.init(allocator, io, environ_map),
         };
     }
 
@@ -189,6 +193,7 @@ pub const Conductor = struct {
         }
         self.pending_connections.deinit(self.allocator);
         live.deinit(self);
+        reconfigure.deinit(self);
         self.cache.deinit();
         self.active_clients.deinit();
         for (self.pending_kills.items) |pk| {
@@ -314,7 +319,11 @@ pub const Conductor = struct {
     pub fn onReadable(self: *Conductor, tag: usize) void {
         const addr = tag & ~@as(usize, 7);
         switch (tag & 7) {
-            live.tag => live.onReadable(self, @ptrFromInt(addr)),
+            // Each view takes only its own, found by address.
+            terminal.tag => {
+                live.onReadable(self, @ptrFromInt(addr));
+                reconfigure.onReadable(self, @ptrFromInt(addr));
+            },
             tag_connection => {
                 const pc: *PendingConnection = @ptrFromInt(addr);
                 if (!removePending(&self.pending_connections, pc)) return;
@@ -402,7 +411,8 @@ pub const Conductor = struct {
             const p = self.pending_spawns.items[i];
             if (p.spawn.check(self.io, &self.cfg)) i += 1 else |err| self.failSpawn(p, err); // failSpawn removes p
         }
-        return self.pending_spawns.items.len > 0 or self.pending_connections.items.len > 0;
+        const settling = reconfigure.onTick(self);
+        return self.pending_spawns.items.len > 0 or self.pending_connections.items.len > 0 or settling;
     }
 
     fn isPending(list: anytype, item: anytype) bool {
@@ -465,8 +475,9 @@ pub const Conductor = struct {
         };
         const subject = std.mem.readInt(u32, buf[1..5], .little); // client id, or worker pid/id
         const ntype = @as(protocol.notification.Type, @enumFromInt(buf[0]));
-        // A live-status subscriber was never assigned a worker.
-        if ((ntype == .client_exit or ntype == .client_interrupt) and live.dropById(self, subject)) return;
+        // A view's client was never assigned a worker.
+        if ((ntype == .client_exit or ntype == .client_interrupt) and
+            (live.dropById(self, subject) or reconfigure.dropById(self, subject))) return;
         switch (ntype) {
             .client_done => _ = self.clientDone(subject),
             .client_exit => {
@@ -554,6 +565,10 @@ pub const Conductor = struct {
             std.debug.print("Client {d}: {s} sandbox\n", .{
                 self.client_counter, @tagName(sandbox),
             });
+        }
+        if (request.parsed.hasSwitch("--reconfigure")) {
+            try self.serveReconfigure(socket, request.flags.tty, sandbox == .none and self.cfg.transport == .local);
+            return .done;
         }
         if (request.parsed.hasSwitch("--status")) {
             const scope: status.Scope = switch (sandbox) {
@@ -1446,6 +1461,46 @@ pub const Conductor = struct {
         return n_starting;
     }
 
+    /// Retires every worker spawned before `before_ns` (on `nowNs`'s clock)
+    /// that runs no client and holds no session, so those that replace them
+    /// start afresh; returns how many.
+    pub fn retireIdleWorkers(self: *Conductor, before_ns: i64) usize {
+        var idle: std.ArrayList(*worker.Worker) = .empty;
+        defer idle.deinit(self.allocator);
+        var it = self.workers.valueIterator();
+        while (it.next()) |list| for (list.items) |w| {
+            if (isRetirable(w, before_ns)) idle.append(self.allocator, w) catch break;
+        };
+        for (idle.items) |w| {
+            w.log("retired: idle, as settings changed", .{});
+            self.retireWorker(w);
+        }
+        self.renewReserve();
+        return idle.items.len;
+    }
+
+    pub fn isRetirable(w: *const worker.Worker, before_ns: i64) bool {
+        return w.spawned_ns < before_ns and w.busyClients() == 0 and w.session_label == null and !w.hosts_session;
+    }
+
+    /// Replaces the reserve worker, so the next new project's starts with
+    /// the settings as they are now.
+    pub fn renewReserve(self: *Conductor) void {
+        if (self.reserve) |r| {
+            r.log("retired: the reserve, as settings changed", .{});
+            self.retireWorker(r);
+        }
+        // One still starting started from the old environment.
+        var i: usize = 0;
+        while (i < self.pending_spawns.items.len) {
+            const p = self.pending_spawns.items[i];
+            if (p.purpose == .reserve) self.failSpawn(p, error.SettingsChanged) else i += 1;
+        }
+        if (self.cfg.reserve_worker) self.beginReserveSpawn() catch |err| {
+            std.debug.print("Reserve worker: spawn failed: {}\n", .{err});
+        };
+    }
+
     // Returns at once; the sweep escalates soft -> SIGTERM -> SIGKILL and reaps.
     pub fn retireWorker(self: *Conductor, w: *worker.Worker) void {
         self.event_loop.cancelPendingPing(w);
@@ -1865,6 +1920,7 @@ pub const Conductor = struct {
         entry.start_time_us = now_us;
         try self.active_clients.put(id, entry);
         const w = info.worker;
+        w.hosts_session = w.hosts_session or (info.session and !info.watcher);
         if (!info.internal) w.log("{s} {d} attached", .{ if (info.watcher) "watcher" else "client", info.pid });
         if (info.watcher) {
             w.watchers += 1;
@@ -2252,6 +2308,22 @@ pub const Conductor = struct {
         var streams = try self.openClientStreams(client_socket);
         defer streams.deinit();
         streams.finish(content, exit_code);
+    }
+
+    // Only the conductor's own user, at a local socket, may change it.
+    fn serveReconfigure(self: *Conductor, client_socket: posix.socket_t, tty: bool, allowed: bool) !void {
+        if (!allowed) {
+            std.debug.print("Client {d}: --reconfigure refused (not a local, unsandboxed client)\n", .{self.client_counter});
+            return self.serveString(client_socket, "--reconfigure needs a local, unsandboxed client of the conductor's own user.\n", 1);
+        }
+        if (!tty) {
+            const text = try reconfigure.listing(self.allocator, &self.settings);
+            defer self.allocator.free(text);
+            return self.serveString(client_socket, text, 0);
+        }
+        var streams = try self.openClientStreams(client_socket);
+        std.debug.print("Client {d}: --reconfigure\n", .{self.client_counter});
+        try reconfigure.subscribe(self, streams, probePalette(&streams));
     }
 
     fn isLiveStatus(format: ?[]const u8) bool {

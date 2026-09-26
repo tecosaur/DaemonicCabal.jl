@@ -80,6 +80,8 @@ pub const CLIENT_HELP =
     \\                            show its stacktrace, interrupt or terminate it
     \\ --watch[=json][,once]      Follow the session's transcript (this project's,
     \\                            or --session=<label>'s), as JSON lines, or once
+    \\ --reconfigure              Show the daemon's settings, to change them live
+    \\                            and save them to its service
     \\
     \\
 ++ DAEMON_MANAGEMENT_HELP;

@@ -5,6 +5,8 @@ const SYSTEMD_SERVICE_NAME = "julia-daemon"
 
 systemd_service_path() =
     BaseDirs.User.config("systemd", "user", "$SYSTEMD_SERVICE_NAME.service", create=true)
+# Where `juliaclient --reconfigure` saves changed settings.
+systemd_dropin_path() = systemd_service_path() * ".d/reconfigure.conf"
 
 function systemd_service_content(env::Dict{String,String})
     env_lines = join(["Environment=\"$k=$v\"" for (k, v) in env], "\n")
@@ -29,7 +31,9 @@ function install_service(env::Dict{String,String})
         ispath(systemd_service_path()) &&
             run(ignorestatus(`systemctl --user stop $SYSTEMD_SERVICE_NAME`))
         @info "Installing systemd service"
+        env = merge(env, Dict("JULIA_DAEMON_SERVICE" => "systemd:" * systemd_service_path()))
         write(systemd_service_path(), systemd_service_content(env))
+        rm(systemd_dropin_path(), force=true)
         run(`systemctl --user daemon-reload`)
         run(`systemctl --user enable --now $SYSTEMD_SERVICE_NAME`)
     else
@@ -42,6 +46,7 @@ function uninstall_service()
         @info "Removing systemd service"
         run(ignorestatus(`systemctl --user disable --now $SYSTEMD_SERVICE_NAME`))
         rm(systemd_service_path())
+        rm(systemd_dropin_path(), force=true)
         run(`systemctl --user daemon-reload`)
     end
 end
