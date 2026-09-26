@@ -125,6 +125,9 @@ pub const Pane = struct {
     footer: []const u8,
     body: []const []const u8,
     dim_body: bool = false,
+    cursor_last: bool = false, // the terminal's cursor is on `body`'s last line, marked there
+    cursor_shown: bool = true, // its blink: marked now, else left blank
+    cursor_sgr: []const u8 = "90", // its colour, as SGR parameters
     branch: []const []const u8 = &.{},
     gutter: []const []const u8 = &.{},
 };
@@ -142,7 +145,8 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
         try out.print(gpa, "│{s} ", .{reset});
         if (pane.dim_body) try out.appendSlice(gpa, dim);
         const text = if (row < pane.body.len) pane.body[row] else "";
-        const used = try appendColumns(out, gpa, text, inner, styled);
+        const cursor = pane.cursor_last and pane.cursor_shown and row + 1 == pane.body.len;
+        const used = try appendLine(out, gpa, text, inner, styled, if (cursor) pane.cursor_sgr else null);
         if (styled) try out.appendSlice(gpa, reset);
         try out.appendNTimes(gpa, ' ', inner - used);
         try out.print(gpa, " {s}│{s}\n", .{ dim, reset });
@@ -178,8 +182,16 @@ fn writeBorder(out: *std.ArrayList(u8), gpa: std.mem.Allocator, style: [2][]cons
 /// (CSI C, D, G) and erasing (CSI K, X). Colour (SGR) is kept when `colour`,
 /// and other escape sequences leave nothing. Invalid UTF-8 shows as U+FFFD.
 pub fn appendColumns(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool) !usize {
+    return appendLine(out, gpa, line, max, colour, null);
+}
+
+/// As `appendColumns`, with where the line leaves the cursor marked `▎`, in
+/// `cursor`'s SGR colour, when given and nothing is drawn there: a prompt
+/// awaiting input.
+pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool, cursor: ?[]const u8) !usize {
     var row = Row{};
     row.draw(line, @min(max, Row.max_cols));
+    if (cursor) |sgr| row.markCursor(@min(max, Row.max_cols), sgr);
     var style: u8 = 0;
     for (row.cells[0..row.len]) |cell| {
         if (colour and cell.style != style) {
@@ -230,6 +242,15 @@ const Row = struct {
             }
             i += 1;
         }
+    }
+
+    // Over a blank cell, or past the row's end, in `sgr`'s colour.
+    fn markCursor(self: *Row, max: usize, sgr: []const u8) void {
+        if (self.col >= max) return;
+        const blank = self.col >= self.len or std.mem.eql(u8, self.cells[self.col].bytes[0..self.cells[self.col].n], " ");
+        if (!blank) return;
+        self.style = self.styles.apply(0, sgr);
+        self.put("▎", max);
     }
 
     fn put(self: *Row, bytes: []const u8, max: usize) void {
@@ -420,6 +441,26 @@ test "columns: colour kept, other sequences dropped, redrawn lines last" {
     out.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 4), try appendColumns(&out, gpa, "50%...\r100%\x1b[K", 20, true));
     try std.testing.expectEqualStrings("100%", out.items);
+}
+
+test "cursor: marked where nothing is drawn, not over text" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    _ = try appendLine(&out, gpa, "julia> ", 40, false, "90");
+    try std.testing.expectEqualStrings("julia> ▎", out.items);
+    out.clearRetainingCapacity();
+    _ = try appendLine(&out, gpa, "julia> ", 40, true, "90");
+    try std.testing.expectEqualStrings("julia> \x1b[0m\x1b[90m▎\x1b[0m", out.items);
+    out.clearRetainingCapacity();
+    _ = try appendLine(&out, gpa, "julia> 1+1\x1b[2D", 40, false, "90");
+    try std.testing.expectEqualStrings("julia> 1+1", out.items);
+    out.clearRetainingCapacity();
+    _ = try appendLine(&out, gpa, "a b\x1b[2D", 40, false, "90");
+    try std.testing.expectEqualStrings("a▎b", out.items);
+    out.clearRetainingCapacity();
+    _ = try appendLine(&out, gpa, "ab\x1b[3C", 40, false, "90");
+    try std.testing.expectEqualStrings("ab   ▎", out.items);
 }
 
 test "columns: a REPL's line editing draws its prompt and input" {

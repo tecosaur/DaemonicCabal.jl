@@ -269,7 +269,7 @@ const Anchor = union(enum) {
     muted,
     slot: struct { idx: usize, fallback: pal.Rgb },
 };
-const MUTED_TOWARD_BG = 0.45;
+pub const MUTED_TOWARD_BG = 0.45;
 const FALLBACK_MUTED = pal.Rgb.init(0x80, 0x80, 0x80);
 fn anslot(idx: usize, fb: pal.Rgb) Anchor {
     return .{ .slot = .{ .idx = idx, .fallback = fb } };
