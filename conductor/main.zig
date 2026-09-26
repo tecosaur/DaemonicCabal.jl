@@ -227,7 +227,7 @@ pub const Conductor = struct {
         if (w.exited()) platform.dumpChildStderr(self.io, self.allocator, &w.process, w.id);
         if (w.stderrFd()) |fd| {
             self.event_loop.unwatchFd(@intFromPtr(w) | tag_worker_stderr, fd);
-            _ = self.drainStderr(w.id, &w.process, null);
+            _ = self.drainStderr(w, false);
             if (w.process.stderr) |f| f.close(self.io);
             w.process.stderr = null;
         }
@@ -328,14 +328,14 @@ pub const Conductor = struct {
             tag_worker_stderr => {
                 const w: *worker.Worker = @ptrFromInt(addr);
                 if (!self.holdsWorker(w)) return;
-                if (self.drainStderr(w.id, &w.process, &w.stderr_scan)) self.event_loop.watchFd(tag, w.stderrFd().?);
+                if (self.drainStderr(w, true)) self.event_loop.watchFd(tag, w.stderrFd().?);
                 if (w.stderr_scan.take(self.allocator)) |stacks| live.onStacks(self, w, stacks);
             },
             tag_spawn_stderr => {
                 const p: *PendingSpawn = @ptrFromInt(addr);
                 if (!isPending(&self.pending_spawns, p)) return;
                 const w = &p.spawn.worker;
-                if (self.drainStderr(w.id, &w.process, null)) self.event_loop.watchFd(tag, w.stderrFd().?);
+                if (self.drainStderr(w, false)) self.event_loop.watchFd(tag, w.stderrFd().?);
             },
             else => {
                 const p: *PendingSpawn = @ptrFromInt(addr);
@@ -345,21 +345,23 @@ pub const Conductor = struct {
         }
     }
 
-    /// Passes a worker's stderr to ours, through `scan` when given; returns
-    /// whether there may be more. At its end the pipe is closed.
-    fn drainStderr(self: *Conductor, id: u32, process: *std.process.Child, scan: ?*peek.Scanner) bool {
-        const file = process.stderr orelse return false;
+    /// Passes a worker's stderr to ours, keeping it among the worker's recent
+    /// lines, and through its stack scanner when `scan`; returns whether there
+    /// may be more. At its end the pipe is closed.
+    fn drainStderr(self: *Conductor, w: *worker.Worker, scan: bool) bool {
+        const file = w.process.stderr orelse return false;
         var buf: [16 << 10]u8 = undefined;
         while (true) {
             const n = platform.readAvailable(file.handle, &buf) orelse {
                 file.close(self.io);
-                process.stderr = null;
-                std.debug.print("Worker {d}: stderr closed\n", .{id});
+                w.process.stderr = null;
+                w.log("stderr closed", .{});
                 return false;
             };
             if (n == 0) return true;
             platform.writeFile(platform.getStderrHandle(), buf[0..n]);
-            if (scan) |sc| sc.feed(self.allocator, buf[0..n]);
+            w.noteStderr(buf[0..n]);
+            if (scan) w.stderr_scan.feed(self.allocator, buf[0..n]);
         }
     }
 
@@ -492,20 +494,17 @@ pub const Conductor = struct {
     // The worker writes it whole before closing, but a stalled one must not
     // hold the conductor: its read is bounded.
     fn receivePeekReport(self: *Conductor, socket: posix.socket_t, worker_id: u32) void {
+        const w = self.findWorkerById(worker_id) orelse return;
         platform.setRecvTimeout(socket, 1);
         var len_buf: [4]u8 = undefined;
         readExact(socket, &len_buf) catch return;
         const len = std.mem.readInt(u32, &len_buf, .little);
-        if (len > max_peek_report_bytes) {
-            std.debug.print("Worker {d}: a {d}-byte profile report is too large; dropped\n", .{ worker_id, len });
-            return;
-        }
+        if (len > max_peek_report_bytes) return w.log("a {d}-byte profile report is too large; dropped", .{len});
         const report = self.allocator.alloc(u8, len) catch return;
         readExact(socket, report) catch |err| {
-            std.debug.print("Worker {d}: profile report cut short: {}\n", .{ worker_id, err });
+            w.log("profile report cut short: {}", .{err});
             return self.allocator.free(report);
         };
-        const w = self.findWorkerById(worker_id) orelse return self.allocator.free(report);
         live.onProfile(self, w, report);
     }
 
@@ -1157,7 +1156,7 @@ pub const Conductor = struct {
     pub fn handleRunClientError(self: *Conductor, w: *worker.Worker, err: anyerror) bool {
         switch (err) {
             error.WorkerBusy => {
-                std.debug.print("Worker {d}: busy (likely has stuck client), syncing\n", .{w.id});
+                w.log("busy (likely has stuck client), syncing", .{});
                 self.syncWorkerClients(w);
                 return true;
             },
@@ -1215,7 +1214,7 @@ pub const Conductor = struct {
             };
         }
         if (label) |l| if (w.session_label == null) {
-            std.debug.print("Worker {d}: assigning label '{s}'\n", .{ w.id, l });
+            w.log("assigning label '{s}'", .{l});
             w.session_label = try self.allocator.dupe(u8, l);
         };
         try list.append(self.allocator, w);
@@ -1306,10 +1305,11 @@ pub const Conductor = struct {
     }
 
     fn failSpawn(self: *Conductor, p: *PendingSpawn, err: anyerror) void {
-        if (err != error.ClientGone) std.debug.print("Worker {d}: spawn failed: {}\n", .{ p.spawn.worker.id, err });
+        if (err != error.ClientGone) p.spawn.worker.log("spawn failed: {}", .{err});
         self.detachSpawn(p);
         p.spawn.abandon(self.io);
-        _ = self.drainStderr(p.spawn.worker.id, &p.spawn.worker.process, null);
+        _ = self.drainStderr(&p.spawn.worker, false);
+        p.spawn.worker.recent.deinit(self.allocator);
         self.settleSpawn(p, .{ .refuse = err });
     }
 
@@ -1351,6 +1351,7 @@ pub const Conductor = struct {
         while (self.pending_spawns.pop()) |p| {
             self.detachSpawn(p);
             p.spawn.abandon(self.io);
+            p.spawn.worker.recent.deinit(self.allocator);
             for (p.waiters.items) |hold| self.resumeHeld(hold, .{ .refuse = error.DaemonShuttingDown });
             p.waiters.clearRetainingCapacity();
             self.settleSpawn(p, .{ .refuse = error.DaemonShuttingDown });
@@ -1550,7 +1551,7 @@ pub const Conductor = struct {
         const now = self.currentTime();
         // Re-scan from the top after each cull: retireWorker mutates the pool.
         while (self.findExpired(now)) |hit| {
-            std.debug.print("Worker {d}: idle {d}s past activity-scaled budget (max TTL {d}s), retiring\n", .{ hit.w.id, now - hit.w.last_active, self.cfg.max_ttl });
+            hit.w.log("idle {d}s past activity-scaled budget (max TTL {d}s), retiring", .{ now - hit.w.last_active, self.cfg.max_ttl });
             self.retireWorker(hit.w);
             // dropColdKey reads hit.key, which dropPoolEntry frees.
             if (self.workers.getPtr(hit.key)) |list| {
@@ -1623,9 +1624,9 @@ pub const Conductor = struct {
             if (evicted >= max_evict_per_episode) break;
             if (!self.inPressureBand(c.w, c.key, now)) continue;
             if (c.size == 0)
-                std.debug.print("Worker {d}: evicting under memory pressure (value={d:.5}, size n/a)\n", .{ c.w.id, c.value })
+                c.w.log("evicting under memory pressure (value={d:.5}, size n/a)", .{c.value})
             else
-                std.debug.print("Worker {d}: evicting under memory pressure (value={d:.5}, {d}MB)\n", .{ c.w.id, c.value, c.size >> 20 });
+                c.w.log("evicting under memory pressure (value={d:.5}, {d}MB)", .{ c.value, c.size >> 20 });
             self.retireWorker(c.w);
             evicted += 1;
         }
@@ -1792,7 +1793,7 @@ pub const Conductor = struct {
 
     pub fn clearLabel(self: *Conductor, w: *worker.Worker) void {
         if (w.session_label) |label| {
-            std.debug.print("Worker {d}: clearing label '{s}'\n", .{ w.id, label });
+            w.log("clearing label '{s}'", .{label});
             w.dropSession(label); // tear down the now-orphaned session REPL before reuse
             self.allocator.free(label);
             w.session_label = null;
@@ -1864,6 +1865,7 @@ pub const Conductor = struct {
         entry.start_time_us = now_us;
         try self.active_clients.put(id, entry);
         const w = info.worker;
+        if (!info.internal) w.log("{s} {d} attached", .{ if (info.watcher) "watcher" else "client", info.pid });
         if (info.watcher) {
             w.watchers += 1;
         } else if (!w.occupancy.fast.busy) {
@@ -1878,7 +1880,7 @@ pub const Conductor = struct {
             if (info.worker.active_clients > 0) {
                 info.worker.active_clients -= 1;
             } else {
-                std.debug.print("Worker {d}: clientDone underflow (map/count drift)\n", .{info.worker.id});
+                info.worker.log("clientDone underflow (map/count drift)", .{});
             }
             if (info.watcher) info.worker.watchers -|= 1;
             const now_ns = self.nowNs();
@@ -1898,6 +1900,9 @@ pub const Conductor = struct {
                 duration_s,
                 duration_ms,
             });
+            if (!info.internal) info.worker.log("{s} {d} left after {d}.{d:0>3}s", .{
+                if (info.watcher) "watcher" else "client", info.pid, duration_s, duration_ms,
+            });
             if (info.worker.busyClients() == 0) return info.worker;
         }
         return null;
@@ -1909,7 +1914,7 @@ pub const Conductor = struct {
         const busy = w.busyClients();
         // The worker's surplus is departed clients' code it could not stop.
         if (synced.running > remaining and busy == 0) {
-            std.debug.print("Worker {d}: {d} departed client(s) still running, retiring\n", .{ w.id, synced.running });
+            w.log("{d} departed client(s) still running, retiring", .{synced.running});
             return self.retireWorker(w);
         }
         const now = self.currentTime();
@@ -1918,7 +1923,7 @@ pub const Conductor = struct {
         } else if (busy > 0 and !w.occupancy.fast.busy) {
             w.occupancy.attach(now, self.activityHalfLife(), self.budgetOccHalfLife());
         }
-        std.debug.print("Worker {d}: sync complete, {d} active clients\n", .{ w.id, remaining });
+        w.log("sync complete, {d} active clients", .{remaining});
     }
 
     /// Tells the worker the clients it has, and it stops any other; returns
@@ -1931,14 +1936,14 @@ pub const Conductor = struct {
         var it = self.active_clients.iterator();
         while (it.next()) |entry| if (entry.value_ptr.worker == w) {
             if (count == ids.len) {
-                std.debug.print("Worker {d}: over {d} clients, skipping sync\n", .{ w.id, ids.len });
+                w.log("over {d} clients, skipping sync", .{ids.len});
                 return error.TooManyClients;
             }
             ids[count] = entry.key_ptr.*;
             count += 1;
         };
         const running = w.syncClients(ids[0..count]) catch |err| {
-            std.debug.print("Worker {d}: sync_clients failed: {}\n", .{ w.id, err });
+            w.log("sync_clients failed: {}", .{err});
             self.retireWorker(w);
             return error.SyncFailed;
         };
@@ -1971,7 +1976,7 @@ pub const Conductor = struct {
             w.forceInterrupt();
             ending = .interrupted;
         }
-        std.debug.print("Worker {d}: an ended client would not stop, retiring\n", .{w.id});
+        w.log("an ended client would not stop, retiring", .{});
         self.retireWorker(w);
         return .retired;
     }
@@ -1991,7 +1996,7 @@ pub const Conductor = struct {
     fn reconcileClientMap(self: *Conductor, w: *worker.Worker) void {
         var running_buf: [max_tracked_clients]u32 = undefined;
         const running = w.queryClients(&running_buf) catch |err| {
-            std.debug.print("Worker {d}: queryClients failed: {}\n", .{ w.id, err });
+            w.log("queryClients failed: {}", .{err});
             return;
         };
         var stale: [max_tracked_clients]u32 = undefined;
@@ -2094,11 +2099,11 @@ pub const Conductor = struct {
         w.ping_pending = false;
         const n = read orelse platform.socketRead(w.socket, &w.pong_buf);
         if (n == 0) {
-            std.debug.print("Worker {d}: connection closed\n", .{w.id});
+            w.log("connection closed", .{});
             return self.retireWorker(w);
         }
         if (n < w.pong_buf.len) readExact(w.socket, w.pong_buf[n..]) catch {
-            std.debug.print("Worker {d}: pong short read\n", .{w.id});
+            w.log("pong short read", .{});
             return self.retireWorker(w);
         };
         // Late for a ping whose timeout was let pass; this one's is still to come.
@@ -2111,17 +2116,17 @@ pub const Conductor = struct {
         w.ping_pending = false;
         if (w.busyClients() > 0) {
             w.last_pinged = self.currentTime(); // hold the slow cadence
-            std.debug.print("Worker {d}: ping slow while busy (ignored)\n", .{w.id});
+            w.log("ping slow while busy (ignored)", .{});
             return;
         }
         // An idle worker's thread 0 may still be spinning in a departed client's code.
         if (!w.unresponsive_interrupted) {
-            std.debug.print("Worker {d}: ping timed out, interrupting\n", .{w.id});
+            w.log("ping timed out, interrupting", .{});
             w.unresponsive_interrupted = true;
             w.forceInterrupt();
             return self.event_loop.awaitPong(w, self.cfg.ping_timeout * 1000);
         }
-        std.debug.print("Worker {d}: ping timed out\n", .{w.id});
+        w.log("ping timed out", .{});
         self.retireWorker(w);
     }
 
@@ -2140,9 +2145,7 @@ pub const Conductor = struct {
         w.unresponsive_interrupted = false;
         const worker_count = std.mem.readInt(u16, pong_buf[4..6], .little);
         if (worker_count != w.active_clients) {
-            std.debug.print("Worker {d}: client count mismatch (worker={d}, conductor={d}), syncing\n", .{
-                w.id, worker_count, w.active_clients,
-            });
+            w.log("client count mismatch (worker={d}, conductor={d}), syncing", .{ worker_count, w.active_clients });
             self.syncWorkerClients(w);
         }
     }

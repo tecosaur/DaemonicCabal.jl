@@ -11,6 +11,7 @@ const protocol = @import("protocol.zig");
 const config = @import("config.zig");
 const args = @import("args.zig");
 const peek = @import("peek.zig");
+const logring = @import("logring.zig");
 pub const sandbox = if (builtin.os.tag == .linux) @import("sandbox.zig") else struct {
     pub fn envAllowed(_: []const u8) bool {
         return false;
@@ -168,6 +169,8 @@ pub const Worker = struct {
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
     recent_ppids_next: usize = 0,
     stderr_scan: peek.Scanner = .{}, // for the stacks a snapshot writes there
+    recent: logring.LogRing = .{}, // its stderr and our lines about it, for the live view
+    io: ?Io = null, // for `recent`'s clock
 
     pub const Launch = union(enum) {
         direct,
@@ -313,6 +316,7 @@ pub const Worker = struct {
                 .active_clients = 0,
                 .launch = launch,
                 .interactive = interactive,
+                .io = io,
             },
             .client_ns = if (launch == .client) launch.client.ns else null,
             .listener = setup,
@@ -352,7 +356,7 @@ pub const Worker = struct {
             const socket = (try self.listener.acceptTimeout(io, 0)) orelse return null;
             var w = self.worker;
             if (!isExpectedWorker(socket, w.launch, self.client_ns, w.process.id)) {
-                std.debug.print("Worker {d}: dropped a setup connection from an unexpected process\n", .{w.id});
+                w.log("dropped a setup connection from an unexpected process", .{});
                 platform.close(socket);
                 return null;
             }
@@ -360,11 +364,11 @@ pub const Worker = struct {
             // Not our child: only a pidfd taken now survives pid reuse.
             if (w.launch == .client) {
                 w.process.id = platform.peerPid(socket) orelse {
-                    std.debug.print("Worker {d}: no peer credentials on the setup connection, so the client-spawned worker cannot be tracked\n", .{w.id});
+                    w.log("no peer credentials on the setup connection, so the client-spawned worker cannot be tracked", .{});
                     return error.UnknownWorkerPid;
                 };
                 w.pidfd = platform.pidfdOpen(w.process.id.?) orelse {
-                    std.debug.print("Worker {d}: pidfd_open failed for pid {d}; client-spawned workers need Linux 5.3+\n", .{ w.id, platform.pidNumber(w.process.id.?) });
+                    w.log("pidfd_open failed for pid {d}; client-spawned workers need Linux 5.3+", .{platform.pidNumber(w.process.id.?)});
                     return error.PidfdUnsupported;
                 };
             }
@@ -385,12 +389,12 @@ pub const Worker = struct {
         /// readable signals failure instead.
         pub fn check(self: *Spawn, io: Io, cfg: *const config.Config) !void {
             if (platform.timeSeconds(io) >= self.deadline) {
-                std.debug.print("Worker {d}: no connection from the new worker within {d}s (JULIA_DAEMON_SPAWN_TIMEOUT)\n", .{ self.worker.id, cfg.spawn_timeout });
+                self.worker.log("no connection from the new worker within {d}s (JULIA_DAEMON_SPAWN_TIMEOUT)", .{cfg.spawn_timeout});
                 return error.WorkerSpawnTimeout;
             }
             if (self.worker.process.id) |pid| if (platform.reapIfExited(pid)) {
                 self.worker.process.id = null; // reaped; the pid may be reused
-                std.debug.print("Worker {d}: process exited before connecting; its output is above\n", .{self.worker.id});
+                self.worker.log("process exited before connecting; its output is above", .{});
                 return error.WorkerExitedEarly;
             };
         }
@@ -477,6 +481,26 @@ pub const Worker = struct {
         if (self.pidfd) |fd| platform.close(fd);
         platform.close(self.socket);
         self.stderr_scan.deinit(self.allocator);
+        self.recent.deinit(self.allocator);
+    }
+
+    /// A line of the conductor's log about this worker, prefixed as ours
+    /// are, and kept among its `recent` lines.
+    pub fn log(self: *Worker, comptime fmt: []const u8, fmt_args: anytype) void {
+        std.debug.print("Worker {d}: " ++ fmt ++ "\n", .{self.id} ++ fmt_args);
+        var buf: [512]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        w.print(fmt, fmt_args) catch {};
+        self.recent.add(self.allocator, self.clockSeconds(), .conductor, w.buffered());
+    }
+
+    /// Its stderr, passed on to ours, and kept among its `recent` lines.
+    pub fn noteStderr(self: *Worker, bytes: []const u8) void {
+        self.recent.feed(self.allocator, self.clockSeconds(), bytes);
+    }
+
+    fn clockSeconds(self: *const Worker) i64 {
+        return if (self.io) |io| Io.Clock.now(.awake, io).toSeconds() else 0;
     }
 
     /// The pipe the conductor drains, where it holds the worker's stderr.
@@ -527,9 +551,7 @@ pub const Worker = struct {
         self.sendPing();
         const header = try self.readHeader();
         if (header.msg_type != .pong) {
-            std.debug.print("Worker {d}: ping expected pong, got {s} ({s})\n", .{
-                self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
-            });
+            self.log("ping expected pong, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.UnexpectedResponse;
         }
         var payload: [protocol.worker.pong_size - 3]u8 = undefined;
@@ -590,15 +612,11 @@ pub const Worker = struct {
         platform.write(self.socket, project);
         const header = try self.readReply();
         if (header.msg_type == .err) {
-            std.debug.print("Worker {d}: setProject got {s} ({s})\n", .{
-                self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
-            });
+            self.log("setProject got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.ProjectError;
         }
         if (header.msg_type != .project_ok) {
-            std.debug.print("Worker {d}: setProject expected project_ok, got {s} ({s})\n", .{
-                self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
-            });
+            self.log("setProject expected project_ok, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.UnexpectedResponse;
         }
         self.project = project;
@@ -631,9 +649,7 @@ pub const Worker = struct {
         }
         const header = try self.readReply();
         if (header.msg_type != .ack) {
-            std.debug.print("Worker {d}: syncClients expected ack, got {s} ({s})\n", .{
-                self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
-            });
+            self.log("syncClients expected ack, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.UnexpectedResponse;
         }
         var count_buf: [2]u8 = undefined;
@@ -647,9 +663,7 @@ pub const Worker = struct {
         self.writeHeader(.query_clients, 0);
         const header = try self.readReply();
         if (header.msg_type != .clients) {
-            std.debug.print("Worker {d}: queryClients expected clients, got {s} ({s})\n", .{
-                self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
-            });
+            self.log("queryClients expected clients, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.UnexpectedResponse;
         }
         var count_buf: [2]u8 = undefined;
@@ -723,9 +737,7 @@ pub const Worker = struct {
         const header = try self.readReply();
         std.debug.print("Worker {d}: got response: {s} ({d} bytes payload)\n", .{ self.id, @tagName(header.msg_type), header.payload_len });
         if (header.msg_type == .err) {
-            std.debug.print("Worker {d}: runClient got {s} ({s})\n", .{
-                self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
-            });
+            self.log("runClient got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             if (header.payload_len > 0 and header.payload_len < 4096) {
                 const err_payload = allocator.alloc(u8, header.payload_len) catch {
                     return error.WorkerError;
@@ -739,16 +751,14 @@ pub const Worker = struct {
                     const msg_len = std.mem.readInt(u16, err_payload[2..4], .little);
                     if (4 + msg_len <= header.payload_len) {
                         const err_msg = err_payload[4..][0..msg_len];
-                        std.debug.print("Worker {d}: error (code {d}): {s}\n", .{ self.id, err_code, err_msg });
+                        self.log("error (code {d}): {s}", .{ err_code, err_msg });
                     }
                 }
             }
             return error.WorkerError;
         }
         if (header.msg_type != .sockets) {
-            std.debug.print("Worker {d}: runClient expected sockets, got {s} ({s})\n", .{
-                self.id, @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower),
-            });
+            self.log("runClient expected sockets, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.UnexpectedResponse;
         }
         const payload = try allocator.alloc(u8, header.payload_len);
