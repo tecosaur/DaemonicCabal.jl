@@ -86,7 +86,7 @@ const Preview = union(enum) {
     unsessioned, // a plain client: nothing of it is recorded
     busy: i64, // the worker didn't answer, as of then
     unrecorded: i64, // as of then: recording may yet start
-    failed: u8, // the watch's exit code
+    failed: i64, // the watch ended in error, as of then
     transcript, // `Subscriber.tail`
 };
 
@@ -427,7 +427,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
             "This session isn't being recorded.",
             "⏎ follows it, recording from then on; JULIA_DAEMON_RECORD records sessions from their start.",
         },
-        .failed => &.{"Its transcript is unavailable (see the conductor's log)."},
+        .failed => &.{"The transcript's watch ended in error; trying again."},
         .transcript => if (sub.tail.items.len == 0)
             &.{"Nothing recorded yet."}
         else
@@ -777,7 +777,7 @@ fn retarget(c: *Conductor, sub: *Subscriber) void {
     const info = c.active_clients.get(focus) orelse return;
     switch (sub.preview) {
         .pending => {},
-        .busy, .unrecorded => |since| if (c.currentTime() - since < 1) return,
+        .busy, .unrecorded, .failed => |since| if (c.currentTime() - since < 1) return,
         else => return,
     }
     sub.preview = if (info.session) attach(c, sub, info.worker, false) else .unsessioned;
@@ -816,7 +816,7 @@ fn attach(c: *Conductor, sub: *Subscriber, w: *worker.Worker, follow: bool) Prev
     if (w.ping_pending or !w.answersWithin(probe_timeout_ms)) return .{ .busy = c.currentTime() };
     const a = openAttachment(c, w, follow) catch |err| {
         std.debug.print("Status: watching worker {d}'s session failed: {}\n", .{ w.id, err });
-        return .{ .failed = 1 };
+        return .{ .failed = c.currentTime() };
     };
     sub.attachment = a;
     watch(c, &a.output);
@@ -940,7 +940,7 @@ fn endAttachment(c: *Conductor, sub: *Subscriber, code: ?u8) void {
     sub.preview = switch (code orelse 0) {
         0 => .transcript,
         2 => .{ .unrecorded = c.currentTime() },
-        else => |n| .{ .failed = n },
+        else => .{ .failed = c.currentTime() },
     };
     noteChange(c);
 }

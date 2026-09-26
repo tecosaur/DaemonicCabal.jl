@@ -305,18 +305,20 @@ function watch_session(label::String, format::String, out::IO;
         else
             push!(transcript.watchers, watcher)
             isnothing(watcher.plain) || Timer(QUIET_ROWS_S; interval = QUIET_ROWS_S) do timer
-                @lock transcript.lock begin
-                    if watcher ∈ transcript.watchers
-                        bytes = released(watcher, release_quiet!)
-                        isempty(bytes) || put!(watcher.queue, bytes)
-                    else
-                        close(timer)
+                uninterrupted() do
+                    @lock transcript.lock begin
+                        if watcher ∈ transcript.watchers
+                            bytes = released(watcher, release_quiet!)
+                            isempty(bytes) || put!(watcher.queue, bytes)
+                        else
+                            close(timer)
+                        end
                     end
                 end
             end
             Threads.@spawn begin
                 try
-                    while !eof(until) readavailable(until) end
+                    uninterrupted(() -> while !eof(until) readavailable(until) end)
                 catch
                 end
                 @lock transcript.lock filter!(w -> w !== watcher, transcript.watchers)
@@ -324,11 +326,25 @@ function watch_session(label::String, format::String, out::IO;
             end
         end
     end
-    for chunk in watcher.queue
-        write(out, chunk)
-        flush(out)
+    uninterrupted() do
+        for chunk in watcher.queue
+            write(out, chunk)
+            flush(out)
+        end
     end
     0
+end
+
+# A client's Ctrl-C reaches whichever task thread 0 runs, perhaps a watch's,
+# but a watcher's own never reaches the worker: a watch carries on, `f` again.
+function uninterrupted(f)
+    while true
+        try
+            return f()
+        catch err
+            err isa InterruptException || rethrow()
+        end
+    end
 end
 
 # Nothing while a plain destination's output is still held. Every other event
