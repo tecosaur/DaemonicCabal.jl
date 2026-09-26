@@ -26,6 +26,7 @@ const pal = @import("palette.zig");
 const tui = @import("tui.zig");
 const peek = @import("peek.zig");
 const logring = @import("logring.zig");
+const terminal = @import("terminal.zig");
 
 const Conductor = main.Conductor;
 const ClientStreams = Conductor.ClientStreams;
@@ -34,7 +35,6 @@ const debounce_ms = 100;
 const heartbeat_ms = 1000;
 const blink_ms = 500; // the redraw's pace while a cursor blinks, so its phase is kept
 const cpu_half_life: f64 = 1.4; // tracks the 1s heartbeat
-const max_queued_bytes = 1 << 20;
 const probe_timeout_ms = 300; // a worker slower to answer is busy on thread 0
 const max_tail_bytes = 64 << 10;
 const max_pane_rows = 16; // a preview: ⏎ shows the whole
@@ -47,15 +47,7 @@ const view_end = "\x1b[?7h\x1b[?25h";
 const alternate_screen = "\x1b[?7h\x1b[?1049h\x1b[H\x1b[2J";
 const main_screen = "\x1b[0m\x1b[?1049l\x1b[?7l";
 
-/// The low bits of an event-loop tag for a `Watch`, whose address it carries.
-pub const tag: usize = 5;
-
-/// A descriptor the event loop watches for a subscriber. Aligned so the
-/// tag's low bits are free.
-pub const Watch = struct {
-    kind: enum { input, signals, watch_output, watch_signals } align(8),
-    fd: posix.socket_t,
-};
+const Watch = terminal.Watch;
 
 pub const Subscribers = struct {
     list: std.ArrayList(*Subscriber) = .empty,
@@ -80,7 +72,7 @@ const Snapshot = struct {
     }
 };
 
-const Size = struct { rows: u16 = 24, cols: u16 = 80 };
+const Size = terminal.Size;
 
 /// What the pane shows of the focused client.
 const Preview = union(enum) {
@@ -99,24 +91,14 @@ const Attachment = struct {
     sockets: [4]posix.socket_t, // stdin, stdout, stderr, signals
     output: Watch,
     signals: Watch,
-    frames: SignalFrames = .{},
+    frames: terminal.SignalFrames = .{},
 };
 
 const Subscriber = struct {
-    streams: ClientStreams, // held open across repaints
-    palette: ?pal.Palette, // probed once at subscribe
-    id: u32, // matched for teardown on exit/interrupt
+    term: terminal.Terminal,
     scope: status.Scope,
     oneshot: bool, // draw one CPU-resolved frame, then disconnect
-    lines_last_printed: usize = 0, // for the cursor-up redraw
-    drawn: u64 = 0, // the last frame's hash: an identical one isn't sent
-    queued: std.ArrayList(u8) = .empty, // output the terminal hasn't taken yet
-    gone: bool = false,
     // The live view's:
-    input: Watch = undefined,
-    signals: Watch = undefined,
-    frames: SignalFrames = .{},
-    size: Size = .{},
     focus: ?u32 = null, // a client id
     focus_row: usize = 0, // its place in the tree, for when it leaves
     order: []u32 = &.{}, // the focusable clients last drawn, top to bottom
@@ -134,10 +116,6 @@ const Subscriber = struct {
     scroll: usize = 0, // the pager's top line
     pager_top: ?usize = null, // the top line on screen, once drawn
     pager_shown: u64 = 0, // `pagerShown` as drawn
-
-    fn stdout(self: *const Subscriber) posix.socket_t {
-        return self.streams.fd(.stdout);
-    }
 };
 
 /// What the pane shows: the focused session's transcript, its worker's
@@ -160,28 +138,11 @@ const Note = struct {
     }
 };
 
-/// Messages framed `id len data`, as a signals socket carries them.
-const SignalFrames = struct {
-    bytes: [16]u8 = undefined,
-    len: usize = 0,
-
-    /// The message `byte` completes, if any.
-    fn feed(self: *SignalFrames, byte: u8) ?[]const u8 {
-        if (self.len == self.bytes.len) self.len = 0; // nothing sent is this long
-        self.bytes[self.len] = byte;
-        self.len += 1;
-        const msg = self.bytes[0..self.len];
-        if (msg.len < 2 or msg.len < 2 + msg[1]) return null;
-        self.len = 0;
-        return msg;
-    }
-};
-
 /// Takes `streams`. A live subscriber's first frame is drawn at once.
 pub fn subscribe(c: *Conductor, streams: ClientStreams, palette: ?pal.Palette, scope: status.Scope, oneshot: bool) !void {
     const sub = try c.allocator.create(Subscriber);
     errdefer c.allocator.destroy(sub);
-    sub.* = .{ .streams = streams, .palette = palette, .id = c.client_counter, .scope = scope, .oneshot = oneshot };
+    sub.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_counter }, .scope = scope, .oneshot = oneshot };
     try c.live.list.append(c.allocator, sub);
     if (oneshot) {
         c.refreshStats(null); // first reading; the deferred fire takes the second
@@ -189,14 +150,7 @@ pub fn subscribe(c: *Conductor, streams: ClientStreams, palette: ?pal.Palette, s
         c.live.armed = true;
         return;
     }
-    // Raw, so keys arrive as they are pressed; the probe left it so already.
-    const signals = streams.fd(.signals);
-    platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
-    platform.write(signals, &[_]u8{ protocol.signals.query_size, 0x00 });
-    sub.input = .{ .kind = .input, .fd = streams.fd(.stdin) };
-    sub.signals = .{ .kind = .signals, .fd = signals };
-    watch(c, &sub.input);
-    watch(c, &sub.signals);
+    sub.term.open(c);
     send(c, sub, view_start);
     repaint(c, sub);
     if (!c.live.armed) {
@@ -218,8 +172,8 @@ pub fn onTimer(c: *Conductor) void {
 
 /// A client's exit or interrupt, when it is a subscriber's.
 pub fn dropById(c: *Conductor, id: u32) bool {
-    for (c.live.list.items) |sub| if (sub.id == id) {
-        sub.gone = true;
+    for (c.live.list.items) |sub| if (sub.term.id == id) {
+        sub.term.gone = true;
         sweep(c);
         return true;
     };
@@ -227,7 +181,7 @@ pub fn dropById(c: *Conductor, id: u32) bool {
 }
 
 pub fn deinit(c: *Conductor) void {
-    for (c.live.list.items) |sub| sub.gone = true;
+    for (c.live.list.items) |sub| sub.term.gone = true;
     sweep(c);
     c.live.list.deinit(c.allocator);
     c.live.trends.deinit(c.allocator);
@@ -281,29 +235,29 @@ fn pruneSnapshots(c: *Conductor) void {
 /// Reads never wait, so a stale readiness costs nothing.
 pub fn onReadable(c: *Conductor, w: *Watch) void {
     const sub = for (c.live.list.items) |s| {
-        if (w == &s.input or w == &s.signals) break s;
+        if (w == &s.term.input or w == &s.term.signals) break s;
         if (s.attachment) |a| if (w == &a.output or w == &a.signals) break s;
     } else return;
     var buf: [16 << 10]u8 = undefined;
     const n = platform.recvNonBlocking(w.fd, &buf) orelse {
         switch (w.kind) {
-            .input, .signals => sub.gone = true,
+            .input, .signals => sub.term.gone = true,
             .watch_output => {}, // the verdict comes on its signals
             .watch_signals => endAttachment(c, sub, null),
         }
-        if (sub.gone) sweep(c);
+        if (sub.term.gone) sweep(c);
         return;
     };
     const bytes = buf[0..n];
     switch (w.kind) {
         .input => onKeys(c, sub, bytes),
-        .signals => onClientSignals(sub, bytes),
+        .signals => sub.term.onSignals(bytes),
         .watch_output => onWatchOutput(c, sub, bytes),
         .watch_signals => onWatchSignals(c, sub, bytes),
     }
-    if (sub.gone) return sweep(c);
+    if (sub.term.gone) return sweep(c);
     // Unless the reading ended what it watched.
-    const still = w == &sub.input or w == &sub.signals or
+    const still = w == &sub.term.input or w == &sub.term.signals or
         if (sub.attachment) |a| w == &a.output or w == &a.signals else false;
     if (still) watch(c, w);
 }
@@ -323,12 +277,12 @@ fn fire(c: *Conductor) void {
     var blinking = false;
     for (c.live.list.items) |sub| {
         if (!sub.oneshot) {
-            platform.write(sub.streams.fd(.signals), &[_]u8{ protocol.signals.query_size, 0x00 });
+            platform.write(sub.term.streams.fd(.signals), &[_]u8{ protocol.signals.query_size, 0x00 });
             retarget(c, sub);
         }
         repaint(c, sub);
-        if (sub.oneshot) sub.gone = true;
-        behind = behind or sub.queued.items.len > 0;
+        if (sub.oneshot) sub.term.gone = true;
+        behind = behind or sub.term.queued.items.len > 0;
         blinking = blinking or sub.cursor_drawn;
     }
     sweep(c);
@@ -340,7 +294,10 @@ fn fire(c: *Conductor) void {
 // A subscriber still behind catches up first, skipping this frame; one
 // following a session gets only its output.
 fn repaint(c: *Conductor, sub: *Subscriber) void {
-    if (sub.queued.items.len > 0) return flushQueued(sub);
+    if (sub.term.queued.items.len > 0) {
+        _ = sub.term.flushQueued();
+        return;
+    }
     if (sub.following) return;
     if (sub.paging) return drawPager(c, sub);
     var out: std.ArrayList(u8) = .empty;
@@ -349,27 +306,19 @@ fn repaint(c: *Conductor, sub: *Subscriber) void {
         std.debug.print("Status: render failed: {}\n", .{err});
         return;
     };
-    sendFrame(c, sub, out.items);
-    sub.lines_last_printed = lines;
-}
-
-// Repainting what is already shown would still clear a selection in it.
-fn sendFrame(c: *Conductor, sub: *Subscriber, frame: []const u8) void {
-    const hash = std.hash.Wyhash.hash(0, frame);
-    if (hash == sub.drawn) return;
-    sub.drawn = hash;
-    send(c, sub, frame);
+    sub.term.sendFrame(c.allocator, out.items);
+    sub.term.lines_last_printed = lines;
 }
 
 // DEC 2026 synchronised update, so no tearing; ESC[<n>F returns to the
 // frame's top and ESC[0J clears any tail. Returns the frame's lines.
 fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize {
     sub.cursor_drawn = false; // until a pane marks one
-    var report = try c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub), !sub.oneshot and sub.focus == null);
+    var report = try c.renderStatus("live", true, sub.term.palette, sub.scope, sub.focus, focusedTrend(c, sub), !sub.oneshot and sub.focus == null);
     const kept = tui.keepFocus(report.clients, sub.focus, sub.focus_row);
     if (kept != sub.focus) {
         sub.focus = kept;
-        const again = c.renderStatus("live", true, sub.palette, sub.scope, sub.focus, focusedTrend(c, sub), !sub.oneshot and sub.focus == null) catch |err| {
+        const again = c.renderStatus("live", true, sub.term.palette, sub.scope, sub.focus, focusedTrend(c, sub), !sub.oneshot and sub.focus == null) catch |err| {
             report.deinit(c.allocator);
             return err;
         };
@@ -378,7 +327,7 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     }
     defer report.deinit(c.allocator);
     try out.appendSlice(c.allocator, "\x1b[?2026h");
-    if (sub.lines_last_printed > 0) try out.print(c.allocator, "\x1b[{d}F\x1b[0J", .{sub.lines_last_printed});
+    if (sub.term.lines_last_printed > 0) try out.print(c.allocator, "\x1b[{d}F\x1b[0J", .{sub.term.lines_last_printed});
     var lines = report.lines;
     const placed = if (sub.focus) |focus| placed: {
         sub.focus_row = std.mem.indexOfScalar(u32, report.clients, focus) orelse 0;
@@ -388,7 +337,7 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     // row short of the screen, so it never scrolls.
     const full = sub.view != .transcript or (sub.preview == .transcript and sub.tail.items.len > 0);
     const wanted: usize = if (full) max_pane_rows else tui.min_pane_rows;
-    const rows = @min(wanted, @as(usize, sub.size.rows) -| 1 -| lines +| 1);
+    const rows = @min(wanted, @as(usize, sub.term.size.rows) -| 1 -| lines +| 1);
     if (placed != null and rows >= tui.min_pane_rows) {
         const at = placed.?;
         try out.appendSlice(c.allocator, report.bytes[0..at.start]);
@@ -421,7 +370,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
     var charted: std.ArrayList(u8) = .empty;
     defer charted.deinit(c.allocator);
     try tui.appendCollapsed(&charted, c.allocator, joined.items);
-    const width = @as(usize, sub.size.cols) -| at.gutter_cols;
+    const width = @as(usize, sub.term.size.cols) -| at.gutter_cols;
     const fits = report.aside.len > 0 and
         try columnsOf(c.allocator, charted.items) + try columnsOf(c.allocator, report.aside) + 10 <= width;
     const label = info.worker.session_label;
@@ -482,17 +431,17 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
         .cursor_last = sub.cursor_drawn,
         // Steady while the session writes, then a second off, a second on.
         .cursor_shown = @mod(@divTrunc(c.nowNs() - sub.output_ns, std.time.ns_per_s), 2) == 0,
-        .cursor_sgr = mutedSgr(sub.palette, &cursor_sgr),
+        .cursor_sgr = mutedSgr(sub.term.palette, &cursor_sgr),
         .branch = &at.branch,
         .gutter = &at.gutter,
-    }, @as(usize, sub.size.cols) -| at.gutter_cols, rows);
+    }, @as(usize, sub.term.size.cols) -| at.gutter_cols, rows);
 }
 
 fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     var keys = tui.KeyIterator{ .bytes = bytes };
     while (keys.next()) |key| {
         if (key == .interrupt) {
-            sub.gone = true;
+            sub.term.gone = true;
             return;
         }
         if (sub.following) {
@@ -513,7 +462,7 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
         switch (key) {
             .char => |ch| switch (ch) {
                 'q' => {
-                    sub.gone = true;
+                    sub.term.gone = true;
                     return;
                 },
                 'i' => if (sub.focus) |focus| interrupt(c, sub, focus),
@@ -650,15 +599,15 @@ fn drawPager(c: *Conductor, sub: *Subscriber) void {
     const shown: u64 = switch (sub.view) {
         .log => shown: {
             logLines(c, info.worker, logring.max_entries, &text, &lines) catch return;
-            break :shown logShown(&info.worker.recent, c.currentTime(), sub.size);
+            break :shown logShown(&info.worker.recent, c.currentTime(), sub.term.size);
         },
         else => shown: {
             const snap = findSnapshot(c, info.worker.id) orelse return;
             pagerLines(c.allocator, snap, &lines) catch return;
-            break :shown pagerShown(snap, sub.size);
+            break :shown pagerShown(snap, sub.term.size);
         },
     };
-    const rows = @as(usize, sub.size.rows) -| 1;
+    const rows = @as(usize, sub.term.size.rows) -| 1;
     sub.scroll = @min(sub.scroll, lines.items.len -| rows);
     const same = sub.pager_top != null and sub.pager_shown == shown;
     if (same and sub.pager_top.? == sub.scroll) return;
@@ -668,7 +617,7 @@ fn drawPager(c: *Conductor, sub: *Subscriber) void {
     const bottom = @min(lines.items.len, top + rows);
     writePager(c, sub, &out, lines.items, top, bottom, rows, if (same) sub.pager_top.? else null) catch return;
     out.print(c.allocator, "\x1b[{d};1H\x1b[2K\x1b[7m worker #{d} · lines {d}–{d} of {d} · \x1b[1m↑↓ PgUp PgDn g G\x1b[22m · \x1b[1mq\x1b[22m back \x1b[0m\x1b[?2026l", .{
-        sub.size.rows, info.worker.id, top + 1, bottom, lines.items.len,
+        sub.term.size.rows, info.worker.id, top + 1, bottom, lines.items.len,
     }) catch return;
     send(c, sub, out.items);
     sub.pager_top = top;
@@ -704,7 +653,7 @@ fn writePager(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8), lines: [
     }
     for (first..last) |i| {
         try out.print(gpa, "\x1b[{d};1H\x1b[2K", .{i - top + 1});
-        _ = try tui.appendColumns(out, gpa, lines[i], sub.size.cols, true);
+        _ = try tui.appendColumns(out, gpa, lines[i], sub.term.size.cols, true);
     }
 }
 
@@ -786,7 +735,7 @@ fn pagerLines(gpa: std.mem.Allocator, snap: *const Snapshot, out: *std.ArrayList
 }
 
 fn pagerKey(c: *Conductor, sub: *Subscriber, key: tui.Key) void {
-    const page = @as(usize, sub.size.rows) -| 2;
+    const page = @as(usize, sub.term.size.rows) -| 2;
     switch (key) {
         .up => sub.scroll -|= 1,
         .down => sub.scroll += 1,
@@ -808,31 +757,9 @@ fn pagerKey(c: *Conductor, sub: *Subscriber, key: tui.Key) void {
 
 fn leavePager(c: *Conductor, sub: *Subscriber) void {
     sub.paging = false;
-    sub.drawn = 0;
+    sub.term.drawn = 0;
     send(c, sub, main_screen);
     repaint(c, sub);
-}
-
-/// "↑↓ focus · q quit" with the keys bold, the rest dim as the border it
-/// sits in; a key without a description stands alone, "y/n" as "y · n".
-fn hints(comptime pairs: []const [2][]const u8) []const u8 {
-    comptime var text: []const u8 = "";
-    inline for (pairs, 0..) |pair, i| {
-        if (i > 0) text = text ++ if (pair[1].len == 0 and pairs[i - 1][1].len == 0) "/" else " · ";
-        text = text ++ "\x1b[0;1m" ++ pair[0] ++ "\x1b[0;2m" ++ (if (pair[1].len > 0) " " ++ pair[1] else "");
-    }
-    return text;
-}
-
-// The client's replies: a raw-mode ack, or the terminal's size.
-fn onClientSignals(sub: *Subscriber, bytes: []const u8) void {
-    for (bytes) |byte| {
-        const msg = sub.frames.feed(byte) orelse continue;
-        if (msg[0] == protocol.signals.query_size and msg[1] == 4) sub.size = .{
-            .rows = std.mem.readInt(u16, msg[2..4], .little),
-            .cols = std.mem.readInt(u16, msg[4..6], .little),
-        };
-    }
 }
 
 // Sampled a second apart, only while a live view is open; a worker gone
@@ -916,7 +843,7 @@ fn enterFollow(c: *Conductor, sub: *Subscriber) void {
         },
     }
     sub.following = true;
-    sub.drawn = 0;
+    sub.term.drawn = 0;
     send(c, sub, alternate_screen);
 }
 
@@ -924,7 +851,7 @@ fn enterFollow(c: *Conductor, sub: *Subscriber) void {
 fn leaveFollow(c: *Conductor, sub: *Subscriber) void {
     detach(c, sub);
     sub.following = false;
-    sub.drawn = 0;
+    sub.term.drawn = 0;
     send(c, sub, main_screen);
     sub.target = null;
     retarget(c, sub);
@@ -1044,8 +971,8 @@ fn onWatchSignals(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
             protocol.signals.raw_mode => platform.write(a.signals.fd, &[_]u8{ msg[0], 0 }),
             protocol.signals.query_size => {
                 var reply = [_]u8{ msg[0], 4, 0, 0, 0, 0 };
-                std.mem.writeInt(u16, reply[2..4], sub.size.rows, .little);
-                std.mem.writeInt(u16, reply[4..6], sub.size.cols, .little);
+                std.mem.writeInt(u16, reply[2..4], sub.term.size.rows, .little);
+                std.mem.writeInt(u16, reply[4..6], sub.term.size.cols, .little);
                 platform.write(a.signals.fd, &reply);
             },
             else => {},
@@ -1068,37 +995,12 @@ fn endAttachment(c: *Conductor, sub: *Subscriber, code: ?u8) void {
 
 // --- I/O ---
 
-fn watch(c: *Conductor, w: *Watch) void {
-    c.event_loop.watchFd(@intFromPtr(w) | tag, w.fd);
-}
-
-fn unwatch(c: *Conductor, w: *Watch) void {
-    c.event_loop.unwatchFd(@intFromPtr(w) | tag, w.fd);
-}
+const watch = terminal.watch;
+const unwatch = terminal.unwatch;
+const hints = terminal.hints;
 
 fn send(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
-    var rest = bytes;
-    if (sub.queued.items.len == 0) {
-        const n = platform.sendNonBlocking(sub.stdout(), rest) orelse {
-            sub.gone = true;
-            return;
-        };
-        rest = rest[n..];
-    }
-    if (rest.len == 0) return;
-    sub.queued.appendSlice(c.allocator, rest) catch {
-        sub.gone = true;
-        return;
-    };
-    if (sub.queued.items.len > max_queued_bytes) sub.gone = true;
-}
-
-fn flushQueued(sub: *Subscriber) void {
-    const n = platform.sendNonBlocking(sub.stdout(), sub.queued.items) orelse {
-        sub.gone = true;
-        return;
-    };
-    sub.queued.replaceRangeAssumeCapacity(0, n, &.{});
+    sub.term.send(c.allocator, bytes);
 }
 
 // Ends the gone: the shell prompt lands under the last frame.
@@ -1106,21 +1008,14 @@ fn sweep(c: *Conductor) void {
     var i: usize = 0;
     while (i < c.live.list.items.len) {
         const sub = c.live.list.items[i];
-        if (!sub.gone) {
+        if (!sub.term.gone) {
             i += 1;
             continue;
         }
         _ = c.live.list.swapRemove(i);
-        if (!sub.oneshot) {
-            detach(c, sub);
-            unwatch(c, &sub.input);
-            unwatch(c, &sub.signals);
-            const leaving = if (sub.following or sub.paging) main_screen ++ "\r\n" ++ view_end else "\r\n" ++ view_end;
-            _ = platform.sendNonBlocking(sub.stdout(), leaving);
-        }
-        sub.streams.closeForExit(0);
-        sub.streams.deinit();
-        sub.queued.deinit(c.allocator);
+        if (!sub.oneshot) detach(c, sub);
+        const full_screen = sub.following or sub.paging;
+        sub.term.close(c, if (sub.oneshot) null else if (full_screen) main_screen ++ "\r\n" ++ view_end else "\r\n" ++ view_end);
         sub.tail.deinit(c.allocator);
         c.allocator.free(sub.order);
         c.allocator.destroy(sub);

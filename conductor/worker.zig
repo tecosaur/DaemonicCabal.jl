@@ -148,7 +148,11 @@ pub const Worker = struct {
     julia_channel: ?[]const u8,
     threads: args.Threads,
     session_label: ?[]const u8,
+    /// Whether a `--session` client has run here: its `Main` outlives it.
+    hosts_session: bool = false,
     created_at: i64,
+    /// As its spawn began, from the environment then (ns, awake clock).
+    spawned_ns: i64,
     last_active: i64,
     last_pinged: i64,
     ping_pending: bool = false,
@@ -313,6 +317,7 @@ pub const Worker = struct {
                 .threads = threads,
                 .session_label = null,
                 .created_at = now,
+                .spawned_ns = @intCast(Io.Clock.now(.awake, io).nanoseconds),
                 .last_active = now,
                 .last_pinged = now,
                 .active_clients = 0,

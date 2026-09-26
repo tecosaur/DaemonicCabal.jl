@@ -93,7 +93,7 @@ function install_service(env::Dict{String,String})
     install_conductor_bundle()
     @info "Installing launchd agent"
     mkpath(dirname(plist))
-    write(plist, launchd_plist_content(env))
+    write(plist, launchd_plist_content(merge(env, Dict("JULIA_DAEMON_SERVICE" => "launchd:" * plist))))
     run(`launchctl load $plist`)
 end
 
