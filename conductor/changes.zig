@@ -58,7 +58,12 @@ pub const State = struct {
     }
 
     pub fn isUnsaved(self: *const State, i: usize) bool {
-        return !same(self.applied[i], self.saved[i]);
+        return !alike(i, self.applied[i], self.saved[i]);
+    }
+
+    /// Whether setting `i` is applied, but read only as the conductor starts.
+    pub fn awaitsRestart(self: *const State, i: usize) bool {
+        return all[i].effect == .restart and !alike(i, self.applied[i], self.running[i]);
     }
 
     /// The service writes what `changesToSave` gave.
@@ -172,8 +177,7 @@ pub const Staged = struct {
     }
 
     fn inEffect(state: *const State, i: usize, value: ?[]const u8) bool {
-        const applied = state.applied[i];
-        return same(value, applied) or (applied == null and same(value, all[i].default));
+        return alike(i, value, state.applied[i]);
     }
 };
 
@@ -205,8 +209,8 @@ pub fn pending(state: *const State, staged: *const Staged, fleet: Fleet, saving:
     for (0..all.len) |i| {
         if (staged.has(i)) p.staged += 1;
         if (state.isUnsaved(i)) p.unsaved += 1;
-        if (!same(staged.effective(state, i), state.saved[i])) p.after += 1;
-        if (all[i].effect == .restart and !same(state.applied[i], state.running[i])) p.restart += 1;
+        if (!alike(i, staged.effective(state, i), state.saved[i])) p.after += 1;
+        if (state.awaitsRestart(i)) p.restart += 1;
         const staged_for_workers = all[i].effect == .new_workers and staged.has(i) and fleet.oldest_spawn_ns != null;
         if (staged_for_workers or isMissed(state, fleet, i)) p.workers += 1;
     }
@@ -217,14 +221,32 @@ pub fn pending(state: *const State, staged: *const Staged, fleet: Fleet, saving:
 /// Whether setting `i` is applied, for workers to read as they start, and
 /// one running started before.
 pub fn isMissed(state: *const State, fleet: Fleet, i: usize) bool {
-    if (all[i].effect != .new_workers or same(state.applied[i], state.running[i])) return false;
+    if (all[i].effect != .new_workers or alike(i, state.applied[i], state.running[i])) return false;
     const oldest = fleet.oldest_spawn_ns orelse return false;
     return oldest < state.workers_changed_ns;
 }
 
-pub fn same(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
+/// Which of a viewer's keys would change something for setting `i`: those
+/// that wouldn't are greyed, and do nothing.
+pub const Actions = struct { default: bool, undo: bool, apply: bool, save: bool };
+
+pub fn actions(state: *const State, staged: *const Staged, p: Pending, i: usize) Actions {
+    return .{
+        .default = all[i].effect != .fixed and !alike(i, staged.effective(state, i), null),
+        .undo = staged.has(i) or state.isUnsaved(i),
+        .apply = p.staged > 0,
+        .save = p.staged + p.unsaved > 0,
+    };
+}
+
+/// Whether `a` and `b` are the same value of setting `i`, unset being its
+/// default: the one notion of a change, so every state agrees on it.
+pub fn alike(i: usize, a: ?[]const u8, b: ?[]const u8) bool {
+    const default = all[i].default;
+    const x = a orelse default;
+    const y = b orelse default;
+    if (x == null or y == null) return x == null and y == null;
+    return std.mem.eql(u8, x.?, y.?);
 }
 
 fn setOwned(gpa: Allocator, slot: *?[]const u8, value: ?[]const u8) Allocator.Error!void {
@@ -242,6 +264,7 @@ const min_ttl = settings.Setting.index("JULIA_DAEMON_MIN_TTL");
 const max_ttl = settings.Setting.index("JULIA_DAEMON_MAX_TTL");
 const ping = settings.Setting.index("JULIA_DAEMON_PING_INTERVAL");
 const project = settings.Setting.index("JULIA_DAEMON_WORKER_PROJECT");
+const maxclients = settings.Setting.index("JULIA_DAEMON_WORKER_MAXCLIENTS");
 
 // A conductor started with `env`, by a service declaring `service_env`.
 fn started(env: []const [2][]const u8, service_env: []const [2][]const u8, unset: []const []const u8) !State {
@@ -309,8 +332,39 @@ test "staging what's in effect, or the installer's, stages nothing" {
     try staged.stage(gpa, &state, min_ttl, "120"); // unset, and its default
     try staged.stage(gpa, &state, project, "/elsewhere");
     try testing.expect(!staged.has(max_ttl) and !staged.has(min_ttl) and !staged.has(project));
-    try staged.stage(gpa, &state, max_ttl, null); // the default, though alike, is a change: unset
-    try testing.expect(staged.has(max_ttl));
+    try staged.stage(gpa, &state, max_ttl, null); // unset, its default: alike
+    try testing.expect(!staged.has(max_ttl));
+    try staged.stage(gpa, &state, max_ttl, "3600");
+    try staged.stage(gpa, &state, max_ttl, null); // a change dropped
+    try testing.expect(!staged.has(max_ttl));
+}
+
+test "a setting reset to the default its service sets is neither unsaved nor awaiting restart" {
+    const gpa = testing.allocator;
+    // The installer writes these, at their defaults; the TTL by its old name.
+    const declared = [_][2][]const u8{ .{ "JULIA_DAEMON_WORKER_MAXCLIENTS", "1" }, .{ "JULIA_DAEMON_WORKER_TTL", "7200" } };
+    var state = try started(&declared, &declared, &.{});
+    defer state.deinit(gpa);
+    var staged: Staged = .{};
+    defer staged.deinit(gpa);
+    for ([_]usize{ maxclients, max_ttl }, [_][]const u8{ "2", "3600" }) |i, changed| {
+        try staged.stage(gpa, &state, i, changed);
+        _ = try state.apply(gpa, &staged);
+        try staged.stage(gpa, &state, i, null);
+        try testing.expect(staged.has(i));
+        _ = try state.apply(gpa, &staged);
+        try testing.expect(state.applied[i] == null and !state.isUnsaved(i) and !state.awaitsRestart(i));
+        // Nothing is left to undo, reset, or save; so nothing to ask on quitting.
+        const p = pending(&state, &staged, .{}, true);
+        try testing.expect(p.unsaved == 0 and p.restart == 0 and p.after == 0 and !p.asks());
+        const a = actions(&state, &staged, p, i);
+        try testing.expect(!a.default and !a.undo and !a.save);
+        try staged.undo(gpa, &state, i);
+        try staged.stage(gpa, &state, i, all[i].default);
+        try testing.expect(!staged.has(i));
+    }
+    var buf: [2 * all.len]service.Change = undefined;
+    try testing.expectEqual(@as(usize, 0), state.changesToSave(&buf).len);
 }
 
 test "undo drops a staged change, else stages the saved value" {

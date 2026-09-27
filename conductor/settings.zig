@@ -183,10 +183,8 @@ fn formOf(kind: Kind, text: []const u8, buf: []u8) Invalid![]const u8 {
         },
         .share => if (std.mem.endsWith(u8, text, "%"))
             printed(buf, "{s}%", .{try percentText(text)})
-        else blk: {
-            const b = try parseBytes(text);
-            break :blk printed(buf, "{d}{s}", .{ b.count, b.suffix });
-        },
+        else
+            formOf(.bytes, text, buf),
         .percent => printed(buf, "{s}", .{try percentText(text)}),
         .flag => if (parseFlag(text)) |on| (if (on) "1" else "0") else error.Invalid,
         .choice => |options| for (options) |option| {
@@ -264,9 +262,9 @@ fn stepOnce(s: *const Setting, input: []const u8, up: bool, buf: []u8) ?[]const 
         .seconds => display(s, printed(&form_buf, "{d}", .{
             ladderStep(&seconds_ladder, std.fmt.parseInt(u64, form, 10) catch return null, up),
         }) catch return null, buf),
-        .bytes => sizeText(ladderStep(&bytes_ladder, (parseBytes(form) catch return null).total(), up), buf),
         .percent => printed(buf, "{d}%", .{percentStep(form, up) orelse return null}) catch null,
-        .share => if (std.mem.endsWith(u8, form, "%"))
+        // Only a share's form can end in `%`.
+        .bytes, .share => if (std.mem.endsWith(u8, form, "%"))
             printed(buf, "{d}%", .{percentStep(form[0 .. form.len - 1], up) orelse return null}) catch null
         else
             sizeText(ladderStep(&bytes_ladder, (parseBytes(form) catch return null).total(), up), buf),

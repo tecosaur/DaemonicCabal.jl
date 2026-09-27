@@ -329,11 +329,11 @@ const Frame = struct {
         const note_at = @max(columns(shown), row.value_cols);
         var note_buf: [192]u8 = undefined;
         var note = std.Io.Writer.fixed(&note_buf);
-        const at_default = isDefault(s, value);
+        const at_default = changes.alike(i, value, null);
         // Being the default is marked fainter than a default it differs from.
         const marked = s.effect != .fixed and at_default and s.default != null;
         // Staged away from the default, it was the default: "was default 1".
-        const was_default = staged and !at_default and s.default != null and isDefault(s, applied);
+        const was_default = staged and !at_default and s.default != null and changes.alike(i, applied, null);
         if (staged and !was_default) {
             var was: [128]u8 = undefined;
             note.print("was {s} · ", .{settings.display(s, applied, &was)}) catch {};
@@ -380,7 +380,7 @@ const Frame = struct {
             parts[n] = unsaved_colour ++ "unsaved";
             n += 1;
         }
-        if (all[i].effect == .restart and !changes.same(state.applied[i], state.running[i])) {
+        if (state.awaitsRestart(i)) {
             parts[n] = "on restart";
             n += 1;
         } else if (changes.isMissed(state, scene.fleet, i)) {
@@ -462,15 +462,15 @@ const Frame = struct {
             try self.write(comptime hints(&.{ .{ "⏎", "stage" }, .{ "Esc", "cancel" } }));
         } else {
             const i = scene.focus;
-            const fixed = all[i].effect == .fixed;
+            const can = changes.actions(scene.state, scene.staged, p, i);
             try self.writeHints(&.{
                 .{ .key = "←→", .action = "tab" },
                 .{ .key = "↑↓", .action = "setting" },
-                .{ .key = "⏎", .action = "edit", .applies = !fixed },
-                .{ .key = "d", .action = "default", .applies = !fixed and !isDefault(&all[i], scene.staged.effective(scene.state, i)) },
-                .{ .key = "u", .action = "undo", .applies = scene.staged.has(i) or scene.state.isUnsaved(i) },
-                .{ .key = "a", .action = "apply", .applies = p.staged > 0 },
-                .{ .key = "w", .action = "save", .applies = p.staged + p.unsaved > 0 },
+                .{ .key = "⏎", .action = "edit", .applies = all[i].effect != .fixed },
+                .{ .key = "d", .action = "default", .applies = can.default },
+                .{ .key = "u", .action = "undo", .applies = can.undo },
+                .{ .key = "a", .action = "apply", .applies = can.apply },
+                .{ .key = "w", .action = "save", .applies = can.save },
                 .{ .key = "q", .action = "quit" },
             });
         }
@@ -532,10 +532,6 @@ fn valueCols(items: []const Item, values: *const changes.Values) usize {
         if (cols <= max_value_cols) widest = @max(widest, cols);
     }
     return widest;
-}
-
-fn isDefault(s: *const Setting, value: ?[]const u8) bool {
-    return value == null or (s.default != null and std.mem.eql(u8, value.?, s.default.?));
 }
 
 fn kindColour(s: *const Setting, value: []const u8) []const u8 {
