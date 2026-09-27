@@ -604,13 +604,17 @@ pub const Conductor = struct {
         };
         defer self.allocator.free(worker_key);
         if (request.parsed.hasSwitch("--watch")) return self.serveWatch(socket, &request, worker_key, sandbox);
-        if (request.parsed.hasSwitch("--sync")) {
+        if (request.parsed.getSwitch("--sync")) |pages| {
             const session = request.parsed.getSwitch("--session");
             if (session == null or session.?.len == 0) {
                 std.debug.print("Client {d}: --sync without --session label, rejecting\n", .{self.client_counter});
                 try self.serveString(socket, "--sync requires --session=<label>\n", 1);
                 return .done;
             }
+            if (pages.len > 0) _ = std.fmt.parseInt(u16, pages, 10) catch {
+                try self.serveString(socket, "--sync=<pages> takes a whole number of pages to replay, 0 for all\n", 1);
+                return .done;
+            };
             std.debug.print("Client {d}: sync mode, session='{s}'\n", .{ self.client_counter, session.? });
         }
         if (request.parsed.hasSwitch("--restart")) {

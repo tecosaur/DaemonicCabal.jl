@@ -77,7 +77,7 @@ let
     write(bw, UInt8(0x41))
     Base.unsafe_write(bw, pointer("test\n"), UInt(5))
     flush(bw)
-    replay_history(IOBuffer(), screen)
+    replay_history(IOBuffer(), screen, (24, 80), 3)
     for event in first(transcript_events(transcript))
         json_event(event)
         render_text(event, false)
@@ -147,6 +147,7 @@ let io = IOContext{Base.PipeEndpoint}, frames = Vector{Base.StackTraces.StackFra
     precompile(Core.kwcall, (NamedTuple{(:backtrace,), Tuple{Bool}}, typeof(showerror), io, ErrorException, frames))
 end
 @static VERSION >= v"1.11" && precompile(display_client_error, (IO, Base.ExceptionStack))
+precompile(replay_history, (Base.PipeEndpoint, Recording, Tuple{Int, Int}, Int))
 precompile(record_package_sources, (Base.PkgId,))
 precompile(accept_client_sockets, (NTuple{4, Sockets.PipeServer}, Int))
 precompile(register_client!, (Int, Task, Base.PipeEndpoint, Base.PipeEndpoint, Base.PipeEndpoint, Base.PipeEndpoint))

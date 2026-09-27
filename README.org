@@ -96,6 +96,9 @@ to have Revise.jl pick up your edits.
 ~$ juliaclient --sync --session=work -e 'x = 42'
 #+end_example
 
+A terminal joining partway is shown the latest prompts and their output,
+three pages of it by default: =--sync=N= asks for =N=, and =--sync=0= for all.
+
 Ctrl-D detaches just your terminal; the REPL ends once the last one leaves.
 
 ** Following a session
