@@ -240,15 +240,26 @@ fn run(init: std.process.Init.Minimal) !void {
     defer arena.deinit();
     const inputs = try collectInputs(arena.allocator(), init);
     var env = scanEnv(inputs.env);
-    const parsed = try args.parse(arena.allocator(), inputs.args);
+    var problem: args.Problem = undefined;
+    const parsed = args.parseReporting(arena.allocator(), inputs.args, &problem) catch |err| switch (err) {
+        error.InvalidArguments => {
+            platform.eprint("ERROR: {f}\n", .{problem});
+            exitClient(1);
+        },
+        else => return err,
+    };
     if (parsed.getSwitch("--address")) |addr| if (addr.len > 0) {
         env.server_path = addr;
     };
-    if (parsed.hasSwitch("--help") or parsed.hasSwitch("-h")) {
+    if (parsed.hasSwitch("--help")) {
         platform.writeFile(platform.getStdoutHandle(), protocol.CLIENT_HELP);
         return;
     }
-    if (parsed.hasSwitch("--version") or parsed.hasSwitch("-v")) {
+    if (parsed.hasSwitch("--help-hidden")) {
+        platform.writeFile(platform.getStdoutHandle(), protocol.CLIENT_HELP_HIDDEN);
+        return;
+    }
+    if (parsed.hasSwitch("--version")) {
         printVersion(env);
         return;
     }
@@ -272,7 +283,7 @@ fn run(init: std.process.Init.Minimal) !void {
     // The worker's own terminal knows nothing of ours. Colour follows where
     // output goes, as Julia's does.
     const color = platform.isatty(platform.getStdoutHandle()) and !hasNoColor(inputs.env);
-    try sendClientInfo(&w, env, is_tty, color, try forwardedArgs(arena.allocator(), inputs.args, &parsed));
+    try sendClientInfo(&w, env, is_tty, color, inputs.args);
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers();
     signal_parser.sync_mode = sync;
@@ -585,14 +596,3 @@ fn getTerminalSize() struct { height: u16, width: u16 } {
     return .{ .height = 24, .width = 80 };
 }
 
-/// argv less the client's own `--address`.
-fn forwardedArgs(allocator: std.mem.Allocator, argv: []const []const u8, parsed: *const args.ParsedArgs) ![]const []const u8 {
-    const keep = try allocator.alloc(bool, argv.len);
-    @memset(keep, true);
-    for (parsed.switches.items) |sw| if (std.mem.eql(u8, sw.name, "--address")) {
-        @memset(keep[sw.index..][0..sw.words], false);
-    };
-    var forwarded: std.ArrayList([]const u8) = .empty;
-    for (argv, keep) |arg, kept| if (kept) try forwarded.append(allocator, arg);
-    return forwarded.items;
-}

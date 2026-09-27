@@ -1175,7 +1175,7 @@ pub const Conductor = struct {
         sandbox: SandboxKind,
     ) !?WorkerAssignment {
         const want_interactive = for (client_info.switches) |sw| {
-            if (std.mem.eql(u8, sw.name, "-i")) break true;
+            if (std.mem.eql(u8, sw.name, "--interactive")) break true;
         } else false;
         // 1. Labeled session: join its worker (global, or scoped to an explicit --project)
         if (is_labeled_session) {
@@ -1368,7 +1368,7 @@ pub const Conductor = struct {
     fn beginClientSpawn(self: *Conductor, hold: *HeldClient) !void {
         const proj = hold.request.project orelse "";
         // Conductor-built sandboxes are never interactive.
-        const interactive = (hold.sandbox == .none or hold.sandbox == .client) and hold.request.parsed.hasSwitch("-i");
+        const interactive = (hold.sandbox == .none or hold.sandbox == .client) and hold.request.parsed.hasSwitch("--interactive");
         var rw_bind: [1][]const u8 = undefined;
         var ro_bind: [1][]const u8 = undefined;
         const launch: worker.Worker.Launch = switch (hold.sandbox) {
