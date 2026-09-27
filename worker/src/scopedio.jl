@@ -107,10 +107,37 @@ end
 
 const TERMINFOS = Dict{String, Base.TermInfo}()
 
+# The client terminal's, for Base's `current_terminfo` and colour queries as the
+# worker overrides them. The worker's code calls these, not Base's: an edge to an
+# overridden method is invalidated with it.
+@static if VERSION >= v"1.12"
+    function client_terminfo()
+        term = ACTIVE_TERM[]
+        isnothing(term.terminfo) || return term.terminfo
+        terminfo = Base.load_terminfo(term.term)
+        if !haskey(terminfo, :setaf) && startswith(term.term, "xterm")
+            terminfo[:setaf] = "\e[3%p1%dm"
+        end
+        term.terminfo = TERMINFOS[term.term] = terminfo
+    end
+
+    function client_have_color()
+        term = ACTIVE_TERM[]
+        isnothing(term.have_color) || return term.have_color
+        term.have_color = haskey(client_terminfo(), :setaf)  # as `Base.ttyhascolor`
+    end
+
+    function client_have_truecolor()
+        term = ACTIVE_TERM[]
+        isnothing(term.have_truecolor) || return term.have_truecolor
+        term.have_truecolor = Base.ttyhastruecolor()
+    end
+end
+
 function Base.get(::Union{ScopedStdout, ScopedStderr, TerminalStdout}, key::Symbol, default)
     if key === :color
         @static if VERSION >= v"1.12"
-            Base.get_have_color()
+            client_have_color()
         else
             something(ACTIVE_TERM[].have_color, false)
         end

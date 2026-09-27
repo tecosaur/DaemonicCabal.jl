@@ -16,6 +16,7 @@ const STATE = (
     conductor_socket = Ref(""),
     standby_sockets = Ref{Union{Nothing, NTuple{4, Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}}}}(nothing),
     standby_module = Ref{Union{Nothing, Module}}(nothing),
+    repl_warmed = Threads.Atomic{Bool}(false),
     sync_sessions = Dict{String, SyncSession}())
 
 # Configuration, set by `runworker`
@@ -499,12 +500,29 @@ function unregister_client!(client::ClientInfo)
     idle && STATE.soft_exit[] && real_exit(0)
     ensure_standby_sockets()
     ensure_standby_module()
-    # An idle worker allocates nothing, so no collection would free the run's garbage.
-    idle && Timer(_ -> (@lock STATE.lock isempty(STATE.clients)) && GC.gc(true), IDLE_COLLECT_DELAY_S)
+    idle && Timer(_ -> settle(), SETTLE_DELAY_S)
+end
+
+# Work for a worker left without clients for `SETTLE_DELAY_S`, so that no client
+# waits on it: the REPL pre-warm (once), then collecting the garbage, which an
+# idle worker, allocating nothing, would otherwise keep.
+function settle()
+    quiet = @lock STATE.lock isempty(STATE.clients) && time() - STATE.lastclient[] >= SETTLE_DELAY_S
+    quiet || return
+    # Off thread 0, which answers the conductor.
+    errormonitor(Threads.@spawn begin
+        Threads.atomic_xchg!(STATE.repl_warmed, true) || warm_repl_path()
+        GC.gc(true)
+        @static if Sys.islinux()
+            # glibc keeps what is freed (largely the compiler's) until asked; musl has no malloc_trim.
+            trim = ccall(:dlsym, Ptr{Cvoid}, (Ptr{Cvoid}, Cstring), C_NULL, "malloc_trim")
+            trim == C_NULL || ccall(trim, Cint, (Csize_t,), 0)
+        end
+    end)
 end
 
 const CLIENT_ACCEPT_TIMEOUT_S = 30.0
-const IDLE_COLLECT_DELAY_S = 0.5
+const SETTLE_DELAY_S = 2.0
 const TCP_KEEPALIVE_IDLE_S = 60
 
 # A bare `accept` would stall pings on a client that died after getting its
@@ -710,7 +728,8 @@ function runworker(socketpath::String, conductor_address::String, worker_id::Int
     queue_orphan_check()
     ensure_standby_sockets()
     ensure_standby_module()
-    errormonitor(Threads.@spawn warm_repl_path())
+    @lock STATE.lock STATE.lastclient[] = time()
+    Timer(_ -> settle(), SETTLE_DELAY_S)
     exit_code = 0
     try
         verify_magic(conn)

@@ -3,66 +3,16 @@
 
 @eval Base.isinteractive() = CLIENT_INTERACTIVE[]
 
+# An override invalidates its callers, to be recompiled against it: those with
+# many are shims into the package's precompiled functions.
 @static if VERSION >= v"1.12"
-    @eval function Base.current_terminfo()
-        term = ACTIVE_TERM[]
-        isnothing(term.terminfo) || return term.terminfo
-        terminfo = Base.load_terminfo(term.term)
-        if !haskey(terminfo, :setaf) && startswith(term.term, "xterm")
-            terminfo[:setaf] = "\e[3%p1%dm"
-        end
-        term.terminfo = TERMINFOS[term.term] = terminfo
-    end
-
-    @eval function Base.get_have_color()
-        term = ACTIVE_TERM[]
-        isnothing(term.have_color) || return term.have_color
-        has_color = Base.ttyhascolor()
-        term.have_color = has_color
-    end
-
-    @eval function Base.get_have_truecolor()
-        term = ACTIVE_TERM[]
-        isnothing(term.have_truecolor) || return term.have_truecolor
-        has_truecolor = Base.ttyhastruecolor()
-        term.have_truecolor = has_truecolor
-    end
-
+    @eval Base.current_terminfo() = $client_terminfo()
+    @eval Base.get_have_color() = $client_have_color()
+    @eval Base.get_have_truecolor() = $client_have_truecolor()
 end
 
 @static if VERSION >= v"1.11"
-    @eval function Base.display_error(io::IO, stack::Base.ExceptionStack)
-        if !isempty(stack) && first(stack).exception isa DaemonClientExit
-            exit = first(stack).exception
-            term = ACTIVE_TERM[]
-            try close(term.stdout) catch end
-            try close(term.stderr) catch end
-            # The REPL still prints its next prompt, which the closed streams would fail.
-            term.redirect_out = devnull
-            term.redirect_err = devnull
-            session = term.sync_session
-            if !isnothing(session)
-                for sig in session.signals
-                    try send_signal(sig, SIGNAL_EXIT, UInt8[exit.code % UInt8]) catch end
-                end
-            else
-                send_signal(term.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8])
-            end
-            display(exit)
-        else
-            # Relayed Ctrl-Cs keep landing after the loop breaks: held off while
-            # the interrupt they asked for renders, then dropped, being answered.
-            try
-                Base.disable_sigint() do
-                    printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
-                    Base.show_exception_stack(IOContext(io, :limit => true), stack)
-                    println(io)
-                end
-            catch err
-                err isa InterruptException || rethrow()
-            end
-        end
-    end
+    @eval Base.display_error(io::IO, stack::Base.ExceptionStack) = $display_client_error(io, stack)
     # The display stack is process-wide, but a REPL's display belongs to its
     # own session: not to a concurrent run, nor to the REPL pre-warm.
     @eval Base.Multimedia.xdisplayable(d::REPL.REPLDisplay, @nospecialize args...) =
@@ -106,15 +56,18 @@ end
         end
         nothing
     end
-    # The per-client Main prints as "Main", not "Main.Main".
-    @eval function Base.print_fullname(io::IO, m::Module)
-        mp = parentmodule(m)
-        if m === Main || m === Base || m === Core || mp === m || m === CLIENT_MODULE[]
-            Base.show_sym(io, nameof(m))
-        else
-            Base.print_fullname(io, mp)
-            print(io, '.')
-            Base.show_sym(io, nameof(m))
+    # The per-client Main prints as "Main", not "Main.Main" (from 1.12, being
+    # its own parent does this: see `create_module`).
+    @static if VERSION < v"1.12"
+        @eval function Base.print_fullname(io::IO, m::Module)
+            mp = parentmodule(m)
+            if m === Main || m === Base || m === Core || mp === m || m === CLIENT_MODULE[]
+                Base.show_sym(io, nameof(m))
+            else
+                Base.print_fullname(io, mp)
+                print(io, '.')
+                Base.show_sym(io, nameof(m))
+            end
         end
     end
     # Replay goes to the client's own stdout, so history doesn't recapture it.
