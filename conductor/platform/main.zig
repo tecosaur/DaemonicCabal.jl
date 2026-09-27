@@ -125,6 +125,11 @@ pub const registerSignalHandlers = shared.registerSignalHandlers;
 pub const setRawMode = shared.setRawMode;
 pub const setWorkerRawMode = shared.setWorkerRawMode;
 pub const setWorkerExecuting = shared.setWorkerExecuting;
+pub const ctrlCIsInput = shared.ctrlCIsInput;
+pub const ctrlCIsKey = shared.ctrlCIsKey;
+pub const interrupt = shared.interrupt;
+pub const lineEditingKeys = shared.lineEditingKeys;
+pub const LineEditingKeys = shared.LineEditingKeys;
 pub const setupConsoleIo = if (os == .windows) impl.setupConsoleIo else struct {
     fn f(_: std.posix.fd_t, _: std.posix.fd_t) ?*anyopaque { return null; }
 }.f;

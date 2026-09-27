@@ -336,16 +336,28 @@ pub fn setTcpNodelay(socket: posix.fd_t) void {
     _ = posix.system.setsockopt(socket, 6, 1, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int)); // IPPROTO_TCP, TCP_NODELAY
 }
 
-// Terminal raw mode. Switched once output drains, keeping input typed ahead
-// (as libuv does): a REPL toggles it around each evaluation.
+// Terminal raw mode, as libuv's: a REPL gets every key, Ctrl-C, Ctrl-S and
+// Ctrl-\\ among them. Switched once output drains, keeping input typed ahead:
+// a REPL toggles it around each evaluation.
 var saved_termios: ?posix.termios = null;
 pub fn setRawMode(raw: bool) void {
     const stdin = impl.STDIN_HANDLE;
     if (raw) {
         var termios = posix.tcgetattr(stdin) catch return;
         if (saved_termios == null) saved_termios = termios;
+        termios.iflag.BRKINT = false;
+        termios.iflag.ICRNL = false;
+        termios.iflag.INPCK = false;
+        termios.iflag.ISTRIP = false;
+        termios.iflag.IXON = false;
+        termios.oflag.ONLCR = true;
+        termios.cflag.CSIZE = .CS8;
         termios.lflag.ECHO = false;
         termios.lflag.ICANON = false;
+        termios.lflag.IEXTEN = false;
+        termios.lflag.ISIG = false;
+        termios.cc[@intFromEnum(posix.V.MIN)] = 1;
+        termios.cc[@intFromEnum(posix.V.TIME)] = 0;
         posix.tcsetattr(stdin, .DRAIN, termios) catch {};
     } else if (saved_termios) |termios| {
         posix.tcsetattr(stdin, .DRAIN, termios) catch {};
@@ -353,11 +365,41 @@ pub fn setRawMode(raw: bool) void {
     }
 }
 
+/// Whether a Ctrl-C typed now comes as a byte: raw mode turns off the
+/// terminal's signals.
+pub fn ctrlCIsInput() bool {
+    return saved_termios != null;
+}
+
+/// The terminal's own line-editing keys, for cooked input emulated in raw mode.
+pub fn lineEditingKeys() LineEditingKeys {
+    const termios = saved_termios orelse (posix.tcgetattr(impl.STDIN_HANDLE) catch return .{});
+    return .{
+        .erase = termios.cc[@intFromEnum(posix.V.ERASE)],
+        .kill = termios.cc[@intFromEnum(posix.V.KILL)],
+        .werase = termios.cc[@intFromEnum(posix.V.WERASE)],
+        .eof = termios.cc[@intFromEnum(posix.V.EOF)],
+    };
+}
+
+pub const LineEditingKeys = struct { erase: u8 = 0x7F, kill: u8 = 0x15, werase: u8 = 0x17, eof: u8 = 0x04 };
+
 // Signal handling
 var worker_raw: bool = false;
 pub fn setWorkerRawMode(raw: bool) void { worker_raw = raw; }
 var worker_executing: bool = false;
 pub fn setWorkerExecuting(executing: bool) void { worker_executing = executing; }
+
+/// Whether a Ctrl-C is a key for the REPL at its prompt, rather than an
+/// interrupt: nothing reads stdin while code runs.
+pub fn ctrlCIsKey() bool {
+    return worker_raw and !worker_executing;
+}
+
+/// Never coalesced: Julia's force-throw for tight loops needs the repeated presses.
+pub fn interrupt() void {
+    if (g_signal_handler) |handler| handler.notifyInterrupt();
+}
 pub const SignalHandler = struct {
     sockets_ptr: *anyopaque,
     write_fn: *const fn (*anyopaque, []const u8) void,
@@ -377,15 +419,8 @@ var g_signal_handler: ?SignalHandler = null;
 fn signalAction(sig: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
     const handler = g_signal_handler orelse return;
     switch (sig) {
-        .INT => {
-            // Nothing reads stdin while code runs. Never coalesce: Julia's
-            // force-throw for tight loops needs the repeated presses.
-            if (worker_raw and !worker_executing)
-                handler.writeStdio("\x03")
-            else
-                handler.notifyInterrupt();
-        },
-        .TERM, .HUP => {
+        .INT => if (ctrlCIsKey()) handler.writeStdio("\x03") else handler.notifyInterrupt(),
+        .TERM, .HUP, .QUIT => {
             handler.notifyExit();
             std.process.exit(128 +% @as(u8, @intCast(@intFromEnum(sig))));
         },
@@ -398,6 +433,7 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     posix.sigaddset(&mask, posix.SIG.INT);
     posix.sigaddset(&mask, posix.SIG.TERM);
     posix.sigaddset(&mask, posix.SIG.HUP);
+    posix.sigaddset(&mask, posix.SIG.QUIT);
     const sigact = posix.Sigaction{
         .handler = .{ .sigaction = signalAction },
         .mask = mask,
@@ -406,6 +442,7 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     posix.sigaction(posix.SIG.INT, &sigact, null);
     posix.sigaction(posix.SIG.TERM, &sigact, null);
     posix.sigaction(posix.SIG.HUP, &sigact, null);
+    posix.sigaction(posix.SIG.QUIT, &sigact, null);
     const pipe_act = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = std.mem.zeroes(posix.sigset_t),

@@ -26,6 +26,7 @@ fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
     var buf: [buf_size]u8 = undefined;
     while (true) {
         var got: win32.DWORD = 0;
+        platform.awaitConsoleKey(args.src);
         if (!platform.ReadFile(args.src, &buf, buf.len, &got, null).toBool() or got == 0) break;
         args.fwd.forward(buf[0..got]);
     }

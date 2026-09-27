@@ -2561,12 +2561,10 @@ pub const Conductor = struct {
         live.onTimer(self);
     }
 
-    // Read raw until the CSI 5n sentinel or a byte cap; the client's exit restores
-    // cooked mode.
+    // Read until the CSI 5n sentinel or a byte cap; a view's client is raw from
+    // the start, so the replies come unechoed.
     fn probePalette(self: *Conductor, streams: *ClientStreams) ?pal.Palette {
         const stdin = streams.fd(.stdin);
-        const signals = streams.fd(.signals);
-        platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
         platform.write(streams.fd(.stdout), pal.queries);
         // This read blocks the event loop, so is bounded as a whole.
         const deadline = self.nowNs() + palette_probe_timeout_s * std.time.ns_per_s;
