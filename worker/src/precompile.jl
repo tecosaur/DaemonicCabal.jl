@@ -141,10 +141,21 @@ precompile(runworker, (String, String, Int))
 precompile(teardown_client, (ClientInfo, IO, IO, IO, IO, Tuple, Int))
 precompile(flush, (BufferedOutput{Base.PipeEndpoint},))
 precompile(settle, ())
-# Error display onto a client's stderr, reached only dynamically.
-let io = IOContext{Base.PipeEndpoint}, frames = Vector{Base.StackTraces.StackFrame}
-    precompile(Base.show_backtrace, (io, frames))
-    precompile(Core.kwcall, (NamedTuple{(:backtrace,), Tuple{Bool}}, typeof(showerror), io, ErrorException, frames))
+# Error display onto a client's stderr, and a REPL's stdout, reached only
+# dynamically: for an error, and what a Ctrl-C throws.
+let frames = Vector{Base.StackTraces.StackFrame}
+    ios = Type[IOContext{Base.PipeEndpoint}]
+    @static VERSION >= v"1.11" && push!(ios, IOContext{ScopedStdout})
+    errors = Type[ErrorException, InterruptException]
+    @static isdefined(Base, :CancellationRequest) && push!(errors, Base.CancellationRequest)
+    for io in ios
+        precompile(Base.show_backtrace, (io, frames))
+        precompile(Base.show_exception_stack, (io, Base.ExceptionStack))
+        precompile(Core.kwcall, (NamedTuple{(:bold, :color), Tuple{Bool, Symbol}}, typeof(printstyled), io, String))
+        for error in errors
+            precompile(Core.kwcall, (NamedTuple{(:backtrace,), Tuple{Bool}}, typeof(showerror), io, error, frames))
+        end
+    end
 end
 @static VERSION >= v"1.11" && precompile(display_client_error, (IO, Base.ExceptionStack))
 precompile(replay_history, (Base.PipeEndpoint, Recording, Tuple{Int, Int}, Int))
