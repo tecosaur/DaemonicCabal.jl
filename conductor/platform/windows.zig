@@ -513,13 +513,20 @@ pub fn write(fd: HANDLE, buf: []const u8) void {
 
 /// For handles that are not sockets.
 pub fn writeFile(fd: HANDLE, buf: []const u8) void {
+    _ = writeFileAll(fd, buf);
+}
+
+/// Whether all of `buf` was written: false once `fd` refuses it, its reader
+/// gone, say.
+pub fn writeFileAll(fd: HANDLE, buf: []const u8) bool {
     var off: usize = 0;
     while (off < buf.len) {
         var written: DWORD = 0;
-        if (!WriteFile(fd, @ptrCast(buf[off..].ptr), @intCast(buf.len - off), &written, null).toBool()) return;
-        if (written == 0) return;
+        if (!WriteFile(fd, @ptrCast(buf[off..].ptr), @intCast(buf.len - off), &written, null).toBool()) return false;
+        if (written == 0) return false;
         off += written;
     }
+    return true;
 }
 
 // =============================================================================

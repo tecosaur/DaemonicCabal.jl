@@ -99,7 +99,11 @@ pub fn run(
                         platform.getStdoutHandle()
                     else
                         platform.getStderrHandle();
-                    platform.writeFile(dst, bufs[idx][0..@intCast(bytes)]);
+                    if (!platform.writeFileAll(dst, bufs[idx][0..@intCast(bytes)])) {
+                        platform.close(stream_fds[idx]);
+                        eof[idx] = true;
+                        continue;
+                    }
                     ctxs[idx] = platform.issueRecv(stream_fds[idx], &bufs[idx]);
                     if (ctxs[idx] == null) eof[idx] = true;
                 } else {

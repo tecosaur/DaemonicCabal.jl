@@ -22,6 +22,9 @@ pub const getppid = impl.getppid;
 pub const write = impl.write;
 /// For console, pipe and file handles.
 pub const writeFile = if (os != .windows) impl.write else impl.writeFile;
+/// Output relayed to our own stdout or stderr, false once its reader has
+/// gone: left unread, the worker's writes then fail as they would to it.
+pub const writeOutput = if (os != .windows) impl.writeAll else impl.writeFileAll;
 pub const kill = impl.kill;
 pub const rawSocket = impl.rawSocket;
 pub const rawConnect = impl.rawConnect;

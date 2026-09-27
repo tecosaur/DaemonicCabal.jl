@@ -32,19 +32,31 @@ pub const geteuid = c.geteuid;
 
 // I/O
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
+    if (!writeAll(fd, buf)) shared.eprint("write error on fd {d}\n", .{fd});
+}
+
+/// Whether all of `buf` was written: false once `fd` refuses it, its reader
+/// gone, say. Waits out a non-blocking `fd` that is full.
+pub fn writeAll(fd: posix.fd_t, buf: []const u8) bool {
     var written: usize = 0;
     while (written < buf.len) {
         const ret = c.write(fd, buf.ptr + written, buf.len - written);
         if (ret < 0) {
             @branchHint(.cold);
-            const e = @as(posix.E, @enumFromInt(c._errno().*));
-            if (e == .INTR) continue;
-            shared.eprint("write error on fd {d}: errno {d}\n", .{ fd, @intFromEnum(e) });
-            return;
+            switch (@as(posix.E, @enumFromInt(c._errno().*))) {
+                .INTR => continue,
+                .AGAIN => {
+                    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                    _ = posix.poll(&pfd, -1) catch return false;
+                    continue;
+                },
+                else => return false,
+            }
         }
-        if (ret == 0) return; // no progress; avoid spinning
+        if (ret == 0) return false; // no progress; avoid spinning
         written += @intCast(ret);
     }
+    return true;
 }
 
 // kqueue, for the event loops
