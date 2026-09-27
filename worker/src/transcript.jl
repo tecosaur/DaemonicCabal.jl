@@ -305,27 +305,7 @@ function watch_session(label::String, format::String, out::IO;
             put!(watcher.queue, released(watcher, finish!))
             close(watcher.queue)
         else
-            push!(transcript.watchers, watcher)
-            isnothing(watcher.plain) || Timer(QUIET_ROWS_S; interval = QUIET_ROWS_S) do timer
-                uninterrupted() do
-                    @lock transcript.lock begin
-                        if watcher ∈ transcript.watchers
-                            bytes = released(watcher, release_quiet!)
-                            isempty(bytes) || put!(watcher.queue, bytes)
-                        else
-                            close(timer)
-                        end
-                    end
-                end
-            end
-            Threads.@spawn begin
-                try
-                    uninterrupted(() -> while !eof(until) readavailable(until) end)
-                catch
-                end
-                @lock transcript.lock filter!(w -> w !== watcher, transcript.watchers)
-                close(watcher.queue)
-            end
+            subscribe!(transcript, watcher, until)
         end
     end
     uninterrupted() do
@@ -335,6 +315,32 @@ function watch_session(label::String, format::String, out::IO;
         end
     end
     0
+end
+
+# Under `transcript.lock`, until `until` ends; a plain destination's rows
+# are let go as they fall quiet.
+function subscribe!(transcript::Transcript, watcher::Watcher, until::IO)
+    push!(transcript.watchers, watcher)
+    isnothing(watcher.plain) || Timer(QUIET_ROWS_S; interval = QUIET_ROWS_S) do timer
+        uninterrupted() do
+            @lock transcript.lock begin
+                if watcher ∈ transcript.watchers
+                    bytes = released(watcher, release_quiet!)
+                    isempty(bytes) || put!(watcher.queue, bytes)
+                else
+                    close(timer)
+                end
+            end
+        end
+    end
+    Threads.@spawn begin
+        try
+            uninterrupted(() -> while !eof(until) readavailable(until) end)
+        catch
+        end
+        @lock transcript.lock filter!(w -> w !== watcher, transcript.watchers)
+        close(watcher.queue)
+    end
 end
 
 # Nothing while a plain destination's output is still held. Every other event

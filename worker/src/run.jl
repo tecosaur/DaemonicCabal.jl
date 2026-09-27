@@ -30,25 +30,8 @@ function create_module()::Module
     mod
 end
 
-function get_module()::Module
-    mod = @lock STATE.lock begin
-        m = STATE.standby_module[]
-        STATE.standby_module[] = nothing
-        m
-    end
-    if isnothing(mod) create_module() else mod end
-end
-
 # Made outside the lock, as `using` waits on any package a client is loading.
-function ensure_standby_module()
-    (@lock STATE.lock isnothing(STATE.standby_module[])) || return
-    mod = create_module()
-    @lock STATE.lock begin
-        if isnothing(STATE.standby_module[])
-            STATE.standby_module[] = mod
-        end
-    end
-end
+ensure_standby_module() = fill_standby!(Returns(nothing), create_module, STATE.standby_module)
 
 # The REPL overrides can't be precompiled, but JIT'd code is process-global.
 function warm_repl_path()
@@ -57,21 +40,21 @@ function warm_repl_path()
     else
         get(ENV, "JULIA_DAEMON_PREWARM", "1") ∈ ("no", "false", "0") && return nothing
         try
-            cin  = Pipe(); Base.link_pipe!(cin;  reader_supports_async=true, writer_supports_async=true)
-            cout = Pipe(); Base.link_pipe!(cout; reader_supports_async=true, writer_supports_async=true)
-            cerr = Pipe(); Base.link_pipe!(cerr; reader_supports_async=true, writer_supports_async=true)
+            cin, cout, cerr, sig = linked_pipe(), linked_pipe(), linked_pipe(), linked_pipe()
             # Closed, so raw!/displaysize skip the client round-trip.
-            sig = Pipe(); Base.link_pipe!(sig); close(sig.in); close(sig.out)
-            dout = errormonitor(@async try read(cout.out) catch end)
-            derr = errormonitor(@async try read(cerr.out) catch end)
-            feeder = errormonitor(@async try write(cin.in, "1+1\n"); close(cin.in) catch end)
+            foreach(close, (sig.in, sig.out))
+            drains = [errormonitor(@async try read(p.out) catch end) for p in (cout, cerr)]
+            feeder = errormonitor(@async try
+                write(cin.in, "1+1\n")
+                close(cin.in)
+            catch end)
             client = ClientInfo(true, true, false, 0, 0, pwd(),
                                 ["TERM" => "xterm-256color", "JULIA_DAEMON_REVISE" => "no"],
                                 [("--history-file", "no")],
-                                nothing, String[], 0xFFFF)
+                                nothing, String[], PORT_SET_NONE)
             runclient(client, cin.out, cout.in, cerr.in, sig.out; owned_streams=())
-            close(cout.in); close(cerr.in)
-            wait(dout); wait(derr); wait(feeder)
+            foreach(close, (cout.in, cerr.in))
+            foreach(wait, [drains; feeder])
         catch e
             @debug "REPL pre-warm failed" exception=(e, catch_backtrace())
         end
@@ -84,7 +67,7 @@ function prepare_module(client::ClientInfo)
     mod = if any(p -> first(p) == "--session", client.switches)
         Main
     else
-        get_module()
+        @something(take_standby!(STATE.standby_module), create_module())
     end
     # A client module's own shadow Base's. Main (a session) sets Base's: 1.10 and
     # 1.11 won't let Main assign a name it has taken from Base.
@@ -150,17 +133,11 @@ end
         term.redirect_out = devnull
         term.redirect_err = devnull
         session = term.sync_session
-        if !isnothing(session)
-            return end_sync_session!(session, code)
+        if isnothing(session)
+            release_client(term.stdout, term.stderr, term.signals, code)
+        else
+            end_sync_session!(session, code)
         end
-        # Closed before the exit is sent, so the client has all its output.
-        # Any of them may be gone already, with the client.
-        try close(term.stdout) catch end
-        try close(term.stderr) catch end
-        try
-            send_signal(term.signals, SIGNAL_EXIT, UInt8[code % UInt8])
-            close(term.signals)
-        catch end
     end
 end
 
@@ -207,22 +184,7 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
                    replay::Union{Nothing, Tuple{StreamIO, Recording, Tuple{Int, Int}, Int}}=nothing)
     watch = getval(client.switches, "--watch", nothing)
     if !isnothing(watch)
-        exit_code = try
-            @static if VERSION >= v"1.11"
-                watch_session(getval(client.switches, "--session", ""), watch, client_stdout;
-                              color=color_choice(client), terminal=client.color, until=signals)
-            else
-                println(client_stderr, "--watch needs the session's worker to run Julia 1.11 or later.")
-                1
-            end
-        catch
-            isopen(client_stderr) && Base.invokelatest(Base.display_error, client_stderr, current_exceptions())
-            1
-        end
-        shielded() do
-            teardown_client(client, client_stdin, client_stdout, client_stderr, signals, owned_streams, exit_code)
-        end
-        return exit_code
+        return watch_client(client, watch, client_stdin, client_stdout, client_stderr, signals, owned_streams)
     end
     hascolor = clienthascolor(client)
     # As Julia's: -i, or a REPL at a terminal.
@@ -241,7 +203,7 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
     # Recording sits under the buffer, so it copies whole chunks.
     run_stdout, owned_streams = if VERSION >= v"1.11" && !is_repl_client(client) && client_stdout isa StreamIO
         buffered = BufferedOutput(recorded(client_stdout, :stdout))
-        buffered, map(s -> if s === client_stdout; buffered else s end, owned_streams)
+        buffered, map(s -> if s === client_stdout buffered else s end, owned_streams)
     else
         recorded(client_stdout, :stdout), owned_streams
     end
@@ -259,7 +221,11 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
         # A terminal's input is read through one a Ctrl-D ends, as a TTY's.
         input = if client.tty && client_stdin isa StreamIO
             copied = TerminalInput()
-            errormonitor(@async copy_input(client_stdin, copied))
+            errormonitor(@async try
+                copy_input(client_stdin, copied)
+            finally
+                close_input!(copied)
+            end)
             copied
         else
             client_stdin
@@ -316,10 +282,7 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
         end
     catch
         # The worker's own failure to run it.
-        if isopen(client_stdout)
-            try flush(run_stdout) catch end
-            Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
-        end
+        display_run_error(run_stdout, stderrx)
         exit_code = 1
     finally
         # After the run's last output, which may still be buffered.
@@ -337,6 +300,34 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
     exit_code
 end
 
+# Following a session's transcript, in place of running code.
+function watch_client(client::ClientInfo, watch::String, client_stdin, client_stdout::IO,
+                      client_stderr::IO, signals::StreamIO, owned_streams::Tuple)
+    exit_code = try
+        @static if VERSION >= v"1.11"
+            watch_session(getval(client.switches, "--session", ""), watch, client_stdout;
+                          color=color_choice(client), terminal=client.color, until=signals)
+        else
+            println(client_stderr, "--watch needs the session's worker to run Julia 1.11 or later.")
+            1
+        end
+    catch
+        isopen(client_stderr) && Base.invokelatest(Base.display_error, client_stderr, current_exceptions())
+        1
+    end
+    shielded() do
+        teardown_client(client, client_stdin, client_stdout, client_stderr, signals, owned_streams, exit_code)
+    end
+    exit_code
+end
+
+# The error being handled, after what stdout still holds, unless the client is gone.
+function display_run_error(run_stdout::IO, stderrx::IO)
+    isopen(run_stdout) || return
+    try flush(run_stdout) catch end
+    Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
+end
+
 # A run's code, then its `atexit` hooks, as stock julia runs them on its way
 # out; its exit code.
 function run_until_exit(mod::Module, client::ClientInfo, ending::RunEnd, run_stdout::IO,
@@ -348,10 +339,7 @@ function run_until_exit(mod::Module, client::ClientInfo, ending::RunEnd, run_std
         if err isa DaemonClientExit
             err.code
         else
-            if isopen(run_stdout)
-                try flush(run_stdout) catch end
-                Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
-            end
+            display_run_error(run_stdout, stderrx)
             1
         end
     end

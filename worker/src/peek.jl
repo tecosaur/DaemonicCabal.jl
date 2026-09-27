@@ -8,6 +8,7 @@
 
 const PEEK_REPORT_BYTES = 128 << 10  # within a local socket's buffer, so sent at once
 const PEEK_REPORT_WIDTH = 160
+const PROFILE_CONTEXT = (:displaysize => (1000, PEEK_REPORT_WIDTH), :color => true)
 
 """
     peek_report(clients) -> String
@@ -32,7 +33,7 @@ function peek_report(clients)
         bytes += sizeof(something(sections[id], ""))
     end
     every = with_logger(NullLogger()) do
-        sprint(; context = profile_context()) do io
+        sprint(; context = PROFILE_CONTEXT) do io
             Profile.print(io; groupby = [:thread, :task])
         end
     end
@@ -54,13 +55,11 @@ function peek_report(clients)
     String(report)
 end
 
-profile_context() = (:displaysize => (1000, PEEK_REPORT_WIDTH), :color => true)
-
 # The task's part of the samples taken, after a newline; nothing when it has none.
 function task_profile(task::Task)
     # Quietly: a task without samples is expected, not worth Profile's warning.
     tree = with_logger(NullLogger()) do
-        sprint(; context = profile_context()) do io
+        sprint(; context = PROFILE_CONTEXT) do io
             Profile.print(io; tasks = UInt(pointer_from_objref(task)), sortedby = :count)
         end
     end

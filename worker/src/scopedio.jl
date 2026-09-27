@@ -23,39 +23,18 @@ VirtualTerm(stdin, stdout, stderr, signals, term, sync_session, terminfo, have_c
     VirtualTerm(stdin, stdout, stderr, signals, term, sync_session,
                 terminfo, have_color, have_truecolor, nothing, nothing, nothing)
 
-function unsafe_pipe!(pipe::Base.PipeEndpoint, tty::Base.TTY)
+function unsafe_pipe!(pipe::Base.PipeEndpoint, stream::Union{Base.TTY, Base.PipeEndpoint})
     Base.disassociate_julia_struct(pipe.handle)
-    Base.disassociate_julia_struct(tty.handle)
-    pipe.handle = tty.handle
-    pipe.status = tty.status
-    pipe.buffer = tty.buffer
-    pipe.cond = tty.cond
-    pipe.readerror = tty.readerror
-    pipe.sendbuf = tty.sendbuf
-    pipe.lock = tty.lock
-    pipe.throttle = tty.throttle
-    tty.handle = C_NULL # or its finalizer frees the handle under us
+    for field in (:handle, :status, :buffer, :cond, :readerror, :sendbuf, :lock, :throttle)
+        setfield!(pipe, field, getfield(stream, field))
+    end
+    stream.handle = C_NULL # or its finalizer frees the handle under us
     Base.associate_julia_struct(pipe.handle, pipe)
     pipe
 end
 
 function unsafe_pipe!(pipe::Base.PipeEndpoint, stream::IOStream)
     unsafe_pipe!(pipe, Base.PipeEndpoint(Base.RawFD(fd(stream))))
-end
-
-function unsafe_pipe!(pipe::Base.PipeEndpoint, pipe2::Base.PipeEndpoint)
-    Base.disassociate_julia_struct(pipe.handle)
-    pipe.handle = pipe2.handle
-    pipe.status = pipe2.status
-    pipe.buffer = pipe2.buffer
-    pipe.cond = pipe2.cond
-    pipe.readerror = pipe2.readerror
-    pipe.sendbuf = pipe2.sendbuf
-    pipe.lock = pipe2.lock
-    pipe.throttle = pipe2.throttle
-    pipe2.handle = C_NULL # or its finalizer frees the handle under us
-    Base.associate_julia_struct(pipe.handle, pipe)
-    pipe
 end
 
 const WORKER_TERM = VirtualTerm(
