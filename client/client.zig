@@ -175,6 +175,8 @@ var conductor_path_buf: [max_socket_path]u8 = undefined;
 var conductor_path: []const u8 = &.{};
 var transport_mode: protocol.TransportMode = .local;
 var watching = false;
+// A view the conductor draws, whose farewell a full socket can hold back.
+var viewing = false;
 // Kept because a signal handler cannot resolve the conductor's name again.
 var conductor_peer: ?Io.net.IpAddress = null;
 var signal_parser = SignalParser{};
@@ -195,6 +197,10 @@ fn signalNotifyExit() void {
 
 fn signalNotifyInterrupt() void {
     notifyConductor(.client_interrupt);
+}
+
+fn signalGiveUp() void {
+    exitClient(130);
 }
 
 // A watcher's Ctrl-C must not reach the session it watches.
@@ -271,11 +277,18 @@ fn run(init: std.process.Init.Minimal) !void {
     };
     const sync = parsed.hasSwitch("--sync");
     watching = parsed.hasSwitch("--watch");
+    viewing = (parsed.hasSwitch("--status") or parsed.hasSwitch("--reconfigure")) and platform.isatty(platform.getStdoutHandle());
     const is_tty = platform.isatty(platform.getStdinHandle());
     const console = if (is_tty) platform.setupConsoleIo(platform.getStdoutHandle(), platform.getStderrHandle()) else null;
     defer platform.restoreConsoleIo(console);
-    if (is_tty) platform.setRawMode(true);
     defer platform.setRawMode(false);
+    // Until a worker is reached, a Ctrl-C gives up, as Julia's does starting.
+    platform.registerSignalHandlers(.{
+        .sockets_ptr = @ptrCast(&sockets),
+        .write_fn = &signalWriteStdin,
+        .notify_exit_fn = &signalNotifyExit,
+        .notify_interrupt_fn = &signalGiveUp,
+    });
     const conductor = try connectToConductor(env);
     if (transport_mode == .tcp) platform.setTcpNodelay(conductor);
     defer notifyConductor(.client_exit);
@@ -287,6 +300,9 @@ fn run(init: std.process.Init.Minimal) !void {
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers();
     signal_parser.sync_mode = sync;
+    // Cooked, as Julia's terminal is, until a REPL asks for raw; a --sync
+    // client's and a view's are raw throughout.
+    if (is_tty and (sync or viewing)) platform.setRawMode(true);
     try runEventLoop(sync);
 }
 
@@ -539,6 +555,8 @@ fn runEventLoop(sync_mode: bool) !void {
 
 // std.process.exit skips main's defer, which restores cooked mode.
 fn exitClient(code: u8) noreturn {
+    // Ends any sequence cut short, and the modes a view sets.
+    if (viewing) platform.writeFile(platform.getStdoutHandle(), "\x18\x1b[0m\x1b[?2026l\x1b[?7h\x1b[?25h");
     platform.setRawMode(false);
     std.process.exit(code);
 }

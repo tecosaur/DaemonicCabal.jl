@@ -4,7 +4,6 @@
 // Cooked-mode line editing for --sync clients, done locally.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
 const platform = @import("platform/main.zig");
 
@@ -17,49 +16,108 @@ pub const StdinForwarder = struct {
     wants_raw: *const bool,
     cooked: CookedState = .{},
 
+    /// A Ctrl-C typed in raw mode comes as a byte, as in Julia's: unless the
+    /// REPL takes it as a key, it interrupts, as the terminal's signal would.
     pub fn forward(self: *StdinForwarder, bytes: []const u8) void {
-        if (self.sync_mode and !@atomicLoad(bool, self.wants_raw, .acquire)) {
+        var rest = bytes;
+        if (platform.ctrlCIsInput() and !platform.ctrlCIsKey()) {
+            while (std.mem.indexOfScalar(u8, rest, 0x03)) |i| {
+                self.pass(rest[0..i]);
+                if (self.isCooked()) self.cooked.discard();
+                platform.interrupt();
+                rest = rest[i + 1 ..];
+            }
+        }
+        self.pass(rest);
+    }
+
+    fn pass(self: *StdinForwarder, bytes: []const u8) void {
+        if (self.isCooked()) {
             for (bytes) |byte| self.cooked.process(byte, self.dst);
         } else platform.write(self.dst, bytes);
     }
+
+    fn isCooked(self: *const StdinForwarder) bool {
+        return self.sync_mode and !@atomicLoad(bool, self.wants_raw, .acquire);
+    }
 };
 
+/// A terminal's canonical mode: a line goes once Enter or end-of-input ends
+/// it, edited meanwhile with the terminal's own keys. Control characters are
+/// kept, echoed as `^X`.
 pub const CookedState = struct {
     line_buf: [4096]u8 = undefined,
     line_len: usize = 0,
+    keys: ?platform.LineEditingKeys = null,
 
     /// Echo goes to local stdout.
-    pub fn process(self: *@This(), byte: u8, stdin_fd: posix.socket_t) void {
-        switch (byte) {
-            0x7F => {
-                if (self.line_len > 0) {
-                    self.line_len -= 1;
-                    writeLocal("\x08 \x08");
-                }
-            },
-            '\r', '\n' => {
-                writeLocal("\r\n");
-                if (self.line_len > 0) {
-                    platform.socketWrite(stdin_fd, self.line_buf[0..self.line_len]);
-                }
-                platform.socketWrite(stdin_fd, "\n");
-                self.line_len = 0;
-            },
-            0x03 => {
-                platform.socketWrite(stdin_fd, "\x03");
-                self.line_len = 0;
-            },
-            0x04 => {
-                if (self.line_len == 0) platform.sendEof(stdin_fd);
-            },
-            else => {
-                if (byte >= 0x20 and self.line_len < self.line_buf.len) {
-                    self.line_buf[self.line_len] = byte;
-                    self.line_len += 1;
-                    writeLocal(&[_]u8{byte});
-                }
-            },
+    pub fn process(self: *CookedState, byte: u8, stdin_fd: posix.socket_t) void {
+        const keys = self.keys orelse keys: {
+            self.keys = platform.lineEditingKeys();
+            break :keys self.keys.?;
+        };
+        if (byte == '\r' or byte == '\n') {
+            writeLocal("\r\n");
+            self.send(stdin_fd);
+            platform.socketWrite(stdin_fd, "\n");
+        } else if (byte == keys.eof) {
+            // Ends input on an empty line, else sends the line so far.
+            if (self.line_len == 0) platform.sendEof(stdin_fd) else self.send(stdin_fd);
+        } else if (byte == keys.erase) {
+            if (self.line_len > 0) self.eraseChar();
+        } else if (byte == keys.kill) {
+            while (self.line_len > 0) self.eraseChar();
+        } else if (byte == keys.werase) {
+            while (self.line_len > 0 and self.line_buf[self.line_len - 1] == ' ') self.eraseChar();
+            while (self.line_len > 0 and self.line_buf[self.line_len - 1] != ' ') self.eraseChar();
+        } else if (self.line_len < self.line_buf.len) {
+            const start = column(self.line_buf[0..self.line_len]);
+            self.line_buf[self.line_len] = byte;
+            self.line_len += 1;
+            if (byte == '\t') {
+                const width = column(self.line_buf[0..self.line_len]) - start;
+                writeLocal("        "[0..width]);
+            } else if (isControl(byte)) {
+                writeLocal(&.{ '^', byte ^ 0x40 });
+            } else writeLocal(&.{byte});
         }
+    }
+
+    /// An interrupt flushes the line, as the terminal's signal would.
+    pub fn discard(self: *CookedState) void {
+        self.line_len = 0;
+        writeLocal("^C");
+    }
+
+    fn send(self: *CookedState, stdin_fd: posix.socket_t) void {
+        if (self.line_len > 0) platform.socketWrite(stdin_fd, self.line_buf[0..self.line_len]);
+        self.line_len = 0;
+    }
+
+    // A whole UTF-8 character, and the cells its echo took.
+    fn eraseChar(self: *CookedState) void {
+        var start = self.line_len - 1;
+        while (start > 0 and self.line_buf[start] & 0xC0 == 0x80) start -= 1;
+        const cells = column(self.line_buf[0..self.line_len]) - column(self.line_buf[0..start]);
+        self.line_len = start;
+        for (0..cells) |_| writeLocal("\x08 \x08");
+    }
+
+    // The column after echoing `line` from the line's start, tabs every eight.
+    fn column(line: []const u8) usize {
+        var col: usize = 0;
+        for (line) |byte| {
+            if (byte == '\t') {
+                col = (col / 8 + 1) * 8;
+            } else if (isControl(byte)) {
+                col += 2;
+            } else if (byte & 0xC0 != 0x80) col += 1;
+        }
+        return col;
+    }
+
+    fn isControl(byte: u8) bool {
+        return byte < 0x20 or byte == 0x7F;
     }
 
     fn writeLocal(data: []const u8) void {

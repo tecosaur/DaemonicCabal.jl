@@ -1326,6 +1326,32 @@ pub fn setRawMode(raw: bool) void {
     }
 }
 
+const KEY_EVENT: u16 = 0x0001;
+const INPUT_RECORD = extern struct {
+    EventType: u16,
+    Event: extern union {
+        key: extern struct { bKeyDown: BOOL, wRepeatCount: u16, wVirtualKeyCode: u16, wVirtualScanCode: u16, uChar: u16, dwControlKeyState: DWORD },
+        other: [16]u8,
+    },
+};
+extern "kernel32" fn PeekConsoleInputW(hConsoleInput: HANDLE, lpBuffer: *INPUT_RECORD, nLength: DWORD, lpNumberOfEventsRead: *DWORD) BOOL;
+extern "kernel32" fn ReadConsoleInputW(hConsoleInput: HANDLE, lpBuffer: *INPUT_RECORD, nLength: DWORD, lpNumberOfEventsRead: *DWORD) BOOL;
+
+/// Returns once a key is pressed at `console`, dropping the events a read
+/// would skip: a console read keeps the mode it began in, so one waiting
+/// already would miss the REPL's switch to raw. At once for other handles.
+pub fn awaitConsoleKey(console: HANDLE) void {
+    var mode: DWORD = undefined;
+    if (!GetConsoleMode(console, &mode).toBool()) return;
+    var record: INPUT_RECORD = undefined;
+    while (WaitForSingleObject(console, INFINITE) == WAIT_OBJECT_0) {
+        var n: DWORD = 0;
+        if (!PeekConsoleInputW(console, &record, 1, &n).toBool() or n == 0) return;
+        if (record.EventType == KEY_EVENT and record.Event.key.bKeyDown.toBool()) return;
+        if (!ReadConsoleInputW(console, &record, 1, &n).toBool()) return;
+    }
+}
+
 const ConsoleSaved = struct { stdout: HANDLE, stderr: HANDLE, out_mode: DWORD, err_mode: DWORD, out_cp: DWORD, in_cp: DWORD };
 
 /// Null when stdout is not a console.
@@ -1390,6 +1416,28 @@ var worker_executing: bool = false;
 pub fn setWorkerExecuting(executing: bool) void {
     worker_executing = executing;
 }
+
+/// Processed input stays on, so Ctrl-C is always a console event.
+pub fn ctrlCIsInput() bool {
+    return false;
+}
+
+/// Whether a Ctrl-C is a key for the REPL at its prompt, rather than an
+/// interrupt: nothing reads stdin while code runs.
+pub fn ctrlCIsKey() bool {
+    return worker_raw and !worker_executing;
+}
+
+pub fn interrupt() void {
+    if (g_signal_handler) |handler| handler.notifyInterrupt();
+}
+
+/// A console's end of input is Ctrl-Z.
+pub fn lineEditingKeys() LineEditingKeys {
+    return .{ .eof = 0x1A };
+}
+
+pub const LineEditingKeys = struct { erase: u8 = 0x7F, kill: u8 = 0x15, werase: u8 = 0x17, eof: u8 = 0x04 };
 var g_signal_handler: ?SignalHandler = null;
 
 // Runs on a console-spawned thread. TRUE stops the default handler killing us.
@@ -1397,7 +1445,7 @@ fn clientCtrlHandler(dwCtrlType: DWORD) callconv(.winapi) BOOL {
     const handler = g_signal_handler orelse return .FALSE;
     switch (dwCtrlType) {
         CTRL_C_EVENT, CTRL_BREAK_EVENT => {
-            if (worker_raw and !worker_executing) handler.writeStdio("\x03") else handler.notifyInterrupt();
+            if (ctrlCIsKey()) handler.writeStdio("\x03") else handler.notifyInterrupt();
         },
         CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT => {
             handler.notifyExit();

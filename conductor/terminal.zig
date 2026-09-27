@@ -52,10 +52,10 @@ pub const Terminal = struct {
     queued: std.ArrayList(u8) = .empty, // output the terminal hasn't taken yet
     gone: bool = false,
 
-    /// Keys as they're pressed, and the terminal's size, from here on.
+    /// Keys as they're pressed (its client is raw from the start), and the
+    /// terminal's size, from here on.
     pub fn open(self: *Terminal, c: *Conductor) void {
         const signals = self.streams.fd(.signals);
-        platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
         self.querySize();
         self.input = .{ .kind = .input, .fd = self.streams.fd(.stdin) };
         self.signals = .{ .kind = .signals, .fd = signals };
