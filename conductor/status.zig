@@ -220,7 +220,7 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
     if (opts.format != null and std.mem.eql(u8, opts.format.?, "json")) {
         try renderJson(c, w, view, now);
     } else {
-        const tints: ?Tints = if (opts.palette) |p| .{ .palette = p } else null;
+        const tints: ?Tints = if (!opts.tty) null else if (opts.palette) |p| .{ .palette = p } else null;
         const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients, .placement = &placement, .trend = opts.trend, .aside = &aside, .hint = opts.hint };
         try renderTree(c, w, Style{ .enabled = opts.tty }, ctx, view, now);
     }
@@ -271,7 +271,6 @@ const Anchor = union(enum) {
     muted,
     slot: struct { idx: usize, fallback: pal.Rgb },
 };
-pub const MUTED_TOWARD_BG = 0.45;
 const FALLBACK_MUTED = pal.Rgb.init(0x80, 0x80, 0x80);
 fn anslot(idx: usize, fb: pal.Rgb) Anchor {
     return .{ .slot = .{ .idx = idx, .fallback = fb } };
@@ -295,7 +294,7 @@ const Tints = struct {
     fn resolve(self: Tints, anchor: Anchor) pal.Rgb {
         return switch (anchor) {
             .muted => if (self.palette.foreground) |fg|
-                if (self.palette.background) |bg| pal.blend(fg, bg, MUTED_TOWARD_BG) else fg
+                if (self.palette.background) |bg| pal.blend(fg, bg, pal.muted_toward_bg) else fg
             else
                 FALLBACK_MUTED,
             .slot => |a| pal.slot(self.palette, a.idx, a.fallback),
@@ -305,13 +304,13 @@ const Tints = struct {
     // Caller resets.
     fn open(self: Tints, w: Writer, tint: Tint, t: f64) !void {
         const a = anchors[@intFromEnum(tint)];
-        var buf: [pal.sgr_fg_len]u8 = undefined;
-        try w.writeAll(pal.sgrFg(pal.blend(self.resolve(a[0]), self.resolve(a[1]), t), &buf));
+        const sgr = pal.Sgr.blended("38", self.resolve(a[0]), self.resolve(a[1]), t, "");
+        try w.writeAll(sgr.get());
     }
 };
 
 const Ctx = struct {
-    tints: ?Tints,
+    tints: ?Tints, // the terminal's palette, for a styled tree
     mem_ceiling: u64,
     focus: ?u32,
     clients: *std.ArrayList(u32), // focusable, in drawing order
@@ -320,10 +319,6 @@ const Ctx = struct {
     aside: *std.ArrayList(u8),
     hint: bool,
 };
-
-fn gradientTints(s: Style, ctx: Ctx) ?Tints {
-    return if (s.enabled) ctx.tints else null;
-}
 
 // --- Health ------------------------------------------------------------------
 
@@ -474,7 +469,8 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const 
         _ = try writeUntrusted(w, path);
     }
     if (workers.len > 1) {
-        const pooled = groupMem(workers);
+        var pooled: u64 = 0;
+        for (workers) |wk| pooled += wk.mem;
         if (pooled > 0) {
             try s.open(w, ansi.dim);
             try w.writeAll("  ");
@@ -503,11 +499,46 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     try w.writeAll(pad);
     try s.wrap(w, ansi.dim, if (is_last) "╰─ " else "├─ ");
     const label_start = w.list.items.len;
+    try writeIdentity(c, w, s, wk, health);
+    if (!dim_line) try s.open(w, ansi.dim);
+    try w.writeAll(" up ");
+    if (!dim_line) try s.close(w);
+    try writeDurationPadded(w, now - wk.created_at, 5);
+    const stats_start = w.list.items.len;
+    try writeStats(w, s, ctx, wk, dim_line);
+    const stats_end = w.list.items.len;
+    if (focused) if (ctx.trend) |trend| try writeTrend(ctx, s, Writer{ .list = ctx.aside, .gpa = w.gpa }, wk, trend);
+    const showed_activity = c.pressure_monitor.active();
+    if (showed_activity) try writeActivity(c, w, s, ctx, wk, key, now, dim_line);
+    if (health == .inactive) try writeIdleState(c, w, s, ctx, wk, key, now, showed_activity);
+    if (dim_line) try s.close(w);
+    const label_end = w.list.items.len;
+    if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
+    if (session != null) try writeHint(ctx, s, w);
+    try w.writeByte('\n');
+    if (focused) ctx.placement.* = .{
+        .start = start,
+        .label_start = label_start,
+        .label_end = label_end,
+        .stats = .{ stats_start, stats_end },
+        .end = w.list.items.len,
+        .branch = .{ pad, if (is_last) "╰" else "├", "" },
+        .gutter = .{ pad, if (is_last) " " else "│", "" },
+        .gutter_cols = pad.len + 1,
+    };
+    // Watchers show under an otherwise idle worker too.
+    if (wk.active_clients > 0) try renderClients(c, w, s, ctx, wk, now, nested, is_last);
+}
+
+// "● #6 [label] v1.11 (interactive)", padded to its column; an inactive
+// worker's line is left dim.
+fn writeIdentity(c: *Conductor, w: Writer, s: Style, wk: *const Worker, health: Health) !void {
     try writeHealthDot(s, w, health);
     try w.writeByte(' ');
-    const id_text = idStr(wk.id);
+    var id_buf: [10]u8 = undefined;
+    const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{wk.id}) catch unreachable;
     var col: usize = 1 + id_text.len; // visible width written so far in this column
-    if (dim_line) {
+    if (health == .inactive) {
         try s.open(w, ansi.dim);
         try w.print("#{s}", .{id_text});
         if (wk.session_label) |label| {
@@ -552,49 +583,23 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
         },
     }
     if (col < id_column_width) try w.writeByteNTimes(' ', id_column_width - col);
-    if (!dim_line) try s.open(w, ansi.dim);
-    try w.writeAll(" up ");
-    if (!dim_line) try s.close(w);
-    try writeDurationPadded(w, now - wk.created_at, 5);
-    // mem == 0 means unmeasured.
-    const stats_start = w.list.items.len;
-    if (wk.mem > 0) {
-        try w.writeAll("  ");
-        const t = if (ctx.mem_ceiling > 0)
-            @as(f64, @floatFromInt(wk.mem)) / @as(f64, @floatFromInt(ctx.mem_ceiling))
-        else
-            0;
-        const styled = try openStat(w, s, ctx, dim_line, .mem, t);
-        try writeBytes(w, wk.mem);
-        try closeStat(w, s, dim_line, styled);
-        const pct = wk.cpu.util * 100;
-        try w.writeAll("  ");
-        const cpu_styled = try openStat(w, s, ctx, dim_line, .cpu, @min(1.0, wk.cpu.util));
-        try w.print("{d:.0}%", .{pct});
-        try closeStat(w, s, dim_line, cpu_styled);
-    }
-    const stats_end = w.list.items.len;
-    if (focused) if (ctx.trend) |trend| try writeTrend(ctx, s, Writer{ .list = ctx.aside, .gpa = w.gpa }, wk, trend);
-    const showed_activity = c.pressure_monitor.active();
-    if (showed_activity) try writeActivity(c, w, s, ctx, wk, key, now, dim_line);
-    if (health == .inactive) try writeIdleState(c, w, s, ctx, wk, key, now, showed_activity);
-    if (dim_line) try s.close(w);
-    const label_end = w.list.items.len;
-    if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
-    if (session != null) try writeHint(ctx, s, w);
-    try w.writeByte('\n');
-    if (focused) ctx.placement.* = .{
-        .start = start,
-        .label_start = label_start,
-        .label_end = label_end,
-        .stats = .{ stats_start, stats_end },
-        .end = w.list.items.len,
-        .branch = .{ pad, if (is_last) "╰" else "├", "" },
-        .gutter = .{ pad, if (is_last) " " else "│", "" },
-        .gutter_cols = pad.len + 1,
-    };
-    // Watchers show under an otherwise idle worker too.
-    if (wk.active_clients > 0) try renderClients(c, w, s, ctx, wk, now, nested, is_last);
+}
+
+// "  490M  2%", tinted by their share; nothing while unmeasured (0).
+fn writeStats(w: Writer, s: Style, ctx: Ctx, wk: *const Worker, dim_line: bool) !void {
+    if (wk.mem == 0) return;
+    try w.writeAll("  ");
+    const t = if (ctx.mem_ceiling > 0)
+        @as(f64, @floatFromInt(wk.mem)) / @as(f64, @floatFromInt(ctx.mem_ceiling))
+    else
+        0;
+    const styled = try openStat(w, s, ctx, dim_line, .mem, t);
+    try writeBytes(w, wk.mem);
+    try closeStat(w, s, dim_line, styled);
+    try w.writeAll("  ");
+    const cpu_styled = try openStat(w, s, ctx, dim_line, .cpu, @min(1.0, wk.cpu.util));
+    try w.print("{d:.0}%", .{wk.cpu.util * 100});
+    try closeStat(w, s, dim_line, cpu_styled);
 }
 
 const trend_bars = [_][]const u8{ "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
@@ -653,7 +658,7 @@ fn writeBar(ctx: Ctx, s: Style, w: Writer, tint: Tint, colour_frac: f64, height:
 // As the row tints its figures; without the terminal's palette, the
 // 8-colour steps of the same scale. Caller closes.
 fn openTrendTint(ctx: Ctx, s: Style, w: Writer, tint: Tint, frac: f64) !void {
-    if (gradientTints(s, ctx)) |t| return t.open(w, tint, frac);
+    if (ctx.tints) |t| return t.open(w, tint, frac);
     if (!s.enabled) return;
     try w.writeAll(if (tint == .mem)
         (if (frac < 0.5) ansi.green else if (frac < 0.8) ansi.yellow else ansi.red)
@@ -670,7 +675,7 @@ fn writeHint(ctx: Ctx, s: Style, w: Writer) !void {
 
 // Pair with `closeStat`. False when the value just inherits the line's dim.
 fn openStat(w: Writer, s: Style, ctx: Ctx, dim_line: bool, tint: Tint, t_frac: f64) !bool {
-    if (gradientTints(s, ctx)) |t| {
+    if (ctx.tints) |t| {
         if (dim_line) try s.open(w, ansi.dim);
         try t.open(w, tint, t_frac);
         return true;
@@ -708,7 +713,7 @@ fn writeIdleState(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worke
 fn writeActivity(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, key: ?[]const u8, now: i64, in_dim: bool) !void {
     const activity = c.workerActivity(wk, key, now);
     try w.writeAll(" · activity ");
-    if (gradientTints(s, ctx)) |t| {
+    if (ctx.tints) |t| {
         if (in_dim) try s.open(w, ansi.reset);
         // Ease-out: low activity still gains visible colour quickly.
         const warmth = 1.0 - (1.0 - activity) * (1.0 - activity);
@@ -727,30 +732,23 @@ fn writeCullCountdown(w: Writer, s: Style, ctx: Ctx, remaining: i64, color_budge
     var buf: [16]u8 = undefined;
     const text = try formatCountdown(&buf, remaining);
     const imminent = remaining <= 60;
-    if (gradientTints(s, ctx)) |t| {
+    const tints = ctx.tints;
+    if (tints == null and remaining > 300) return w.writeAll(text);
+    try s.open(w, ansi.reset);
+    if (imminent) try s.open(w, ansi.bold);
+    if (tints) |t| {
         const frac = 1.0 - @as(f64, @floatFromInt(@max(0, remaining))) / @as(f64, @floatFromInt(@max(1, color_budget)));
         // Ease-in: hold neutral while there's time, sharpen toward yellow near cull.
-        const warmth = 2.0 - @sqrt(4.0 - 3.0 * frac * frac);
-        try s.open(w, ansi.reset);
-        if (imminent) try s.open(w, ansi.bold);
-        try t.open(w, .cull, warmth);
-        try w.writeAll(text);
-        try s.open(w, ansi.dim);
-    } else if (imminent) {
-        try s.open(w, ansi.reset ++ ansi.bold ++ ansi.red);
-        try w.writeAll(text);
-        try s.open(w, ansi.dim);
-    } else if (remaining <= 300) {
-        try s.open(w, ansi.reset ++ ansi.yellow);
-        try w.writeAll(text);
-        try s.open(w, ansi.dim);
-    } else {
-        try w.writeAll(text);
-    }
+        try t.open(w, .cull, 2.0 - @sqrt(4.0 - 3.0 * frac * frac));
+    } else if (imminent) try s.open(w, ansi.red) else try s.open(w, ansi.yellow);
+    try w.writeAll(text);
+    try s.open(w, ansi.dim);
 }
 
 fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, now: i64, nested: bool, worker_last: bool) !void {
     const base = if (nested) indent ++ indent else indent;
+    const trunk = if (worker_last) "   " else "│  ";
+    const by_worker = focusesWorkers(c);
     const total = countClients(c, wk);
     var seen: usize = 0;
     // Clients first, then watchers.
@@ -760,10 +758,10 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             const info = entry.value_ptr;
             if (info.worker != wk or info.watcher != watchers or info.internal) continue;
             seen += 1;
-            const focused = !focusesWorkers(c) and ctx.focus == entry.key_ptr.*;
-            if (!watchers and !focusesWorkers(c)) try ctx.clients.append(w.gpa, entry.key_ptr.*);
+            const focusable = !watchers and !by_worker;
+            const focused = !by_worker and ctx.focus == entry.key_ptr.*;
+            if (focusable) try ctx.clients.append(w.gpa, entry.key_ptr.*);
             const start = w.list.items.len;
-            const trunk = if (worker_last) "   " else "│  ";
             const last = seen == total;
             try w.writeAll(base);
             try s.open(w, ansi.dim);
@@ -786,7 +784,7 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             try s.close(w);
             const label_end = w.list.items.len;
             if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
-            if (!watchers and !focusesWorkers(c)) try writeHint(ctx, s, w);
+            if (focusable) try writeHint(ctx, s, w);
             try w.writeByte('\n');
             if (focused) ctx.placement.* = .{
                 .start = start,
@@ -851,12 +849,6 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style, view: View) !void {
 
 // --- Helpers -----------------------------------------------------------------
 
-fn groupMem(workers: []const *Worker) u64 {
-    var total: u64 = 0;
-    for (workers) |wk| total += wk.mem;
-    return total;
-}
-
 // The RSS painted fully hot: the heaviest worker, or a padded fair share of
 // memory, total / (n + 8), so a pool of light workers doesn't all peg red.
 fn memCeiling(view: View) u64 {
@@ -885,11 +877,6 @@ fn writeChannel(w: Writer, channel: []const u8) !usize {
 // terminal of whoever asks; returns its columns.
 fn writeUntrusted(w: Writer, text: []const u8) !usize {
     return tui.appendColumns(w.list, w.gpa, text, std.math.maxInt(usize), false);
-}
-
-threadlocal var id_buf: [16]u8 = undefined;
-fn idStr(id: u32) []const u8 {
-    return std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch "?";
 }
 
 // --- JSON --------------------------------------------------------------------
@@ -967,14 +954,17 @@ fn writeJsonString(w: Writer, value: []const u8) !void {
     try w.writeByte('"');
     var i: usize = 0;
     while (i < value.len) {
-        const ch = value[i];
-        const len = std.unicode.utf8ByteSequenceLength(ch) catch 0;
-        if (len != 1) {
-            const whole = len > 1 and i + len <= value.len and std.unicode.utf8ValidateSlice(value[i .. i + len]);
-            try w.writeAll(if (whole) value[i .. i + len] else "\u{fffd}");
-            i += if (whole) len else 1;
+        const char = tui.decode(value[i..]) orelse {
+            try w.writeAll("\u{fffd}");
+            i += 1;
+            continue;
+        };
+        if (char.len > 1) {
+            try w.writeAll(value[i .. i + char.len]);
+            i += char.len;
             continue;
         }
+        const ch = value[i];
         switch (ch) {
             '"' => try w.writeAll("\\\""),
             '\\' => try w.writeAll("\\\\"),

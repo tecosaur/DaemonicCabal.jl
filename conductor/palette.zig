@@ -170,11 +170,47 @@ pub fn blend(lo: Rgb, hi: Rgb, t: f64) Rgb {
 
 // --- gradient ----------------------------------------------------------------
 
-pub const sgr_fg_len = 19;
+/// How far the grey that explains is blended from the terminal's text
+/// toward its background: muted on any theme.
+pub const muted_toward_bg = 0.45;
 
-pub fn sgrFg(c: Rgb, buf: *[sgr_fg_len]u8) []const u8 {
-    return std.fmt.bufPrint(buf, "\x1b[38;2;{d};{d};{d}m", .{ c.r, c.g, c.b }) catch unreachable;
-}
+/// An SGR sequence setting a colour between two of the terminal's, else a
+/// fallback where it didn't give them.
+pub const Sgr = struct {
+    bytes: [24]u8 = undefined,
+    len: usize = 0,
+
+    /// `code` (38 foreground, 48 background) for the colour a fraction `t`
+    /// from `from` to `to`.
+    pub fn blended(comptime code: []const u8, from: ?Rgb, to: ?Rgb, t: f64, fallback: []const u8) Sgr {
+        var sgr: Sgr = .{};
+        if (from != null and to != null) {
+            const c = blend(from.?, to.?, t);
+            if (std.fmt.bufPrint(&sgr.bytes, "\x1b[" ++ code ++ ";2;{d};{d};{d}m", .{ c.r, c.g, c.b })) |text| {
+                sgr.len = text.len;
+                return sgr;
+            } else |_| {}
+        }
+        @memcpy(sgr.bytes[0..fallback.len], fallback);
+        sgr.len = fallback.len;
+        return sgr;
+    }
+
+    /// The grey that explains; ANSI 90 without the terminal's colours.
+    pub fn muted(palette: ?Palette) Sgr {
+        const p = palette orelse Palette{};
+        return blended("38", p.foreground, p.background, muted_toward_bg, "\x1b[90m");
+    }
+
+    pub fn get(self: *const Sgr) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    /// Its parameters alone, between `ESC [` and `m`.
+    pub fn params(self: *const Sgr) []const u8 {
+        return if (self.len > 3) self.bytes[2 .. self.len - 1] else "";
+    }
+};
 
 pub fn slot(palette: *const Palette, idx: usize, default: Rgb) Rgb {
     if (idx >= palette.ansi.len) return default;
