@@ -92,6 +92,7 @@ pub fn run(
                     if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
                         stdout_eof = true;
                     }
+                    if (stdout_eof) unwatch(kq, stdout_fd);
                 },
                 UDATA_STDERR => {
                     var remaining: usize = @intCast(ev.data);
@@ -111,6 +112,7 @@ pub fn run(
                     if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
                         stderr_eof = true;
                     }
+                    if (stderr_eof) unwatch(kq, stderr_fd);
                 },
                 UDATA_STDIN => {
                     if (exit_code != null or stdin_closed) continue;
@@ -125,6 +127,7 @@ pub fn run(
                     if ((ev.flags & EV_EOF) != 0) {
                         platform.sendEof(stdin_fd);
                         stdin_closed = true;
+                        unwatch(kq, posix.STDIN_FILENO);
                     }
                 },
                 UDATA_SIGNALS => {
@@ -144,6 +147,11 @@ pub fn run(
                     }
                     if ((ev.flags & EV_EOF) != 0) {
                         if (exit_code == null) exit_code = 1;
+                    }
+                    // No longer read, so unwatched: they would stay ready.
+                    if (exit_code != null) {
+                        unwatch(kq, signals_fd);
+                        if (stdin_polled) unwatch(kq, posix.STDIN_FILENO);
                     }
                 },
                 else => {},
@@ -181,6 +189,12 @@ fn makeKevent(
         .data = data,
         .udata = udata,
     };
+}
+/// Level-triggered, a registration left at an end reports it forever.
+fn unwatch(kq: posix.fd_t, fd: posix.fd_t) void {
+    var change = [1]c.Kevent{makeKevent(@intCast(fd), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
+    var no_events: [0]c.Kevent = undefined;
+    _ = keventCall(kq, &change, &no_events, null);
 }
 fn udataInt(ev: c.Kevent) usize {
     return ev.udata;
