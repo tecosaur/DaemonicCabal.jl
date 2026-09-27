@@ -366,9 +366,12 @@ fn appendXmlEscaped(out: *std.ArrayList(u8), gpa: Allocator, text: []const u8) A
 
 // --- PowerShell ---
 
+/// Windows PowerShell 5.1 reads a script without one as the ANSI code page.
+const utf8_bom = "\xEF\xBB\xBF";
+
 // `$env:KEY = 'value'`, a quote within doubled.
 fn powershellLine(line: []const u8) ?struct { key: []const u8, quoted: []const u8 } {
-    const trimmed = std.mem.trim(u8, line, " \t\r");
+    const trimmed = std.mem.trim(u8, std.mem.trimStart(u8, line, utf8_bom), " \t\r");
     if (!std.mem.startsWith(u8, trimmed, "$env:")) return null;
     const eq = std.mem.indexOf(u8, trimmed, " = '") orelse return null;
     if (!std.mem.endsWith(u8, trimmed, "'") or trimmed.len < eq + 5) return null;
@@ -398,14 +401,18 @@ fn parsePowershell(gpa: Allocator, text: []const u8, out: *Environ.Map) Error!vo
 
 // Lines set in place, removed, or added after the last; the conductor's
 // launch must follow them.
-fn rewritePowershell(gpa: Allocator, text: []const u8, changes: []const Change) Error![]u8 {
+fn rewritePowershell(gpa: Allocator, script: []const u8, changes: []const Change) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const text = if (std.mem.cutPrefix(u8, script, utf8_bom)) |body| body: {
+        try out.appendSlice(gpa, utf8_bom);
+        break :body body;
+    } else script;
     const launch = std.mem.indexOf(u8, text, "\n& \"") orelse return error.Unrecognised;
     var done = try gpa.alloc(bool, changes.len);
     defer gpa.free(done);
     @memset(done, false);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var last_set: usize = 0; // where in `out` new lines go
+    var last_set: usize = out.items.len; // where in `out` new lines go
     var lines = std.mem.splitScalar(u8, text[0 .. launch + 1], '\n');
     while (lines.next()) |line| {
         if (lines.index == null and line.len == 0) break;
@@ -666,6 +673,19 @@ test "a script's $env: lines are set, removed and added" {
     , text);
     try std.testing.expectError(error.Unrecognised, rewrite(gpa, .powershell, "$env:A = '1'\n", &.{}));
     try std.testing.expectError(error.Unwritable, rewrite(gpa, .powershell, script_text, &.{.{ .key = "A", .value = "a\nb" }}));
+}
+
+test "a script keeps its BOM, and its quotes are doubled" {
+    const gpa = std.testing.allocator;
+    const bom_script = utf8_bom ++ "$env:A = 'x''y'\n\n& \"c:\\conductor.exe\"\n";
+    var env = Declared.init(gpa);
+    defer env.deinit();
+    try parse(gpa, .powershell, bom_script, &env);
+    try std.testing.expectEqualStrings("x'y", env.set.get("A").?);
+    const text = try rewrite(gpa, .powershell, bom_script, &.{.{ .key = "B", .value = "it's" }});
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, utf8_bom ++ "$env:A"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "$env:B = 'it''s'\n") != null);
 }
 
 test "a script doubles PowerShell's typographic single quotes too, and reads them back" {

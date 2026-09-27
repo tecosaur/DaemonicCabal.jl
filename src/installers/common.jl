@@ -10,47 +10,64 @@ install_dir() = Sys.iswindows() ?
 installed_worker_project() = joinpath(install_dir(), "worker")
 installed_conductor() = joinpath(install_dir(), "julia-conductor$EXE")
 installed_client() = joinpath(install_dir(), CLIENT_NAME)
-client_symlink_path() = begin
-    @static if Sys.iswindows()
-        # On PATH by default.
-        joinpath(ENV["LOCALAPPDATA"],
-            "Microsoft", "WindowsApps", CLIENT_NAME
-        )
-    else
-        BaseDirs.User.bin(CLIENT_NAME)
-    end
-end
-worker_executable() = something(
-    get(ENV, "JULIA_DAEMON_WORKER_EXECUTABLE", nothing),
-    Sys.which("julia"),
-    joinpath(Sys.BINDIR, "julia"))
+# WindowsApps is on PATH by default.
+client_symlink_path() = Sys.iswindows() ?
+       joinpath(ENV["LOCALAPPDATA"], "Microsoft", "WindowsApps", CLIENT_NAME) :
+       BaseDirs.User.bin(CLIENT_NAME)
 
-function daemon_env(; worker_maxclients::Integer, worker_ttl::Integer,
-                    worker_args::AbstractString, mode::Symbol,
+"""
+    daemon_env(settings; worker_maxclients, worker_ttl, worker_args, mode,
+               conductor_host, conductor_port, ports, env) -> Dict{String,String}
+
+The service's environment: `settings`, overridden by the arguments given
+(not `nothing`), then by `env`, with the worker project installed.
+
+`mode=:tcp` sets the server to `conductor_host:conductor_port` and the worker
+`ports` (none when empty); `mode=:sockets` drops any TCP server, bind address
+and ports for the default local socket.
+
+Throws an `ArgumentError` for an unknown `mode`, ports outside 1024-65535, or
+a value holding a line break.
+"""
+function daemon_env(settings::Dict{String,String};
+                    worker_maxclients::Union{Integer,Nothing}, worker_ttl::Union{Integer,Nothing},
+                    worker_args::Union{AbstractString,Nothing}, mode::Union{Symbol,Nothing},
                     conductor_host::AbstractString, conductor_port::Integer,
                     ports::UnitRange{Int}, env)
-    mode in (:sockets, :tcp) || throw(ArgumentError("mode must be :sockets or :tcp, got :$mode"))
-    d = Dict{String,String}(
-        "JULIA_DAEMON_WORKER_EXECUTABLE" => worker_executable(),
-        "JULIA_DAEMON_WORKER_PROJECT" => installed_worker_project(),
-        "JULIA_DAEMON_WORKER_MAXCLIENTS" => string(worker_maxclients),
-        "JULIA_DAEMON_WORKER_ARGS" => worker_args,
-        "JULIA_DAEMON_WORKER_TTL" => string(worker_ttl))
-    for optkey in ("JULIA_DAEMON_SERVER", "JULIA_NUM_THREADS")
-        if haskey(ENV, optkey)
-            d[optkey] = ENV[optkey]
+    d = copy(settings)
+    d["JULIA_DAEMON_WORKER_PROJECT"] = installed_worker_project()
+    get!(() -> something(Sys.which("julia"), joinpath(Sys.BINDIR, "julia")),
+         d, "JULIA_DAEMON_WORKER_EXECUTABLE")
+    for (key, value) in ("JULIA_DAEMON_WORKER_MAXCLIENTS" => worker_maxclients,
+                         "JULIA_DAEMON_MAX_TTL" => worker_ttl,
+                         "JULIA_DAEMON_WORKER_ARGS" => worker_args)
+        if !isnothing(value)
+            d[key] = string(value)
         end
     end
     if mode === :tcp
-        d["JULIA_DAEMON_SERVER"] = "$conductor_host:$conductor_port"
+        # An IPv6 address is bracketed, as its colons would read as the port's.
+        host = occursin(':', conductor_host) ? "[$conductor_host]" : conductor_host
+        d["JULIA_DAEMON_SERVER"] = "$host:$conductor_port"
+        delete!(d, "JULIA_DAEMON_PORTS")
         if !isempty(ports)
             1024 <= first(ports) || throw(ArgumentError("port range must start at 1024 or above"))
             last(ports) <= 65535 || throw(ArgumentError("port range must end at 65535 or below"))
             d["JULIA_DAEMON_PORTS"] = "$(first(ports))-$(last(ports))"
         end
+    elseif mode === :sockets
+        for key in ("JULIA_DAEMON_SERVER", "JULIA_DAEMON_BIND", "JULIA_DAEMON_PORTS")
+            delete!(d, key)
+        end
+    elseif !isnothing(mode)
+        throw(ArgumentError("mode must be :sockets or :tcp, got :$mode"))
     end
     for (k, v) in env
         d[string(k)] = string(v)
+    end
+    for (k, v) in d
+        occursin(r"[\r\n]", v) &&
+            throw(ArgumentError("$k holds a line break, which no service file can hold: $(repr(v))"))
     end
     return d
 end
@@ -116,33 +133,53 @@ function make_tree_readonly(path::AbstractString)
     chmod(path, 0o555)
 end
 
-# Orchestration — platform files provide install_service(env) and uninstall_service()
+# Orchestration — platform files provide service_environment(), stop_service(),
+# install_service(env) and uninstall_service()
 
 BaseDirs.@promise_no_assign @doc """
-    install(; mode=:$(DEFAULTS.mode), conductor_host="$(DEFAULTS.conductor_host)", conductor_port=$(DEFAULTS.conductor_port), ports=$(DEFAULTS.ports), ...)
+    install(; worker_maxclients, worker_ttl, worker_args, mode,
+            conductor_host="$(DEFAULTS.conductor_host)", conductor_port=$(DEFAULTS.conductor_port), ports=$(DEFAULTS.ports), env)
 
-Install the daemon and client on this machine.
+Install the daemon and client on this machine, replacing any earlier install.
 
-Installs files to `$(BaseDirs.User.data(BaseDirs.App("julia-daemon"), create=false))`,
-sets up a platform-specific service (systemd on Linux, launchd on macOS,
-manual instructions on BSD), and symlinks the client to
-`$(BaseDirs.User.bin(CLIENT_NAME))`.
+Installs files to `$(install_dir())`, sets up the platform's service (see
+[`DaemonicCabal`](@ref)), and links the client to `$(client_symlink_path())`.
 
-Set `mode=:tcp` to use TCP transport instead of unix domain sockets.
-`conductor_host`/`conductor_port` set the conductor's listen address, and
-`ports` allocates a range for worker connections.
+The service's settings are, each over the last: those of the service it
+replaces (with any `juliaclient --reconfigure` saved), the daemon's variables
+set where `install()` runs (see `juliaclient --reconfigure`, and
+`JULIA_DEPOT_PATH`), the arguments given, and `env`, of variable => value
+pairs. The daemon's defaults stand for the rest.
+
+- `worker_maxclients` sets `JULIA_DAEMON_WORKER_MAXCLIENTS`, `worker_args`
+  `JULIA_DAEMON_WORKER_ARGS`, and `worker_ttl` `JULIA_DAEMON_MAX_TTL` (seconds).
+- `mode=:tcp` serves clients over TCP at `conductor_host:conductor_port`, with
+  workers listening on `ports` (any free when empty); `mode=:sockets` over a
+  local socket.
+
+Throws an `ArgumentError` for an unknown `mode`, ports outside 1024-65535, or
+a value holding a line break.
 """ install
-function install(; worker_maxclients::Integer = DEFAULTS.worker_maxclients,
-                 worker_ttl::Integer = DEFAULTS.worker_ttl,
-                 worker_args::AbstractString = DEFAULTS.worker_args,
-                 mode::Symbol = DEFAULTS.mode,
+function install(; worker_maxclients::Union{Integer,Nothing} = nothing,
+                 worker_ttl::Union{Integer,Nothing} = nothing,
+                 worker_args::Union{AbstractString,Nothing} = nothing,
+                 mode::Union{Symbol,Nothing} = nothing,
                  conductor_host::AbstractString = DEFAULTS.conductor_host,
                  conductor_port::Integer = DEFAULTS.conductor_port,
                  ports::UnitRange{Int} = DEFAULTS.ports,
-                 env = julia_env())
+                 env = Dict{String,String}())
+    # The shell's settings over those saved in the service it replaces: the
+    # daemon's own, and JULIA_DEPOT_PATH, as a worker's depot is fixed as it starts.
+    settings = filter(merge(service_environment(), ENV)) do (key, _)
+        key in ("JULIA_NUM_THREADS", "JULIA_DEPOT_PATH") ||
+            startswith(key, "JULIA_DAEMON_") &&
+            key ∉ ("JULIA_DAEMON_SERVICE", "JULIA_DAEMON_WORKER_PROJECT", "JULIA_DAEMON_SANDBOXED")
+    end
+    denv = daemon_env(settings; worker_maxclients, worker_ttl, worker_args,
+                      mode, conductor_host, conductor_port, ports, env)
+    # First, as Windows can't delete a running executable.
+    stop_service()
     install_files()
-    denv = daemon_env(; worker_maxclients, worker_ttl, worker_args,
-                        mode, conductor_host, conductor_port, ports, env)
     install_service(denv)
     install_client_symlink()
     @info "Done"
