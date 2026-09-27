@@ -74,6 +74,7 @@ pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
 
 /// Owner-only: the sockets inside run code as us.
 pub const runtime_dir_permissions: Io.File.Permissions = .fromMode(0o700);
+pub const private_file_permissions: Io.File.Permissions = .fromMode(0o600);
 /// Refuses `path` unless it is a directory of ours, not a symlink, which is
 /// narrowed to owner-only. Absent is fine: there is nothing in it to trust.
 pub fn secureRuntimeDir(path: []const u8) error{UntrustedRuntimeDir}!void {
@@ -96,6 +97,14 @@ fn refuseRuntimeDir(path: []const u8, comptime reason: []const u8, args: anytype
     eprint("The runtime directory {s} " ++ reason ++ ", so another user could control it.\n" ++
         "Remove it, or set JULIA_DAEMON_RUNTIME to a directory of your own.\n", .{path} ++ args);
     return error.UntrustedRuntimeDir;
+}
+/// Up to `buf`'s length of a small file; null where it can't be read.
+pub fn readSmallFile(path: []const u8, buf: []u8) ?[]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pathz = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
+    const fd = posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return null;
+    defer impl.rawClose(fd);
+    return buf[0 .. posix.read(fd, buf) catch return null];
 }
 // Local transport: AF_UNIX sockets in the runtime dir.
 pub const max_local_addr = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len;

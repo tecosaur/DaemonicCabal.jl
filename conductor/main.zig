@@ -36,16 +36,7 @@ pub const PeerInfo = struct {
 
     pub fn isRemote(self: *const PeerInfo, transport: protocol.TransportMode) bool {
         if (transport != .tcp) return false;
-        return !isLoopback(self.address orelse return true);
-    }
-
-    fn isLoopback(address: Io.net.IpAddress) bool {
-        const v4_mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
-        return switch (address) {
-            .ip4 => |a| a.bytes[0] == 127,
-            .ip6 => |a| std.mem.eql(u8, &a.bytes, &Io.net.Ip6Address.loopback(0).bytes) or
-                (std.mem.eql(u8, a.bytes[0..12], &v4_mapped) and a.bytes[12] == 127),
-        };
+        return !protocol.isLoopback(self.address orelse return true);
     }
 };
 
@@ -159,6 +150,10 @@ pub const Conductor = struct {
     event_loop: eventLoopImpl.EventLoop,
     live: live.Subscribers,
     settings: reconfigure.Settings,
+    /// Keys clients and workers by their ids (`protocol.keyFor`).
+    secret: [16]u8,
+    /// Kept in the runtime dir, which no sandbox sees.
+    host_key: protocol.client.HostKey,
 
     // --- Lifecycle ---
 
@@ -184,7 +179,21 @@ pub const Conductor = struct {
             .event_loop = try eventLoopImpl.EventLoop.init(64),
             .live = .{},
             .settings = try reconfigure.Settings.init(allocator, io, environ_map),
+            .secret = secret: {
+                var secret: [16]u8 = undefined;
+                io.random(&secret);
+                break :secret secret;
+            },
+            .host_key = key: {
+                var key: protocol.client.HostKey = undefined;
+                io.random(&key);
+                break :key key;
+            },
         };
+    }
+
+    pub fn keyFor(self: *const Conductor, kind: protocol.KeyKind, id: u32) u64 {
+        return protocol.keyFor(&self.secret, kind, id);
     }
 
     pub fn deinit(self: *Conductor) void {
@@ -265,6 +274,7 @@ pub const Conductor = struct {
         defer if (self.cfg.transport == .local) {
             Io.Dir.deleteFileAbsolute(self.io, g_pid_path) catch {};
         };
+        if (self.cfg.transport == .tcp) try self.writeHostKey();
         var listener = try self.createServer();
         defer listener.close(self.io);
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
@@ -288,7 +298,9 @@ pub const Conductor = struct {
                 const id = std.mem.cutPrefix(u8, entry.name, "sandbox-") orelse continue;
                 _ = std.fmt.parseInt(u32, id, 10) catch continue;
                 dir.deleteTree(self.io, entry.name) catch {};
-            } else if (std.mem.endsWith(u8, entry.name, ".sock") or std.mem.eql(u8, entry.name, "conductor.pid")) {
+            } else if (std.mem.endsWith(u8, entry.name, ".sock") or std.mem.eql(u8, entry.name, "conductor.pid") or
+                std.mem.eql(u8, entry.name, protocol.client.host_key_file))
+            {
                 dir.deleteFile(self.io, entry.name) catch {};
             }
         }
@@ -507,31 +519,54 @@ pub const Conductor = struct {
         const msg = try std.fmt.bufPrint(&buf, "This juliaclient speaks protocol v{d} but the daemon speaks v{d}: {s}.\n", .{
             theirs, ours, if (theirs < ours) "rebuild or reinstall juliaclient to match the daemon" else "restart the daemon so it runs the newly installed version",
         });
-        try self.serveString(socket, msg, 1);
+        // Its streams come without a key: it knows of none. Id 0 is no
+        // client's, so neither is the key it is sent.
+        self.client_id = 0;
+        var streams = try self.openClientStreams(socket, false);
+        defer streams.deinit();
+        streams.finish(msg, 1);
     }
 
     const Notification = struct {
         kind: protocol.notification.Type,
-        subject: u32, // client id, or worker pid/id
+        subject: u32, // client id, or a peek's worker id
+        key: u64, // its sender's
         evaluation: u32 = 0, // an interrupt's
         report: []const u8 = "", // a peek's, in the connection's buffer
     };
 
     fn parseNotification(r: *protocol.SliceReader) !Notification {
-        const kind = std.enums.fromInt(protocol.notification.Type, try r.int(u8)) orelse return error.UnknownNotification;
-        const subject = try r.int(u32);
-        return switch (kind) {
-            .client_interrupt => .{ .kind = kind, .subject = subject, .evaluation = try r.int(u32) },
-            .peek_report => blk: {
+        var note = Notification{
+            .kind = std.enums.fromInt(protocol.notification.Type, try r.int(u8)) orelse return error.UnknownNotification,
+            .subject = try r.int(u32),
+            .key = try r.int(u64),
+        };
+        switch (note.kind) {
+            .client_interrupt => note.evaluation = try r.int(u32),
+            .peek_report => {
                 const len = try r.int(u32);
                 if (len > max_peek_report_bytes) return error.ReportTooLarge;
-                break :blk .{ .kind = kind, .subject = subject, .report = try r.take(len) };
+                note.report = try r.take(len);
             },
-            else => .{ .kind = kind, .subject = subject },
+            else => {},
+        }
+        return note;
+    }
+
+    /// Whether the notification's key is its sender's: the client it names,
+    /// or the worker that client is on, or whose peek it is.
+    fn isGenuine(self: *Conductor, note: Notification) bool {
+        const worker_id = switch (note.kind) {
+            .client_exit, .client_interrupt => return note.key == self.keyFor(.client, note.subject),
+            // Of a client gone already, it can do nothing.
+            .client_done => (self.active_clients.get(note.subject) orelse return true).worker.id,
+            .peek_report => note.subject,
         };
+        return note.key == self.keyFor(.worker, worker_id);
     }
 
     fn handleNotification(self: *Conductor, note: Notification) void {
+        if (!self.isGenuine(note)) return std.debug.print("Dropped a {s} notification with a wrong key\n", .{@tagName(note.kind)});
         const subject = note.subject;
         // A view's client was never assigned a worker.
         if ((note.kind == .client_exit or note.kind == .client_interrupt) and
@@ -550,18 +585,9 @@ pub const Conductor = struct {
                 info.worker.cancelClient(subject, note.evaluation);
                 info.worker.signal(platform.SIG.INT);
             },
-            .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{subject}),
             .peek_report => {
                 const w = self.findWorkerById(subject) orelse return;
                 live.onProfile(self, w, self.allocator.dupe(u8, note.report) catch return);
-            },
-            .worker_exit => {
-                if (self.findWorkerByPid(subject)) |w| {
-                    std.debug.print("Worker {d} exiting (TTL expired)\n", .{w.id});
-                    self.retireWorker(w);
-                } else {
-                    std.debug.print("Worker (pid {d}) exiting (TTL expired)\n", .{subject});
-                }
             },
         }
     }
@@ -571,24 +597,33 @@ pub const Conductor = struct {
         flags: protocol.client.Flags,
         pid: u32, // self-reported
         ppid: u32,
+        host_key: *const protocol.client.HostKey,
         cwd: []const u8,
         fingerprint: u64,
         args_at: usize, // their count
     };
 
     fn parseRequestHead(r: *protocol.SliceReader) !RequestHead {
-        // flags(1) + reserved(3) + pid(4) + ppid(4)
-        const fixed = try r.take(12);
+        // flags(1) + reserved(3) + pid(4) + ppid(4) + host key(16)
+        const fixed = try r.take(28);
         const cwd = try r.lenPrefixed(u32);
         const fingerprint = try r.int(u64);
         return .{
             .flags = @bitCast(fixed[0]),
             .pid = std.mem.readInt(u32, fixed[4..8], .little),
             .ppid = std.mem.readInt(u32, fixed[8..12], .little),
+            .host_key = fixed[12..28],
             .cwd = cwd,
             .fingerprint = fingerprint,
             .args_at = r.pos,
         };
+    }
+
+    /// Over TCP, a loopback peer is the host's only with the host key: a
+    /// sandbox shares the host's network, but not its runtime dir.
+    fn isRemote(self: *const Conductor, peer: *const PeerInfo, host_key: *const protocol.client.HostKey) bool {
+        if (peer.isRemote(self.cfg.transport)) return true;
+        return self.cfg.transport == .tcp and !std.crypto.timing_safe.eql(protocol.client.HostKey, host_key.*, self.host_key);
     }
 
     /// A local client's environment comes from the cache, where its first
@@ -596,7 +631,7 @@ pub const Conductor = struct {
     fn receiveRequest(self: *Conductor, pc: *PendingConnection, r: *protocol.SliceReader) !?Outcome {
         const head = parseRequestHead(r) catch |err| return if (err == error.Truncated) null else err;
         const args_end = pc.env_at orelse pc.listEnd(head.args_at, 1) catch |err| return if (err == error.Truncated) null else err;
-        const is_remote = pc.peer.isRemote(self.cfg.transport);
+        const is_remote = self.isRemote(&pc.peer, head.host_key);
         // The cache is this machine's: a remote client's environment would
         // only evict local ones.
         const cached = if (is_remote or pc.env_at != null) null else self.cache.lookup(head.fingerprint);
@@ -642,7 +677,7 @@ pub const Conductor = struct {
                 .owned_env = owned_env,
             };
         };
-        return try self.handleClient(pc.socket, &pc.peer, request);
+        return try self.handleClient(pc.socket, is_remote, request);
     }
 
     // `r`'s lengths are already checked.
@@ -676,8 +711,7 @@ pub const Conductor = struct {
         return env;
     }
 
-    fn handleClient(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo, received: ClientRequest) !Outcome {
-        const is_remote = peer.isRemote(self.cfg.transport);
+    fn handleClient(self: *Conductor, socket: posix.socket_t, is_remote: bool, received: ClientRequest) !Outcome {
         var request = received;
         var request_held = false; // moved into a HeldClient while its worker starts
         defer if (!request_held) request.deinit(self.allocator);
@@ -929,8 +963,7 @@ pub const Conductor = struct {
             .color = request.flags.color,
             .force = is_labeled_session,
             .id = self.client_id,
-            .pid = request.pid,
-            .host_pid = request.host_pid,
+            .key = self.keyFor(.client, self.client_id),
             .ppid = request.ppid,
             .cwd = if (sandbox == .remote) sandbox_home else request.cwd,
             .env = sandbox_env orelse request.env,
@@ -1100,8 +1133,7 @@ pub const Conductor = struct {
             .color = request.flags.color,
             .force = is_labeled_session or watcher,
             .id = self.client_id,
-            .pid = request.pid,
-            .host_pid = request.host_pid,
+            .key = self.keyFor(.client, self.client_id),
             .ppid = request.ppid,
             .cwd = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/",
             .env = if (watcher) &.{} else request.env,
@@ -1400,7 +1432,7 @@ pub const Conductor = struct {
 
     // The setup listener turned readable: the worker, or an impostor, connected.
     fn onSpawnReadable(self: *Conductor, p: *PendingSpawn) void {
-        const connected = p.spawn.accept(self.io, &self.cfg) catch |err| return self.failSpawn(p, err);
+        const connected = p.spawn.accept(self.io, &self.cfg, self.keyFor(.worker, p.spawn.worker.id)) catch |err| return self.failSpawn(p, err);
         if (connected) |w| self.completeSpawn(p, w) else self.event_loop.watchFd(@intFromPtr(p) | tag_spawn_listener, p.spawn.listenerFd());
     }
 
@@ -1987,19 +2019,6 @@ pub const Conductor = struct {
         return self.workers.getPtr(key).?;
     }
 
-    fn findWorkerByPid(self: *Conductor, pid: u32) ?*worker.Worker {
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| {
-                if (platform.getChildPid(w.process) == pid) return w;
-            }
-        }
-        if (self.reserve) |r| {
-            if (platform.getChildPid(r.process) == pid) return r;
-        }
-        return null;
-    }
-
     // --- Session labels ---
 
     fn isLabelExpired(self: *Conductor, w: *worker.Worker, now: i64) bool {
@@ -2375,6 +2394,14 @@ pub const Conductor = struct {
         return protocol.listenAddress(self.io, self.cfg.transport, self.cfg.socket_path);
     }
 
+    fn writeHostKey(self: *Conductor) !void {
+        var dir = try Io.Dir.openDirAbsolute(self.io, self.cfg.runtime_dir, .{});
+        defer dir.close(self.io);
+        var file = try dir.createFile(self.io, protocol.client.host_key_file, .{ .permissions = platform.private_file_permissions });
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, &self.host_key);
+    }
+
     fn writePidFile(self: *Conductor) void {
         var buf: [16]u8 = undefined;
         const pid_str = std.fmt.bufPrint(&buf, "{d}", .{platform.getpid()}) catch unreachable;
@@ -2421,7 +2448,7 @@ pub const Conductor = struct {
     };
 
     // On failure everything partial is released first.
-    fn openClientStreams(self: *Conductor, client_socket: posix.socket_t) !ClientStreams {
+    fn openClientStreams(self: *Conductor, client_socket: posix.socket_t, keyed: bool) !ClientStreams {
         const mode = self.cfg.transport;
         const bind = self.cfg.bind_address;
         var port_set_idx: u16 = protocol.PortPool.none;
@@ -2455,12 +2482,17 @@ pub const Conductor = struct {
             // A client that gave up waiting must not wedge us in a bare accept.
             conns[i] = (try listeners[i].acceptTimeout(self.io, reply_accept_timeout_ms)) orelse return error.ClientGone;
             accepted += 1;
+            if (keyed) {
+                var key: [8]u8 = undefined;
+                try protocol.readExactWithin(self.io, conns[i], &key, reply_accept_timeout_ms);
+                if (std.mem.readInt(u64, &key, .little) != self.keyFor(.client, self.client_id)) return error.WrongKey;
+            }
         }
         return .{ .c = self, .listeners = listeners, .conns = conns, .port_set_idx = port_set_idx };
     }
 
     fn serveString(self: *Conductor, client_socket: posix.socket_t, content: []const u8, exit_code: u8) !void {
-        var streams = try self.openClientStreams(client_socket);
+        var streams = try self.openClientStreams(client_socket, true);
         defer streams.deinit();
         streams.finish(content, exit_code);
     }
@@ -2476,7 +2508,7 @@ pub const Conductor = struct {
             defer self.allocator.free(text);
             return self.serveString(client_socket, text, 0);
         }
-        var streams = try self.openClientStreams(client_socket);
+        var streams = try self.openClientStreams(client_socket, true);
         std.debug.print("Client {d}: --reconfigure\n", .{self.client_id});
         try reconfigure.subscribe(self, streams, self.probePalette(&streams));
     }
@@ -2488,7 +2520,7 @@ pub const Conductor = struct {
     // A TTY client is colour-probed first; a non-answering terminal gets the flat report.
     // A styled TTY one-shot waits a beat so its CPU meter resolves.
     fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool, scope: status.Scope) !void {
-        var streams = try self.openClientStreams(client_socket);
+        var streams = try self.openClientStreams(client_socket, true);
         var held = false;
         defer if (!held) streams.deinit();
         const is_live = tty and isLiveStatus(format);
@@ -2554,7 +2586,7 @@ pub const Conductor = struct {
     /// Each path is at most `protocol.max_socket_path` long, as `runClient`
     /// and `createListener` ensure.
     fn sendSocketPaths(self: *Conductor, socket: posix.socket_t, paths: worker.Worker.SocketPaths) void {
-        var buf: [1 + 4 + 4 * (2 + protocol.max_socket_path)]u8 = undefined;
+        var buf: [1 + 4 + 4 * (2 + protocol.max_socket_path) + 8]u8 = undefined;
         var w = protocol.BufWriter{ .buf = &buf };
         w.writeInt(u8, protocol.client.socket_paths);
         w.writeInt(u32, self.client_id);
@@ -2568,6 +2600,7 @@ pub const Conductor = struct {
                 w.writeLenPrefixed(u16, path);
             }
         }
+        w.writeInt(u64, self.keyFor(.client, self.client_id));
         platform.write(socket, w.written());
     }
 };
