@@ -74,17 +74,13 @@ pub const State = struct {
     /// What saving writes, into `buf`: each unsaved setting, and the
     /// deprecated alias of one dropped.
     pub fn changesToSave(self: *const State, buf: *[2 * all.len]service.Change) []service.Change {
-        var n: usize = 0;
+        var list: std.ArrayList(service.Change) = .initBuffer(buf);
         for (all, 0..) |s, i| {
             if (!self.isUnsaved(i)) continue;
-            buf[n] = .{ .key = s.key, .value = self.applied[i] };
-            n += 1;
-            if (s.alias) |alias| {
-                buf[n] = .{ .key = alias, .value = null };
-                n += 1;
-            }
+            list.appendAssumeCapacity(.{ .key = s.key, .value = self.applied[i] });
+            if (s.alias) |alias| list.appendAssumeCapacity(.{ .key = alias, .value = null });
         }
-        return buf[0..n];
+        return list.items;
     }
 
     /// `staged`, checked together, into the applied; they're unstaged.

@@ -256,18 +256,33 @@ pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const
     return row.len;
 }
 
+/// The columns `appendColumns` would draw `line` in, unbounded.
+pub fn columns(line: []const u8) usize {
+    var row = Row{};
+    row.draw(line, Row.max_cols);
+    return row.len;
+}
+
 /// The columns `text`, printable UTF-8, takes at a terminal; an invalid
 /// byte takes one, as U+FFFD would.
 pub fn textWidth(text: []const u8) usize {
     var cols: usize = 0;
     var i: usize = 0;
     while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
-        const cp: ?u21 = if (len > 0 and i + len <= text.len) std.unicode.utf8Decode(text[i .. i + len]) catch null else null;
-        cols += if (cp) |c| codepointWidth(c) else 1;
-        i += if (cp != null) len else 1;
+        const char = decode(text[i..]);
+        cols += if (char) |ch| codepointWidth(ch.cp) else 1;
+        i += if (char) |ch| ch.len else 1;
     }
     return cols;
+}
+
+/// The character `text` starts with: its code point and length in bytes;
+/// null for a byte that doesn't start valid UTF-8.
+pub fn decode(text: []const u8) ?struct { cp: u21, len: u3 } {
+    const len = std.unicode.utf8ByteSequenceLength(text[0]) catch return null;
+    if (len > text.len) return null;
+    const cp = std.unicode.utf8Decode(text[0..len]) catch return null;
+    return .{ .cp = cp, .len = len };
 }
 
 /// The columns a terminal gives `cp`: none for a control or a character
@@ -355,13 +370,14 @@ const Row = struct {
                 '\t' => self.col = @min(max, (self.col / tab_width + 1) * tab_width),
                 0...0x07, 0x0a...0x0c, 0x0e...0x1a, 0x1c...0x1f, 0x7f => {},
                 else => {
-                    const len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
-                    const cp: ?u21 = if (len > 0 and i + len <= text.len) std.unicode.utf8Decode(text[i .. i + len]) catch null else null;
-                    if (cp) |c| {
-                        // C1 controls are dropped as the rest.
-                        if (c < 0x80 or c >= 0xa0) self.put(text[i .. i + len], codepointWidth(c), max);
-                    } else self.put("\u{fffd}", 1, max);
-                    i += if (cp != null) len else 1;
+                    const char = decode(text[i..]) orelse {
+                        self.put("\u{fffd}", 1, max);
+                        i += 1;
+                        continue;
+                    };
+                    // C1 controls are dropped as the rest.
+                    if (char.cp < 0x80 or char.cp >= 0xa0) self.put(text[i .. i + char.len], codepointWidth(char.cp), max);
+                    i += char.len;
                     continue;
                 },
             }
@@ -771,6 +787,7 @@ test "columns: colour kept, other sequences dropped, redrawn lines last" {
     defer out.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 7), try appendColumns(&out, gpa, "\x1b]0;title\x07\x1b[31mred\x1b[0m ok!\x1b[?25l", 20, true));
     try std.testing.expectEqualStrings("\x1b[0;31mred\x1b[0m ok!", out.items);
+    try std.testing.expectEqual(@as(usize, 7), columns("\x1b]0;title\x07\x1b[31mred\x1b[0m ok!\x1b[?25l"));
     out.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 4), try appendColumns(&out, gpa, "50%...\r100%\x1b[K", 20, true));
     try std.testing.expectEqualStrings("100%", out.items);

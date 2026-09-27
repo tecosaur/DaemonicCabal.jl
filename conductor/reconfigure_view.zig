@@ -10,7 +10,6 @@ const Allocator = std.mem.Allocator;
 const settings = @import("settings.zig");
 const changes = @import("changes.zig");
 const pal = @import("palette.zig");
-const status = @import("status.zig");
 const terminal = @import("terminal.zig");
 const tui = @import("tui.zig");
 
@@ -44,42 +43,18 @@ const apply_colour = "\x1b[34m";
 
 /// Colours taken from the terminal's own, where it gave them.
 pub const Styles = struct {
-    muted: Sgr, // grey, for what explains
-    field: Sgr, // an edited value's background
-    tab_tint: Sgr, // an inactive tab's background
+    muted: pal.Sgr, // grey, for what explains
+    field: pal.Sgr, // an edited value's background
+    tab_tint: pal.Sgr, // an inactive tab's background
 
     pub fn of(palette: ?pal.Palette) Styles {
         const fg = if (palette) |p| p.foreground else null;
         const bg = if (palette) |p| p.background else null;
         return .{
-            .muted = .blended("38", fg, bg, status.MUTED_TOWARD_BG, "\x1b[90m"),
+            .muted = .muted(palette),
             .field = .blended("48", bg, fg, field_toward_fg, "\x1b[100m"),
             .tab_tint = .blended("48", bg, fg, tab_toward_fg, ""),
         };
-    }
-};
-
-const Sgr = struct {
-    bytes: [24]u8 = undefined,
-    len: usize = 0,
-
-    // `code` for the colour between `from` and `to`, else `fallback`.
-    fn blended(comptime code: []const u8, from: ?pal.Rgb, to: ?pal.Rgb, t: f64, fallback: []const u8) Sgr {
-        var sgr: Sgr = .{};
-        if (from != null and to != null) {
-            const c = pal.blend(from.?, to.?, t);
-            if (std.fmt.bufPrint(&sgr.bytes, "\x1b[" ++ code ++ ";2;{d};{d};{d}m", .{ c.r, c.g, c.b })) |text| {
-                sgr.len = text.len;
-                return sgr;
-            } else |_| {}
-        }
-        @memcpy(sgr.bytes[0..fallback.len], fallback);
-        sgr.len = fallback.len;
-        return sgr;
-    }
-
-    fn get(self: *const Sgr) []const u8 {
-        return self.bytes[0..self.len];
     }
 };
 
@@ -177,17 +152,13 @@ const Item = struct {
 };
 
 fn itemsOf(tab: settings.Tab, buf: *[max_items]Item) []Item {
-    var n: usize = 0;
+    var items: std.ArrayList(Item) = .initBuffer(buf);
     for (all, 0..) |s, i| {
         if (s.tab != tab) continue;
-        if (s.heading) |heading| {
-            buf[n] = .{ .depth = s.depth - 1, .setting = null, .label = heading };
-            n += 1;
-        }
-        buf[n] = .{ .depth = s.depth, .setting = i, .label = s.label };
-        n += 1;
+        if (s.heading) |heading| items.appendAssumeCapacity(.{ .depth = s.depth - 1, .setting = null, .label = heading });
+        items.appendAssumeCapacity(.{ .depth = s.depth, .setting = i, .label = s.label });
     }
-    return buf[0..n];
+    return items.items;
 }
 
 /// An item among its tab's.
@@ -323,9 +294,10 @@ const Frame = struct {
         const value = row.values[i];
         const staged = scene.staged.has(i);
         const applied = scene.state.applied[i];
+        const used = row.used();
         var buf: [128]u8 = undefined;
         const shown = settings.display(s, value, &buf);
-        const colour = if (!row.used())
+        const colour = if (!used)
             ""
         else if (staged)
             staged_colour
@@ -356,8 +328,8 @@ const Frame = struct {
         const cols = tui.textWidth(text) + if (marked) "default".len else 0;
         if (cols == 0) return tui.textWidth(shown);
         try self.pad(note_at - tui.textWidth(shown));
-        try self.print("  {s}{s}{s}\x1b[39m", .{ if (row.used()) self.muted() else "", text, if (marked) dim ++ "default\x1b[22m" else "" });
-        if (!row.used()) try self.write(dim);
+        try self.print("  {s}{s}{s}\x1b[39m", .{ if (used) self.muted() else "", text, if (marked) dim ++ "default\x1b[22m" else "" });
+        if (!used) try self.write(dim);
         return note_at + 2 + cols;
     }
 
@@ -381,27 +353,20 @@ const Frame = struct {
     fn writeStatus(self: *Frame, i: usize, used: bool) !void {
         const scene = self.scene;
         const state = scene.state;
-        var parts: [3][]const u8 = undefined;
-        var n: usize = 0;
+        var buf: [3][]const u8 = undefined;
+        var parts: std.ArrayList([]const u8) = .initBuffer(&buf);
         if (scene.staged.has(i)) {
-            parts[n] = staged_colour ++ "staged";
-            n += 1;
+            parts.appendAssumeCapacity(staged_colour ++ "staged");
         } else if (state.isUnsaved(i)) {
-            parts[n] = unsaved_colour ++ "unsaved";
-            n += 1;
+            parts.appendAssumeCapacity(unsaved_colour ++ "unsaved");
         }
         if (state.awaitsRestart(i)) {
-            parts[n] = "on restart";
-            n += 1;
+            parts.appendAssumeCapacity("on restart");
         } else if (changes.isMissed(state, scene.fleet, i)) {
-            parts[n] = "new workers";
-            n += 1;
+            parts.appendAssumeCapacity("new workers");
         }
-        if (!used) {
-            parts[n] = "unused";
-            n += 1;
-        }
-        for (parts[0..n], 0..) |part, p| {
+        if (!used) parts.appendAssumeCapacity("unused");
+        for (parts.items, 0..) |part, p| {
             if (p > 0) try self.print("{s} · ", .{self.muted()});
             try self.print("{s}{s}" ++ reset, .{ self.muted(), part });
         }

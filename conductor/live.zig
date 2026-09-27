@@ -42,6 +42,7 @@ const note_s = 4; // how long an action's outcome stays in the pane's border
 const resample_s = 5; // a snapshot still sampling is not asked for again sooner
 const alternate_screen = "\x1b[?7h\x1b[?1049h\x1b[H\x1b[2J";
 const main_screen = "\x1b[0m\x1b[?1049l\x1b[?7l";
+const profile_follows = "The profile follows once the session yields.";
 
 const Watch = terminal.Watch;
 
@@ -73,7 +74,7 @@ const Size = terminal.Size;
 /// What the pane shows of the focused client.
 const Preview = union(enum) {
     pending,
-    unsessioned, // a plain client: nothing of it is recorded
+    unsessioned, // a plain client, which has no transcript
     busy: i64, // the worker didn't answer, as of then
     unrecorded: i64, // as of then: recording may yet start
     failed: i64, // the watch ended in error, as of then
@@ -112,6 +113,12 @@ const Subscriber = struct {
     scroll: usize = 0, // the pager's top line
     pager_top: ?usize = null, // the top line on screen, once drawn
     pager_shown: u64 = 0, // `pagerShown` as drawn
+
+    fn owns(self: *const Subscriber, w: *const Watch) bool {
+        if (w == &self.term.input or w == &self.term.signals) return true;
+        const a = self.attachment orelse return false;
+        return w == &a.output or w == &a.signals;
+    }
 };
 
 /// What the pane shows: the focused session's transcript, its worker's
@@ -230,8 +237,7 @@ fn pruneSnapshots(c: *Conductor) void {
 /// Reads never wait, so a stale readiness costs nothing.
 pub fn onReadable(c: *Conductor, w: *Watch) void {
     const sub = for (c.live.list.items) |s| {
-        if (w == &s.term.input or w == &s.term.signals) break s;
-        if (s.attachment) |a| if (w == &a.output or w == &a.signals) break s;
+        if (s.owns(w)) break s;
     } else return;
     var buf: [16 << 10]u8 = undefined;
     const n = platform.recvNonBlocking(w.fd, &buf) orelse {
@@ -252,9 +258,7 @@ pub fn onReadable(c: *Conductor, w: *Watch) void {
     }
     if (sub.term.gone) return sweep(c);
     // Unless the reading ended what it watched.
-    const still = w == &sub.term.input or w == &sub.term.signals or
-        if (sub.attachment) |a| w == &a.output or w == &a.signals else false;
-    if (still) watch(c, w);
+    if (sub.owns(w)) watch(c, w);
 }
 
 // One-shots set util to the raw rate; any live view uses the EWMA.
@@ -309,16 +313,17 @@ fn repaint(c: *Conductor, sub: *Subscriber) void {
 // frame's top and ESC[0J clears any tail. Returns the frame's lines.
 fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize {
     sub.cursor_drawn = false; // until a pane marks one
-    var report = try c.renderStatus("live", true, sub.term.palette, sub.scope, sub.focus, focusedTrend(c, sub), !sub.oneshot and sub.focus == null);
+    const render = struct {
+        fn f(conductor: *Conductor, s: *const Subscriber) !status.Report {
+            return conductor.renderStatus("live", true, s.term.palette, s.scope, s.focus, focusedTrend(conductor, s), !s.oneshot and s.focus == null);
+        }
+    }.f;
+    var report = try render(c, sub);
     const kept = tui.keepFocus(report.clients, sub.focus, sub.focus_row);
     if (kept != sub.focus) {
         sub.focus = kept;
-        const again = c.renderStatus("live", true, sub.term.palette, sub.scope, sub.focus, focusedTrend(c, sub), !sub.oneshot and sub.focus == null) catch |err| {
-            report.deinit(c.allocator);
-            return err;
-        };
         report.deinit(c.allocator);
-        report = again;
+        report = try render(c, sub);
     }
     defer report.deinit(c.allocator);
     try out.appendSlice(c.allocator, "\x1b[?2026h");
@@ -360,9 +365,9 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     return shown;
 }
 
-// `row` is the focused client's, as the tree drew it: the pane's title.
-// The focused row is the pane's title; a worker's charts, where they fit,
-// stand at its end for the row's own memory and CPU.
+// The focused row, as the tree drew it at `at`, is the pane's title; a
+// worker's charts, where they fit, stand at its end for the row's own
+// memory and CPU.
 fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8), at: status.Placement, report: status.Report, rows: usize) !void {
     const info = c.active_clients.get(focus) orelse return;
     // The tree's column alignment is no use in a title.
@@ -377,9 +382,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
     defer charted.deinit(c.allocator);
     try tui.appendCollapsed(&charted, c.allocator, joined.items);
     const width = @as(usize, sub.term.size.cols) -| at.gutter_cols;
-    const fits = report.aside.len > 0 and
-        try columnsOf(c.allocator, charted.items) + try columnsOf(c.allocator, report.aside) + 10 <= width;
-    const label = info.worker.session_label;
+    const fits = report.aside.len > 0 and tui.columns(charted.items) + tui.columns(report.aside) + 10 <= width;
     var lines_buf: [256][]const u8 = undefined;
     var view_lines: std.ArrayList([]const u8) = .empty;
     defer view_lines.deinit(c.allocator);
@@ -393,7 +396,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
     const hint = latestEntry(c, info.worker, &hint_buf);
     const body: []const []const u8 = if (sub.view != .transcript) view_lines.items else switch (sub.preview) {
         .pending => &.{},
-        .unsessioned => &.{"Not a --session client, so nothing of it is recorded."},
+        .unsessioned => &.{"Transcripts are only available in sessions."},
         .busy => &.{ "Its worker is busy, so the transcript waits until it yields.", hint },
         .unrecorded => &.{
             "This session isn't being recorded.",
@@ -406,41 +409,45 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
             tui.lastLines(sub.tail.items, lines_buf[0..@min(lines_buf.len, rows - 2)]),
     };
     var footer_buf: [160]u8 = undefined;
-    const footer = if (sub.confirming) |id|
-        std.fmt.bufPrint(&footer_buf, "terminate client {d}{s}? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } }), .{
-            if (c.active_clients.get(id)) |target| target.pid else id,
-            if (info.session and (info.sync or label != null)) " and its session" else "",
-        }) catch "terminate? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } })
-    else if (sub.note.text(c.currentTime())) |note|
-        note
-    else if (snap) |sn|
-        if (sn.report == null)
-            "sampling… · " ++ comptime hints(&.{ .{ "⏎", "expand" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
-        else
-            comptime hints(&.{ .{ "⏎", "expand" }, .{ "s", "again" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
-    else if (sub.view == .log)
-        comptime hints(&.{ .{ "⏎", "expand" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
-    else if (info.session)
-        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "expand" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } })
-    else
-        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } });
-    var cursor_sgr: [24]u8 = undefined;
+    const cursor_sgr = pal.Sgr.muted(sub.term.palette); // the grey the tree dims with
     // Output mid-line, such as a prompt, leaves the cursor on its last.
     sub.cursor_drawn = sub.view == .transcript and sub.preview == .transcript and
         sub.tail.items.len > 0 and sub.tail.items[sub.tail.items.len - 1] != '\n';
     try tui.writePane(out, c.allocator, true, .{
         .title = if (fits) charted.items else row.items,
         .aside = if (fits) report.aside else "",
-        .footer = footer,
+        .footer = paneFooter(c, sub, info, snap, &footer_buf),
         .body = body,
         .dim_body = sub.view == .transcript and (sub.preview != .transcript or sub.tail.items.len == 0),
         .cursor_last = sub.cursor_drawn,
         // Steady while the session writes, then a second off, a second on.
         .cursor_shown = @mod(@divTrunc(c.nowNs() - sub.output_ns, std.time.ns_per_s), 2) == 0,
-        .cursor_sgr = mutedSgr(sub.term.palette, &cursor_sgr),
+        .cursor_sgr = cursor_sgr.params(),
         .branch = &at.branch,
         .gutter = &at.gutter,
     }, @as(usize, sub.term.size.cols) -| at.gutter_cols, rows);
+}
+
+// The pane's bottom border: the terminate prompt, an action's outcome, or
+// the keys the pane's view takes.
+fn paneFooter(c: *Conductor, sub: *const Subscriber, info: main.ActiveClientInfo, snap: ?*const Snapshot, buf: *[160]u8) []const u8 {
+    if (sub.confirming) |id| {
+        const whole = info.session and (info.sync or info.worker.session_label != null);
+        return std.fmt.bufPrint(buf, "terminate client {d}{s}? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } }), .{
+            if (c.active_clients.get(id)) |target| target.pid else id,
+            if (whole) " and its session" else "",
+        }) catch "terminate? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } });
+    }
+    if (sub.note.text(c.currentTime())) |note| return note;
+    if (snap) |sn| return if (sn.report == null)
+        "sampling… · " ++ comptime hints(&.{ .{ "⏎", "expand" }, .{ "Esc", "transcript" }, .{ "q", "quit" } })
+    else
+        comptime hints(&.{ .{ "⏎", "expand" }, .{ "s", "again" }, .{ "Esc", "transcript" }, .{ "q", "quit" } });
+    if (sub.view == .log) return comptime hints(&.{ .{ "⏎", "expand" }, .{ "Esc", "transcript" }, .{ "q", "quit" } });
+    return if (info.session)
+        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "expand" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } })
+    else
+        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } });
 }
 
 fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
@@ -502,7 +509,7 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
                 sub.paging = true;
                 sub.scroll = 0;
                 sub.pager_top = null;
-                send(c, sub, alternate_screen ++ "\x1b[?7l");
+                sub.term.send(c.allocator, alternate_screen ++ "\x1b[?7l");
                 repaint(c, sub);
             } else enterFollow(c, sub),
             else => {},
@@ -532,19 +539,17 @@ fn terminate(c: *Conductor, sub: *Subscriber, focus: u32) void {
     const info = c.active_clients.get(focus) orelse return;
     const w = info.worker;
     const whole = info.session and (info.sync or w.session_label != null);
-    var ids: [256]u32 = undefined;
-    var n: usize = 0;
+    var buf: [256]u32 = undefined;
+    var ids: std.ArrayList(u32) = .initBuffer(&buf);
     var it = c.active_clients.iterator();
     while (it.next()) |entry| {
         const other = entry.value_ptr;
         const included = if (whole) other.worker == w and !other.internal else entry.key_ptr.* == focus;
-        if (!included or n == ids.len) continue;
-        ids[n] = entry.key_ptr.*;
-        n += 1;
+        if (included) ids.appendBounded(entry.key_ptr.*) catch break;
     }
     const worker_id = w.id;
     const labelled = whole and w.session_label != null;
-    const ending = c.endClients(w, ids[0..n]);
+    const ending = c.endClients(w, ids.items);
     if (labelled and ending != .retired) c.clearLabel(w);
     const now = c.currentTime();
     switch (ending) {
@@ -575,14 +580,16 @@ fn takeSnapshot(c: *Conductor, sub: *Subscriber, focus: u32) void {
 // The focused client's part of the profile, or until it comes, a digest of
 // the stacks; the whole view has both.
 fn snapshotLines(gpa: std.mem.Allocator, snap: *const Snapshot, focus: u32, out: *std.ArrayList([]const u8)) !void {
-    if (snap.report) |report| {
-        var lines = std.mem.splitScalar(u8, clientSection(report, focus), '\n');
-        while (lines.next()) |line| try out.append(gpa, line);
-        return;
-    }
+    if (snap.report) |report| return appendLines(gpa, out, clientSection(report, focus));
     if (snap.stacks) |stacks| try peek.digest(gpa, stacks, 8, out) else try out.append(gpa, "Asking for the worker's stacks…");
     try out.append(gpa, "");
-    try out.append(gpa, "The profile follows once the session yields.");
+    try out.append(gpa, profile_follows);
+}
+
+// Each of `text`'s lines, a slice of it.
+fn appendLines(gpa: std.mem.Allocator, out: *std.ArrayList([]const u8), text: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| try out.append(gpa, line);
 }
 
 // The worker heads each client's part `── client <id> ──`; the whole report
@@ -628,7 +635,7 @@ fn drawPager(c: *Conductor, sub: *Subscriber) void {
     out.print(c.allocator, "\x1b[{d};1H\x1b[2K\x1b[7m worker #{d} · lines {d}–{d} of {d} · \x1b[1m↑↓ PgUp PgDn g G\x1b[22m · \x1b[1mq\x1b[22m back \x1b[0m\x1b[?2026l", .{
         sub.term.size.rows, info.worker.id, top + 1, bottom, lines.items.len,
     }) catch return;
-    send(c, sub, out.items);
+    sub.term.send(c.allocator, out.items);
     sub.pager_top = top;
     sub.pager_shown = shown;
 }
@@ -734,13 +741,9 @@ fn ageText(buf: []u8, seconds: i64) []const u8 {
 }
 
 fn pagerLines(gpa: std.mem.Allocator, snap: *const Snapshot, out: *std.ArrayList([]const u8)) !void {
-    if (snap.report) |report| {
-        var it = std.mem.splitScalar(u8, report, '\n');
-        while (it.next()) |line| try out.append(gpa, line);
-    } else try out.append(gpa, "The profile follows once the session yields.");
+    if (snap.report) |report| try appendLines(gpa, out, report) else try out.append(gpa, profile_follows);
     try out.append(gpa, "");
-    var it = std.mem.splitScalar(u8, snap.stacks orelse "", '\n');
-    while (it.next()) |line| try out.append(gpa, line);
+    try appendLines(gpa, out, snap.stacks orelse "");
 }
 
 fn pagerKey(c: *Conductor, sub: *Subscriber, key: tui.Key) void {
@@ -767,7 +770,7 @@ fn pagerKey(c: *Conductor, sub: *Subscriber, key: tui.Key) void {
 fn leavePager(c: *Conductor, sub: *Subscriber) void {
     sub.paging = false;
     sub.term.drawn = 0;
-    send(c, sub, main_screen);
+    sub.term.send(c.allocator, main_screen);
     repaint(c, sub);
 }
 
@@ -777,14 +780,11 @@ fn recordTrends(c: *Conductor) void {
     const now = c.currentTime();
     if (now == c.live.trend_at) return;
     c.live.trend_at = now;
-    var gone: [64]u32 = undefined;
-    var n: usize = 0;
+    var buf: [64]u32 = undefined;
+    var gone: std.ArrayList(u32) = .initBuffer(&buf);
     var it = c.live.trends.keyIterator();
-    while (it.next()) |id| if (n < gone.len and c.findWorkerById(id.*) == null) {
-        gone[n] = id.*;
-        n += 1;
-    };
-    for (gone[0..n]) |id| _ = c.live.trends.remove(id);
+    while (it.next()) |id| if (c.findWorkerById(id.*) == null) gone.appendBounded(id.*) catch break;
+    for (gone.items) |id| _ = c.live.trends.remove(id);
     var workers = c.workers.iterator();
     while (workers.next()) |entry| for (entry.value_ptr.items) |w| {
         const trend = c.live.trends.getOrPut(c.allocator, w.id) catch continue;
@@ -797,22 +797,6 @@ fn focusedTrend(c: *Conductor, sub: *const Subscriber) ?*const status.Trend {
     const focus = sub.focus orelse return null;
     const info = c.active_clients.get(focus) orelse return null;
     return c.live.trends.getPtr(info.worker.id);
-}
-
-// The grey the tree dims with, the terminal's text blended toward its
-// background, as SGR parameters; its 8-colour grey without the palette.
-fn mutedSgr(palette: ?pal.Palette, buf: *[24]u8) []const u8 {
-    const p = palette orelse return "90";
-    const fg = p.foreground orelse return "90";
-    const bg = p.background orelse return "90";
-    const grey = pal.blend(fg, bg, status.MUTED_TOWARD_BG);
-    return std.fmt.bufPrint(buf, "38;2;{d};{d};{d}", .{ grey.r, grey.g, grey.b }) catch "90";
-}
-
-fn columnsOf(gpa: std.mem.Allocator, text: []const u8) !usize {
-    var scratch: std.ArrayList(u8) = .empty;
-    defer scratch.deinit(gpa);
-    return tui.appendColumns(&scratch, gpa, text, std.math.maxInt(usize), false);
 }
 
 // --- The focused client's session ---
@@ -853,7 +837,7 @@ fn enterFollow(c: *Conductor, sub: *Subscriber) void {
     }
     sub.following = true;
     sub.term.drawn = 0;
-    send(c, sub, alternate_screen);
+    sub.term.send(c.allocator, alternate_screen);
 }
 
 // Back to the tree, which the main screen still shows.
@@ -861,7 +845,7 @@ fn leaveFollow(c: *Conductor, sub: *Subscriber) void {
     detach(c, sub);
     sub.following = false;
     sub.term.drawn = 0;
-    send(c, sub, main_screen);
+    sub.term.send(c.allocator, main_screen);
     sub.target = null;
     retarget(c, sub);
     repaint(c, sub);
@@ -961,7 +945,7 @@ fn detach(c: *Conductor, sub: *Subscriber) void {
 }
 
 fn onWatchOutput(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
-    if (sub.following) return send(c, sub, bytes);
+    if (sub.following) return sub.term.send(c.allocator, bytes);
     sub.output_ns = c.nowNs();
     sub.tail.appendSlice(c.allocator, bytes) catch return;
     if (sub.tail.items.len > max_tail_bytes) {
@@ -1009,10 +993,6 @@ fn endAttachment(c: *Conductor, sub: *Subscriber, code: ?u8) void {
 const watch = terminal.watch;
 const unwatch = terminal.unwatch;
 const hints = terminal.hints;
-
-fn send(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
-    sub.term.send(c.allocator, bytes);
-}
 
 // Ends the gone: the shell prompt lands under the last frame.
 fn sweep(c: *Conductor) void {
