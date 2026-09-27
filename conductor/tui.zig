@@ -142,8 +142,8 @@ pub const tab_width = 8;
 /// `title` and `footer` sit in the borders, and `aside` at the top border's
 /// end, its title cut first to make room; `body` fills the rows between,
 /// from the top, cut to fit. Text keeps its colour (SGR) and loses other
-/// escape sequences; each character counts as one column, as in the
-/// transcript's `TerminalText`.
+/// escape sequences; each character takes the columns a terminal gives it
+/// (`codepointWidth`).
 pub const Pane = struct {
     title: []const u8,
     aside: []const u8 = "",
@@ -218,22 +218,94 @@ pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const
     row.draw(line, @min(max, Row.max_cols));
     if (cursor) |sgr| row.markCursor(@min(max, Row.max_cols), sgr);
     var style: u8 = 0;
-    for (row.cells[0..row.len]) |cell| {
+    for (row.cells[0..row.len], 0..) |cell, k| {
         if (colour and cell.style != style) {
             try out.appendSlice(gpa, "\x1b[0m");
             try out.appendSlice(gpa, row.styles.get(cell.style));
             style = cell.style;
         }
-        try out.appendSlice(gpa, cell.bytes[0..cell.n]);
+        try out.appendSlice(gpa, row.shown(k));
     }
     if (style != 0) try out.appendSlice(gpa, "\x1b[0m");
     return row.len;
 }
 
-/// A terminal row being drawn: cells with the colour each was drawn in.
+/// The columns `text`, printable UTF-8, takes at a terminal; an invalid
+/// byte takes one, as U+FFFD would.
+pub fn textWidth(text: []const u8) usize {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        const cp: ?u21 = if (len > 0 and i + len <= text.len) std.unicode.utf8Decode(text[i .. i + len]) catch null else null;
+        cols += if (cp) |c| codepointWidth(c) else 1;
+        i += if (cp != null) len else 1;
+    }
+    return cols;
+}
+
+/// The columns a terminal gives `cp`: none for a control or a character
+/// that joins the one before (a combining mark, a joiner, a variation
+/// selector), two for East Asian wide and fullwidth characters and emoji.
+pub fn codepointWidth(cp: u21) u2 {
+    if (cp < 0x20 or (cp >= 0x7f and cp < 0xa0)) return 0;
+    if (cp < 0x300) return 1;
+    if (inRanges(&zero_width, cp)) return 0;
+    return if (inRanges(&wide, cp)) 2 else 1;
+}
+
+fn inRanges(ranges: []const [2]u21, cp: u21) bool {
+    for (ranges) |range| {
+        if (cp < range[0]) return false;
+        if (cp <= range[1]) return true;
+    }
+    return false;
+}
+
+// Sorted, as `inRanges` stops at the first past `cp`. The common scripts'
+// combining marks, not all of Unicode's.
+const zero_width = [_][2]u21{
+    .{ 0x0300, 0x036f }, .{ 0x0483, 0x0489 }, .{ 0x0591, 0x05bd }, .{ 0x05bf, 0x05bf },
+    .{ 0x05c1, 0x05c2 }, .{ 0x05c4, 0x05c5 }, .{ 0x05c7, 0x05c7 }, .{ 0x0610, 0x061a },
+    .{ 0x064b, 0x065f }, .{ 0x0670, 0x0670 }, .{ 0x06d6, 0x06dc }, .{ 0x06df, 0x06e4 },
+    .{ 0x06e7, 0x06e8 }, .{ 0x06ea, 0x06ed }, .{ 0x0900, 0x0902 }, .{ 0x093a, 0x093a },
+    .{ 0x093c, 0x093c }, .{ 0x0941, 0x0948 }, .{ 0x094d, 0x094d }, .{ 0x0951, 0x0957 },
+    .{ 0x0962, 0x0963 }, .{ 0x0e31, 0x0e31 }, .{ 0x0e34, 0x0e3a }, .{ 0x0e47, 0x0e4e },
+    .{ 0x1160, 0x11ff }, .{ 0x1ab0, 0x1aff }, .{ 0x1dc0, 0x1dff }, .{ 0x200b, 0x200f },
+    .{ 0x202a, 0x202e }, .{ 0x2060, 0x2064 }, .{ 0x20d0, 0x20ff }, .{ 0x302a, 0x302d },
+    .{ 0x3099, 0x309a }, .{ 0xd7b0, 0xd7ff }, .{ 0xfe00, 0xfe0f }, .{ 0xfe20, 0xfe2f },
+    .{ 0xfeff, 0xfeff }, .{ 0x1f3fb, 0x1f3ff }, .{ 0xe0000, 0xe007f }, .{ 0xe0100, 0xe01ef },
+};
+
+const wide = [_][2]u21{
+    .{ 0x1100, 0x115f },   .{ 0x231a, 0x231b },   .{ 0x2329, 0x232a },   .{ 0x23e9, 0x23ec },
+    .{ 0x23f0, 0x23f0 },   .{ 0x23f3, 0x23f3 },   .{ 0x25fd, 0x25fe },   .{ 0x2614, 0x2615 },
+    .{ 0x2648, 0x2653 },   .{ 0x267f, 0x267f },   .{ 0x2693, 0x2693 },   .{ 0x26a1, 0x26a1 },
+    .{ 0x26aa, 0x26ab },   .{ 0x26bd, 0x26be },   .{ 0x26c4, 0x26c5 },   .{ 0x26ce, 0x26ce },
+    .{ 0x26d4, 0x26d4 },   .{ 0x26ea, 0x26ea },   .{ 0x26f2, 0x26f3 },   .{ 0x26f5, 0x26f5 },
+    .{ 0x26fa, 0x26fa },   .{ 0x26fd, 0x26fd },   .{ 0x2705, 0x2705 },   .{ 0x270a, 0x270b },
+    .{ 0x2728, 0x2728 },   .{ 0x274c, 0x274c },   .{ 0x274e, 0x274e },   .{ 0x2753, 0x2755 },
+    .{ 0x2757, 0x2757 },   .{ 0x2795, 0x2797 },   .{ 0x27b0, 0x27b0 },   .{ 0x27bf, 0x27bf },
+    .{ 0x2b1b, 0x2b1c },   .{ 0x2b50, 0x2b50 },   .{ 0x2b55, 0x2b55 },   .{ 0x2e80, 0x303e },
+    .{ 0x3041, 0x33ff },   .{ 0x3400, 0x4dbf },   .{ 0x4e00, 0x9fff },   .{ 0xa000, 0xa4cf },
+    .{ 0xa960, 0xa97f },   .{ 0xac00, 0xd7a3 },   .{ 0xf900, 0xfaff },   .{ 0xfe10, 0xfe19 },
+    .{ 0xfe30, 0xfe6f },   .{ 0xff00, 0xff60 },   .{ 0xffe0, 0xffe6 },   .{ 0x16fe0, 0x16fe4 },
+    .{ 0x17000, 0x18cff }, .{ 0x1b000, 0x1b2ff }, .{ 0x1f004, 0x1f004 }, .{ 0x1f0cf, 0x1f0cf },
+    .{ 0x1f18e, 0x1f18e }, .{ 0x1f191, 0x1f19a }, .{ 0x1f200, 0x1f265 }, .{ 0x1f300, 0x1f64f },
+    .{ 0x1f680, 0x1f6ff }, .{ 0x1f7e0, 0x1f7eb }, .{ 0x1f900, 0x1f9ff }, .{ 0x1fa70, 0x1faff },
+    .{ 0x20000, 0x2fffd }, .{ 0x30000, 0x3fffd },
+};
+
+/// A terminal row being drawn: cells with the colour each was drawn in. A
+/// wide character takes two, the second with no bytes of its own.
 const Row = struct {
     const max_cols = 512;
-    const Cell = struct { bytes: [4]u8 = .{ ' ', 0, 0, 0 }, n: u3 = 1, style: u8 = 0 };
+    const Cell = struct {
+        bytes: [16]u8 = .{' '} ++ .{0} ** 15, // room for combining marks
+        n: u5 = 1, // 0: the second column of the wide character before
+        wide: bool = false,
+        style: u8 = 0,
+    };
 
     cells: [max_cols]Cell = undefined,
     len: usize = 0, // columns drawn
@@ -258,10 +330,12 @@ const Row = struct {
                 0...0x07, 0x0a...0x0c, 0x0e...0x1a, 0x1c...0x1f, 0x7f => {},
                 else => {
                     const len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
-                    const whole = len > 0 and i + len <= text.len and
-                        if (std.unicode.utf8Decode(text[i .. i + len])) |cp| !(cp >= 0x80 and cp < 0xa0) else |_| false;
-                    self.put(if (whole) text[i .. i + len] else "\u{fffd}", max);
-                    i += if (whole) len else 1;
+                    const cp: ?u21 = if (len > 0 and i + len <= text.len) std.unicode.utf8Decode(text[i .. i + len]) catch null else null;
+                    if (cp) |c| {
+                        // C1 controls are dropped as the rest.
+                        if (c < 0x80 or c >= 0xa0) self.put(text[i .. i + len], codepointWidth(c), max);
+                    } else self.put("\u{fffd}", 1, max);
+                    i += if (cp != null) len else 1;
                     continue;
                 },
             }
@@ -275,17 +349,45 @@ const Row = struct {
         const blank = self.col >= self.len or std.mem.eql(u8, self.cells[self.col].bytes[0..self.cells[self.col].n], " ");
         if (!blank) return;
         self.style = self.styles.apply(0, sgr);
-        self.put("▎", max);
+        self.put("▎", 1, max);
     }
 
-    fn put(self: *Row, bytes: []const u8, max: usize) void {
+    // A wide character that doesn't fit ends the row, as the terminal
+    // would wrap it.
+    fn put(self: *Row, bytes: []const u8, width: u2, max: usize) void {
+        if (width == 0) return self.combine(bytes);
         if (self.col >= max) return;
+        if (self.col + width > max) {
+            self.col = max;
+            return;
+        }
         if (self.col > self.len) @memset(self.cells[self.len..self.col], .{});
-        var cell = Cell{ .n = @intCast(bytes.len), .style = self.style };
+        var cell = Cell{ .n = @intCast(bytes.len), .wide = width == 2, .style = self.style };
         @memcpy(cell.bytes[0..bytes.len], bytes);
         self.cells[self.col] = cell;
-        self.col += 1;
+        if (width == 2) self.cells[self.col + 1] = .{ .n = 0, .style = self.style };
+        self.col += width;
         self.len = @max(self.len, self.col);
+    }
+
+    // Onto the character before, where its cell has room.
+    fn combine(self: *Row, bytes: []const u8) void {
+        var at = @min(self.col, self.len);
+        if (at == 0) return;
+        at -= 1;
+        if (self.cells[at].n == 0 and at > 0) at -= 1;
+        const cell = &self.cells[at];
+        if (cell.n == 0 or @as(usize, cell.n) + bytes.len > cell.bytes.len) return;
+        @memcpy(cell.bytes[cell.n..][0..bytes.len], bytes);
+        cell.n += @intCast(bytes.len);
+    }
+
+    // Cell `k`'s bytes: a wide character's halves, one drawn over, blank.
+    fn shown(self: *const Row, k: usize) []const u8 {
+        const cell = &self.cells[k];
+        if (cell.n == 0) return if (k > 0 and self.cells[k - 1].wide) "" else " ";
+        const whole = !cell.wide or (k + 1 < self.len and self.cells[k + 1].n == 0);
+        return if (whole) cell.bytes[0..cell.n] else " ";
     }
 
     // `seq` is the sequence after `ESC [`, its final byte last.
@@ -295,7 +397,7 @@ const Row = struct {
         const n: usize = std.fmt.parseInt(usize, params, 10) catch 0;
         switch (final) {
             'm' => self.style = self.styles.apply(self.style, params),
-            'C' => self.col = @min(max, self.col + @max(n, 1)),
+            'C' => self.col = @min(max, self.col +| @max(n, 1)),
             'D' => self.col -|= @max(n, 1),
             'G' => self.col = @min(max, @max(n, 1) - 1),
             'K' => switch (n) {
@@ -305,7 +407,7 @@ const Row = struct {
                 },
                 else => self.len = 0,
             },
-            'X' => if (self.col < self.len) for (self.col..@min(self.col + @max(n, 1), self.len)) |c| {
+            'X' => if (self.col < self.len) for (self.col..@min(self.col +| @max(n, 1), self.len)) |c| {
                 self.cells[c] = .{};
             },
             else => {},
@@ -472,6 +574,17 @@ test "columns: controls dropped, tabs expanded, cut at the width" {
     try std.testing.expectEqualStrings("abc", out.items);
 }
 
+test "columns: a count past any row's width moves or erases to its end" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), try appendColumns(&out, gpa, "a\x1b[18446744073709551615Cb", 8, false));
+    try std.testing.expectEqualStrings("a", out.items);
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 3), try appendColumns(&out, gpa, "abc\x1b[2D\x1b[18446744073709551615X", 8, false));
+    try std.testing.expectEqualStrings("a  ", out.items);
+}
+
 test "columns: erasing past what is drawn erases nothing" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -482,6 +595,36 @@ test "columns: erasing past what is drawn erases nothing" {
     out.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 9), try appendColumns(&out, gpa, "ab\x1b[9C\x1b[X\x1b[3Dc", 80, false));
     try std.testing.expectEqualStrings("ab      c", out.items);
+}
+
+test "widths: wide characters take two columns, joining ones none" {
+    try std.testing.expectEqual(@as(usize, 5), textWidth("a世界"));
+    try std.testing.expectEqual(@as(usize, 1), textWidth("e\u{301}"));
+    try std.testing.expectEqual(@as(usize, 2), textWidth("✅\u{fe0f}\u{200d}"));
+    try std.testing.expectEqual(@as(usize, 4), textWidth("🎉ab"));
+    try std.testing.expectEqual(@as(usize, 2), textWidth("\xffé"));
+    try std.testing.expectEqual(@as(u2, 0), codepointWidth(0x1b));
+    try std.testing.expectEqual(@as(u2, 1), codepointWidth('─'));
+}
+
+test "columns: a wide character's two columns, and a mark joining the one before" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 5), try appendColumns(&out, gpa, "世e\u{301}\x1b[Cx\u{85}", 20, false));
+    try std.testing.expectEqualStrings("世e\u{301} x", out.items);
+    // Drawn over, a wide character's other half is blank; one past the width isn't drawn.
+    for ([_][2][]const u8{
+        .{ "世界\x1b[3Gx", "世x " },
+        .{ "世界\x1b[2Gx", " x界" },
+        .{ "世界\x1b[3G\x1b[K", "世" },
+        .{ "abc世", "abc" },
+        .{ "abc世d", "abc" },
+    }) |case| {
+        out.clearRetainingCapacity();
+        _ = try appendColumns(&out, gpa, case[0], 4, false);
+        try std.testing.expectEqualStrings(case[1], out.items);
+    }
 }
 
 test "columns: colour kept, other sequences dropped, redrawn lines last" {
