@@ -13,7 +13,7 @@ Add the package and run ~DaemonicCabal.install()~ to set up the daemon and put
 =juliaclient= on your path:
 
 #+begin_src shell
-julia --project=temp -e 'using Pkg; Pkg.add(url="https://github.com/tecosaur/DaemonicCabal.jl.git"); using DaemonicCabal; DaemonicCabal.install()'
+julia -e 'using Pkg; Pkg.activate(temp=true); Pkg.add(url="https://github.com/tecosaur/DaemonicCabal.jl.git"); using DaemonicCabal; DaemonicCabal.install()'
 #+end_src
 
 Then use =juliaclient= wherever you would use =julia=:
@@ -48,7 +48,11 @@ worker per project, plus a spare already started, so even a project's first
 run skips Julia's own startup.
 
 When a worker's manifest or =dev='d package source changes on disk, the next
-run gets a fresh worker.
+run gets a fresh worker. To start afresh yourself, =juliaclient --restart= ends
+the project's workers (or, with =--session=<label>=, that session's).
+
+On Linux, the conductor uses io_uring where the kernel allows it, and epoll
+where it doesn't.
 
 * Live monitoring
 
@@ -135,7 +139,14 @@ project:
 The daemon can also serve other machines over TCP, sandboxing each remote
 client in a worker of its own with a read-only depot, no view of your home
 directory, and optional memory and CPU limits. Platforms other than Linux
-refuse remote clients.
+refuse remote clients. To serve over TCP, install with
+
+#+begin_src julia
+DaemonicCabal.install(mode=:tcp, conductor_host="0.0.0.0")  # port 9345, every address
+#+end_src
+
+then point clients at it with =juliaclient -a host:9345= (or =--address=), or
+by setting =JULIA_DAEMON_SERVER=tcp://host:9345=.
 
 A client already in a sandbox of its own (bubblewrap, say) gets a worker started
 inside it, so Julia sees the same filesystem the client does. The sandbox just
@@ -144,6 +155,6 @@ needs the daemon's runtime directory (where its sockets live) mounted.
 * Memory usage
 
 To avoid filling up system memory with idle workers, system memory usage is
-monitored and idle workers reaped based to avoid being responsible for an OOM.
+monitored and idle workers reaped before they can cause an out-of-memory kill.
 More actively and recently used workers are kept for longer, and the particular
 behaviour is configurable.
