@@ -113,21 +113,18 @@ pub const Scene = struct {
     asking: bool = false, // whether to save before quitting
     styles: *const Styles,
     cols: u16,
+    rows: u16,
 };
 
-/// Leaves the terminal as it was, the frame (the cursor `from` lines below
-/// its top) erased, and `last` (a line or more) left in its place.
+/// The frame (the cursor `from` lines below its top) erased, and `last` (a
+/// line or more) left in its place.
 pub fn clear(gpa: Allocator, out: *std.ArrayList(u8), from: usize, last: ?[]const u8) !void {
     if (from > 0) try out.print(gpa, "\x1b[{d}F", .{from}) else try out.append(gpa, '\r');
-    try out.appendSlice(gpa, "\x1b[0J" ++ view_end);
+    try out.appendSlice(gpa, "\x1b[0J");
     const text = last orelse return;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| try out.print(gpa, "{s}\r\n", .{line});
 }
-
-/// Autowrap off, the cursor hidden: a frame's height is its lines.
-pub const view_start = "\x1b[?25l\x1b[?7l";
-const view_end = "\x1b[?7h\x1b[?25h";
 
 /// `scene` drawn over the last frame, the cursor `from` lines below its top;
 /// returns how far below its own top it leaves the cursor.
@@ -135,15 +132,22 @@ pub fn draw(gpa: Allocator, out: *std.ArrayList(u8), scene: *const Scene, from: 
     try out.appendSlice(gpa, "\x1b[?2026h\x1b[?25l");
     if (from > 0) try out.print(gpa, "\x1b[{d}F", .{from}) else try out.append(gpa, '\r');
     try out.appendSlice(gpa, "\x1b[0J");
-    var frame: Frame = .{ .gpa = gpa, .out = out, .start = out.items.len, .scene = scene };
+    var composed: std.ArrayList(u8) = .empty;
+    defer composed.deinit(gpa);
+    var frame: Frame = .{ .gpa = gpa, .out = &composed, .scene = scene };
     try frame.compose();
-    const lines = frame.line();
+    // Cut to the screen, scrolled to keep the focus in view.
+    const total = frame.line();
+    const height = @min(total, @as(usize, scene.rows) -| 1);
+    const top = tui.scrollTop(total, height, frame.focus_lines[0], frame.focus_lines[1]);
+    try out.appendSlice(gpa, tui.lineRange(composed.items, top, height));
     const at = frame.cursor orelse {
         try out.appendSlice(gpa, "\x1b[?2026l");
-        return lines;
+        return height;
     };
-    try out.print(gpa, "\x1b[{d}A\x1b[{d}G\x1b[?25h\x1b[?2026l", .{ lines - at.line, at.col + 1 });
-    return at.line;
+    const line = at.line - top;
+    try out.print(gpa, "\x1b[{d}A\x1b[{d}G\x1b[?25h\x1b[?2026l", .{ height - line, at.col + 1 });
+    return line;
 }
 
 /// The first setting of each tab: where its focus starts.
@@ -208,12 +212,12 @@ const Row = struct {
 const Frame = struct {
     gpa: Allocator,
     out: *std.ArrayList(u8),
-    start: usize,
     scene: *const Scene,
     cursor: ?struct { line: usize, col: usize } = null,
+    focus_lines: [2]usize = .{ 0, 0 }, // the focused setting and what explains it
 
     fn line(self: *const Frame) usize {
-        return std.mem.count(u8, self.out.items[self.start..], "\n");
+        return std.mem.count(u8, self.out.items, "\n");
     }
 
     fn write(self: *Frame, bytes: []const u8) !void {
@@ -242,8 +246,13 @@ const Frame = struct {
         const items = itemsOf(tabs[scene.tab], &buf);
         for (items, 0..) |item, k| {
             const row: Row = .{ .items = items, .k = k, .values = &values, .value_cols = valueCols(items, &values) };
+            const focused = item.setting == scene.focus;
+            if (focused) self.focus_lines[0] = self.line();
             try self.writeRow(row);
-            if (item.setting == scene.focus) try self.writeInfo(row, width);
+            if (focused) {
+                try self.writeInfo(row, width);
+                self.focus_lines[1] = self.line();
+            }
         }
         try self.writeRule(width);
         try self.writeFooter(width);
@@ -495,7 +504,7 @@ const Frame = struct {
             first = false;
             try self.print("{s}{d}" ++ reset ++ "{s} {s}", .{ count[1], count[0], noun, count[2] });
         }
-        if (p.retirable) try self.write(comptime dim ++ ": " ++ hints(&.{.{ "r", "restarts the idle ones" }}) ++ reset);
+        if (p.retirable) try self.write(comptime dim ++ ": " ++ hints(&.{.{ "r", "retires the idle ones" }}) ++ reset);
         try self.write("\n");
     }
 
@@ -587,7 +596,7 @@ fn drawnText(scene: *const Scene) ![]u8 {
 }
 
 fn sceneOf(state: *const changes.State, staged: *const changes.Staged, styles: *const Styles, tab: usize, focus: usize) Scene {
-    return .{ .state = state, .staged = staged, .fleet = .{}, .saving = true, .tab = tab, .focus = focus, .styles = styles, .cols = 100 };
+    return .{ .state = state, .staged = staged, .fleet = .{}, .saving = true, .tab = tab, .focus = focus, .styles = styles, .cols = 100, .rows = 50 };
 }
 
 test "a staged change shows what it was, and the footer counts it" {
@@ -652,7 +661,34 @@ test "a change workers missed is marked on its row" {
     const text = try drawnText(&scene);
     defer gpa.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "unsaved · new workers") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "1 change unsaved · 1 only for new workers: r restarts the idle ones") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "1 change unsaved · 1 only for new workers: r retires the idle ones") != null);
+}
+
+test "a frame taller than the terminal scrolls to keep its focus" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const styles = Styles.of(null);
+    const high = Setting.index("JULIA_DAEMON_MEMFREE_HIGH"); // the memory tab's last
+    const check: Check = .{};
+    var scene = sceneOf(&state, &staged, &styles, 3, high);
+    scene.rows = 8;
+    scene.editor = .{ .text = "20%", .cursor = 1, .check = &check };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const cursor_line = try draw(gpa, &out, &scene, 0);
+    const text = try drawnText(&scene);
+    defer gpa.free(text);
+    try testing.expectEqual(@as(usize, 7), std.mem.count(u8, text, "\n"));
+    try testing.expect(std.mem.indexOf(u8, text, "❯") != null and std.mem.indexOf(u8, text, "eased above") != null);
+    // The cursor's line is the focused row's, among those shown.
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    for (0..cursor_line) |_| _ = lines.next();
+    try testing.expect(std.mem.indexOf(u8, lines.next().?, "eased above") != null);
 }
 
 test "the editor's cursor is placed past wide characters' two columns" {

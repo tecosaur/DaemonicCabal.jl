@@ -17,6 +17,14 @@ const Conductor = main.Conductor;
 const ClientStreams = Conductor.ClientStreams;
 
 const max_queued_bytes = 1 << 20;
+// Without autowrap a row wider than the terminal is cut, not wrapped, so a
+// frame's height is its line count, which a redraw moves back over.
+const view_start = "\x1b[?25l\x1b[?7l";
+const view_end = "\x1b[?7h\x1b[?25h";
+// After output the terminal took only part of: CAN abandons an escape
+// sequence it stopped inside, then a frame's colour and synchronised update
+// are ended.
+const cut_short = "\x18\x1b[0m\x1b[?2026l";
 
 /// The low bits of an event-loop tag for a `Watch`, whose address it carries.
 pub const tag: usize = 5;
@@ -53,7 +61,8 @@ pub const Terminal = struct {
     gone: bool = false,
 
     /// Keys as they're pressed (its client is raw from the start), and the
-    /// terminal's size, from here on.
+    /// terminal's size, from here on; the cursor hidden and autowrap off until
+    /// it's closed.
     pub fn open(self: *Terminal, c: *Conductor) void {
         const signals = self.streams.fd(.signals);
         self.querySize();
@@ -61,15 +70,26 @@ pub const Terminal = struct {
         self.signals = .{ .kind = .signals, .fd = signals };
         watch(c, &self.input);
         watch(c, &self.signals);
+        self.send(c.allocator, view_start);
     }
 
-    /// Stops reading it, sends `leaving`, and lets the client exit.
+    /// Stops reading it and lets the client exit: first what it hasn't yet
+    /// taken, as far as it takes it now, ended cleanly where it stops short;
+    /// then, for one opened, `leaving` with the terminal set back as it was.
     pub fn close(self: *Terminal, c: *Conductor, leaving: ?[]const u8) void {
-        if (leaving) |bytes| {
+        const gpa = c.allocator;
+        if (leaving != null) {
             unwatch(c, &self.input);
             unwatch(c, &self.signals);
-            _ = platform.sendNonBlocking(self.stdout(), bytes);
         }
+        const cut = self.queued.items.len > 0 and !self.flushQueued();
+        self.queued.clearRetainingCapacity();
+        if (cut) self.queued.appendSlice(gpa, cut_short) catch {};
+        if (leaving) |bytes| {
+            self.queued.appendSlice(gpa, bytes) catch {};
+            self.queued.appendSlice(gpa, view_end) catch {};
+        }
+        if (self.queued.items.len > 0) _ = platform.sendNonBlocking(self.stdout(), self.queued.items);
         self.streams.closeForExit(0);
         self.streams.deinit();
         self.queued.deinit(c.allocator);

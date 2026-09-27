@@ -11,6 +11,7 @@ const config = @import("config.zig");
 const worker = @import("worker.zig");
 const argspec = @import("args.zig");
 const pal = @import("palette.zig");
+const tui = @import("tui.zig");
 
 const Conductor = main.Conductor;
 const Worker = worker.Worker;
@@ -394,9 +395,10 @@ fn formatDuration(buf: *[16]u8, total_seconds: i64) ![]const u8 {
     return std.fmt.bufPrint(buf, "{d}{c}{d}{c}", .{ big, units[0], small, units[1] });
 }
 
-fn contractHome(path: []const u8, home: []const u8) []const u8 {
-    if (home.len == 0 or !std.mem.startsWith(u8, path, home)) return path;
-    return path[home.len..]; // caller re-prepends "~"
+/// `path` past `home`, when within it: what follows `~`.
+pub fn withinHome(path: []const u8, home: []const u8) ?[]const u8 {
+    const within = home.len > 0 and path.len > home.len and std.mem.startsWith(u8, path, home) and path[home.len] == '/';
+    return if (within) path[home.len..] else null;
 }
 
 // --- Tree rendering ----------------------------------------------------------
@@ -452,24 +454,24 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const 
         try w.writeByte(' ');
         try s.wrap(w, ansi.dim, "(default environment)");
     } else if (s.enabled) {
-        const shown = contractHome(path, c.cfg.host_home);
-        const tilde = shown.ptr != path.ptr;
+        const home_relative = withinHome(path, c.cfg.host_home);
+        const shown = home_relative orelse path;
+        const tilde = home_relative != null;
         const slash = std.mem.lastIndexOfScalar(u8, shown, '/');
         const basename = if (slash) |i| shown[i + 1 ..] else shown;
         const parent = if (slash) |i| shown[0 .. i + 1] else "";
-        if (all_inactive)
-            try s.wrap(w, ansi.dim, basename)
-        else
-            try s.wrap(w, ansi.bold ++ ansi.blue, basename);
+        if (all_inactive) try s.open(w, ansi.dim) else try s.open(w, ansi.bold ++ ansi.blue);
+        _ = try writeUntrusted(w, basename);
+        try s.close(w);
         if (parent.len > 0 or tilde) {
             try s.open(w, ansi.dim);
             try w.writeAll(" · ");
             if (tilde) try w.writeByte('~');
-            try w.writeAll(parent);
+            _ = try writeUntrusted(w, parent);
             try s.close(w);
         }
     } else {
-        try w.writeAll(path);
+        _ = try writeUntrusted(w, path);
     }
     if (workers.len > 1) {
         const pooled = groupMem(workers);
@@ -509,8 +511,9 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
         try s.open(w, ansi.dim);
         try w.print("#{s}", .{id_text});
         if (wk.session_label) |label| {
-            try w.print(" [{s}]", .{label});
-            col += 3 + label.len;
+            try w.writeAll(" [");
+            col += 3 + try writeUntrusted(w, label);
+            try w.writeByte(']');
         }
     } else {
         try s.wrap(w, ansi.dim, "#");
@@ -518,9 +521,10 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
         if (wk.session_label) |label| {
             try w.writeByte(' ');
             try s.wrap(w, ansi.dim, "[");
-            try s.wrap(w, ansi.cyan, label);
+            try s.open(w, ansi.cyan);
+            col += 3 + try writeUntrusted(w, label);
+            try s.close(w);
             try s.wrap(w, ansi.dim, "]");
-            col += 3 + label.len;
         }
     }
     if (wk.julia_channel) |ch| {
@@ -770,7 +774,9 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             try w.print("{d}", .{info.pid});
             var name_buf: [64]u8 = undefined;
             if (platform.getParentName(info.pid, &name_buf)) |name| {
-                try w.print(" ({s})", .{name});
+                try w.writeAll(" (");
+                _ = try writeUntrusted(w, name);
+                try w.writeByte(')');
             }
             const attached_s = @divTrunc(now * 1_000_000 - info.start_time_us, 1_000_000);
             try s.open(w, ansi.dim);
@@ -837,7 +843,9 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style, view: View) !void {
     }
     try w.writeByte('\n');
     try w.writeAll(indent);
-    try w.print("worker args  {s}\n", .{c.cfg.worker_args});
+    try w.writeAll("worker args  ");
+    _ = try writeUntrusted(w, c.cfg.worker_args);
+    try w.writeByte('\n');
     try s.close(w);
 }
 
@@ -863,11 +871,20 @@ fn memCeiling(view: View) u64 {
 fn writeChannel(w: Writer, channel: []const u8) !usize {
     const ch = if (channel.len > 0 and channel[0] == '+') channel[1..] else channel;
     if (ch.len > 0 and std.ascii.isDigit(ch[0])) {
-        try w.print("v{s}", .{ch});
-        return 1 + ch.len;
+        try w.writeByte('v');
+        return 1 + try writeUntrusted(w, ch);
     }
-    try w.print("({s})", .{ch});
-    return 2 + ch.len;
+    try w.writeByte('(');
+    const cols = try writeUntrusted(w, ch);
+    try w.writeByte(')');
+    return 2 + cols;
+}
+
+// What a client or process named (a label, a path, a command) as a terminal
+// would show it, escape sequences and controls dropped, so none reaches the
+// terminal of whoever asks; returns its columns.
+fn writeUntrusted(w: Writer, text: []const u8) !usize {
+    return tui.appendColumns(w.list, w.gpa, text, std.math.maxInt(usize), false);
 }
 
 threadlocal var id_buf: [16]u8 = undefined;
@@ -918,7 +935,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     try writeJsonStringOrNull(w, threads_str);
     try w.print(",\"interactive\":{},\"launch\":\"{s}\"", .{ wk.interactive, @tagName(wk.launch) });
     try w.print(",\"created_at\":{d},\"last_active\":{d},\"last_pinged\":{d}", .{ wk.created_at, wk.last_active, wk.last_pinged });
-    try w.print(",\"ping_pending\":{},\"active_clients\":{d},\"watchers\":{d}", .{ wk.ping_pending, wk.busyClients(), countClients(c, wk) - wk.busyClients() });
+    try w.print(",\"ping_pending\":{},\"active_clients\":{d},\"watchers\":{d}", .{ wk.ping_pending, wk.busyClients(), countClients(c, wk) -| wk.busyClients() });
     try w.print(",\"activity\":{d:.4},\"cull_budget_s\":{d}", .{ c.workerActivity(wk, key, now), c.idleBudget(wk, key orelse "") });
     if (stats) |st| {
         try w.print(",\"mem_bytes\":{d},\"cpu_seconds\":{d:.3}", .{ st.mem_bytes, st.cpu_seconds });
@@ -945,15 +962,52 @@ fn writeJsonStringOrNull(w: Writer, value: ?[]const u8) !void {
     if (value) |v| try writeJsonString(w, v) else try w.writeAll("null");
 }
 
+// Any bytes as valid JSON: controls escaped, invalid UTF-8 as U+FFFD.
 fn writeJsonString(w: Writer, value: []const u8) !void {
     try w.writeByte('"');
-    for (value) |ch| switch (ch) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\t' => try w.writeAll("\\t"),
-        '\r' => try w.writeAll("\\r"),
-        else => try w.writeByte(ch),
-    };
+    var i: usize = 0;
+    while (i < value.len) {
+        const ch = value[i];
+        const len = std.unicode.utf8ByteSequenceLength(ch) catch 0;
+        if (len != 1) {
+            const whole = len > 1 and i + len <= value.len and std.unicode.utf8ValidateSlice(value[i .. i + len]);
+            try w.writeAll(if (whole) value[i .. i + len] else "\u{fffd}");
+            i += if (whole) len else 1;
+            continue;
+        }
+        switch (ch) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\t' => try w.writeAll("\\t"),
+            '\r' => try w.writeAll("\\r"),
+            0...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => try w.print("\\u{x:0>4}", .{ch}),
+            else => try w.writeByte(ch),
+        }
+        i += 1;
+    }
     try w.writeByte('"');
+}
+
+test "a path is within home only past a whole directory's name" {
+    try std.testing.expectEqualStrings("/work/x", withinHome("/home/tec/work/x", "/home/tec").?);
+    try std.testing.expect(withinHome("/home/tecnical/x", "/home/tec") == null);
+    try std.testing.expect(withinHome("/home/tec", "/home/tec") == null);
+    try std.testing.expect(withinHome("/home/tec/x", "") == null);
+}
+
+test "a label reaches the tree without its escapes, counted as it shows" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 4), try writeUntrusted(.{ .list = &out, .gpa = gpa }, "a\x1b]52;c;eA==\x07\x1b[2J世\x07b"));
+    try std.testing.expectEqualStrings("a世b", out.items);
+}
+
+test "JSON strings escape controls and replace invalid UTF-8" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try writeJsonString(.{ .list = &out, .gpa = gpa }, "a\"\\\n\x1b]52;c;x\x07\x7fé\xff\xe2\x94世\xed\xa0\x80");
+    try std.testing.expectEqualStrings("\"a\\\"\\\\\\n\\u001b]52;c;x\\u0007\\u007fé\u{fffd}\u{fffd}\u{fffd}世\u{fffd}\u{fffd}\u{fffd}\"", out.items);
 }

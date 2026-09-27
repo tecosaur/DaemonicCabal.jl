@@ -22,6 +22,7 @@ const view = @import("reconfigure_view.zig");
 const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
 const pal = @import("palette.zig");
+const status = @import("status.zig");
 
 const Conductor = main.Conductor;
 const all = settings.all;
@@ -46,7 +47,7 @@ pub const Settings = struct {
         var declared = service.Declared.init(gpa);
         defer declared.deinit();
         const read = if (svc) |s| if (service.load(gpa, io, s, &declared)) |_| true else |err| blk: {
-            std.debug.print("Settings: couldn't read {s}: {}; taking the environment as its\n", .{ s.path, err });
+            std.debug.print("Settings: couldn't read {s}: {}; taking the conductor's environment as what it declares\n", .{ s.path, err });
             break :blk false;
         } else false;
         return .{ .model = try .init(gpa, env, if (read) &declared else null), .service = svc };
@@ -115,11 +116,10 @@ const Message = struct {
 pub fn subscribe(c: *Conductor, streams: Conductor.ClientStreams, palette: ?pal.Palette) !void {
     const v = try c.allocator.create(Viewer);
     errdefer c.allocator.destroy(v);
-    v.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_counter }, .styles = .of(palette) };
+    v.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_id }, .styles = .of(palette) };
     try c.settings.viewers.append(c.allocator, v);
     if (c.settings.viewers.items.len == 1) rereadService(c, v);
     v.term.open(c);
-    v.term.send(c.allocator, view.view_start);
     repaint(c, v);
 }
 
@@ -522,10 +522,8 @@ fn reloadFailed(c: *Conductor, err: anyerror) void {
 
 // "~/…" for a path within the home directory.
 fn homeRelative(c: *const Conductor, path: []const u8, buf: []u8) []const u8 {
-    const home = c.cfg.host_home;
-    const within = home.len > 0 and path.len > home.len and std.mem.startsWith(u8, path, home) and path[home.len] == '/';
-    if (!within) return path;
-    return std.fmt.bufPrint(buf, "~{s}", .{path[home.len..]}) catch path;
+    const rest = status.withinHome(path, c.cfg.host_home) orelse return path;
+    return std.fmt.bufPrint(buf, "~{s}", .{rest}) catch path;
 }
 
 fn noServiceMessage(message: *Message, to_save: []const service.Change) void {
@@ -664,6 +662,7 @@ fn repaint(c: *Conductor, v: *Viewer) void {
         .asking = v.asking,
         .styles = &v.styles,
         .cols = v.term.size.cols,
+        .rows = v.term.size.rows,
     };
     v.cursor_line = view.draw(c.allocator, &out, &scene, v.cursor_line) catch |err| {
         std.debug.print("Settings: drawing failed: {}\n", .{err});
