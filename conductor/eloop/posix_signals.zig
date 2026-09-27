@@ -46,8 +46,8 @@ pub fn installSignalHandlers() !void {
         .flags = 0,
     };
     posix.sigaction(posix.SIG.USR1, &usr1_sigact, null);
-    // A write to a vanished client must not kill the daemon; io_uring masks
-    // SIGPIPE, but macOS c.write does not.
+    // Writes are plain write(2) on every loop, so one to a vanished peer
+    // raises SIGPIPE, which must not kill the daemon.
     const pipe_sigact = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = std.mem.zeroes(posix.sigset_t),

@@ -5,7 +5,6 @@
 // pipes, both overlapped HANDLEs driven through ntdll; there is no ws2_32.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const win32 = std.os.windows;
 const ntdll = win32.ntdll;
 const posix = std.posix;
@@ -118,7 +117,9 @@ extern "kernel32" fn ReleaseSRWLockExclusive(SRWLock: *win32.SRWLOCK) void;
 extern "kernel32" fn Sleep(dwMilliseconds: DWORD) void;
 extern "kernel32" fn PeekNamedPipe(hNamedPipe: HANDLE, lpBuffer: ?*anyopaque, nBufferSize: DWORD, lpBytesRead: ?*DWORD, lpTotalBytesAvailable: ?*DWORD, lpBytesLeftThisMessage: ?*DWORD) BOOL;
 extern "kernel32" fn GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: [*]u16) DWORD;
-extern "kernel32" fn GetCurrentProcess() HANDLE;
+pub extern "kernel32" fn GetCurrentProcess() HANDLE;
+/// For the loops' helper threads: std.Thread is unavailable under -fsingle-threaded.
+pub extern "kernel32" fn CreateThread(lpThreadAttributes: ?*anyopaque, dwStackSize: usize, lpStartAddress: *const fn (?*anyopaque) callconv(.winapi) DWORD, lpParameter: ?*anyopaque, dwCreationFlags: DWORD, lpThreadId: ?*DWORD) ?HANDLE;
 extern "kernel32" fn DuplicateHandle(hSourceProcessHandle: HANDLE, hSourceHandle: HANDLE, hTargetProcessHandle: HANDLE, lpTargetHandle: *HANDLE, dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwOptions: DWORD) BOOL;
 extern "psapi" fn GetProcessMemoryInfo(hProcess: HANDLE, ppsmemCounters: *PROCESS_MEMORY_COUNTERS_EX, cb: DWORD) BOOL;
 extern "advapi32" fn GetUserNameW(lpBuffer: [*]u16, pcbBuffer: *DWORD) BOOL;

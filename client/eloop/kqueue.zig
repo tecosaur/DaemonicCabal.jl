@@ -8,12 +8,13 @@ const c = std.c;
 const posix = std.posix;
 
 const platform = @import("../platform/main.zig");
-const protocol = @import("../protocol.zig");
 const cooked = @import("../cooked.zig");
+const bsd = @import("../platform/bsd.zig");
 
-// Some BSDs lack these in Zig's bindings.
-const EV_EOF: u16 = if (@hasDecl(c.EV, "EOF")) c.EV.EOF else 0x8000;
-const EV_ERROR: u16 = if (@hasDecl(c.EV, "ERROR")) c.EV.ERROR else 0x4000;
+const EV_EOF = bsd.EV_EOF;
+const EV_ERROR = bsd.EV_ERROR;
+const makeKevent = bsd.makeKevent;
+const keventCall = bsd.keventCall;
 
 const UDATA_STDIN: usize = 0;
 const UDATA_STDOUT: usize = 1;
@@ -49,8 +50,7 @@ pub fn run(
         break :blk keventCall(kq, &stdin_change, &no_events, null) >= 0;
     };
     const buf_size = 1024;
-    var stdout_buf: [buf_size]u8 = undefined;
-    var stderr_buf: [buf_size]u8 = undefined;
+    var out_buf: [buf_size]u8 = undefined;
     var stdin_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
     var stdin_fwd = cooked.StdinForwarder{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw };
@@ -73,46 +73,14 @@ pub fn run(
         for (events[0..event_count]) |ev| {
             if ((ev.flags & EV_ERROR) != 0) continue;
             // kqueue can deliver data and EOF in one event: drain before EOF.
-            switch (udataInt(ev)) {
-                UDATA_STDOUT => {
-                    var remaining: usize = @intCast(ev.data);
-                    while (remaining > 0) {
-                        const want = @min(remaining, stdout_buf.len);
-                        const n = posix.read(stdout_fd, stdout_buf[0..want]) catch {
-                            stdout_eof = true;
-                            break;
-                        };
-                        if (n == 0) {
-                            stdout_eof = true;
-                            break;
-                        }
-                        platform.write(posix.STDOUT_FILENO, stdout_buf[0..n]);
-                        remaining -= n;
-                    }
-                    if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
-                        stdout_eof = true;
-                    }
-                    if (stdout_eof) unwatch(kq, stdout_fd);
+            switch (ev.udata) {
+                UDATA_STDOUT => if (relay(stdout_fd, posix.STDOUT_FILENO, &out_buf, ev)) {
+                    stdout_eof = true;
+                    unwatch(kq, stdout_fd);
                 },
-                UDATA_STDERR => {
-                    var remaining: usize = @intCast(ev.data);
-                    while (remaining > 0) {
-                        const want = @min(remaining, stderr_buf.len);
-                        const n = posix.read(stderr_fd, stderr_buf[0..want]) catch {
-                            stderr_eof = true;
-                            break;
-                        };
-                        if (n == 0) {
-                            stderr_eof = true;
-                            break;
-                        }
-                        platform.write(posix.STDERR_FILENO, stderr_buf[0..n]);
-                        remaining -= n;
-                    }
-                    if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
-                        stderr_eof = true;
-                    }
-                    if (stderr_eof) unwatch(kq, stderr_fd);
+                UDATA_STDERR => if (relay(stderr_fd, posix.STDERR_FILENO, &out_buf, ev)) {
+                    stderr_eof = true;
+                    unwatch(kq, stderr_fd);
                 },
                 UDATA_STDIN => {
                     if (exit_code != null or stdin_closed) continue;
@@ -173,32 +141,20 @@ pub fn run(
     }
 }
 
-fn makeKevent(
-    ident: usize,
-    filter: i16,
-    flags: u16,
-    fflags: u32,
-    data: isize,
-    udata: usize,
-) c.Kevent {
-    return .{
-        .ident = ident,
-        .filter = filter,
-        .flags = flags,
-        .fflags = fflags,
-        .data = data,
-        .udata = udata,
-    };
-}
 /// Level-triggered, a registration left at an end reports it forever.
 fn unwatch(kq: posix.fd_t, fd: posix.fd_t) void {
     var change = [1]c.Kevent{makeKevent(@intCast(fd), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
     var no_events: [0]c.Kevent = undefined;
     _ = keventCall(kq, &change, &no_events, null);
 }
-fn udataInt(ev: c.Kevent) usize {
-    return ev.udata;
-}
-fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent, timeout: ?*const c.timespec) c_int {
-    return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), timeout);
+/// Passes on what `ev` reports `src` holds; returns whether `src` has ended.
+fn relay(src: posix.fd_t, dst: posix.fd_t, buf: []u8, ev: c.Kevent) bool {
+    var remaining: usize = @intCast(ev.data);
+    while (remaining > 0) {
+        const n = posix.read(src, buf[0..@min(remaining, buf.len)]) catch return true;
+        if (n == 0) return true;
+        platform.write(dst, buf[0..n]);
+        remaining -= n;
+    }
+    return (ev.flags & EV_EOF) != 0 or ev.data == 0;
 }

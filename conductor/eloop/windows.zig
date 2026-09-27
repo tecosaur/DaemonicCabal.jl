@@ -25,9 +25,6 @@ const HANDLE = win32.HANDLE;
 const WT_EXECUTEDEFAULT: ULONG = 0;
 extern "kernel32" fn CreateTimerQueueTimer(phNewTimer: *HANDLE, TimerQueue: ?HANDLE, Callback: win.WAITORTIMERCALLBACK, Parameter: ?*anyopaque, DueTime: DWORD, Period: DWORD, Flags: ULONG) BOOL;
 extern "kernel32" fn DeleteTimerQueueTimer(TimerQueue: ?HANDLE, Timer: HANDLE, CompletionEvent: ?HANDLE) BOOL;
-extern "kernel32" fn CreateThread(lpThreadAttributes: ?*anyopaque, dwStackSize: usize, lpStartAddress: *const fn (?*anyopaque) callconv(.winapi) DWORD, lpParameter: ?*anyopaque, dwCreationFlags: DWORD, lpThreadId: ?*DWORD) ?HANDLE;
-extern "kernel32" fn Sleep(dwMilliseconds: DWORD) void;
-extern "kernel32" fn GetCurrentProcess() HANDLE;
 
 // Worker keys are pointers (>= 0x1000, bit 0 set for a health check).
 const tag_accept: usize = @intFromEnum(EventLocation.accept);
@@ -39,14 +36,14 @@ var g_console_iocp: ?HANDLE = null;
 // The watchdog covers a loop parked in an unalertable call.
 fn consoleCtrlHandler(_: DWORD) callconv(.winapi) BOOL {
     if (g_console_iocp) |iocp| _ = win.PostQueuedCompletionStatus(iocp, 0, @intFromEnum(EventLocation.signal), null);
-    _ = CreateThread(null, 0, &watchdogProc, null, 0, null);
+    _ = win.CreateThread(null, 0, &watchdogProc, null, 0, null);
     return .TRUE;
 }
 
 fn watchdogProc(_: ?*anyopaque) callconv(.winapi) DWORD {
-    Sleep(5000);
+    win.sleepMs(5000);
     std.debug.print("\nCtrl-C: forced exit (event loop unresponsive)\n", .{});
-    _ = win.TerminateProcess(GetCurrentProcess(), 130);
+    _ = win.TerminateProcess(win.GetCurrentProcess(), 130);
     return 0;
 }
 

@@ -9,7 +9,6 @@ const win32 = std.os.windows;
 const posix = std.posix;
 
 const platform = @import("../platform/windows.zig");
-const protocol = @import("../protocol.zig");
 const cooked = @import("../cooked.zig");
 
 const Location = enum(u64) {
@@ -19,9 +18,6 @@ const Location = enum(u64) {
 };
 
 const buf_size = 1024;
-
-// std.Thread is unavailable under -fsingle-threaded.
-extern "kernel32" fn CreateThread(lpThreadAttributes: ?*anyopaque, dwStackSize: usize, lpStartAddress: *const fn (?*anyopaque) callconv(.winapi) win32.DWORD, lpParameter: ?*anyopaque, dwCreationFlags: win32.DWORD, lpThreadId: ?*win32.DWORD) ?win32.HANDLE;
 
 const StdinArgs = struct { src: posix.fd_t, fwd: cooked.StdinForwarder };
 
@@ -55,7 +51,7 @@ pub fn run(
         .src = platform.getStdinHandle(),
         .fwd = .{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw },
     };
-    _ = CreateThread(null, 0, &stdinProc, args, 0, null) orelse
+    _ = platform.CreateThread(null, 0, &stdinProc, args, 0, null) orelse
         return error.StdinThreadFailed;
 
     const stream_fds = [3]posix.fd_t{ stdout_fd, stderr_fd, signals_fd };

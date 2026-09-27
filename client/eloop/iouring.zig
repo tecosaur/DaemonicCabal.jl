@@ -8,7 +8,6 @@ const linux = std.os.linux;
 const posix = std.posix;
 
 const platform = @import("../platform/main.zig");
-const protocol = @import("../protocol.zig");
 const cooked = @import("../cooked.zig");
 
 const Location = enum(u64) {
