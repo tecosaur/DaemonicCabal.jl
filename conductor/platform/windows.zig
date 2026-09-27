@@ -682,6 +682,25 @@ fn comptimeWide(comptime name: []const u8) [name.len:0]u16 {
 /// The runtime dir is under the per-user %LOCALAPPDATA%, and the pipes carry their own ACL.
 pub const runtime_dir_permissions: Io.File.Permissions = .default_dir;
 pub fn secureRuntimeDir(_: []const u8) error{UntrustedRuntimeDir}!void {}
+pub const private_file_permissions: Io.File.Permissions = .default_file;
+
+extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE;
+
+/// Up to `buf`'s length of a small file; null where it can't be read.
+pub fn readSmallFile(path: []const u8, buf: []u8) ?[]u8 {
+    var wide: [std.fs.max_path_bytes:0]u16 = undefined;
+    const len = std.unicode.utf8ToUtf16Le(&wide, path) catch return null;
+    wide[len] = 0;
+    const GENERIC_READ: DWORD = 0x80000000;
+    const FILE_SHARE_READ: DWORD = 1;
+    const OPEN_EXISTING: DWORD = 3;
+    const handle = CreateFileW(wide[0..len :0], GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
+    if (handle == win32.INVALID_HANDLE_VALUE) return null;
+    defer close(handle);
+    var n: DWORD = 0;
+    if (!ReadFile(handle, buf.ptr, @intCast(buf.len), &n, null).toBool()) return null;
+    return buf[0..n];
+}
 
 pub fn localSocketDir(out: anytype, _: []const u8) ![]const u8 {
     var wide: [257]u16 = undefined;

@@ -57,6 +57,8 @@ pub const sendEof = if (os == .windows) impl.sendEof else shared.shutdownWrite;
 pub const Listener = shared.Listener;
 pub const runtime_dir_permissions = shared.runtime_dir_permissions;
 pub const secureRuntimeDir = shared.secureRuntimeDir;
+pub const private_file_permissions = shared.private_file_permissions;
+pub const readSmallFile = shared.readSmallFile;
 pub const localSocketDir = shared.localSocketDir;
 pub const localSocketPath = shared.localSocketPath;
 pub const listenLocal = shared.listenLocal;

@@ -89,17 +89,28 @@ pub const CLIENT_HELP =
 ++ DAEMON_MANAGEMENT_HELP;
 
 
-// Client ↔ Conductor: magic + flags + pid + ppid + cwd + env_fingerprint + args,
-// answered by kind-byte frames ending in socket_paths.
+// Client ↔ Conductor: magic + flags + pid + ppid + host key + cwd +
+// env_fingerprint + args, answered by kind-byte frames ending in socket_paths.
+// Over TCP, the host key (`host_key_file` in the runtime dir) shows a
+// loopback client to be the host's, not a sandbox's; zeros elsewhere.
+//
+// A client's key, sent with its paths, it gives first on each of its stdio
+// connections, and with each notification it sends; a worker's, sent as it
+// connects, it gives with its notifications. Both are MACs of their ids
+// under a secret of the conductor's, so none can be forged from an id.
 pub const client = struct {
     pub const magic_prefix: u32 = 0x4A4443; // "JDC", then the version byte
     pub const version: u8 = 3;
     pub const magic: u32 = magic_prefix << 8 | version;
     pub const env_request: u8 = 0x3F; // fingerprint cache miss: send the full env
+    pub const host_key_file = "conductor.key";
+    pub const HostKey = [16]u8;
     // The client spawns its own worker: u16 argc, argc × (u16 len + bytes), then
     // u16 n, n × (u16 len + "KEY=VALUE") placed ahead of the client's env.
     pub const spawn_request: u8 = 0x00;
-    // u32 client id, then len-prefixed stdin, stdout, stderr, signals paths.
+    // u32 client id, then u16-len-prefixed stdin, stdout, stderr, signals
+    // paths, then the client's key (u64). A client of another version reads
+    // as far as the paths, so a mismatch can be reported to it.
     pub const socket_paths: u8 = 0x01;
 
     pub const Flags = packed struct(u8) {
@@ -124,14 +135,12 @@ pub const worker = struct {
         project_ok = 0x11,
         client_run = 0x20,
         sockets = 0x21,
-        query_state = 0x30,
-        state = 0x31,
         query_clients = 0x32,
         clients = 0x33,
         soft_exit = 0x40,
         ack = 0x41,
         sync_clients = 0x50, // the worker kills any client not listed
-        drop_session = 0x51, // payload: label (u16-len + bytes)
+        drop_session = 0x51, // payload: label (u32-len + bytes)
         cancel_client = 0x52, // payload: client id, evaluation (u32 each; 0 if unknown); no reply
         start_peek = 0x60, // no reply; the report follows as a `peek_report` notification
         err = 0xFF,
@@ -155,20 +164,30 @@ pub const worker = struct {
     };
 };
 
-// Notifications → Conductor: connect, send magic + type + payload, close.
-// Payloads are a u32: the client id, except as noted.
+// Notifications → Conductor: connect, send magic + type + subject (u32) +
+// the sender's key (u64) + payload, close. The subject is the client id,
+// except as noted.
 pub const notification = struct {
-    pub const magic: u32 = 0x4A444E01; // "JDN\x01"
+    pub const magic: u32 = 0x4A444E02; // "JDN\x02"
 
     pub const Type = enum(u8) {
-        client_done = 0x01,
-        worker_unresponsive = 0x02, // pid
-        worker_exit = 0x03, // worker id
+        client_done = 0x01, // from its worker
         client_exit = 0x04,
-        client_interrupt = 0x05, // client id, then the evaluation it's meant for (u32; 0 if unknown)
-        peek_report = 0x06, // worker id, then the report: u32 length + bytes
+        client_interrupt = 0x05, // then the evaluation it's meant for (u32; 0 if unknown)
+        peek_report = 0x06, // the worker's id, then the report: u32 length + bytes
     };
 };
+
+pub const KeyKind = enum(u8) { client, worker };
+
+/// A client's or worker's key: a MAC of its id, which only the conductor,
+/// holding `secret`, can make.
+pub fn keyFor(secret: *const [16]u8, kind: KeyKind, id: u32) u64 {
+    var msg: [5]u8 = undefined;
+    msg[0] = @intFromEnum(kind);
+    std.mem.writeInt(u32, msg[1..5], id, .little);
+    return std.crypto.auth.siphash.SipHash64(2, 4).toInt(&msg, secret);
+}
 
 // Signals (Worker → Client): id:u8 + len:u8 + data
 pub const signals = struct {
@@ -409,6 +428,16 @@ pub fn connectAddress(mode: TransportMode, addr: []const u8, timeout_ms: u32) !C
             return last_err;
         },
     }
+}
+
+/// 127.0.0.0/8, ::1, or an IPv4-mapped 127.x.
+pub fn isLoopback(address: Io.net.IpAddress) bool {
+    const v4_mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    return switch (address) {
+        .ip4 => |a| a.bytes[0] == 127,
+        .ip6 => |a| std.mem.eql(u8, &a.bytes, &Io.net.Ip6Address.loopback(0).bytes) or
+            (std.mem.eql(u8, a.bytes[0..12], &v4_mapped) and a.bytes[12] == 127),
+    };
 }
 
 pub fn probeAddress(mode: TransportMode, addr: []const u8, timeout_ms: u32) bool {

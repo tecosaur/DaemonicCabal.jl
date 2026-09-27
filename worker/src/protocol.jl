@@ -2,13 +2,11 @@
 # SPDX-License-Identifier: MPL-2.0
 
 const PROTOCOL_MAGIC = 0x4A445704  # "JDW\x04" little-endian
-const NOTIFICATION_MAGIC = 0x4A444E01  # "JDN\x01" little-endian
+const NOTIFICATION_MAGIC = 0x4A444E02  # "JDN\x02" little-endian
 
 # Notifications, over the conductor's main socket
 const NOTIF_TYPE = (
     client_done = 0x01,
-    worker_unresponsive = 0x02,
-    worker_exit = 0x03,
     peek_report = 0x06,
 )
 
@@ -46,9 +44,11 @@ struct MessageHeader
     payload_len::UInt32
 end
 
-function verify_magic(conn::IO)
+# The conductor's greeting: its magic, then our key.
+function read_greeting(conn::IO)
     magic = read(conn, UInt32)
     magic == PROTOCOL_MAGIC || error("Invalid protocol magic: $(repr(magic))")
+    read(conn, UInt64)
 end
 
 function read_header(conn::IO)
@@ -109,10 +109,11 @@ function connect_to(address::AbstractString)
     end
 end
 
-function send_notification(address::AbstractString, type::UInt8, payload...)
+# `subject` is a client's id, or ours for a peek.
+function send_notification(address::AbstractString, type::UInt8, subject::UInt32, payload...)
     try
         conn = connect_to(address)
-        write(conn, NOTIFICATION_MAGIC, type, payload...)
+        write(conn, NOTIFICATION_MAGIC, type, subject, WORKER_KEY[], payload...)
         close(conn)
     catch
         # The conductor may have shut down.
@@ -154,7 +155,7 @@ struct ClientInfo
     color::Bool
     force::Bool  # bypass capacity (labeled sessions)
     id::Int      # conductor-assigned
-    pid::Int     # as our kernel reports it; 0 = unchecked
+    key::UInt64  # which it gives on each of its stdio connections
     cwd::String
     env::Vector{Pair{String, String}}
     switches::Vector{Tuple{String, String}}
@@ -169,14 +170,13 @@ function read_client_run(conn::IO)
     color = (flags & 0x02) != 0
     force = (flags & 0x04) != 0
     id = Int(read(conn, UInt32))
-    pid = Int(read(conn, UInt32))
+    key = read(conn, UInt64)
     cwd = read_string(conn)
     env_count = read(conn, UInt32)
     env = Vector{Pair{String, String}}(undef, env_count)
     for i in 1:env_count
-        key = read_string(conn)
-        val = read_string(conn)
-        env[i] = key => val
+        name = read_string(conn)
+        env[i] = name => read_string(conn)
     end
     switch_count = read(conn, UInt32)
     switches = Vector{Tuple{String, String}}(undef, switch_count)
@@ -197,6 +197,6 @@ function read_client_run(conn::IO)
         args[i] = read_string(conn)
     end
     port_set = Int(read(conn, UInt16))
-    ClientInfo(tty, color, force, id, pid, cwd, env, switches, programfile, args, port_set)
+    ClientInfo(tty, color, force, id, key, cwd, env, switches, programfile, args, port_set)
 end
 

@@ -572,18 +572,21 @@ const SETTLE_DELAY_S = 2.0
 const TCP_KEEPALIVE_IDLE_S = 60
 
 # A bare `accept` would stall pings on a client that died after getting its
-# paths. Only the named client may connect (`pid` as our kernel reports it;
-# 0 = any): anything reaching the runtime dir could take over the terminal.
-function accept_client_sockets(servers, pid::Integer)
-    want = expected_peer(pid)
-    deadline = Timer(_ -> foreach(close, servers), CLIENT_ACCEPT_TIMEOUT_S)
+# paths. Only the named client may connect, giving its key first: anything
+# reaching the runtime dir, or the port, could take over the terminal.
+function accept_client_sockets(servers, key::UInt64)
+    accepted = Base.IO[]
+    deadline = Timer(CLIENT_ACCEPT_TIMEOUT_S) do _
+        foreach(close, servers)
+        foreach(close, accepted)
+    end
     try
         map(servers) do srv
             while true
                 sock = accept(srv)
-                peer = peer_pid(sock)
-                (pid == 0 || isnothing(peer) || peer == want) && return sock
-                @warn "Dropped a client socket connection from an unexpected process" expected=want actual=peer
+                push!(accepted, sock)
+                read(sock, UInt64) == key && return sock
+                @warn "Dropped a client socket connection without its client's key"
                 close(sock)
             end
         end
@@ -593,26 +596,6 @@ function accept_client_sockets(servers, pid::Integer)
     finally
         close(deadline)
     end
-end
-
-# SO_PEERCRED reports the client's pid within our pid namespace, or 0 from outside
-# it. A conductor-sandboxed worker is init of its own namespace with its client
-# outside; a client-spawned worker shares its client's, so there 0 is an outsider.
-expected_peer(pid) = getpid() == 1 ? 0 : pid
-
-# `nothing` where the platform offers no credentials (TCP, non-Linux).
-@static if Sys.islinux()
-    function peer_pid(sock)
-        sock isa Sockets.TCPSocket && return nothing
-        cred = Ref((Cint(0), Cuint(0), Cuint(0)))  # struct ucred: pid, uid, gid
-        len = Ref{Cuint}(sizeof(cred[]))
-        SOL_SOCKET, SO_PEERCRED = 1, 17
-        rc = ccall(:getsockopt, Cint, (Cint, Cint, Cint, Ptr{Cvoid}, Ptr{Cuint}),
-                   Base._fd(sock), SOL_SOCKET, SO_PEERCRED, cred, len)
-        rc == 0 ? Int(cred[][1]) : nothing
-    end
-else
-    peer_pid(::Any) = nothing
 end
 
 function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
@@ -627,7 +610,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
     is_tcp = stdin_srv isa Sockets.TCPServer
     t0 = time_ns()
     client_stdin, client_stdout, client_stderr, signals = try
-        accept_client_sockets((stdin_srv, stdout_srv, stderr_srv, signals_srv), client.pid)
+        accept_client_sockets((stdin_srv, stdout_srv, stderr_srv, signals_srv), client.key)
     catch
         @lock STATE.lock filter!(c -> c !== client, STATE.clients)
         # Or the conductor keeps counting it, port set and all.
@@ -781,7 +764,7 @@ function runworker(socketpath::String, conductor_address::String, worker_id::Int
     Timer(_ -> settle(), SETTLE_DELAY_S)
     exit_code = 0
     try
-        verify_magic(conn)
+        WORKER_KEY[] = read_greeting(conn)
         while isopen(conn)
             # A client's Ctrl-C may land on this task.
             try

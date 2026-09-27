@@ -179,6 +179,7 @@ var watching = false;
 var conductor_peer: ?Io.net.IpAddress = null;
 var signal_parser = SignalParser{};
 var client_id: u32 = 0; // conductor-assigned
+var client_key: u64 = 0; // with it, which proves it ours
 
 // --- Signal handler wiring ---
 
@@ -324,6 +325,9 @@ fn locateConductor(env: EnvInfo, runtime_dir_buf: *[max_socket_path]u8) !struct 
     return .{ .runtime_dir = runtime_dir, .address = try protocol.parseAddress(raw_path) };
 }
 
+/// Over TCP, what shows this client the host's rather than a sandbox's.
+var host_key = std.mem.zeroes(protocol.client.HostKey);
+
 fn connectToConductor(env: EnvInfo) !posix.socket_t {
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
     const located = locateConductor(env, &runtime_dir_buf) catch |err| switch (err) {
@@ -339,7 +343,7 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     conductor_path = located.address.addr;
     const addr = conductor_path;
     const timeout = protocol.connect_timeout_ms;
-    const first_err = if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c) else |err| err;
+    const first_err = if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c, runtime_dir) else |err| err;
     // A refusal may be a conductor restarting, and a live conductor can be asked
     // to recreate a missing socket; a timeout is not worth repeating.
     const worth_retrying = switch (transport_mode) {
@@ -352,7 +356,7 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     if (worth_retrying) {
         for (0..20) |_| {
             platform.sleepMs(100);
-            if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c) else |_| {}
+            if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c, runtime_dir) else |_| {}
         }
         // Alive with no local socket: it may be listening on TCP.
         if (transport_mode == .local) {
@@ -360,7 +364,7 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
             if (protocol.connectAddress(.tcp, tcp_addr, timeout)) |c| {
                 transport_mode = .tcp;
                 conductor_path = tcp_addr;
-                return keepConductor(c);
+                return keepConductor(c, runtime_dir);
             } else |_| {}
         }
     }
@@ -394,8 +398,16 @@ fn printVersion(env: EnvInfo) void {
     platform.writeFile(platform.getStdoutHandle(), line);
 }
 
-fn keepConductor(connection: protocol.Connection) posix.socket_t {
+/// The host key goes only to a conductor dialled on loopback, never off the host.
+fn keepConductor(connection: protocol.Connection, runtime_dir: []const u8) posix.socket_t {
     conductor_peer = connection.peer;
+    if (connection.peer) |ip| if (protocol.isLoopback(ip)) {
+        var path_buf: [max_socket_path + 16]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/" ++ protocol.client.host_key_file, .{runtime_dir}) catch "";
+        if (platform.readSmallFile(path, &host_key)) |read| {
+            if (read.len != host_key.len) host_key = std.mem.zeroes(protocol.client.HostKey);
+        }
+    };
     return connection.socket;
 }
 
@@ -405,6 +417,7 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, for
     w.writeSlice(&.{ 0, 0, 0 });
     w.writeInt(u32, @intCast(platform.getpid()));
     w.writeInt(u32, @intCast(platform.getppid()));
+    w.writeSlice(&host_key);
     // CWD, read straight into the buffer behind its length
     if (w.pos + 4 >= w.buf.len) w.flush();
     const len_pos = w.pos;
@@ -433,6 +446,7 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
     const stdout_path = try takeString(reader, fba.allocator());
     const stderr_path = try takeString(reader, fba.allocator());
     const signals_path = try takeString(reader, fba.allocator());
+    client_key = try reader.readInt(u64);
     platform.close(conductor);
     const result = SocketSet{
         .stdin = connectToWorkerSocket(stdin_path, "stdin"),
@@ -533,6 +547,10 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.sock
         exitClient(127);
     };
     if (transport_mode == .tcp) platform.setTcpKeepalive(socket, protocol.tcp_keepalive_idle_s);
+    // Whoever else reached the socket first is refused for want of the key.
+    var key: [8]u8 = undefined;
+    std.mem.writeInt(u64, &key, client_key, .little);
+    platform.socketWrite(socket, &key);
     return socket;
 }
 
@@ -543,12 +561,13 @@ var evaluation: u32 = 0;
 /// Dials the conductor already reached, never resolving a name again, as
 /// this also runs in signal handlers. Errors are dropped.
 fn notifyConductor(kind: protocol.notification.Type) void {
-    var buf: [13]u8 = undefined;
+    var buf: [21]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
     buf[4] = @intFromEnum(kind);
     std.mem.writeInt(u32, buf[5..9], client_id, .little);
-    std.mem.writeInt(u32, buf[9..13], evaluation, .little);
-    const len: usize = if (kind == .client_interrupt) 13 else 9;
+    std.mem.writeInt(u64, buf[9..17], client_key, .little);
+    std.mem.writeInt(u32, buf[17..21], evaluation, .little);
+    const len: usize = if (kind == .client_interrupt) 21 else 17;
     const fd = switch (transport_mode) {
         .local => platform.connectLocal(conductor_path, protocol.connect_timeout_ms),
         .tcp => platform.connectTcp(conductor_peer orelse return, protocol.connect_timeout_ms),

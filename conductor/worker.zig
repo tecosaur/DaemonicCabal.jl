@@ -361,8 +361,8 @@ pub const Worker = struct {
         /// Null when nothing was waiting or an unexpected process connected:
         /// anything reaching the runtime directory could pose as the worker.
         /// The worker returned takes over what `self.worker` owns, but not
-        /// the listener.
-        pub fn accept(self: *Spawn, io: Io, cfg: *const config.Config) !?Worker {
+        /// the listener; it is sent `key`, to give with its notifications.
+        pub fn accept(self: *Spawn, io: Io, cfg: *const config.Config, key: u64) !?Worker {
             const socket = (try self.listener.acceptTimeout(io, 0)) orelse return null;
             const w = &self.worker;
             if (!isExpectedWorker(socket, w.launch, self.client_ns, w.process.id)) {
@@ -384,9 +384,10 @@ pub const Worker = struct {
             }
             platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
             w.reply_timeout_ms = @intCast(cfg.ping_timeout * 1000);
-            var magic_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
-            platform.write(socket, &magic_buf);
+            var hello: [12]u8 = undefined;
+            std.mem.writeInt(u32, hello[0..4], protocol.worker.magic, .little);
+            std.mem.writeInt(u64, hello[4..12], key, .little);
+            platform.write(socket, &hello);
             w.socket = socket;
             w.created_at = Io.Clock.now(.awake, io).toSeconds();
             w.last_active = w.created_at;
@@ -735,8 +736,8 @@ pub const Worker = struct {
         client_info: *const ClientInfo,
     ) !SocketPaths {
         const pf_len: usize = if (client_info.programfile) |pf| 4 + pf.len else 0;
-        // flags, id, pid, cwd, the three counts, the program file's flag, port set
-        var payload_size: usize = 1 + 4 + 4 + 4 + client_info.cwd.len + 3 * 4 + 1 + pf_len + 2;
+        // flags, id, key, cwd, the three counts, the program file's flag, port set
+        var payload_size: usize = 1 + 4 + 8 + 4 + client_info.cwd.len + 3 * 4 + 1 + pf_len + 2;
         for (client_info.env) |e| payload_size += 8 + e.key.len + e.value.len;
         for (client_info.switches) |sw| payload_size += 8 + sw.name.len + sw.value.len;
         for (client_info.args) |arg| payload_size += 4 + arg.len;
@@ -745,9 +746,7 @@ pub const Worker = struct {
         var w = BufWriter{ .buf = send_buf };
         w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .color = client_info.color, .force = client_info.force }));
         w.writeInt(u32, client_info.id);
-        // The pid as the worker will see it: a client-launched worker shares
-        // the client's pid namespace.
-        w.writeInt(u32, if (self.launch == .client) client_info.pid else (client_info.host_pid orelse client_info.pid));
+        w.writeInt(u64, client_info.key);
         w.writeLenPrefixed(u32, client_info.cwd);
         w.writeInt(u32, @intCast(client_info.env.len));
         for (client_info.env) |e| {
@@ -829,8 +828,7 @@ pub const ClientInfo = struct {
     color: bool,
     force: bool, // bypass the worker's capacity check
     id: u32, // conductor-assigned
-    pid: u32, // self-reported
-    host_pid: ?u32, // from peer credentials
+    key: u64, // which the client gives the worker on each stdio connection
     ppid: u32,
     cwd: []const u8,
     env: []const EnvVar,

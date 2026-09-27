@@ -887,8 +887,7 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
         .color = true,
         .force = true,
         .id = id,
-        .pid = pid,
-        .host_pid = null,
+        .key = c.keyFor(.client, id),
         .ppid = 0,
         .cwd = "/",
         .env = &.{},
@@ -905,9 +904,12 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
     var sockets: [4]posix.socket_t = undefined;
     var opened: usize = 0;
     errdefer for (sockets[0..opened]) |s| platform.close(s);
+    var key: [8]u8 = undefined;
+    std.mem.writeInt(u64, &key, info.key, .little);
     for ([_][]const u8{ paths.stdin, paths.stdout, paths.stderr, paths.signals }) |path| {
         sockets[opened] = try dialWorker(c, path);
         opened += 1;
+        platform.write(sockets[opened - 1], &key);
     }
     const a = try c.allocator.create(Attachment);
     errdefer c.allocator.destroy(a);

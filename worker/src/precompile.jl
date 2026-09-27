@@ -5,7 +5,7 @@ if ccall(:jl_generating_output, Cint, ()) == 1
 let
     # -- Conductor messages ------------------------------------------------------
     buf = IOBuffer()
-    write(buf, UInt32(PROTOCOL_MAGIC))
+    write(buf, UInt32(PROTOCOL_MAGIC), UInt64(0))
     write(buf, UInt8(MSG_TYPE.ping), UInt32(1), UInt8(1))
     proj = "/tmp/test"
     write(buf, UInt8(MSG_TYPE.set_project), UInt32(4 + ncodeunits(proj)))
@@ -14,7 +14,7 @@ let
     cr = IOBuffer()
     write(cr, UInt8(0x00))                        # flags: tty=false, force=false
     write(cr, UInt32(7))                          # client id
-    write(cr, UInt32(12345))                      # pid
+    write(cr, UInt64(12345))                      # key
     write_string(cr, "/tmp")                               # cwd
     write(cr, UInt32(2))                          # env_count
     write_string(cr, "TERM"); write_string(cr, "xterm-256color")
@@ -34,7 +34,7 @@ let
     write(buf, UInt8(MSG_TYPE.soft_exit), UInt32(0))
     seekstart(buf)
     # -- Protocol reading ------------------------------------------------------
-    verify_magic(buf)
+    read_greeting(buf)
     read_header(buf)                              # ping
     read(buf, UInt8)
     h = read_header(buf)                          # set_project
@@ -124,7 +124,7 @@ end # let
 end # if jl_generating_output
 
 # Stream types that cannot be instantiated during precompilation
-precompile(verify_magic, (Base.PipeEndpoint,))
+precompile(read_greeting, (Base.PipeEndpoint,))
 precompile(read_header, (Base.PipeEndpoint,))
 precompile(read_client_run, (Base.PipeEndpoint,))
 precompile(read_string, (Base.PipeEndpoint,))

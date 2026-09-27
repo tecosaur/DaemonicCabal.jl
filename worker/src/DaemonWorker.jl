@@ -12,6 +12,7 @@ using Sockets
 
 const WORKER_ID = Ref("")
 const CONDUCTOR_WORKER_ID = Ref(0)  # as the conductor numbers its workers
+const WORKER_KEY = Ref(UInt64(0))  # the conductor's, proving our notifications ours
 const StreamIO = Union{Base.PipeEndpoint, Sockets.TCPSocket}
 
 include("terminaltext.jl")
