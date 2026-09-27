@@ -49,15 +49,12 @@ else if (builtin.os.tag == .windows)
 else
     @compileError("unsupported OS");
 
-const EventLocation = protocol.EventLocation;
-
-
 // --- Constants ---
 
 /// Grace per retirement stage; SIGTERM/SIGKILL fire only for a wedged worker.
 const retire_grace_s: i64 = 5;
 
-/// Bounds runaway culling under sustained pressure (WORKER_CACHE.md §Bounding).
+/// Bounds runaway culling under sustained pressure.
 const max_evict_per_episode: usize = 4;
 
 /// Episodes beyond this rank only the first `episode_capacity`, logged.
@@ -158,7 +155,7 @@ pub const Conductor = struct {
     // --- Lifecycle ---
 
     pub fn init(io: Io, allocator: Allocator, cfg: config.Config, environ_map: *std.process.Environ.Map) !Conductor {
-        return .{
+        var c: Conductor = .{
             .io = io,
             .allocator = allocator,
             .cfg = cfg,
@@ -179,17 +176,12 @@ pub const Conductor = struct {
             .event_loop = try eventLoopImpl.EventLoop.init(64),
             .live = .{},
             .settings = try reconfigure.Settings.init(allocator, io, environ_map),
-            .secret = secret: {
-                var secret: [16]u8 = undefined;
-                io.random(&secret);
-                break :secret secret;
-            },
-            .host_key = key: {
-                var key: protocol.client.HostKey = undefined;
-                io.random(&key);
-                break :key key;
-            },
+            .secret = undefined,
+            .host_key = undefined,
         };
+        io.random(&c.secret);
+        io.random(&c.host_key);
+        return c;
     }
 
     pub fn keyFor(self: *const Conductor, kind: protocol.KeyKind, id: u32) u64 {
@@ -229,13 +221,33 @@ pub const Conductor = struct {
 
     // Event loops drop completions for workers retired (and maybe freed) since.
     pub fn isLiveWorker(self: *Conductor, w: *const worker.Worker) bool {
-        if (self.reserve == w) return true;
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items) |item| if (item == w) return true;
-        }
+        var it = self.liveWorkers();
+        while (it.next()) |item| if (item == w) return true;
         return false;
     }
+
+    /// Every pooled worker, then the reserve.
+    fn liveWorkers(self: *Conductor) LiveWorkers {
+        return .{ .pools = self.workers.valueIterator(), .reserve = self.reserve };
+    }
+
+    const LiveWorkers = struct {
+        pools: std.StringHashMap(WorkerList).ValueIterator,
+        pool: []const *worker.Worker = &.{},
+        reserve: ?*worker.Worker,
+
+        fn next(self: *LiveWorkers) ?*worker.Worker {
+            while (self.pool.len == 0) {
+                const list = self.pools.next() orelse {
+                    defer self.reserve = null;
+                    return self.reserve;
+                };
+                self.pool = list.items;
+            }
+            defer self.pool = self.pool[1..];
+            return self.pool[0];
+        }
+    };
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
         if (w.exited()) platform.dumpChildStderr(self.io, self.allocator, &w.process, w.id);
@@ -266,9 +278,7 @@ pub const Conductor = struct {
         try eventLoopImpl.installSignalHandlers();
         defer eventLoopImpl.cleanupSignalHandlers();
         if (self.cfg.transport == .local) {
-            const pid_path = try std.fmt.allocPrint(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir});
-            g_pid_path = try self.allocator.dupeZ(u8, pid_path);
-            self.allocator.free(pid_path);
+            g_pid_path = try std.fmt.allocPrintSentinel(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir}, 0);
             self.writePidFile();
         }
         defer if (self.cfg.transport == .local) {
@@ -397,10 +407,12 @@ pub const Conductor = struct {
                 const w = &p.spawn.worker;
                 if (self.drainStderr(w, false)) self.event_loop.watchFd(tag, w.stderrFd().?);
             },
-            else => if (tag & 1 == 0) {
+            tag_spawn_listener => {
                 const p: *PendingSpawn = @ptrFromInt(addr);
                 if (isPending(&self.pending_spawns, p)) self.onSpawnReadable(p);
-            } else self.onHeldClientGone(@ptrFromInt(addr)),
+            },
+            tag_spawn_client => self.onHeldClientGone(@ptrFromInt(addr)),
+            else => {},
         }
     }
 
@@ -432,11 +444,8 @@ pub const Conductor = struct {
     }
 
     pub fn findWorkerById(self: *Conductor, id: u32) ?*worker.Worker {
-        if (self.reserve) |r| if (r.id == id) return r;
-        var it = self.workers.iterator();
-        while (it.next()) |entry| for (entry.value_ptr.items) |w| {
-            if (w.id == id) return w;
-        };
+        var it = self.liveWorkers();
+        while (it.next()) |w| if (w.id == id) return w;
         return null;
     }
 
@@ -651,7 +660,7 @@ pub const Conductor = struct {
         };
         // Its parts are freed here only until handleClient owns them.
         const request: ClientRequest = request: {
-            errdefer if (owned_env) |e| freeEnv(self.allocator, e, e);
+            errdefer if (owned_env) |e| worker.freeEnv(self.allocator, e);
             var args_reader = protocol.SliceReader{ .bytes = r.bytes, .pos = head.args_at };
             const raw_args = try self.copyArgs(&args_reader);
             errdefer {
@@ -696,19 +705,9 @@ pub const Conductor = struct {
     // `r`'s lengths are already checked.
     fn copyEnv(self: *Conductor, r: *protocol.SliceReader) ![]worker.EnvVar {
         const env = try self.allocator.alloc(worker.EnvVar, try r.int(u32));
-        var copied: usize = 0;
-        errdefer freeEnv(self.allocator, env[0..copied], env);
-        for (env) |*e| {
-            const key = try r.lenPrefixed(u32);
-            const value = try r.lenPrefixed(u32);
-            e.key = try self.allocator.dupe(u8, key);
-            e.value = self.allocator.dupe(u8, value) catch |err| {
-                self.allocator.free(e.key);
-                return err;
-            };
-            copied += 1;
-        }
-        return env;
+        defer self.allocator.free(env);
+        for (env) |*e| e.* = .{ .key = try r.lenPrefixed(u32), .value = try r.lenPrefixed(u32) };
+        return worker.dupeEnv(self.allocator, env);
     }
 
     fn handleClient(self: *Conductor, socket: posix.socket_t, is_remote: bool, received: ClientRequest) !Outcome {
@@ -717,47 +716,7 @@ pub const Conductor = struct {
         defer if (!request_held) request.deinit(self.allocator);
         self.client_counter += 1;
         self.client_id = self.client_counter;
-        const project_path = request.project orelse "";
-        const julia_channel = request.parsed.julia_channel;
-        // Thread count is fixed at worker startup, so it's part of pool identity.
-        const threads = resolveThreads(&request);
-        // A client in another mount namespace is sandboxed by something we cannot
-        // see into, so it spawns its own worker there.
-        const foreign_ns = if (is_remote) null else platform.peerForeignMountNs(socket);
-        const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or request.parsed.hasSwitch("--sandbox")))
-            .remote
-        else if (foreign_ns) |ns| blk: {
-            // Refused, not downgraded: we can neither see into nor nest in the client's sandbox.
-            if (request.parsed.hasSwitch("--sandbox")) {
-                std.debug.print("Client {d}: --sandbox from inside a sandbox, rejecting\n", .{self.client_id});
-                try self.serveString(socket,
-                    "--sandbox: this client is already inside a sandbox (its mount namespace differs from the\n" ++
-                        "daemon's), and the daemon cannot nest another in it. Drop --sandbox: the worker runs\n" ++
-                        "inside this sandbox as it is.\n", 1);
-                return .done;
-            }
-            break :blk .{ .client = .{ .socket = socket, .ns = ns } };
-        } else if (request.parsed.hasSwitch("--sandbox")) blk: {
-            const cwd = trimTrailingSlashes(request.cwd);
-            const proj = trimTrailingSlashes(project_path);
-            const has_local_project = proj.len > 0 and proj[0] != '@';
-            break :blk .{ .local = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd };
-        } else .none;
-        if (sandbox != .none) {
-            if (comptime builtin.os.tag != .linux) {
-                const msg = if (sandbox == .remote)
-                    "Sandboxed workers are only available on Linux. " ++
-                        "Remote TCP clients from non-loopback addresses are rejected.\n"
-                else
-                    "--sandbox requires Linux (user namespaces).\n";
-                std.debug.print("Client {d}: sandbox rejected (Linux only)\n", .{self.client_id});
-                try self.serveString(socket, msg, 1);
-                return .done;
-            }
-            std.debug.print("Client {d}: {s} sandbox\n", .{
-                self.client_id, @tagName(sandbox),
-            });
-        }
+        const sandbox = try self.sandboxFor(socket, is_remote, &request) orelse return .done;
         if (request.parsed.hasSwitch("--reconfigure")) {
             try self.serveReconfigure(socket, request.flags.tty, sandbox == .none and self.cfg.transport == .local);
             return .done;
@@ -771,59 +730,23 @@ pub const Conductor = struct {
             try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty, scope);
             return .done;
         }
-        // Session bypass
-        if (sandbox == .remote) {
-            const session_label = request.parsed.getSwitch("--session");
-            if (session_label != null and session_label.?.len > 0 and self.cfg.sandbox_session_bypass) {
-                if (self.findWorkerByLabelGlobal(session_label.?, false)) |found| {
-                    const w = found.w;
-                    std.debug.print("Client {d}: session bypass — joining local worker {d} (label '{s}')\n", .{
-                        self.client_id, w.id, session_label.?,
-                    });
-                    if (try self.assignClientToExistingWorker(socket, &request, w)) return .done;
-                }
+        if (sandbox == .remote and self.cfg.sandbox_session_bypass) if (labelOf(&request)) |label| {
+            if (self.findLabelled(label, .host)) |found| {
+                std.debug.print("Client {d}: session bypass — joining local worker {d} (label '{s}')\n", .{ self.client_id, found.w.id, label });
+                if (try self.assignClientToExistingWorker(socket, &request, found.w)) return .done;
             }
-        }
-        const tkey = args.packThreads(threads);
-        const ch = julia_channel orelse "";
-        const worker_key = switch (sandbox) {
-            .none => try std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
-            .remote => try std.fmt.allocPrint(self.allocator, "__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
-            // Keyed by mount namespace: a worker never serves another sandbox or the host.
-            .client => |c| try std.fmt.allocPrint(self.allocator, "__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
-            // Workers share only when their mounts match.
-            .local => |rw| try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw, trimTrailingSlashes(project_path), ch, tkey }),
         };
+        const worker_key = try self.poolKey(&request, sandbox);
         defer self.allocator.free(worker_key);
         if (request.parsed.hasSwitch("--watch")) return self.serveWatch(socket, &request, worker_key, sandbox);
-        if (request.parsed.getSwitch("--sync")) |pages| {
-            const session = request.parsed.getSwitch("--session");
-            if (session == null or session.?.len == 0) {
-                std.debug.print("Client {d}: --sync without --session label, rejecting\n", .{self.client_id});
-                try self.serveString(socket, "--sync requires --session=<label>\n", 1);
-                return .done;
-            }
-            if (pages.len > 0) _ = std.fmt.parseInt(u16, pages, 10) catch {
-                try self.serveString(socket, "--sync=<pages> takes a whole number of pages to replay, 0 for all\n", 1);
-                return .done;
-            };
-            std.debug.print("Client {d}: sync mode, session='{s}'\n", .{ self.client_id, session.? });
+        if (syncRefusal(&request)) |why| {
+            std.debug.print("Client {d}: refused: {s}", .{ self.client_id, why });
+            try self.serveString(socket, why, 1);
+            return .done;
         }
+        if (request.parsed.hasSwitch("--sync")) std.debug.print("Client {d}: sync mode, session='{s}'\n", .{ self.client_id, labelOf(&request).? });
         if (request.parsed.hasSwitch("--restart")) {
-            if (labelOf(&request)) |label| {
-                try self.restartSession(socket, &request, worker_key, label, sandbox);
-                return .done;
-            }
-            const nkilled = self.killWorkersForProject(worker_key);
-            std.debug.print("Restart: killed {d} worker(s) for {s}{s}{s}\n", .{
-                nkilled,
-                project_path,
-                if (julia_channel != null) " " else "",
-                julia_channel orelse "",
-            });
-            const msg = try std.fmt.allocPrint(self.allocator, "Reset: killed {d} worker(s) for project\n", .{nkilled});
-            defer self.allocator.free(msg);
-            try self.serveString(socket, msg, 0);
+            try self.serveRestart(socket, &request, worker_key, sandbox);
             return .done;
         }
         const outcome = self.assignClientToWorker(socket, &request, worker_key, sandbox, null, null) catch |err| {
@@ -834,6 +757,85 @@ pub const Conductor = struct {
         return outcome;
     }
 
+    /// How the client's worker is sandboxed; null once the client has been
+    /// refused one.
+    fn sandboxFor(self: *Conductor, socket: posix.socket_t, is_remote: bool, request: *const ClientRequest) !?SandboxKind {
+        const wants_sandbox = request.parsed.hasSwitch("--sandbox");
+        // A client in another mount namespace is sandboxed by something we cannot
+        // see into, so it spawns its own worker there.
+        const foreign_ns = if (is_remote) null else platform.peerForeignMountNs(socket);
+        const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or wants_sandbox))
+            .remote
+        else if (foreign_ns) |ns| blk: {
+            // Refused, not downgraded: we can neither see into nor nest in the client's sandbox.
+            if (wants_sandbox) {
+                std.debug.print("Client {d}: --sandbox from inside a sandbox, rejecting\n", .{self.client_id});
+                try self.serveString(socket,
+                    "--sandbox: this client is already inside a sandbox (its mount namespace differs from the\n" ++
+                        "daemon's), and the daemon cannot nest another in it. Drop --sandbox: the worker runs\n" ++
+                        "inside this sandbox as it is.\n", 1);
+                return null;
+            }
+            break :blk .{ .client = .{ .socket = socket, .ns = ns } };
+        } else if (wants_sandbox) blk: {
+            const cwd = trimTrailingSlashes(request.cwd);
+            const proj = trimTrailingSlashes(request.project orelse "");
+            const has_local_project = proj.len > 0 and proj[0] != '@';
+            break :blk .{ .local = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd };
+        } else .none;
+        if (sandbox == .none) return sandbox;
+        if (comptime builtin.os.tag != .linux) {
+            const msg = if (sandbox == .remote)
+                "Sandboxed workers are only available on Linux. " ++
+                    "Remote TCP clients from non-loopback addresses are rejected.\n"
+            else
+                "--sandbox requires Linux (user namespaces).\n";
+            std.debug.print("Client {d}: sandbox rejected (Linux only)\n", .{self.client_id});
+            try self.serveString(socket, msg, 1);
+            return null;
+        }
+        std.debug.print("Client {d}: {s} sandbox\n", .{ self.client_id, @tagName(sandbox) });
+        return sandbox;
+    }
+
+    /// The pool the request's workers are in: its project, Julia channel and
+    /// thread counts, fixed as a worker starts, and its sandbox.
+    fn poolKey(self: *Conductor, request: *const ClientRequest, sandbox: SandboxKind) ![]u8 {
+        const project_path = request.project orelse "";
+        const ch = request.parsed.julia_channel orelse "";
+        const tkey = args.packThreads(resolveThreads(request));
+        return switch (sandbox) {
+            .none => std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
+            .remote => std.fmt.allocPrint(self.allocator, "__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
+            // Keyed by mount namespace: a worker never serves another sandbox or the host.
+            .client => |c| std.fmt.allocPrint(self.allocator, "__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
+            // Workers share only when their mounts match.
+            .local => |rw| std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw, trimTrailingSlashes(project_path), ch, tkey }),
+        };
+    }
+
+    /// Why a `--sync` request is refused, if it is.
+    fn syncRefusal(request: *const ClientRequest) ?[]const u8 {
+        const pages = request.parsed.getSwitch("--sync") orelse return null;
+        if (labelOf(request) == null) return "--sync requires --session=<label>\n";
+        if (pages.len > 0) _ = std.fmt.parseInt(u16, pages, 10) catch
+            return "--sync=<pages> takes a whole number of pages to replay, 0 for all\n";
+        return null;
+    }
+
+    /// Ends the request's session, or without a label every worker of its pool.
+    fn serveRestart(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandbox: SandboxKind) !void {
+        if (labelOf(request)) |label| return self.restartSession(socket, request, worker_key, label, sandbox);
+        const nkilled = self.killWorkersForProject(worker_key);
+        const channel = request.parsed.julia_channel;
+        std.debug.print("Restart: killed {d} worker(s) for {s}{s}{s}\n", .{
+            nkilled, request.project orelse "", if (channel != null) " " else "", channel orelse "",
+        });
+        const msg = try std.fmt.allocPrint(self.allocator, "Reset: killed {d} worker(s) for project\n", .{nkilled});
+        defer self.allocator.free(msg);
+        try self.serveString(socket, msg, 0);
+    }
+
     /// With a label, that session; without, the one a `--session` run of the
     /// caller's would join: in its pool, on the worker running a client, else the
     /// one used last. A labelled worker holds a session of its own.
@@ -841,7 +843,7 @@ pub const Conductor = struct {
         const pool: []const *worker.Worker = if (self.workers.getPtr(worker_key)) |list| list.items else &.{};
         const label = labelOf(request);
         const found: ?*worker.Worker = if (label) |l|
-            (if (sandbox != .none) findWorkerByLabel(pool, l) else if (self.findWorkerByLabelGlobal(l, true)) |f| f.w else null)
+            (if (sandbox != .none) findWorkerByLabel(pool, l) else if (self.findLabelled(l, .enterable)) |f| f.w else null)
         else blk: {
             var best: ?*worker.Worker = null;
             for (pool) |w| if (w.session_label == null) {
@@ -909,7 +911,7 @@ pub const Conductor = struct {
         owned_env: ?[]worker.EnvVar = null, // a remote client's, kept out of the cache
 
         fn deinit(self: *ClientRequest, allocator: Allocator) void {
-            if (self.owned_env) |env| freeEnv(allocator, env, env);
+            if (self.owned_env) |env| worker.freeEnv(allocator, env);
             allocator.free(self.cwd);
             if (self.project) |p| allocator.free(p);
             self.parsed.deinit();
@@ -940,38 +942,49 @@ pub const Conductor = struct {
         waiters: std.array_list.Aligned(*HeldClient, null) = .empty,
     };
 
-    const PreparedClient = struct {
-        port_set: u16,
-        sandbox_env: ?[]const worker.EnvVar,
-        info: worker.ClientInfo,
-    };
-
-    fn prepareClient(self: *Conductor, request: *const ClientRequest, sandbox: SandboxKind) !PreparedClient {
-        const session_label = request.parsed.getSwitch("--session");
-        const is_labeled_session = session_label != null and session_label.?.len > 0;
-        const port_set = if (self.port_pool) |*pool| blk: {
-            break :blk pool.allocate() orelse {
-                std.debug.print("Client {d}: port pool exhausted\n", .{self.client_id});
-                return error.PortPoolExhausted;
-            };
-        } else protocol.PortPool.none;
-        errdefer self.releasePortSet(port_set);
-        // So withenv(client.env...) doesn't leak the remote HOME etc.
-        const sandbox_env = if (sandbox == .remote) try self.buildSandboxClientEnv(request.env) else null;
-        return .{ .port_set = port_set, .sandbox_env = sandbox_env, .info = .{
+    /// What the worker is sent of `request`, run where the client runs.
+    fn clientInfo(self: *const Conductor, request: *const ClientRequest, port_set: u16) worker.ClientInfo {
+        return .{
             .tty = request.flags.tty,
             .color = request.flags.color,
-            .force = is_labeled_session,
+            .force = labelOf(request) != null,
             .id = self.client_id,
             .key = self.keyFor(.client, self.client_id),
             .ppid = request.ppid,
-            .cwd = if (sandbox == .remote) sandbox_home else request.cwd,
-            .env = sandbox_env orelse request.env,
+            .cwd = request.cwd,
+            .env = request.env,
             .switches = request.parsed.switches.items,
             .programfile = request.parsed.program_file,
             .args = request.parsed.program_args,
             .port_set = port_set,
-        } };
+        };
+    }
+
+    fn allocatePortSet(self: *Conductor) !u16 {
+        const pool = if (self.port_pool) |*p| p else return protocol.PortPool.none;
+        return pool.allocate() orelse {
+            std.debug.print("Client {d}: port pool exhausted\n", .{self.client_id});
+            return error.PortPoolExhausted;
+        };
+    }
+
+    const PreparedClient = struct {
+        info: worker.ClientInfo,
+        sandbox_env: ?[]const worker.EnvVar = null,
+    };
+
+    fn prepareClient(self: *Conductor, request: *const ClientRequest, sandbox: SandboxKind) !PreparedClient {
+        const port_set = try self.allocatePortSet();
+        errdefer self.releasePortSet(port_set);
+        var prepared = PreparedClient{ .info = self.clientInfo(request, port_set) };
+        if (sandbox == .remote) {
+            // So withenv(client.env...) doesn't leak the remote HOME etc.
+            const env = try self.buildSandboxClientEnv(request.env);
+            prepared.sandbox_env = env;
+            prepared.info.env = env;
+            prepared.info.cwd = sandbox_home;
+        }
+        return prepared;
     }
 
     /// `direct` is the worker started for the client; `existing_hold` resumes a hold.
@@ -995,20 +1008,21 @@ pub const Conductor = struct {
             if (self.findStartingSession(label, worker_key, request.parsed.hasSwitch("--project") or sandbox != .none)) |p|
                 return self.queueBehind(p, socket, request, worker_key, sandbox, existing_hold);
         };
-        var prepared = try self.prepareClient(request, sandbox);
+        const prepared = try self.prepareClient(request, sandbox);
         defer if (prepared.sandbox_env) |e| self.allocator.free(e);
-        var port_set_held = true;
-        errdefer if (port_set_held) self.releasePortSet(prepared.port_set);
-        const assignment: ?WorkerAssignment = if (direct) |w|
-            self.tryAssignWorker(w, &prepared.info, .new_worker) orelse return error.WorkerUnavailable
-        else
-            try self.selectWorker(list, &prepared.info, session_label, labelOf(request) != null, request.project orelse "", request.parsed.julia_channel, resolveThreads(request), self.currentTime(), sandbox);
+        const port_set = prepared.info.port_set;
+        const assignment = blk: {
+            errdefer self.releasePortSet(port_set);
+            break :blk if (direct) |w|
+                self.tryAssignWorker(w, &prepared.info, .new_worker) orelse return error.WorkerUnavailable
+            else
+                try self.selectWorker(list, request, &prepared.info, sandbox);
+        };
         if (assignment) |a| {
-            self.finishAssignment(socket, request, worker_key, a, prepared.port_set);
+            self.finishAssignment(socket, request, worker_key, a, port_set);
             return .done;
         }
-        self.releasePortSet(prepared.port_set);
-        port_set_held = false;
+        self.releasePortSet(port_set);
         // With no worker free, the one starting is the next to be.
         if (starting) |p| return self.queueBehind(p, socket, request, worker_key, sandbox, existing_hold);
         const hold = existing_hold orelse try self.holdClient(socket, request, worker_key, sandbox);
@@ -1033,23 +1047,23 @@ pub const Conductor = struct {
 
     fn finishAssignment(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, assignment: WorkerAssignment, port_set: u16) void {
         std.debug.print("Assigned client {d} to worker {d}: {s}\n", .{ self.client_id, assignment.w.id, @tagName(assignment.reason) });
-        defer self.allocator.free(assignment.paths.stdin);
-        defer self.allocator.free(assignment.paths.stdout);
-        defer self.allocator.free(assignment.paths.stderr);
-        defer self.allocator.free(assignment.paths.signals);
-        const now = self.currentTime();
-        assignment.w.last_pinged = now;
-        assignment.w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        self.registerClient(self.client_id, request, assignment.w, port_set) catch |err| {
-            std.debug.print("Client {d}: cannot track: {}\n", .{ self.client_id, err });
-        };
-        self.bumpCrf(worker_key, now); // count the summons only once the client is tracked
-        std.debug.print("Client {d}: sending socket paths to client\n", .{self.client_id});
-        self.sendSocketPaths(socket, assignment.paths);
-        std.debug.print("Client {d}: done\n", .{self.client_id});
+        self.seatClient(socket, request, assignment, port_set);
+        self.bumpCrf(worker_key, self.currentTime()); // count the summons only once the client is tracked
         if (self.cfg.reserve_worker) self.beginReserveSpawn() catch |err| {
             std.debug.print("Warning: failed to start a reserve worker: {}\n", .{err});
         };
+    }
+
+    /// Tracks the client on the worker now running it, and sends it there.
+    fn seatClient(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, assignment: WorkerAssignment, port_set: u16) void {
+        defer assignment.paths.deinit(self.allocator);
+        const w = assignment.w;
+        w.last_pinged = self.currentTime();
+        w.recordPpid(request.ppid, self.cfg.worker_maxclients);
+        self.registerClient(self.client_id, request, w, port_set) catch |err| {
+            std.debug.print("Client {d}: cannot track: {}\n", .{ self.client_id, err });
+        };
+        self.sendSocketPaths(socket, assignment.paths);
     }
 
     // --- Held clients ---
@@ -1058,32 +1072,17 @@ pub const Conductor = struct {
     fn holdClient(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandbox: SandboxKind) !*HeldClient {
         const hold = try self.allocator.create(HeldClient);
         errdefer self.allocator.destroy(hold);
-        const env = try self.allocator.alloc(worker.EnvVar, request.env.len);
-        var copied: usize = 0;
-        errdefer freeEnv(self.allocator, env[0..copied], env);
-        for (request.env, env) |src, *dst| {
-            dst.key = try self.allocator.dupe(u8, src.key);
-            errdefer self.allocator.free(dst.key);
-            dst.value = try self.allocator.dupe(u8, src.value);
-            copied += 1;
-        }
+        const env = try worker.dupeEnv(self.allocator, request.env);
+        errdefer worker.freeEnv(self.allocator, env);
         const key = try self.allocator.dupe(u8, worker_key);
         hold.* = .{ .socket = socket, .request = request.*, .worker_key = key, .sandbox = sandbox, .id = self.client_id };
         hold.request.env = env;
         return hold;
     }
 
-    fn freeEnv(allocator: Allocator, filled: []const worker.EnvVar, storage: []const worker.EnvVar) void {
-        for (filled) |e| {
-            allocator.free(e.key);
-            allocator.free(e.value);
-        }
-        allocator.free(storage);
-    }
-
     // Undo holdClient while the caller still owns the request.
     fn unholdClient(self: *Conductor, hold: *HeldClient) void {
-        freeEnv(self.allocator, hold.request.env, hold.request.env);
+        worker.freeEnv(self.allocator, hold.request.env);
         self.allocator.free(hold.worker_key);
         self.allocator.destroy(hold);
     }
@@ -1115,74 +1114,32 @@ pub const Conductor = struct {
 
     /// False when the worker already died; the caller falls back to selection.
     fn assignClientToExistingWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, w: *worker.Worker) !bool {
+        const watcher = request.parsed.hasSwitch("--watch");
+        const port_set = try self.allocatePortSet();
+        var info = self.clientInfo(request, port_set);
+        info.force = info.force or watcher;
+        // The remote cwd doesn't exist here.
+        info.cwd = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/";
         // A watch runs no code, so it carries no environment: whatever reaches a
         // worker is readable by the session's own code.
-        const watcher = request.parsed.hasSwitch("--watch");
-        const port_set = if (self.port_pool) |*pool| blk: {
-            break :blk pool.allocate() orelse {
-                std.debug.print("Client {d}: port pool exhausted\n", .{self.client_id});
-                return error.PortPoolExhausted;
-            };
-        } else protocol.PortPool.none;
-        errdefer self.releasePortSet(port_set);
-        const session_label = request.parsed.getSwitch("--session");
-        const is_labeled_session = session_label != null and session_label.?.len > 0;
-        // The remote cwd doesn't exist here.
-        const client_info = worker.ClientInfo{
-            .tty = request.flags.tty,
-            .color = request.flags.color,
-            .force = is_labeled_session or watcher,
-            .id = self.client_id,
-            .key = self.keyFor(.client, self.client_id),
-            .ppid = request.ppid,
-            .cwd = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/",
-            .env = if (watcher) &.{} else request.env,
-            .switches = request.parsed.switches.items,
-            .programfile = request.parsed.program_file,
-            .args = request.parsed.program_args,
-            .port_set = port_set,
-        };
-        self.event_loop.cancelPendingPing(w);
-        const paths = w.runClient(self.allocator, &client_info) catch |err| {
-            if (!self.handleRunClientError(w, err)) return err;
+        if (watcher) info.env = &.{};
+        const assignment = self.tryAssignWorker(w, &info, .session_label) orelse {
             self.releasePortSet(port_set);
             return false;
         };
-        defer self.allocator.free(paths.stdin);
-        defer self.allocator.free(paths.stdout);
-        defer self.allocator.free(paths.stderr);
-        defer self.allocator.free(paths.signals);
-        const now = self.currentTime();
-        w.last_pinged = now;
-        w.recordPpid(request.ppid, self.cfg.worker_maxclients);
-        try self.registerClient(self.client_id, request, w, port_set);
-        self.sendSocketPaths(socket, paths);
+        self.seatClient(socket, request, assignment, port_set);
         return true;
     }
 
     // --- Worker selection ---
 
-    fn selectWorker(
-        self: *Conductor,
-        list: *WorkerList,
-        client_info: *const worker.ClientInfo,
-        session_label: ?[]const u8,
-        is_labeled_session: bool,
-        project_path: []const u8,
-        julia_channel: ?[]const u8,
-        threads: args.Threads,
-        now: i64,
-        sandbox: SandboxKind,
-    ) !?WorkerAssignment {
-        const want_interactive = for (client_info.switches) |sw| {
-            if (std.mem.eql(u8, sw.name, "--interactive")) break true;
-        } else false;
+    fn selectWorker(self: *Conductor, list: *WorkerList, request: *const ClientRequest, client_info: *const worker.ClientInfo, sandbox: SandboxKind) !?WorkerAssignment {
+        const now = self.currentTime();
+        const label = labelOf(request);
+        const want_interactive = request.parsed.hasSwitch("--interactive");
         // 1. Labeled session: join its worker (global, or scoped to an explicit --project)
-        if (is_labeled_session) {
-            const explicit_project = for (client_info.switches) |sw| {
-                if (std.mem.eql(u8, sw.name, "--project")) break true;
-            } else false;
-            if (self.findSession(list.items, session_label.?, explicit_project or sandbox != .none)) |f| {
+        if (label) |l| {
+            if (self.findSession(list.items, l, request.parsed.hasSwitch("--project") or sandbox != .none)) |f| {
                 // A host client carries into a sandbox only what the sandbox itself starts with.
                 var info = client_info.*;
                 const entering = sandbox == .none and f.w.launch == .sandboxed;
@@ -1197,7 +1154,7 @@ pub const Conductor = struct {
         }
         // Skip ppid/recency reuse for remote clients (isolation) and labeled
         // sessions (their identity is the label, handled above and below).
-        if (sandbox != .remote and !is_labeled_session) {
+        if (sandbox != .remote and label == null) {
             // 2. PPID-affinity (interactive flag must match)
             if (self.findWorkerByPpid(list, client_info.ppid, want_interactive, now)) |w| {
                 if (self.tryAssignWorker(w, client_info, .ppid_affinity)) |a| return a;
@@ -1206,16 +1163,16 @@ pub const Conductor = struct {
             if (self.tryExistingWorkers(list, client_info, want_interactive, now)) |a| return a;
         }
         // 3b. New labeled session: claim an idle worker and tag it, else spawn.
-        if (is_labeled_session and sandbox == .none) {
+        if (label != null and sandbox == .none) {
             if (self.findClaimableWorker(list, want_interactive, now)) |w| {
                 if (w.session_label != null) self.clearLabel(w); // expired
-                w.session_label = try self.allocator.dupe(u8, session_label.?);
+                w.session_label = try self.allocator.dupe(u8, label.?);
                 if (self.tryAssignWorker(w, client_info, .session_label)) |a| return a;
             }
         }
         // 4. The warm reserve, for a plain non-interactive request it matches.
         if (sandbox == .none and !want_interactive) {
-            if (try self.claimReserve(list, project_path, julia_channel, threads, if (is_labeled_session) session_label else null)) |w| {
+            if (try self.claimReserve(list, request.project orelse "", request.parsed.julia_channel, resolveThreads(request), label)) |w| {
                 if (self.tryAssignWorker(w, client_info, .new_worker)) |a| return a;
             }
         }
@@ -1332,12 +1289,10 @@ pub const Conductor = struct {
     fn claimReserve(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, threads: args.Threads, label: ?[]const u8) !?*worker.Worker {
         const r = self.reserve orelse return null;
         if (!std.meta.eql(threads, r.threads)) return null;
-        const channel_matches = if (julia_channel == null and r.julia_channel == null)
-            true
-        else if (julia_channel != null and r.julia_channel != null)
-            std.mem.eql(u8, julia_channel.?, r.julia_channel.?)
+        const channel_matches = if (julia_channel) |ch|
+            r.julia_channel != null and std.mem.eql(u8, ch, r.julia_channel.?)
         else
-            false;
+            r.julia_channel == null;
         if (!channel_matches) return null;
         self.reserve = null;
         std.debug.print("Assigning reserve worker {d} to project {s}{s}{s}\n", .{
@@ -1518,23 +1473,23 @@ pub const Conductor = struct {
 
     const LabelledWorker = struct { w: *worker.Worker, pool_key: []const u8 };
 
-    /// A sandboxed pool never serves a caller from another sandbox, but the host
-    /// may enter one the conductor built. A client-spawned worker's sockets are
-    /// in a mount namespace the host cannot see.
-    fn findWorkerByLabelGlobal(self: *Conductor, label: []const u8, from_host: bool) ?LabelledWorker {
+    /// The pools a session is looked for in: the host's own; those the host
+    /// may enter too, the sandboxes the conductor built (a sandboxed pool
+    /// never serves a caller from another sandbox); or any, a client-spawned
+    /// worker's too, whose sockets are in a mount namespace the host cannot see.
+    const Reach = enum { host, enterable, any };
+
+    fn findLabelled(self: *Conductor, label: []const u8, reach: Reach) ?LabelledWorker {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             const pool = entry.value_ptr.items;
-            if (pool.len > 0 and pool[0].launch != .direct and !(from_host and pool[0].launch == .sandboxed)) continue;
+            const reachable = pool.len == 0 or switch (reach) {
+                .host => pool[0].launch == .direct,
+                .enterable => pool[0].launch != .client,
+                .any => true,
+            };
+            if (!reachable) continue;
             if (findWorkerByLabel(pool, label)) |w| return .{ .w = w, .pool_key = entry.key_ptr.* };
-        }
-        return null;
-    }
-
-    fn findLabelAnywhere(self: *Conductor, label: []const u8) ?LabelledWorker {
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            if (findWorkerByLabel(entry.value_ptr.items, label)) |w| return .{ .w = w, .pool_key = entry.key_ptr.* };
         }
         return null;
     }
@@ -1543,7 +1498,7 @@ pub const Conductor = struct {
     /// pool when `scoped` (it names its project, or is sandboxed: joining a host
     /// worker would escape), else wherever the host may enter.
     fn findSession(self: *Conductor, pool: []const *worker.Worker, label: []const u8, scoped: bool) ?LabelledWorker {
-        if (!scoped) return self.findWorkerByLabelGlobal(label, true);
+        if (!scoped) return self.findLabelled(label, .enterable);
         return .{ .w = findWorkerByLabel(pool, label) orelse return null, .pool_key = "" };
     }
 
@@ -1613,7 +1568,7 @@ pub const Conductor = struct {
         const pool: []const *worker.Worker = if (self.workers.getPtr(worker_key)) |list| list.items else &.{};
         const scoped = request.parsed.hasSwitch("--project") or sandbox != .none;
         // The host may end even a session it cannot join.
-        const running = if (scoped) self.findSession(pool, label, true) else self.findLabelAnywhere(label);
+        const running = if (scoped) self.findSession(pool, label, true) else self.findLabelled(label, .any);
         if (running) |f| {
             f.w.log("retired: --restart of session '{s}'", .{label});
             self.retireWorker(f.w);
@@ -1631,11 +1586,11 @@ pub const Conductor = struct {
         try self.serveString(socket, msg, 0);
     }
 
-    fn killWorkersForProject(self: *Conductor, proj: []const u8) usize {
+    fn killWorkersForProject(self: *Conductor, worker_key: []const u8) usize {
         var count: usize = 0;
         // The pool goes first: the clients of a failed spawn select again, and
         // must not land on a worker about to be killed.
-        if (self.workers.getPtr(proj)) |list| {
+        if (self.workers.getPtr(worker_key)) |list| {
             count = list.items.len;
             for (list.items) |w| {
                 self.event_loop.cancelPendingPing(w);
@@ -1643,11 +1598,11 @@ pub const Conductor = struct {
                 self.enqueueKill(w);
             }
             // crf history is kept: --restart is a non-TTL death (may come back hot).
-            self.dropPoolEntry(proj);
+            self.dropPoolEntry(worker_key);
         }
         // A starting worker counts too; its clients are told to try again. There
         // is at most one per key, as later clients queue behind it.
-        if (self.findPendingSpawn(proj)) |p| {
+        if (self.findPendingSpawn(worker_key)) |p| {
             self.failSpawn(p, error.Restarted);
             count += 1;
         }
@@ -1767,11 +1722,8 @@ pub const Conductor = struct {
     // Null `half_life_s` sets util to the raw rate (one-shot); a value blends the EWMA.
     pub fn refreshStats(self: *Conductor, half_life_s: ?f64) void {
         const now_ns = self.nowNs();
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| _ = refreshOne(w, now_ns, half_life_s);
-        }
-        if (self.reserve) |r| _ = refreshOne(r, now_ns, half_life_s);
+        var it = self.liveWorkers();
+        while (it.next()) |w| _ = refreshOne(w, now_ns, half_life_s);
     }
 
     /// Whether its stats could be read.
@@ -2039,7 +1991,6 @@ pub const Conductor = struct {
     // --- Sandbox env filtering ---
 
     const sandbox_home = "/home/sandbox";
-    const sandbox_identity_keys = [_][]const u8{ "HOME", "USER", "LOGNAME" };
     const sandbox_identity_vars = [_]worker.EnvVar{
         .{ .key = "HOME", .value = sandbox_home },
         .{ .key = "USER", .value = "sandbox" },
@@ -2049,6 +2000,7 @@ pub const Conductor = struct {
     /// Free only the slice, as `buildSandboxClientEnv`.
     fn buildSandboxJoinEnv(self: *Conductor, env: []const worker.EnvVar) ![]const worker.EnvVar {
         const result = try self.allocator.alloc(worker.EnvVar, env.len);
+        errdefer self.allocator.free(result);
         var n: usize = 0;
         for (env) |e| if (worker.sandbox.envAllowed(e.key)) {
             result[n] = e;
@@ -2063,14 +2015,15 @@ pub const Conductor = struct {
         errdefer self.allocator.free(result);
         var n: usize = 0;
         for (env) |e| {
-            var is_identity = false;
-            for (sandbox_identity_keys) |k|
-                if (std.mem.eql(u8, e.key, k)) { is_identity = true; };
-            if (!is_identity) { result[n] = e; n += 1; }
+            const is_identity = for (sandbox_identity_vars) |v| {
+                if (std.mem.eql(u8, e.key, v.key)) break true;
+            } else false;
+            if (is_identity) continue;
+            result[n] = e;
+            n += 1;
         }
-        for (sandbox_identity_vars) |e| { result[n] = e; n += 1; }
-        // Callers free the whole allocation.
-        return self.allocator.realloc(result, n);
+        @memcpy(result[n..][0..sandbox_identity_vars.len], &sandbox_identity_vars);
+        return self.allocator.realloc(result, n + sandbox_identity_vars.len);
     }
 
     // --- Port pool ---
@@ -2111,38 +2064,34 @@ pub const Conductor = struct {
     }
 
     fn clientDone(self: *Conductor, id: u32) ?*worker.Worker {
-        if (self.active_clients.fetchRemove(id)) |entry| {
-            const info = entry.value;
-            self.releasePortSet(info.port_set);
-            if (info.worker.active_clients > 0) {
-                info.worker.active_clients -= 1;
-            } else {
-                info.worker.log("clientDone underflow (map/count drift)", .{});
-            }
-            if (info.watcher) info.worker.watchers -|= 1;
-            const now_ns = self.nowNs();
-            const now_us = @divTrunc(now_ns, 1000);
-            const now_s = @divTrunc(now_us, 1_000_000);
-            if (!info.watcher) info.worker.last_active = now_s;
-            if (!info.watcher and info.worker.busyClients() == 0) {
-                info.worker.occupancy.detach(now_s, self.activityHalfLife(), self.budgetOccHalfLife());
-                _ = refreshOne(info.worker, now_ns, null);
-            }
-            const duration_us = now_us - info.start_time_us;
-            const duration_s: u64 = @intCast(@divTrunc(duration_us, 1_000_000));
-            const duration_ms: u64 = @intCast(@divTrunc(@mod(duration_us, 1_000_000), 1_000));
-            std.debug.print("Client {d} disconnected; worker: {d}, duration: {d}.{d:0>3}s\n", .{
-                entry.key,
-                info.worker.id,
-                duration_s,
-                duration_ms,
-            });
-            if (!info.internal) info.worker.log("{s} {d} left after {d}.{d:0>3}s", .{
-                if (info.watcher) "watcher" else "client", info.pid, duration_s, duration_ms,
-            });
-            if (info.worker.busyClients() == 0) return info.worker;
+        const info = (self.active_clients.fetchRemove(id) orelse return null).value;
+        const w = info.worker;
+        self.releasePortSet(info.port_set);
+        if (w.active_clients > 0) {
+            w.active_clients -= 1;
+        } else {
+            w.log("clientDone underflow (map/count drift)", .{});
         }
-        return null;
+        const now_ns = self.nowNs();
+        const now_us = @divTrunc(now_ns, 1000);
+        const now_s = @divTrunc(now_us, 1_000_000);
+        if (info.watcher) {
+            w.watchers -|= 1;
+        } else {
+            w.last_active = now_s;
+            if (w.busyClients() == 0) {
+                w.occupancy.detach(now_s, self.activityHalfLife(), self.budgetOccHalfLife());
+                _ = refreshOne(w, now_ns, null);
+            }
+        }
+        const duration_us = now_us - info.start_time_us;
+        const duration_s: u64 = @intCast(@divTrunc(duration_us, 1_000_000));
+        const duration_ms: u64 = @intCast(@divTrunc(@mod(duration_us, 1_000_000), 1_000));
+        std.debug.print("Client {d} disconnected; worker: {d}, duration: {d}.{d:0>3}s\n", .{ id, w.id, duration_s, duration_ms });
+        if (!info.internal) w.log("{s} {d} left after {d}.{d:0>3}s", .{
+            if (info.watcher) "watcher" else "client", info.pid, duration_s, duration_ms,
+        });
+        return if (w.busyClients() == 0) w else null;
     }
 
     pub fn syncWorkerClients(self: *Conductor, w: *worker.Worker) void {
@@ -2260,11 +2209,8 @@ pub const Conductor = struct {
 
     pub fn gracefulShutdown(self: *Conductor) void {
         self.abandonSpawns();
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| w.softExit();
-        }
-        if (self.reserve) |r| r.softExit();
+        var it = self.liveWorkers();
+        while (it.next()) |w| w.softExit();
         if (self.waitForWorkers(1000)) return;
         std.debug.print("Timeout waiting for soft exit, sending SIGTERM\n", .{});
         self.signalAllWorkers(platform.SIG.TERM);
@@ -2283,22 +2229,16 @@ pub const Conductor = struct {
     }
 
     fn signalAllWorkers(self: *Conductor, sig: platform.SIG) void {
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| w.signal(sig);
-        }
-        if (self.reserve) |r| r.signal(sig);
+        var it = self.liveWorkers();
+        while (it.next()) |w| w.signal(sig);
         // Workers mid-retirement are no longer in the pool but still dying.
         for (self.pending_kills.items) |pk| pk.w.signal(sig);
     }
 
     fn anyWorkerAlive(self: *Conductor) bool {
-        var it = self.workers.iterator();
-        while (it.next()) |entry| {
-            for (entry.value_ptr.items) |w| if (!w.exited()) return true;
-        }
+        var it = self.liveWorkers();
+        while (it.next()) |w| if (!w.exited()) return true;
         for (self.pending_kills.items) |pk| if (!pk.w.exited()) return true;
-        if (self.reserve) |r| return !r.exited();
         return false;
     }
 
@@ -2314,9 +2254,8 @@ pub const Conductor = struct {
         if (!self.pressure_monitor.active()) self.sweepPendingKills();
         self.enforceMaxTtl();
         const now = self.currentTime();
-        var it = self.workers.iterator();
-        while (it.next()) |entry| for (entry.value_ptr.items) |w| self.pingIfDue(w, now);
-        if (self.reserve) |r| self.pingIfDue(r, now);
+        var it = self.liveWorkers();
+        while (it.next()) |w| self.pingIfDue(w, now);
     }
 
     pub fn onPressureTimer(self: *Conductor) void {
@@ -2513,10 +2452,6 @@ pub const Conductor = struct {
         try reconfigure.subscribe(self, streams, self.probePalette(&streams));
     }
 
-    fn isLiveStatus(format: ?[]const u8) bool {
-        return format != null and std.mem.eql(u8, format.?, "live");
-    }
-
     // A TTY client is colour-probed first; a non-answering terminal gets the flat report.
     // A styled TTY one-shot waits a beat so its CPU meter resolves.
     fn serveStatus(self: *Conductor, client_socket: posix.socket_t, switch_value: ?[]const u8, tty: bool, scope: status.Scope) !void {
@@ -2525,7 +2460,7 @@ pub const Conductor = struct {
         var streams = try self.openClientStreams(client_socket, true);
         var held = false;
         defer if (!held) streams.deinit();
-        const is_live = tty and isLiveStatus(format);
+        const is_live = tty and format != null and std.mem.eql(u8, format.?, "live");
         const palette: ?pal.Palette = if (tty and (format == null or is_live)) self.probePalette(&streams) else null;
         if (is_live or (tty and format == null)) {
             try live.subscribe(self, streams, palette, scope, !is_live);

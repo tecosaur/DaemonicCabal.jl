@@ -250,17 +250,13 @@ pub const Worker = struct {
             .sandboxed => |s| if (comptime builtin.os.tag != .linux) return error.SandboxUnsupported else blk: {
                 const exe_path = resolved orelse cfg.worker_executable;
                 var ro_binds: [8][]const u8 = undefined;
-                var n_ro: usize = 0;
-                ro_binds[n_ro] = cfg.worker_project;
-                n_ro += 1;
-                if (s.ro_binds.len > ro_binds.len - n_ro) {
-                    std.debug.print("Worker: too many ro binds ({d}), max {d}\n", .{ s.ro_binds.len + 1, ro_binds.len });
+                const n_ro = 1 + s.ro_binds.len;
+                if (n_ro > ro_binds.len) {
+                    std.debug.print("Worker: too many ro binds ({d}), max {d}\n", .{ n_ro, ro_binds.len });
                     return error.TooManyBinds;
                 }
-                for (s.ro_binds) |b| {
-                    ro_binds[n_ro] = b;
-                    n_ro += 1;
-                }
+                ro_binds[0] = cfg.worker_project;
+                @memcpy(ro_binds[1..n_ro], s.ro_binds);
                 const sandbox_cfg = sandbox.SandboxConfig{
                     .julia_executable = exe_path,
                     .julia_channel = julia_channel,
@@ -317,7 +313,7 @@ pub const Worker = struct {
             },
         };
         const now = Io.Clock.now(.awake, io).toSeconds();
-        const pending = Spawn{
+        return .{
             .worker = .{
                 .allocator = allocator,
                 .id = id,
@@ -340,7 +336,6 @@ pub const Worker = struct {
             .listener = setup,
             .deadline = now + @as(i64, @intCast(cfg.spawn_timeout)),
         };
-        return pending;
     }
 
     /// Escapes `"`, `\` and `$` for embedding in `--eval` source.
@@ -392,7 +387,6 @@ pub const Worker = struct {
                     return error.PidfdUnsupported;
                 };
             }
-            platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
             w.reply_timeout_ms = @intCast(cfg.ping_timeout * 1000);
             var hello: [12]u8 = undefined;
             std.mem.writeInt(u32, hello[0..4], protocol.worker.magic, .little);
@@ -573,6 +567,12 @@ pub const Worker = struct {
         return protocol.readExactWithin(self.io.?, self.socket, buf, self.reply_timeout_ms);
     }
 
+    /// `what` names the request and the reply it expected.
+    fn unexpectedReply(self: *Worker, comptime what: []const u8, header: Header) error{UnexpectedResponse} {
+        self.log(what ++ ", got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
+        return error.UnexpectedResponse;
+    }
+
     /// The reply to a request, past any pong still owed for a ping whose
     /// timeout was let pass (a busy worker answers late).
     fn readReply(self: *Worker) !Header {
@@ -585,33 +585,23 @@ pub const Worker = struct {
 
     pub const Pong = struct { seq: u8, clients: u16 };
 
-    /// A pong the event loop found readable, read whole within the reply timeout.
+    /// A pong, read whole within the reply timeout.
     pub fn readPong(self: *Worker) !Pong {
-        var buf: [protocol.worker.pong_size]u8 = undefined;
-        try self.readAll(&buf);
-        if (buf[0] != @intFromEnum(protocol.worker.MessageType.pong)) return error.UnexpectedResponse;
-        return parsePong(buf[protocol.worker.header_size..]);
+        const header = try self.readHeader();
+        if (header.msg_type != .pong) return self.unexpectedReply("expected pong", header);
+        return self.readPongPayload();
     }
 
     /// Past its header.
     fn readPongPayload(self: *Worker) !Pong {
         var payload: [protocol.worker.pong_size - protocol.worker.header_size]u8 = undefined;
         try self.readAll(&payload);
-        return parsePong(&payload);
-    }
-
-    fn parsePong(payload: *const [protocol.worker.pong_size - protocol.worker.header_size]u8) Pong {
         return .{ .seq = payload[0], .clients = std.mem.readInt(u16, payload[1..3], .little) };
     }
 
     pub fn ping(self: *Worker) !void {
         self.sendPing();
-        const header = try self.readHeader();
-        if (header.msg_type != .pong) {
-            self.log("ping expected pong, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
-            return error.UnexpectedResponse;
-        }
-        if ((try self.readPongPayload()).seq != self.ping_seq) return error.UnexpectedResponse;
+        if ((try self.readPong()).seq != self.ping_seq) return error.UnexpectedResponse;
     }
 
     /// Clients in use of the worker: a watcher only reads a session's transcript.
@@ -627,6 +617,13 @@ pub const Worker = struct {
         return now - self.last_pinged >= @as(i64, @intCast(interval));
     }
 
+    /// Reads the pong owed for a pending ping no longer awaited, so the next
+    /// read is a reply's.
+    pub fn skipOwedPong(self: *Worker) void {
+        _ = self.readPong() catch {};
+        self.ping_pending = false;
+    }
+
     pub fn sendPing(self: *Worker) void {
         self.ping_seq +%= 1;
         self.writeHeader(.ping, 1);
@@ -639,9 +636,7 @@ pub const Worker = struct {
     pub fn answersWithin(self: *Worker, timeout_ms: u32) bool {
         self.sendPing();
         while (platform.waitReadable(self.socket, timeout_ms)) {
-            const header = self.readHeader() catch return false;
-            if (header.msg_type != .pong) return false;
-            const pong = self.readPongPayload() catch return false;
+            const pong = self.readPong() catch return false;
             if (pong.seq == self.ping_seq) return true;
         }
         return false;
@@ -665,10 +660,7 @@ pub const Worker = struct {
             self.log("setProject got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.ProjectError;
         }
-        if (header.msg_type != .project_ok) {
-            self.log("setProject expected project_ok, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
-            return error.UnexpectedResponse;
-        }
+        if (header.msg_type != .project_ok) return self.unexpectedReply("setProject expected project_ok", header);
         self.project = project;
     }
 
@@ -703,10 +695,7 @@ pub const Worker = struct {
             platform.write(self.socket, &id_buf);
         }
         const header = try self.readReply();
-        if (header.msg_type != .ack) {
-            self.log("syncClients expected ack, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
-            return error.UnexpectedResponse;
-        }
+        if (header.msg_type != .ack) return self.unexpectedReply("syncClients expected ack", header);
         var count_buf: [2]u8 = undefined;
         try self.readAll(&count_buf);
         return std.mem.readInt(u16, &count_buf, .little);
@@ -717,10 +706,7 @@ pub const Worker = struct {
     pub fn queryClients(self: *Worker, buf: []u32) ![]u32 {
         self.writeHeader(.query_clients, 0);
         const header = try self.readReply();
-        if (header.msg_type != .clients) {
-            self.log("queryClients expected clients, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
-            return error.UnexpectedResponse;
-        }
+        if (header.msg_type != .clients) return self.unexpectedReply("queryClients expected clients", header);
         var count_buf: [2]u8 = undefined;
         try self.readAll(&count_buf);
         const count = std.mem.readInt(u16, &count_buf, .little);
@@ -738,6 +724,12 @@ pub const Worker = struct {
         stdout: []const u8,
         stderr: []const u8,
         signals: []const u8,
+        /// What the paths are slices of, where they are owned.
+        owned: []const u8 = &.{},
+
+        pub fn deinit(self: SocketPaths, allocator: Allocator) void {
+            allocator.free(self.owned);
+        }
     };
 
     pub fn runClient(
@@ -787,14 +779,10 @@ pub const Worker = struct {
         std.debug.print("Worker {d}: got response: {s} ({d} bytes payload)\n", .{ self.id, @tagName(header.msg_type), header.payload_len });
         if (header.msg_type == .err) {
             self.log("runClient got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
-            if (header.payload_len > 0 and header.payload_len < 4096) {
-                const err_payload = allocator.alloc(u8, header.payload_len) catch {
-                    return error.WorkerError;
-                };
-                defer allocator.free(err_payload);
-                self.readAll(err_payload) catch {
-                    return error.WorkerError;
-                };
+            var err_buf: [4096]u8 = undefined;
+            if (header.payload_len > 0 and header.payload_len < err_buf.len) {
+                const err_payload = err_buf[0..header.payload_len];
+                self.readAll(err_payload) catch return error.WorkerError;
                 var r = protocol.SliceReader{ .bytes = err_payload };
                 const err_code = r.int(u16) catch return error.WorkerError;
                 const err_msg = r.lenPrefixed(u32) catch return error.WorkerError;
@@ -802,17 +790,11 @@ pub const Worker = struct {
             }
             return error.WorkerError;
         }
-        if (header.msg_type != .sockets) {
-            self.log("runClient expected sockets, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
-            return error.UnexpectedResponse;
-        }
+        if (header.msg_type != .sockets) return self.unexpectedReply("runClient expected sockets", header);
         // Its count and four paths; a sandboxed worker's length is untrusted.
-        if (header.payload_len > 4 + 4 * (4 + protocol.max_socket_path)) {
-            self.log("runClient expected sockets of at most four paths, got {d} bytes", .{header.payload_len});
-            return error.UnexpectedResponse;
-        }
+        if (header.payload_len > 4 + 4 * (4 + protocol.max_socket_path)) return self.unexpectedReply("runClient expected sockets of at most four paths", header);
         const payload = try allocator.alloc(u8, header.payload_len);
-        defer allocator.free(payload);
+        errdefer allocator.free(payload);
         try self.readAll(payload);
         var r = protocol.SliceReader{ .bytes = payload };
         self.active_clients = r.int(u32) catch return error.UnexpectedResponse;
@@ -823,13 +805,7 @@ pub const Worker = struct {
             if (i == 0 and path.len == 0) return error.WorkerBusy;
             if (path.len > protocol.max_socket_path) return error.UnexpectedResponse;
         }
-        const stdin_path = try allocator.dupe(u8, paths[0]);
-        errdefer allocator.free(stdin_path);
-        const stdout_path = try allocator.dupe(u8, paths[1]);
-        errdefer allocator.free(stdout_path);
-        const stderr_path = try allocator.dupe(u8, paths[2]);
-        errdefer allocator.free(stderr_path);
-        return .{ .stdin = stdin_path, .stdout = stdout_path, .stderr = stderr_path, .signals = try allocator.dupe(u8, paths[3]) };
+        return .{ .stdin = paths[0], .stdout = paths[1], .stderr = paths[2], .signals = paths[3], .owned = payload };
     }
 };
 
@@ -852,6 +828,27 @@ pub const EnvVar = struct {
     key: []const u8,
     value: []const u8,
 };
+
+/// Copies `env`'s keys and values; free with `freeEnv`.
+pub fn dupeEnv(allocator: Allocator, env: []const EnvVar) ![]EnvVar {
+    const copy = try allocator.alloc(EnvVar, env.len);
+    // Empty until copied, and freeing an empty slice does nothing.
+    @memset(copy, .{ .key = &.{}, .value = &.{} });
+    errdefer freeEnv(allocator, copy);
+    for (env, copy) |src, *dst| {
+        dst.key = try allocator.dupe(u8, src.key);
+        dst.value = try allocator.dupe(u8, src.value);
+    }
+    return copy;
+}
+
+pub fn freeEnv(allocator: Allocator, env: []const EnvVar) void {
+    for (env) |e| {
+        allocator.free(e.key);
+        allocator.free(e.value);
+    }
+    allocator.free(env);
+}
 
 var resolve_buf: [std.fs.max_path_bytes]u8 = undefined;
 fn resolveInPath(io: Io, name: []const u8, path_env: []const u8) ?[]const u8 {

@@ -23,7 +23,6 @@ pub const peek_signal: ?SIG = .INFO;
 pub const STDIN_HANDLE: posix.fd_t = posix.STDIN_FILENO;
 pub const STDOUT_HANDLE: posix.fd_t = posix.STDOUT_FILENO;
 pub const STDERR_HANDLE: posix.fd_t = posix.STDERR_FILENO;
-pub const Timeval = c.timeval;
 
 // Process info
 pub const getpid = c.getpid;
@@ -232,9 +231,6 @@ pub fn rawClose(fd: posix.fd_t) void {
 pub fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
     const rc = c.socket(@intCast(family), @intCast(sock_type), 0);
     return if (rc >= 0) rc else null;
-}
-pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
-    return c.connect(fd, addr, len) == 0;
 }
 pub fn fileOwner(fd: posix.fd_t) ?struct { uid: posix.uid_t, mode: u32 } {
     var st: c.Stat = undefined;

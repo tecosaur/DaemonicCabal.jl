@@ -317,11 +317,6 @@ pub fn getTerminalSize(fd: posix.fd_t) ?struct { rows: u16, cols: u16 } {
     return null;
 }
 pub fn isatty(fd: posix.fd_t) bool { return getTerminalSize(fd) != null; }
-pub fn setRecvTimeout(socket: posix.fd_t, seconds: u32) void {
-    posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(
-        &impl.Timeval{ .sec = @intCast(seconds), .usec = 0 },
-    )) catch {};
-}
 
 /// Then probes each second, ten times, as libuv does for the worker's end.
 pub fn setTcpKeepalive(socket: posix.fd_t, idle_s: u32) void {

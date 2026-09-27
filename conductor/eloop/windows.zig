@@ -150,9 +150,7 @@ pub const EventLoop = struct {
         if (!w.ping_pending) return;
         self.unwatchFd(@intFromPtr(w), w.socket);
         self.disarm(@intFromPtr(w));
-        var buf: [protocol.worker.pong_size]u8 = undefined;
-        protocol.readExact(w.socket, &buf) catch {};
-        w.ping_pending = false;
+        w.skipOwedPong();
     }
 
     /// The pong watch and its timer race; whichever packet lands first settles the ping.

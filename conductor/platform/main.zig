@@ -26,9 +26,6 @@ pub const writeFile = if (os != .windows) impl.write else impl.writeFile;
 /// gone: left unread, the worker's writes then fail as they would to it.
 pub const writeOutput = if (os != .windows) impl.writeAll else impl.writeFileAll;
 pub const kill = impl.kill;
-pub const rawSocket = impl.rawSocket;
-pub const rawConnect = impl.rawConnect;
-pub const rawClose = impl.rawClose;
 pub const defaultRuntimeDir = impl.defaultRuntimeDir;
 pub fn getStdinHandle() std.posix.fd_t {
     if (os == .windows) return impl.getStdinHandle();
@@ -52,7 +49,6 @@ pub const waitReadable = shared.waitReadable;
 pub const readAvailable = shared.readAvailable;
 pub const peek_signal = impl.peek_signal;
 pub const close = shared.close;
-pub const shutdownWrite = shared.shutdownWrite;
 pub const eprint = shared.eprint;
 /// The peer reads EOF; the handle stays valid wherever the transport can half-close.
 pub const sendEof = if (os == .windows) impl.sendEof else shared.shutdownWrite;
@@ -119,7 +115,6 @@ pub const processReclaimable = shared.processReclaimable;
 pub const readPsiSomeAvg10 = shared.readPsiSomeAvg10;
 pub const readMemInfo = shared.readMemInfo;
 pub const getParentName = shared.getParentName;
-pub const setRecvTimeout = shared.setRecvTimeout;
 pub const setTcpNodelay = shared.setTcpNodelay;
 pub const setTcpKeepalive = shared.setTcpKeepalive;
 pub const getTerminalSize = shared.getTerminalSize;
