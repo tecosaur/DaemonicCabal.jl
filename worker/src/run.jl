@@ -137,8 +137,8 @@ end
             term.redirect_err = devnull
             session = term.sync_session
             if !isnothing(session)
-                for sig in session.signals
-                    try send_signal(sig, SIGNAL_EXIT, UInt8[exit.code % UInt8]) catch end
+                for p in @atomic session.participants
+                    try send_signal(p.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8]) catch end
                 end
             else
                 send_signal(term.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8])

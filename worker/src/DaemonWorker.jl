@@ -20,16 +20,29 @@ include("transcript.jl")
 include("broadcastio.jl")
 include("replay.jl")
 
-struct SyncSession
-    mergedin::Base.PipeEndpoint
-    writesink::Base.PipeEndpoint
-    out::BroadcastWriter{StreamIO}
-    err::BroadcastWriter{StreamIO}
-    signals::Vector{StreamIO}
-    screen::Recording  # the shared run, whose output a joiner is replayed
-    repl::Base.RefValue{REPL.LineEditREPL}
-    executing::Base.RefValue{Tuple{Bool, UInt32}}  # the REPL's evaluation, as its clients are told
-    executing_lock::ReentrantLock  # held telling them, so a joiner is told in order
+# A --sync client. One task reads its answers (`read_replies`), so waiting on
+# them can be bounded: one slow to answer holds up only itself.
+mutable struct Participant
+    const stdout::StreamIO
+    const stderr::StreamIO
+    const signals::StreamIO
+    const replied::Threads.Condition
+    acks_due::Int  # raw-mode switches sent it, yet to be acknowledged
+    sizes_due::Int  # display size queries, yet to be answered
+    size::Union{Nothing, Tuple{Int, Int}}  # its latest answer
+end
+
+mutable struct SyncSession
+    const label::String
+    const mergedin::Base.PipeEndpoint
+    const writesink::Base.PipeEndpoint
+    const out::BroadcastWriter{StreamIO}
+    const err::BroadcastWriter{StreamIO}
+    @atomic participants::Vector{Participant}  # replaced whole, under `STATE.lock`
+    const screen::Recording  # the shared run, whose output a joiner is replayed
+    const repl::Base.RefValue{REPL.LineEditREPL}
+    const executing::Base.RefValue{Tuple{Bool, UInt32}}  # the REPL's evaluation, as its clients are told
+    const executing_lock::ReentrantLock  # held telling them, so a joiner is told in order
 end
 
 include("bufferedio.jl")
