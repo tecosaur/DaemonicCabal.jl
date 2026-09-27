@@ -24,7 +24,6 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--help", {} },
     .{ "--restart", {} },
     .{ "--reconfigure", {} },
-    .{ "--sync", {} },
     .{ "--sandbox", {} },
     .{ "-q", {} },
     .{ "--quiet", {} },
@@ -34,6 +33,7 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
 // word is the program.
 const optional_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },
+    .{ "--sync", {} },
     .{ "--status", {} },
     .{ "--watch", {} },
     .{ "--revise", {} },

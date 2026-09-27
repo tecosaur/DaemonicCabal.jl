@@ -17,6 +17,7 @@ const StreamIO = Union{Base.PipeEndpoint, Sockets.TCPSocket}
 include("terminaltext.jl")
 include("transcript.jl")
 include("broadcastio.jl")
+include("replay.jl")
 
 struct SyncSession
     mergedin::Base.PipeEndpoint

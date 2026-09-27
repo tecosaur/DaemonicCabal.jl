@@ -28,6 +28,7 @@ HISTORY_BYTES::Int = 1 << 20  # per session transcript
 # Which sessions record from their start; --sync ones always do, and any from its first watch.
 @enum RecordLevel record_sync record_interactive record_session
 RECORD_LEVEL::RecordLevel = record_session
+SYNC_REPLAY_PAGES::Int = 3  # of a sync session's screen, replayed to a joiner; 0 for all
 
 # "64K", "1M" and the like, or plain bytes; at most 4G, as records carry a UInt32 length.
 function history_bytes(value::AbstractString)
@@ -46,6 +47,13 @@ function record_level(value::AbstractString)
     end
     @warn "Ignoring JULIA_DAEMON_RECORD=$value, which should be sync, interactive or session"
     RECORD_LEVEL
+end
+
+function replay_pages(value::AbstractString)
+    pages = tryparse(Int, value)
+    !isnothing(pages) && pages >= 0 && return pages
+    @warn "Ignoring JULIA_DAEMON_SYNC_REPLAY_PAGES=$value, which should be a whole number of pages, 0 for all"
+    SYNC_REPLAY_PAGES
 end
 
 # A switch or variable given with no value counts as yes.
@@ -418,25 +426,20 @@ end
 function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::StreamIO,
                                         client_stdout::StreamIO, client_stderr::StreamIO,
                                         signals::StreamIO, session::SyncSession)
+    # Its `--sync=N`, or the daemon's setting.
+    pages = something(tryparse(Int, getval(client.switches, "--sync", "")), SYNC_REPLAY_PAGES)
+    replay = (client_stdout, session.screen, query_displaysize(signals), pages)
     if isassigned(session.repl)
-        # Reposition the cursor so the REPL's refresh lands right on a fresh terminal.
-        height = first(query_displaysize(signals))
-        maxlines = 3 * height
-        replay_history(client_stdout, session.screen; maxlines)
+        # Leaves the cursor where the REPL's is, for its refresh to redraw the line.
+        replay_history(replay...)
         send_signal(signals, SIGNAL_RAW_MODE, UInt8[true])
         read(signals, 2)
-        if session.repl[].mistate !== nothing
-            let mi = session.repl[].mistate::REPL.LineEdit.MIState
-                ps = mi.mode_state[mi.current_mode]::REPL.LineEdit.PromptState
-                write(client_stdout, "\n" ^ (ps.ias.curs_row - 1))
-                put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
-            end
-        end
+        mi = session.repl[].mistate
+        isnothing(mi) || put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
     else
         @async try # thread 0 for Ctrl-C; see `spawn_client!`
             runclient(client, session.mergedin, session.out, session.err, signals;
-                      owned_streams=(), sync_session=session, repl_ref=session.repl,
-                      replay=(client_stdout, session))
+                      owned_streams=(), sync_session=session, repl_ref=session.repl, replay)
         catch end
     end
     task = Threads.@spawn begin
@@ -721,6 +724,7 @@ function runworker(socketpath::String, conductor_address::String, worker_id::Int
     global ORPHAN_FAILSAFE = max_ttl > 0 ? max_ttl * 4 : 0
     global HISTORY_BYTES = history_bytes(get(ENV, "JULIA_DAEMON_HISTORY_BYTES", "1M"))
     global RECORD_LEVEL = record_level(get(ENV, "JULIA_DAEMON_RECORD", "session"))
+    global SYNC_REPLAY_PAGES = replay_pages(get(ENV, "JULIA_DAEMON_SYNC_REPLAY_PAGES", "3"))
     global PORT_BASE = if haskey(ENV, "JULIA_DAEMON_PORTS")
         parse(Int, split(ENV["JULIA_DAEMON_PORTS"], '-')[1])
     else 0 end

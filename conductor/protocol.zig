@@ -71,7 +71,8 @@ pub const CLIENT_HELP =
     \\ -a, --address <addr>       Connect to conductor at <addr> instead of default
     \\ --session[=<label>]        Reuse worker state in Main module. With a label,
     \\                            multiple clients can share the same session.
-    \\ --sync                     Attach to shared REPL (requires --session=<label>)
+    \\ --sync[=<pages>]           Attach to shared REPL (requires --session=<label>),
+    \\                            replaying up to <pages> of it (0 for all)
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
     \\ --restart                  Kill workers for the project (or just the
     \\                            --session=<label>'s) and exit

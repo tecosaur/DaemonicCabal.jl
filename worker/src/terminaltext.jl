@@ -14,7 +14,13 @@ const UNSTYLED = Style((0, 0, 0))
 struct Cell
     char::Char
     style::Style
+    marks::String  # the combining characters joining it
 end
+
+Cell(char::Char, style::Style) = Cell(char, style, "")
+
+# The columns after a wide character's first, or a tab's.
+const CONTINUATION = '\0'
 
 """
     TerminalText(sink::IO) <: IO
@@ -32,10 +38,14 @@ What is drawn on the alternate screen, which a terminal discards, is dropped.
 
 When `styled`, each character keeps the colours and attributes (SGR) it was
 drawn with, and a released row sets each change of them and ends unstyled.
+
+With `columns`, rows wrap at that width as a terminal's would, so each row
+released is one a terminal of that width shows.
 """
 mutable struct TerminalText{S <: IO} <: IO
     const sink::S
     const styled::Bool
+    const columns::Int  # 0 for rows of any width
     state::Symbol  # :ground, :escape, :escape_intermediate, :csi, :csi_private, :csi_ignore, :string
     alternate::Bool  # on the alternate screen
     const params::Vector{Int}  # a CSI sequence's parameters
@@ -50,8 +60,8 @@ mutable struct TerminalText{S <: IO} <: IO
     const utf8::Vector{UInt8}  # a character's bytes so far
 end
 
-TerminalText(sink::IO; styled::Bool=false) =
-    TerminalText(sink, styled, :ground, false, Int[], 0x0000, [Cell[]], 1, 0, 0, (1, 0), typemax(Int), UNSTYLED, UInt8[])
+TerminalText(sink::IO; styled::Bool=false, columns::Int=0) =
+    TerminalText(sink, styled, columns, :ground, false, Int[], 0x0000, [Cell[]], 1, 0, 0, (1, 0), typemax(Int), UNSTYLED, UInt8[])
 
 function Base.unsafe_write(t::TerminalText, p::Ptr{UInt8}, n::UInt)
     transform!(t, unsafe_wrap(Array, p, Int(n)))
@@ -99,7 +109,7 @@ end
 # Only valid, unstyled text appended at the window's end moves as it is, bar
 # the rows staying editable.
 function transform!(t::TerminalText, data)
-    appending = t.state === :ground && !t.alternate && isempty(t.utf8) && t.row == length(t.rows) &&
+    appending = t.columns == 0 && t.state === :ground && !t.alternate && isempty(t.utf8) && t.row == length(t.rows) &&
         t.column == length(t.rows[end]) && (!t.styled || t.style == UNSTYLED)
     if appending && all(b -> b >= 0x20 && b != 0x7f || b == UInt8('\n') || b == UInt8('\t'), data) &&
             isvalid(String, data)
@@ -229,16 +239,48 @@ function escape!(t::TerminalText, byte::UInt8)
     end
 end
 
+# A tab moves to the next stop, as far as the margin; a character that won't
+# fit wraps whole, and one of no width joins the one before the cursor.
 function put_char!(t::TerminalText, c::Char)
+    if c != '\t' && textwidth(c) == 0
+        line = t.rows[t.row]
+        base = findprev(cell -> cell.char != CONTINUATION, line, min(t.column, length(line)))
+        isnothing(base) && return
+        (; char, style, marks) = line[base]
+        ncodeunits(marks) < 64 || return
+        line[base] = Cell(char, style, marks * c)
+        t.edited_top = min(t.edited_top, t.released + t.row)
+        return
+    end
+    width = if c == '\t' 8 - t.column % 8 elseif textwidth(c) == 2 2 else 1 end
+    if t.columns > 0
+        if c == '\t'
+            width = min(width, t.columns - t.column)
+            width > 0 || return
+        elseif t.column + width > t.columns
+            line_feed!(t)
+            t.column = 0
+        end
+    end
     t.edited_top = min(t.edited_top, t.released + t.row)
     line = t.rows[t.row]
-    if t.column < length(line)
-        line[t.column + 1] = Cell(c, t.style)
-    else
-        append!(line, fill(Cell(' ', UNSTYLED), t.column - length(line)))
-        push!(line, Cell(c, t.style))
+    length(line) < t.column + width &&
+        append!(line, fill(Cell(' ', UNSTYLED), t.column + width - length(line)))
+    # Writing over part of a wide character or a tab leaves none of it.
+    if line[t.column + 1].char == CONTINUATION
+        lead = findprev(cell -> cell.char != CONTINUATION, line, t.column + 1)
+        isnothing(lead) || fill!(view(line, lead:t.column), Cell(' ', line[lead].style))
     end
-    t.column += 1
+    line[t.column + 1] = Cell(c, t.style)
+    for i in t.column + 2:t.column + width
+        line[i] = Cell(CONTINUATION, t.style)
+    end
+    after = t.column + width + 1
+    while after <= length(line) && line[after].char == CONTINUATION
+        line[after] = Cell(' ', line[after].style)
+        after += 1
+    end
+    t.column += width
 end
 
 # Onto the next row, a new one at the end, releasing the oldest beyond the window.
@@ -313,6 +355,8 @@ function csi!(t::TerminalText, final::Char)
     elseif final == 'u'
         restore_cursor!(t)
     end
+    # Past the margin is a pending wrap, which moving the cursor ends.
+    t.columns > 0 && final != 'm' && (t.column = min(t.column, t.columns - 1))
 end
 
 # Select Graphic Rendition: its parameters, in order, change the style.
@@ -389,14 +433,18 @@ function sgr!(t::TerminalText)
 end
 
 # A row to the sink: its text, and when styled, each change of style.
+# A continuation prints nothing after its character, and a space once that's gone.
 function write_row(t::TerminalText, row::Vector{Cell}; newline::Bool=true)
     style = UNSTYLED
+    continued = false
     for cell in row
+        cell.char == CONTINUATION && continued && continue
         if t.styled && cell.style != style
             style = cell.style
             write_sgr(t.sink, style)
         end
-        print(t.sink, cell.char)
+        continued = cell.char == '\t' || textwidth(cell.char) == 2
+        print(t.sink, if cell.char == CONTINUATION ' ' else cell.char end, cell.marks)
     end
     style == UNSTYLED || print(t.sink, "\e[0m")
     newline && print(t.sink, '\n')

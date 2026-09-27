@@ -75,9 +75,8 @@ end
         CLIENT_REPL[][] = repl
         target = REPLAY_TARGET[]
         if target !== nothing
-            (stdout, session) = target
-            REPL.banner(IOContext(stdout, :color => something(ACTIVE_TERM[].have_color, false)))
-            replay_history(stdout, session.screen)
+            REPL.banner(IOContext(first(target), :color => something(ACTIVE_TERM[].have_color, false)))
+            replay_history(target...)
         end
         recording = CLIENT_RECORDING[]
         if !isnothing(recording) && repl.t isa REPL.Terminals.TTYTerminal

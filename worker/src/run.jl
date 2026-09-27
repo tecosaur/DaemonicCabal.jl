@@ -196,7 +196,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                    sync_session::Union{Nothing, SyncSession}=nothing,
                    repl_ref::Base.RefValue{REPL.LineEditREPL}=Ref{REPL.LineEditREPL}(),
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing,
-                   replay::Union{Nothing, Tuple{StreamIO, SyncSession}}=nothing)
+                   replay::Union{Nothing, Tuple{StreamIO, Recording, Tuple{Int, Int}, Int}}=nothing)
     watch = getval(client.switches, "--watch", nothing)
     if !isnothing(watch)
         exit_code = try
