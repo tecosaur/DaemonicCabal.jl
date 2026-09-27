@@ -104,9 +104,7 @@ pub const EventLoop = struct {
         if (self.pong_polls.fetchRemove(w)) |kv|
             self.queueCancel(@intFromPtr(kv.value)) catch |err| w.log("pong poll not cancelled: {}", .{err});
         if (!w.ping_pending) return;
-        var buf: [protocol.worker.pong_size]u8 = undefined;
-        protocol.readExact(w.socket, &buf) catch {};
-        w.ping_pending = false;
+        w.skipOwedPong();
     }
 
     fn queuePongPoll(self: *EventLoop, w: *worker.Worker) !void {

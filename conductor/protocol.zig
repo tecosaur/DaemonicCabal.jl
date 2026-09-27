@@ -319,14 +319,6 @@ pub const BufReader = struct {
     pub fn readSlice(self: BufReader, buf: []u8) !void {
         try readExact(self.fd, buf);
     }
-
-    pub fn readLenPrefixed(self: BufReader, comptime T: type, allocator: std.mem.Allocator) ![]u8 {
-        const len = try self.readInt(T);
-        const buf = try allocator.alloc(u8, len);
-        errdefer allocator.free(buf);
-        try readExact(self.fd, buf);
-        return buf;
-    }
 };
 
 pub fn randomSocketPath(io: Io, socket_dir: []const u8, suffix: []const u8, buf: []u8) ![]const u8 {

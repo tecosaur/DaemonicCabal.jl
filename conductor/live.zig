@@ -893,7 +893,7 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
         _ = c.handleRunClientError(w, err);
         return err;
     };
-    defer for ([_][]const u8{ paths.stdin, paths.stdout, paths.stderr, paths.signals }) |p| c.allocator.free(p);
+    defer paths.deinit(c.allocator);
     var sockets: [4]posix.socket_t = undefined;
     var opened: usize = 0;
     errdefer for (sockets[0..opened]) |s| platform.close(s);

@@ -19,14 +19,6 @@ pub const EnvCache = struct {
         env: []EnvVar,
         julia_project: ?[]const u8,
         access_time: u64,
-
-        fn deinit(self: *Entry, allocator: Allocator) void {
-            for (self.env) |e| {
-                allocator.free(e.key);
-                allocator.free(e.value);
-            }
-            allocator.free(self.env);
-        }
     };
 
     pub fn init(allocator: Allocator) EnvCache {
@@ -35,8 +27,8 @@ pub const EnvCache = struct {
 
     pub fn deinit(self: *EnvCache) void {
         for (&self.entries) |*entry| {
-            if (entry.*) |*e| {
-                e.deinit(self.allocator);
+            if (entry.*) |e| {
+                worker.freeEnv(self.allocator, e.env);
                 entry.* = null;
             }
         }
@@ -70,9 +62,7 @@ pub const EnvCache = struct {
             }
         }
         const slot = self.findEvictionSlot();
-        if (self.entries[slot]) |*old| {
-            old.deinit(self.allocator);
-        }
+        if (self.entries[slot]) |old| worker.freeEnv(self.allocator, old.env);
         self.entries[slot] = .{
             .fingerprint = fingerprint,
             .env = env,

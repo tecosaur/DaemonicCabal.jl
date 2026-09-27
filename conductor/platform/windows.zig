@@ -135,7 +135,6 @@ const IoStatusToken = struct { iosb: win32.IO_STATUS_BLOCK };
 
 var handle_kinds: std.AutoHashMapUnmanaged(usize, HandleKind) = .empty;
 var associated: std.AutoHashMapUnmanaged(usize, void) = .empty;
-var read_timeouts_ms: std.AutoHashMapUnmanaged(usize, u32) = .empty;
 var sync_tokens: std.AutoHashMapUnmanaged(usize, *IoStatusToken) = .empty;
 var registry_lock: win32.SRWLOCK = win32.SRWLOCK_INIT;
 
@@ -195,7 +194,6 @@ fn forgetHandle(fd: HANDLE) void {
     defer unlockRegistry();
     _ = associated.remove(@intFromPtr(fd));
     _ = handle_kinds.remove(@intFromPtr(fd));
-    _ = read_timeouts_ms.remove(@intFromPtr(fd));
 }
 
 /// True when `ovl` was a synchronous operation's, already consumed.
@@ -425,10 +423,6 @@ pub fn sendEof(fd: HANDLE) void {
 
 /// 0 on timeout, EOF or error.
 pub fn socketRead(fd: HANDLE, buf: []u8) usize {
-    lockRegistry();
-    const timeout_ms = read_timeouts_ms.get(@intFromPtr(fd));
-    unlockRegistry();
-    if (timeout_ms) |ms| return socketReadTimeout(fd, buf, ms);
     return switch (handleKind(fd)) {
         .pipe, .pipe_listener => pipeSyncOp(fd, true, buf) catch |err| {
             eprint("socketRead error: {}\n", .{err});
@@ -441,21 +435,9 @@ pub fn socketRead(fd: HANDLE, buf: []u8) usize {
     };
 }
 
-/// Neither pipes nor AFD handles take a receive timeout. AFD waits for
-/// readiness, which bounds itself; a receive left pending past this frame
-/// would outlive its RECV_INFO and WSABUF.
-fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
-    if (handleKind(fd) == .afd) {
-        if (!(pollReadable(fd, @intCast(timeout_ms)) catch return 0)) return 0;
-        return afdRecv(fd, buf) catch 0;
-    }
-    return pipeRead(fd, buf, timeout_ms);
-}
-
 /// Posts no completion packet, so reads any pipe, on a port or not, without
-/// the registry. 0 on timeout, EOF or error.
-fn pipeRead(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
-    // The IRP writes into this frame, so an expired read is cancelled and waited out.
+/// the registry. 0 on EOF or error.
+fn pipeRead(fd: HANDLE, buf: []u8) usize {
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = ensureEvent() catch return 0;
     defer win32.CloseHandle(ev);
@@ -463,16 +445,7 @@ fn pipeRead(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
         .SUCCESS, .PENDING => {},
         else => return 0,
     }
-    switch (WaitForSingleObject(ev, timeout_ms)) {
-        WAIT_OBJECT_0 => {},
-        WAIT_TIMEOUT => {
-            var scratch: win32.IO_STATUS_BLOCK = undefined;
-            _ = ntdll.NtCancelIoFileEx(fd, &iosb, &scratch);
-            _ = WaitForSingleObject(ev, INFINITE);
-            return 0;
-        },
-        else => return 0,
-    }
+    if (WaitForSingleObject(ev, INFINITE) != WAIT_OBJECT_0) return 0;
     return switch (iosb.u.Status) {
         .SUCCESS => iosb.Information,
         .CANCELLED, .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE => 0,
@@ -481,17 +454,6 @@ fn pipeRead(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
             break :blk 0;
         },
     };
-}
-
-/// 0 lifts the bound.
-pub fn setRecvTimeout(fd: HANDLE, seconds: u32) void {
-    lockRegistry();
-    defer unlockRegistry();
-    if (seconds == 0) {
-        _ = read_timeouts_ms.remove(@intFromPtr(fd));
-    } else {
-        read_timeouts_ms.put(std.heap.page_allocator, @intFromPtr(fd), seconds * 1000) catch {};
-    }
 }
 
 /// A pipe cannot half-close; see `sendEof`.
@@ -631,14 +593,6 @@ pub fn rawSocket(family: u32, sock_type: u32) ?HANDLE {
         eprint("rawSocket: AFD endpoint creation failed: {}\n", .{err});
         return null;
     };
-}
-
-pub fn rawConnect(fd: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
-    connectAfd(fd, addr, len, null) catch |err| {
-        eprint("rawConnect failed: {}\n", .{err});
-        return false;
-    };
-    return true;
 }
 
 /// std's connect collapses the failure reason into error.Unexpected.
@@ -1094,20 +1048,20 @@ pub fn readAvailable(pipe: HANDLE, buf: []u8) ?usize {
     var available: DWORD = 0;
     if (!PeekNamedPipe(pipe, null, 0, null, &available, null).toBool()) return null;
     if (available == 0) return 0;
-    const n = pipeRead(pipe, buf[0..@min(buf.len, available)], INFINITE);
+    const n = pipeRead(pipe, buf[0..@min(buf.len, available)]);
     return if (n == 0) null else n;
 }
 
-/// The worker must have exited: the read runs to EOF.
+/// Only what the pipe holds: a grandchild may keep it open past the worker.
 pub fn dumpChildStderr(_: Io, _: Allocator, child: *std.process.Child, id: u32) void {
     const f = child.stderr orelse return;
     child.stderr = null;
     defer win32.CloseHandle(f.handle);
     var buf: [8192]u8 = undefined;
-    var n = pipeRead(f.handle, &buf, INFINITE);
+    var n = readAvailable(f.handle, &buf) orelse 0;
     if (n == 0) return;
     eprint("Worker {d} stderr:\n", .{id});
-    while (n > 0) : (n = pipeRead(f.handle, &buf, INFINITE)) writeFile(getStderrHandle(), buf[0..n]);
+    while (n > 0) : (n = readAvailable(f.handle, &buf) orelse 0) writeFile(getStderrHandle(), buf[0..n]);
     writeFile(getStderrHandle(), "\n");
 }
 
