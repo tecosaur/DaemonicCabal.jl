@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: MPL-2.0
 
 function create_module()::Module
-    mod = Module(:Main)
+    # Its own parent, as Main is, so it prints as "Main" (before 1.12 a NULL
+    # parent stays NULL, and an override prints it).
+    mod = @static if VERSION >= v"1.12"
+        ccall(:jl_new_module, Ref{Module}, (Any, Ptr{Cvoid}), :Main, C_NULL)
+    else
+        Module(:Main)
+    end
     # From base/client.jl
     maininclude = quote
+        using Base
         baremodule MainInclude
         using ..Base
         include(mapexpr::Function, fname::AbstractString) = Base._include(mapexpr, $mod, fname)
@@ -106,6 +113,42 @@ function Base.display(d::REPL.REPLDisplay, ::MIME"text/plain", exit::DaemonClien
     REPL.LineEdit.transition(d.repl.mistate, :abort)
 end
 
+@static if VERSION >= v"1.11"
+    # `Base.display_error`, as the worker overrides it.
+    function display_client_error(@nospecialize(io::IO), stack::Base.ExceptionStack)
+        if !isempty(stack) && first(stack).exception isa DaemonClientExit
+            exit = first(stack).exception
+            term = ACTIVE_TERM[]
+            try close(term.stdout) catch end
+            try close(term.stderr) catch end
+            # The REPL still prints its next prompt, which the closed streams would fail.
+            term.redirect_out = devnull
+            term.redirect_err = devnull
+            session = term.sync_session
+            if !isnothing(session)
+                for sig in session.signals
+                    try send_signal(sig, SIGNAL_EXIT, UInt8[exit.code % UInt8]) catch end
+                end
+            else
+                send_signal(term.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8])
+            end
+            Base.invokelatest(display, exit)
+        else
+            # Relayed Ctrl-Cs keep landing after the loop breaks: held off while
+            # the interrupt they asked for renders, then dropped, being answered.
+            try
+                Base.disable_sigint() do
+                    printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
+                    Base.show_exception_stack(IOContext(io, :limit => true), stack)
+                    println(io)
+                end
+            catch err
+                err isa InterruptException || rethrow()
+            end
+        end
+    end
+end
+
 function getval(pairlist, key, default)
     index = findfirst(p -> first(p) == key, pairlist)
     if isnothing(index) default else last(pairlist[index]) end
@@ -190,7 +233,8 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     exit_code = 0
     try
         mod = prepare_module(client)
-        withenv(client.env...) do
+        saved_env = swap_env!(client.env)
+        try
             @static if VERSION < v"1.11"
                 CLIENT_SIGNALS[] = signals
                 CLIENT_INTERACTIVE[] = interactive
@@ -220,15 +264,16 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     client_stdin, run_stdout, run_stderr, signals,
                     term, sync_session,
                     get(TERMINFOS, term, nothing), color, nothing)
-                with(ACTIVE_TERM => client_vterm,
-                     CLIENT_MODULE => mod,
-                     CLIENT_INTERACTIVE => interactive,
-                     CLIENT_REPL => repl_ref,
-                     CLIENT_RECORDING => recording,
-                     REPLAY_TARGET => replay) do
-                    runclient(mod, client; stdout=stdoutx, broadcast)
-                end
+                @with(ACTIVE_TERM => client_vterm,
+                      CLIENT_MODULE => mod,
+                      CLIENT_INTERACTIVE => interactive,
+                      CLIENT_REPL => repl_ref,
+                      CLIENT_RECORDING => recording,
+                      REPLAY_TARGET => replay,
+                      runclient(mod, client; stdout=stdoutx, broadcast))
             end
+        finally
+            swap_env!(saved_env)
         end
     catch err
         if err isa DaemonClientExit
@@ -250,6 +295,16 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                             signals, owned_streams, exit_code)
         end
     end
+end
+
+# Sets `env` (`nothing` unsets), returning what it replaced. Unlike `withenv`'s
+# splat, a call is dispatched statically, so precompiled.
+function swap_env!(env::Vector{<:Pair{String}})
+    replaced = [key => get(ENV, key, nothing) for (key, _) in env]
+    for (key, value) in env
+        if isnothing(value) delete!(ENV, key) else ENV[key] = value end
+    end
+    replaced
 end
 
 # Stock julia's trace ends where it entered user code; ours would run on
@@ -295,6 +350,7 @@ end
 # A sync REPL task owns no streams; its clients are cleaned up by stdin_copy_loop.
 function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO,
                          client_stderr::IO, signals::IO, owned_streams::Tuple, exit_code::Int)
+    @nospecialize client_stdin client_stdout client_stderr signals owned_streams
     try flush(client_stdout) catch end
     try flush(client_stderr) catch end
     for io in owned_streams
@@ -342,7 +398,7 @@ end
     end
 end
 
-function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
+function runclient(mod::Module, client::ClientInfo; @nospecialize(stdout::IO=stdout),
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing)
     wants_revise(client) && revise_code()
     # A session keeps its state, so it is warned rather than moved to a fresh worker.
@@ -351,7 +407,6 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
         isempty(stale) || @warn join(["Running outdated code: these changed on disk after this session loaded them";
                                       map(f -> "  " * f, stale)], '\n') _module=nothing _file=nothing
     end
-    set_switches = [s for (s, _) in client.switches]
     runrepl = is_repl_client(client)
     for (switch, value) in client.switches
         if switch == "--eval"
@@ -383,29 +438,35 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
     if runrepl && !client.tty
         run_piped_repl(mod)
     elseif runrepl
-        interactiveinput = client.tty
-        hascolor = get(stdout, :color, clienthascolor(client))
-        quiet = "-q" ∈ set_switches || "--quiet" ∈ set_switches
-        # The atreplinit hook prints the banner itself when replaying.
-        banner = if VERSION >= v"1.11" && REPLAY_TARGET[] !== nothing
-            :no
-        else
-            Symbol(getval(client.switches, "--banner", if interactiveinput && !quiet "yes" else "no" end))
-        end
-        histfile = getval(client.switches, "--history-file", "yes") != "no"
-        @static if VERSION < v"1.11"
-            setglobal!(Base, :have_color, hascolor)
-            Base.run_main_repl(interactiveinput, quiet, banner != :no, histfile, hascolor)
-        else
-            try
-                @static if VERSION < v"1.12"
-                    Base.run_main_repl(interactiveinput, quiet, banner, histfile, hascolor)
-                else
-                    Base.run_main_repl(interactiveinput, quiet, banner, histfile)
-                end
-            finally
-                repl_ended!(CLIENT_REPL[])
+        Base.invokelatest(run_terminal_repl, client, stdout)
+    end
+end
+
+# Called through `invokelatest`: loading packages calls `isinteractive`, whose
+# override would otherwise invalidate `runclient`, and so every run's code.
+function run_terminal_repl(client::ClientInfo, stdout::IO)
+    interactiveinput = client.tty
+    hascolor = get(stdout, :color, clienthascolor(client))
+    quiet = any(((s, _),) -> s ∈ ("-q", "--quiet"), client.switches)
+    # The atreplinit hook prints the banner itself when replaying.
+    banner = if VERSION >= v"1.11" && REPLAY_TARGET[] !== nothing
+        :no
+    else
+        Symbol(getval(client.switches, "--banner", if interactiveinput && !quiet "yes" else "no" end))
+    end
+    histfile = getval(client.switches, "--history-file", "yes") != "no"
+    @static if VERSION < v"1.11"
+        setglobal!(Base, :have_color, hascolor)
+        Base.run_main_repl(interactiveinput, quiet, banner != :no, histfile, hascolor)
+    else
+        try
+            @static if VERSION < v"1.12"
+                Base.run_main_repl(interactiveinput, quiet, banner, histfile, hascolor)
+            else
+                Base.run_main_repl(interactiveinput, quiet, banner, histfile)
             end
+        finally
+            repl_ended!(CLIENT_REPL[])
         end
     end
 end
