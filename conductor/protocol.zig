@@ -130,6 +130,7 @@ pub const worker = struct {
         ack = 0x41,
         sync_clients = 0x50, // the worker kills any client not listed
         drop_session = 0x51, // payload: label (u16-len + bytes)
+        cancel_client = 0x52, // payload: client id, evaluation (u32 each; 0 if unknown); no reply
         start_peek = 0x60, // no reply; the report follows as a `peek_report` notification
         err = 0xFF,
     };
@@ -162,7 +163,7 @@ pub const notification = struct {
         worker_unresponsive = 0x02, // pid
         worker_exit = 0x03, // worker id
         client_exit = 0x04,
-        client_interrupt = 0x05,
+        client_interrupt = 0x05, // client id, then the evaluation it's meant for (u32; 0 if unknown)
         peek_report = 0x06, // worker id, then the report: u32 length + bytes
     };
 };
@@ -173,7 +174,7 @@ pub const signals = struct {
     pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw
     pub const query_size: u8 = 0x03; // response: height(u16) + width(u16)
     pub const nodelay: u8 = 0x04;
-    pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating
+    pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating (+ its number, u32)
 };
 
 // Event keys >= 0x1000 are pointers with tag bits. Bit 2: pending connection.

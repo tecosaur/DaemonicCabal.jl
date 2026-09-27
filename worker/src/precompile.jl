@@ -159,6 +159,24 @@ let frames = Vector{Base.StackTraces.StackFrame}
 end
 @static VERSION >= v"1.11" && precompile(display_client_error, (IO, Base.ExceptionStack))
 precompile(replay_history, (Base.PipeEndpoint, Recording, Tuple{Int, Int}, Int))
+@static if isdefined(Base, :sigint_new_episode!)
+    precompile(with_client_scope, (Function, ClientInfo))
+    precompile(as_client_code, (Function,))
+    precompile(shielded, (Function,))
+    precompile(interrupt_client, (UInt32, UInt32))
+    precompile(session_cancel_source, ())
+    precompile(cancel_session_work, ())
+    precompile(install_cancellation, ())
+    # Scopes are keyed by a client id or a label.
+    for key in (Int, String), value in (Base.CancellationTokenSource, Evaluation)
+        table = Dict{Any, value}
+        precompile(get!, (Type{value}, table, key))
+        precompile(get, (table, key, Nothing))
+        precompile(setindex!, (table, value, key))
+        precompile(delete!, (table, key))
+        precompile(pop!, (table, key, Nothing))
+    end
+end
 precompile(record_package_sources, (Base.PkgId,))
 precompile(accept_client_sockets, (NTuple{4, Sockets.PipeServer}, Int))
 precompile(register_client!, (Int, Task, Base.PipeEndpoint, Base.PipeEndpoint, Base.PipeEndpoint, Base.PipeEndpoint))

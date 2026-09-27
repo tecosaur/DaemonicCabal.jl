@@ -27,6 +27,7 @@ const MSG_TYPE = (
     ack         = 0x41,
     sync_clients = 0x50,
     drop_session = 0x51,
+    cancel_client = 0x52,
     start_peek  = 0x60,
     error       = 0xFF,
 )

@@ -643,6 +643,16 @@ pub const Worker = struct {
         platform.write(self.socket, label);
     }
 
+    /// A client's Ctrl-C during `evaluation`, which from Julia 1.14 cancels
+    /// exactly that client's code.
+    pub fn cancelClient(self: *Worker, id: u32, evaluation: u32) void {
+        self.writeHeader(.cancel_client, 8);
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u32, buf[0..4], id, .little);
+        std.mem.writeInt(u32, buf[4..8], evaluation, .little);
+        platform.write(self.socket, &buf);
+    }
+
     /// The worker drops clients not in `pids`; returns its remaining count.
     /// Returns the worker's count of clients still running.
     pub fn syncClients(self: *Worker, ids: []const u32) !u16 {

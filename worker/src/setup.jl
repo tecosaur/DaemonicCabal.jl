@@ -153,6 +153,40 @@ function set_parent_death_signal()
     end
 end
 
+# A client's run is `with_client_scope`, each evaluation of its code
+# `as_client_code`, and the worker's rendering of what it asked `shielded`.
+# From 1.14 a Ctrl-C cancels a scope (cancellation.jl), reaching the worker as
+# `interrupt_client`; before, it is a SIGINT thrown into whichever task thread 0
+# runs, passed on (`pass_interrupt`) when it lands on the worker's own.
+@static if isdefined(Base, :sigint_new_episode!)
+    include("cancellation.jl")
+else
+    with_client_scope(f, ::ClientInfo) = f()
+    interrupt_client(::Integer, ::Integer) = nothing  # the conductor's SIGINT does it
+    const EXECUTING = Task[]  # running a client's code, under `STATE.lock`
+    function as_client_code(f)
+        task = current_task()
+        @lock STATE.lock push!(EXECUTING, task)
+        signal_executing(true)
+        try
+            f()
+        finally
+            signal_executing(false)
+            @lock STATE.lock filter!(!=(task), EXECUTING)
+        end
+    end
+    shielded(f) = Base.disable_sigint(f)
+    function pass_interrupt()
+        for task in @lock STATE.lock copy(EXECUTING)
+            # Injecting into a task on another thread is fatal, and a task not
+            # held to thread 0 (the REPL pre-warm's) is none a Ctrl-C was for.
+            task.sticky && Threads.threadid(task) == Threads.threadid() || continue
+            task === current_task() && continue
+            try schedule(task, InterruptException(); error=true) catch end
+        end
+    end
+end
+
 # Closing streams unwinds a task blocked on them, but not one looping on
 # other waits (`sleep`, timers), which needs the exception injected.
 function kill_stuck_clients(active_ids::Set{Int})
@@ -204,33 +238,38 @@ function send_signal(io::IO, id::UInt8, data::Vector{UInt8})
     write(io, frame)
 end
 
-"""
-    signal_executing(executing::Bool)
+function send_executing(signals::StreamIO, executing::Bool, evaluation::UInt32)
+    isopen(signals) || return
+    # `isopen` lags a peer close, so a client leaving mid-evaluation throws here.
+    try send_signal(signals, SIGNAL_EXECUTING, [UInt8(executing); reinterpret(UInt8, [htol(evaluation)])])
+    catch err
+        err isa Base.IOError || rethrow()
+    end
+end
 
-Tell the active client whether user code is evaluating, so it can route Ctrl-C.
-Raw mode cannot stand in: LineEdit holds the terminal raw across evaluation.
+"""
+    signal_executing(executing::Bool, evaluation::UInt32=0)
+
+Tell the active client whether user code is evaluating, so it can route Ctrl-C,
+and which evaluation (0 if unnumbered), for its Ctrl-C to name. Raw mode cannot
+stand in: LineEdit holds the terminal raw across evaluation.
 """
 @static if VERSION >= v"1.11"
-    function signal_executing(executing::Bool)
+    function signal_executing(executing::Bool, evaluation::UInt32=UInt32(0))
         term = ACTIVE_TERM[]
-        isnothing(term.sync_session) || return
-        # Outside a client session this is WORKER_TERM, whose pipe is never opened.
-        isopen(term.signals) || return
-        # `isopen` lags a peer close, so a client leaving mid-evaluation throws here.
-        try send_signal(term.signals, SIGNAL_EXECUTING, UInt8[executing])
-        catch err
-            err isa Base.IOError || rethrow()
+        # Outside a client session there's no client, and the pipe was never opened.
+        term === WORKER_TERM && return
+        session = term.sync_session
+        isnothing(session) && return send_executing(term.signals, executing, evaluation)
+        @lock session.executing_lock begin
+            session.executing[] = (executing, evaluation)
+            foreach(sig -> send_executing(sig, executing, evaluation), @lock STATE.lock copy(session.signals))
         end
     end
 else
-    function signal_executing(executing::Bool)
+    function signal_executing(executing::Bool, evaluation::UInt32=UInt32(0))
         sig = CLIENT_SIGNALS[]
-        isnothing(sig) && return
-        isopen(sig) || return
-        try send_signal(sig, SIGNAL_EXECUTING, UInt8[executing])
-        catch err
-            err isa Base.IOError || rethrow()
-        end
+        isnothing(sig) || send_executing(sig, executing, evaluation)
     end
 end
 
@@ -395,7 +434,7 @@ function build_sync_session(label::String, client_stdout::StreamIO, client_stder
         push!(err.writers, client_stderr)
         push!(sigs, signals)
     end
-    SyncSession(pipe.out, pipe.in, out, err, sigs, screen, Ref{REPL.LineEditREPL}())
+    SyncSession(pipe.out, pipe.in, out, err, sigs, screen, Ref{REPL.LineEditREPL}(), Ref((false, UInt32(0))), ReentrantLock())
 end
 
 # REPL-style without a repl object, which an -E-created session may lack.
@@ -434,8 +473,12 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
         replay_history(replay...)
         send_signal(signals, SIGNAL_RAW_MODE, UInt8[true])
         read(signals, 2)
+        # Joining mid-evaluation, its Ctrl-C is to interrupt it.
+        @lock session.executing_lock send_executing(signals, session.executing[]...)
         mi = session.repl[].mistate
-        isnothing(mi) || put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
+        # Unbuffered, and taken only at a prompt: waiting out an evaluation here
+        # would hold up every message after it.
+        isnothing(mi) || @async put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
     else
         @async try # thread 0 for Ctrl-C; see `spawn_client!`
             runclient(client, session.mergedin, session.out, session.err, signals;
@@ -702,6 +745,8 @@ function serve_message(conn::IO, header::MessageHeader)
         flush(conn)
     elseif header.msg_type == MSG_TYPE.drop_session
         teardown_session!(read_string(conn))
+    elseif header.msg_type == MSG_TYPE.cancel_client
+        interrupt_client(read(conn, UInt32), read(conn, UInt32))
     elseif header.msg_type == MSG_TYPE.start_peek
         start_peek()
     else
@@ -745,6 +790,7 @@ function runworker(socketpath::String, conductor_address::String, worker_id::Int
                 serve_message(conn, header)
             catch err
                 err isa InterruptException || rethrow()
+                pass_interrupt()
             end
         end
     catch err
