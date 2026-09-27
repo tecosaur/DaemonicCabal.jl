@@ -93,7 +93,7 @@ pub const CLIENT_HELP =
 // answered by kind-byte frames ending in socket_paths.
 pub const client = struct {
     pub const magic_prefix: u32 = 0x4A4443; // "JDC", then the version byte
-    pub const version: u8 = 2;
+    pub const version: u8 = 3;
     pub const magic: u32 = magic_prefix << 8 | version;
     pub const env_request: u8 = 0x3F; // fingerprint cache miss: send the full env
     // The client spawns its own worker: u16 argc, argc × (u16 len + bytes), then
@@ -111,9 +111,11 @@ pub const client = struct {
 
 // Conductor ↔ Worker Protocol
 pub const worker = struct {
-    pub const magic: u32 = 0x4A445703; // "JDW\x03"
+    pub const magic: u32 = 0x4A445704; // "JDW\x04"
+    /// type(u8) + payload length(u32).
+    pub const header_size = 5;
     /// Header, then the ping's sequence byte echoed and the worker's client count (u16).
-    pub const pong_size = 3 + 1 + 2;
+    pub const pong_size = header_size + 1 + 2;
 
     pub const MessageType = enum(u8) {
         ping = 0x01,

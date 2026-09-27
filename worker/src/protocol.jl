@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-const PROTOCOL_MAGIC = 0x4A445703  # "JDW\x03" little-endian
+const PROTOCOL_MAGIC = 0x4A445704  # "JDW\x04" little-endian
 const NOTIFICATION_MAGIC = 0x4A444E01  # "JDN\x01" little-endian
 
 # Notifications, over the conductor's main socket
@@ -43,7 +43,7 @@ const ERR_CODE = (
 
 struct MessageHeader
     msg_type::UInt8
-    payload_len::UInt16
+    payload_len::UInt32
 end
 
 function verify_magic(conn::IO)
@@ -53,22 +53,22 @@ end
 
 function read_header(conn::IO)
     msg_type = read(conn, UInt8)
-    payload_len = read(conn, UInt16)
+    payload_len = read(conn, UInt32)
     MessageHeader(msg_type, payload_len)
 end
 
 function write_header(conn::IO, msg_type::UInt8, payload_len::Integer)
     write(conn, msg_type)
-    write(conn, UInt16(payload_len))
+    write(conn, UInt32(payload_len))
 end
 
 function read_string(conn::IO)
-    len = read(conn, UInt16)
+    len = read(conn, UInt32)
     String(read(conn, len))
 end
 
 function write_string(conn::IO, s::AbstractString)
-    write(conn, UInt16(ncodeunits(s)))
+    write(conn, UInt32(ncodeunits(s)))
     write(conn, s)
 end
 
@@ -122,8 +122,8 @@ end
 function send_sockets(conn::IO, stdin_path::AbstractString, stdout_path::AbstractString,
                       stderr_path::AbstractString, signals_path::AbstractString,
                       active_clients::Integer)
-    payload_len = 4 + 2 + ncodeunits(stdin_path) + 2 + ncodeunits(stdout_path) +
-                      2 + ncodeunits(stderr_path) + 2 + ncodeunits(signals_path)
+    payload_len = 4 + 4 + ncodeunits(stdin_path) + 4 + ncodeunits(stdout_path) +
+                      4 + ncodeunits(stderr_path) + 4 + ncodeunits(signals_path)
     write_header(conn, MSG_TYPE.sockets, payload_len)
     write(conn, UInt32(active_clients))
     write_string(conn, stdin_path)
@@ -142,7 +142,7 @@ function send_state(conn::IO, active_clients::Integer, last_client_ts::Integer, 
 end
 
 function send_error(conn::IO, code::UInt16, message::AbstractString)
-    payload_len = 2 + 2 + ncodeunits(message)
+    payload_len = 2 + 4 + ncodeunits(message)
     write_header(conn, MSG_TYPE.error, payload_len)
     write(conn, code)
     write_string(conn, message)
@@ -171,14 +171,14 @@ function read_client_run(conn::IO)
     id = Int(read(conn, UInt32))
     pid = Int(read(conn, UInt32))
     cwd = read_string(conn)
-    env_count = read(conn, UInt16)
+    env_count = read(conn, UInt32)
     env = Vector{Pair{String, String}}(undef, env_count)
     for i in 1:env_count
         key = read_string(conn)
         val = read_string(conn)
         env[i] = key => val
     end
-    switch_count = read(conn, UInt16)
+    switch_count = read(conn, UInt32)
     switches = Vector{Tuple{String, String}}(undef, switch_count)
     for i in 1:switch_count
         name = read_string(conn)
@@ -191,7 +191,7 @@ function read_client_run(conn::IO)
     else
         nothing
     end
-    arg_count = read(conn, UInt16)
+    arg_count = read(conn, UInt32)
     args = Vector{String}(undef, arg_count)
     for i in 1:arg_count
         args[i] = read_string(conn)

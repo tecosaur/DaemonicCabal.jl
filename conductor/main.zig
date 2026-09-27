@@ -307,6 +307,26 @@ pub const Conductor = struct {
         received: std.ArrayList(u8) = .empty,
         /// Where the client's environment begins, once it was asked for.
         env_at: ?usize = null,
+        /// The strings of a list checked so far, so each chunk walks only what is new.
+        walk: ?struct { list_at: usize, at: usize, left: usize } = null,
+
+        /// Where the list at `list_at` ends, once all of it has arrived: a
+        /// count of entries, each `strings_per_entry` length-prefixed strings.
+        pub fn listEnd(pc: *PendingConnection, list_at: usize, comptime strings_per_entry: usize) !usize {
+            var r = protocol.SliceReader{ .bytes = pc.received.items, .pos = list_at };
+            if (pc.walk == null or pc.walk.?.list_at != list_at) {
+                const count = try r.int(u32);
+                if (count > (max_message_bytes - r.pos) / (4 * strings_per_entry)) return error.MessageTooLarge;
+                pc.walk = .{ .list_at = list_at, .at = r.pos, .left = count * strings_per_entry };
+            }
+            const walk = &pc.walk.?;
+            r.pos = walk.at;
+            while (walk.left > 0) : (walk.left -= 1) {
+                _ = try r.lenPrefixed(u32);
+                walk.at = r.pos;
+            }
+            return walk.at;
+        }
     };
 
     /// Whatever a peer may send: a request with its arguments and
@@ -553,23 +573,21 @@ pub const Conductor = struct {
         ppid: u32,
         cwd: []const u8,
         fingerprint: u64,
-        args: protocol.SliceReader, // at their count
+        args_at: usize, // their count
     };
 
     fn parseRequestHead(r: *protocol.SliceReader) !RequestHead {
         // flags(1) + reserved(3) + pid(4) + ppid(4)
         const fixed = try r.take(12);
-        const cwd = try r.lenPrefixed(u16);
+        const cwd = try r.lenPrefixed(u32);
         const fingerprint = try r.int(u64);
-        const args_at = r.*;
-        for (0..try r.int(u16)) |_| _ = try r.lenPrefixed(u16);
         return .{
             .flags = @bitCast(fixed[0]),
             .pid = std.mem.readInt(u32, fixed[4..8], .little),
             .ppid = std.mem.readInt(u32, fixed[8..12], .little),
             .cwd = cwd,
             .fingerprint = fingerprint,
-            .args = args_at,
+            .args_at = r.pos,
         };
     }
 
@@ -577,19 +595,21 @@ pub const Conductor = struct {
     /// request leaves it; the rest are asked for theirs.
     fn receiveRequest(self: *Conductor, pc: *PendingConnection, r: *protocol.SliceReader) !?Outcome {
         const head = parseRequestHead(r) catch |err| return if (err == error.Truncated) null else err;
+        const args_end = pc.env_at orelse pc.listEnd(head.args_at, 1) catch |err| return if (err == error.Truncated) null else err;
         const is_remote = pc.peer.isRemote(self.cfg.transport);
         // The cache is this machine's: a remote client's environment would
         // only evict local ones.
         const cached = if (is_remote or pc.env_at != null) null else self.cache.lookup(head.fingerprint);
         if (cached == null and pc.env_at == null) {
-            pc.env_at = r.pos;
+            pc.env_at = args_end;
             platform.write(pc.socket, &[_]u8{protocol.client.env_request});
             return null;
         }
         var owned_env: ?[]worker.EnvVar = null;
         const env = cached orelse blk: {
+            _ = pc.listEnd(pc.env_at.?, 2) catch |err| return if (err == error.Truncated) null else err;
             var er = protocol.SliceReader{ .bytes = r.bytes, .pos = pc.env_at.? };
-            const full = self.copyEnv(&er) catch |err| return if (err == error.Truncated) null else err;
+            const full = try self.copyEnv(&er);
             if (!is_remote) break :blk self.cache.insert(head.fingerprint, full);
             owned_env = full;
             break :blk env_cache.EnvCache.LookupResult{ .env = full, .julia_project = null };
@@ -597,7 +617,7 @@ pub const Conductor = struct {
         // Its parts are freed here only until handleClient owns them.
         const request: ClientRequest = request: {
             errdefer if (owned_env) |e| freeEnv(self.allocator, e, e);
-            var args_reader = head.args;
+            var args_reader = protocol.SliceReader{ .bytes = r.bytes, .pos = head.args_at };
             const raw_args = try self.copyArgs(&args_reader);
             errdefer {
                 for (raw_args) |a| self.allocator.free(a);
@@ -627,24 +647,25 @@ pub const Conductor = struct {
 
     // `r`'s lengths are already checked.
     fn copyArgs(self: *Conductor, r: *protocol.SliceReader) ![][]const u8 {
-        const client_args = try self.allocator.alloc([]const u8, try r.int(u16));
+        const client_args = try self.allocator.alloc([]const u8, try r.int(u32));
         errdefer self.allocator.free(client_args);
         var copied: usize = 0;
         errdefer for (client_args[0..copied]) |arg| self.allocator.free(arg);
         for (client_args) |*arg| {
-            arg.* = try self.allocator.dupe(u8, try r.lenPrefixed(u16));
+            arg.* = try self.allocator.dupe(u8, try r.lenPrefixed(u32));
             copied += 1;
         }
         return client_args;
     }
 
+    // `r`'s lengths are already checked.
     fn copyEnv(self: *Conductor, r: *protocol.SliceReader) ![]worker.EnvVar {
-        const env = try self.allocator.alloc(worker.EnvVar, try r.int(u16));
+        const env = try self.allocator.alloc(worker.EnvVar, try r.int(u32));
         var copied: usize = 0;
         errdefer freeEnv(self.allocator, env[0..copied], env);
         for (env) |*e| {
-            const key = try r.lenPrefixed(u16);
-            const value = try r.lenPrefixed(u16);
+            const key = try r.lenPrefixed(u32);
+            const value = try r.lenPrefixed(u32);
             e.key = try self.allocator.dupe(u8, key);
             e.value = self.allocator.dupe(u8, value) catch |err| {
                 self.allocator.free(e.key);
@@ -2297,13 +2318,18 @@ pub const Conductor = struct {
         // A timeout in the same batch may have settled this ping already.
         if (!w.ping_pending) return;
         w.ping_pending = false;
-        protocol.readExactWithin(self.io, w.socket, &w.pong_buf, w.reply_timeout_ms) catch |err| {
+        const pong = w.readPong() catch |err| {
             w.log("no pong read: {}", .{err});
             return self.retireWorker(w);
         };
         // Late for a ping whose timeout was let pass; this one's is still to come.
-        if (w.pong_buf[3] != w.ping_seq) return self.event_loop.awaitPong(w, self.cfg.ping_timeout * 1000);
-        self.processPong(w, &w.pong_buf);
+        if (pong.seq != w.ping_seq) return self.event_loop.awaitPong(w, self.cfg.ping_timeout * 1000);
+        w.last_pinged = self.currentTime();
+        w.unresponsive_interrupted = false;
+        if (pong.clients != w.active_clients) {
+            w.log("client count mismatch (worker={d}, conductor={d}), syncing", .{ pong.clients, w.active_clients });
+            self.syncWorkerClients(w);
+        }
     }
 
     pub fn onPongTimeout(self: *Conductor, w: *worker.Worker) void {
@@ -2333,16 +2359,6 @@ pub const Conductor = struct {
     fn queuePing(self: *Conductor, w: *worker.Worker) void {
         w.sendPing();
         self.event_loop.awaitPong(w, self.cfg.ping_timeout * 1000);
-    }
-
-    fn processPong(self: *Conductor, w: *worker.Worker, pong_buf: *const [protocol.worker.pong_size]u8) void {
-        w.last_pinged = self.currentTime();
-        w.unresponsive_interrupted = false;
-        const worker_count = std.mem.readInt(u16, pong_buf[4..6], .little);
-        if (worker_count != w.active_clients) {
-            w.log("client count mismatch (worker={d}, conductor={d}), syncing", .{ worker_count, w.active_clients });
-            self.syncWorkerClients(w);
-        }
     }
 
     // --- Utilities ---
