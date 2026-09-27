@@ -47,25 +47,50 @@ pub const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
     ,
 };
 
-pub const CLIENT_HELP =
+const help_usage =
     \\
     \\    juliaclient [switches] -- [programfile] [args...]
     \\
+    \\
+;
+
+pub const CLIENT_HELP = help_usage ++
     \\Switches (a '*' marks the default value, if applicable):
     \\
     \\ -v, --version              Display version information
-    \\ -h, --help                 Print this message
-    \\ -P, --project[=<dir>|@.]    Set <dir> as the home project/environment
+    \\ -h, --help                 Print command-line options (this message)
+    \\ --help-hidden              Print uncommon options not shown by `-h`
+    \\ -P, --project[={<dir>|@.}] Set <dir> as the active project/environment
     \\ -e, --eval <expr>          Evaluate <expr>
     \\ -E, --print <expr>         Evaluate <expr> and display the result
+    \\ -m, --module <Package> [args]
+    \\                            Run entry point of `Package` (`@main` function) with `args`
     \\ -L, --load <file>          Load <file> immediately on all processors
-    \\ -i                         Interactive mode; REPL runs and `isinteractive()` is true
-    \\ -t, --threads <N|auto>[,<M|auto>]  Launch N threads (and M interactive threads)
+    \\ -t, --threads {auto|N[,auto|M]}
+    \\                            Enable N[+M] threads, M in the `interactive` threadpool
+    \\ -i, --interactive          Interactive mode; REPL runs and `isinteractive()` is true
     \\ -q, --quiet                Quiet startup: no banner, suppress REPL warnings
-    \\ --banner={yes|no|auto*}    Enable or disable startup banner
+    \\ --banner={yes|no|short|auto*}
+    \\                            Enable or disable startup banner
     \\ --color={yes|no|auto*}     Enable or disable color text
     \\ --history-file={yes*|no}   Load or save history
     \\
+    \\Julia's other switches only apply as a worker starts: set them for every
+    \\worker in JULIA_DAEMON_WORKER_ARGS.
+    \\
+    \\
+++ client_switches_help;
+
+/// Points to stock julia's `--help-hidden`, none of whose switches a running
+/// worker takes.
+pub const CLIENT_HELP_HIDDEN = help_usage ++
+    \\Julia's uncommon switches (see `julia --help-hidden`) only apply as a
+    \\worker starts: set them for every worker in JULIA_DAEMON_WORKER_ARGS.
+    \\
+    \\
+++ client_switches_help;
+
+const client_switches_help =
     \\Client-specific switches:
     \\
     \\ -a, --address <addr>       Connect to conductor at <addr> instead of default
