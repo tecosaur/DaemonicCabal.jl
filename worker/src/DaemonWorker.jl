@@ -40,7 +40,7 @@ include("peek.jl")
 include("run.jl")
 
 function __init__()
-    isyes(get(ENV, "JULIA_DAEMON_REVISE", "no")) && load_revise()
+    !haskey(ENV, "JULIA_DAEMON_SANDBOXED") && isyes(get(ENV, "JULIA_DAEMON_REVISE", "no")) && load_revise()
     push!(Base.package_callbacks, record_package_sources)
     WORKER_ID[] = String(rand('a':'z', 6))
     include(joinpath(@__DIR__, "overrides.jl"))

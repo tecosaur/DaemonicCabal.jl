@@ -261,6 +261,7 @@ pub const Worker = struct {
                     .eval_expr = eval_expr,
                     .host_environ = s.environ,
                     .setup_socket_path = setup.addr(),
+                    .conductor_socket_path = if (cfg.transport == .local) cfg.socket_path else "",
                     .worker_id = id,
                     .host_home = cfg.host_home,
                     .depot_env = s.environ.get("JULIA_DEPOT_PATH"),
