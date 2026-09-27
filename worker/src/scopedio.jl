@@ -106,6 +106,13 @@ Base.unsafe_write(::TerminalStdout, p::Ptr{UInt8}, n::UInt) =
     with(() -> unsafe_write(ScopedStdout(), p, n), TERMINAL_WRITE => true)
 Base.write(::TerminalStdout, byte::UInt8) = with(() -> write(ScopedStdout(), byte), TERMINAL_WRITE => true)
 
+# As stock stdio's, so a `print` holds together across threads: the client's
+# own stream, not a redirect, which could change while held.
+Base.lock(::Union{ScopedStdout, TerminalStdout}) = lock(ACTIVE_TERM[].stdout)
+Base.unlock(::Union{ScopedStdout, TerminalStdout}) = unlock(ACTIVE_TERM[].stdout)
+Base.lock(::ScopedStderr) = lock(ACTIVE_TERM[].stderr)
+Base.unlock(::ScopedStderr) = unlock(ACTIVE_TERM[].stderr)
+
 # A `ScopedStd*` argument is the worker installing its own globals, not a client
 # redirect, so it clears the slot.
 function set_redirect!(f::Base.RedirectStdStream, io)
