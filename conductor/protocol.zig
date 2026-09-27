@@ -221,6 +221,7 @@ pub const signals = struct {
     pub const query_size: u8 = 0x03; // response: height(u16) + width(u16)
     pub const nodelay: u8 = 0x04;
     pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating (+ its number, u32)
+    pub const suspend_client: u8 = 0x06; // acked once the client runs again
 };
 
 // Event keys >= 0x1000 are pointers with tag bits: a pending record's (a

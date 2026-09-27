@@ -161,6 +161,11 @@ const SignalParser = struct {
                 platform.socketWrite(fd, &resp);
                 break :blk .none;
             },
+            protocol.signals.suspend_client => blk: {
+                platform.suspendSelf();
+                platform.socketWrite(fd, &[_]u8{ id, 0 }); // ack
+                break :blk .none;
+            },
             protocol.signals.nodelay => blk: {
                 platform.setTcpNodelay(sockets.stdin);
                 platform.setTcpNodelay(fd);

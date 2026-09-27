@@ -296,10 +296,11 @@ function register_client!(id::Int, task::Task, streams::StreamIO...)
     @lock STATE.lock STATE.client_tasks[id] = ClientTask(task, streams)
 end
 
-# Pre-1.11 stand-ins for ACTIVE_TERM's signals and CLIENT_INTERACTIVE; that
-# path is single-client.
+# Pre-1.11 stand-ins for ACTIVE_TERM's signals and stdin, and
+# CLIENT_INTERACTIVE; that path is single-client.
 @static if VERSION < v"1.11"
     const CLIENT_SIGNALS = Ref{Union{Nothing, StreamIO}}(nothing)
+    const CLIENT_INPUT = Ref{Union{Nothing, StreamIO, TerminalInput}}(nothing)
     const CLIENT_INTERACTIVE = Ref(false)
     const CLIENT_END = Ref{Union{Nothing, RunEnd}}(nothing)
 end
@@ -310,6 +311,7 @@ const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
 const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
 const SIGNAL_NODELAY = 0x04    # disable Nagle on stdin + signals
 const SIGNAL_EXECUTING = 0x05  # data: 0x00 = at prompt, 0x01 = evaluating; evaluation number (u32 LE)
+const SIGNAL_SUSPEND = 0x06    # acked once the client runs again
 
 const DEFAULT_DISPLAYSIZE = (24, 80)
 
@@ -459,7 +461,7 @@ function end_sync_session!(session::SyncSession, code::Int)
             delete!(STATE.sync_sessions, session.label)
         end
     end
-    try close(session.writesink) catch end
+    close_input!(session.input)
     participants = @lock STATE.lock begin
         taken = @atomic session.participants
         set_participants!(session, Participant[])
@@ -485,30 +487,6 @@ function sync_echo_expressions(session::SyncSession, client::ClientInfo)
     end
 end
 
-# Under `intercept_eof`, Ctrl-D detaches this client rather than ending the shared REPL.
-function stdin_copy_loop(client_stdin::StreamIO, merged_write::Base.PipeEndpoint;
-                         intercept_eof::Bool=false)
-    buf = Vector{UInt8}(undef, 64 * 1024)
-    try
-        while true
-            Base.wait_readnb(client_stdin, 1)
-            avail = bytesavailable(client_stdin)
-            if avail == 0
-                eof(client_stdin) && return
-                continue
-            end
-            n = min(avail, length(buf))
-            GC.@preserve buf unsafe_read(client_stdin, pointer(buf), n)
-            if intercept_eof && n == 1 && buf[1] == 0x04
-                return
-            end
-            write(merged_write, @view buf[1:n])
-        end
-    catch e
-        e isa Base.IOError || e isa EOFError || rethrow()
-    end
-end
-
 # Made only by the message loop, so never twice for a label.
 function sync_session!(label::String)::SyncSession
     session = @lock STATE.lock get(STATE.sync_sessions, label, nothing)
@@ -519,14 +497,12 @@ end
 
 # A sync session is always recorded: a joiner is replayed its screen.
 function build_sync_session(label::String)::SyncSession
-    pipe = Pipe()
-    Base.link_pipe!(pipe; reader_supports_async=true, writer_supports_async=true)
     start_recording!(session_transcript(label))
     screen = begin_run(label, "--sync")
     out = BroadcastWriter(StreamIO[], screen, :stdout)
     err = BroadcastWriter(StreamIO[], screen, :stderr)
-    SyncSession(label, pipe.out, pipe.in, out, err, Participant[], screen,
-                Ref{REPL.LineEditREPL}(), Ref((false, UInt32(0))), ReentrantLock())
+    SyncSession(label, TerminalInput(), out, err, Participant[], screen,
+                Ref{REPL.LineEditREPL}(), Ref((false, UInt32(0))), ReentrantLock(), false)
 end
 
 # Participants
@@ -616,6 +592,7 @@ detach!(session::SyncSession, p::Participant) =
 # Every participant is switched, but one yet to acknowledge an earlier switch
 # is not waited on.
 function switch_raw_mode!(session::SyncSession, raw::Bool)
+    @lock session.input.lock session.input.raw = raw
     waited = Participant[]
     for p in @atomic session.participants
         isopen(p.signals) || continue
@@ -697,15 +674,16 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
     participant = Participant(client_stdout, client_stderr, signals)
     # Its `--sync=N`, or the daemon's setting.
     pages = something(tryparse(Int, getval(client.switches, "--sync", "")), SYNC_REPLAY_PAGES)
-    if isassigned(session.repl)
+    if session.repl_started
         errormonitor(@async join_sync_repl(session, participant, pages))
     else
+        session.repl_started = true
         attach!(session, participant)
         errormonitor(@async begin # thread 0 for Ctrl-C; see `spawn_client!`
             replay = (client_stdout, session.screen, participant_size(participant), pages)
             code = 1
             try
-                code = runclient(client, session.mergedin, session.out, session.err, signals;
+                code = runclient(client, session.input, session.out, session.err, signals;
                                  owned_streams=(), sync_session=session, repl_ref=session.repl, replay)
             finally
                 end_sync_session!(session, code)
@@ -713,7 +691,7 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
         end)
     end
     task = Threads.@spawn begin
-        stdin_copy_loop(client_stdin, session.writesink; intercept_eof=true)
+        copy_input(client_stdin, session.input; leaves = () -> is_line_empty(session))
         sync_client_disconnect!(client, client_stdin, participant, session)
     end
     register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals)
@@ -725,9 +703,9 @@ function join_sync_repl(session::SyncSession, p::Participant, pages::Int)
         # Leaves the cursor where the REPL's is, for its refresh to redraw the line.
         replay_history(p.stdout, session.screen, participant_size(p), pages)
         attach!(session, p)
-        isopen(session.writesink) || return end_sync_session!(session, 0)
+        is_input_open(session.input) || return end_sync_session!(session, 0)
         @lock p.replied p.acks_due += 1
-        send_signal(p.signals, SIGNAL_RAW_MODE, UInt8[true])
+        send_signal(p.signals, SIGNAL_RAW_MODE, UInt8[@lock session.input.lock session.input.raw])
         await_replies(q -> q.acks_due, (p,))
         # Joining mid-evaluation, its Ctrl-C is to interrupt it.
         @lock session.executing_lock send_executing(p.signals, session.executing[]...)
@@ -736,9 +714,19 @@ function join_sync_repl(session::SyncSession, p::Participant, pages::Int)
         err isa Base.IOError || rethrow()
         return
     end
+    # A REPL yet to start draws its prompt for all as it does.
+    isassigned(session.repl) || return
     mi = session.repl[].mistate
     # Taken only at a prompt, so after any evaluation running.
     isnothing(mi) || put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
+end
+
+# Whether the shared REPL's line is empty, where a Ctrl-D is a participant
+# leaving, not a key deleting forward.
+function is_line_empty(session::SyncSession)
+    isassigned(session.repl) || return true
+    mi = session.repl[].mistate
+    isnothing(mi) || REPL.LineEdit.buffer(mi).size == 0
 end
 
 # The result goes plainly to this client and REPL-style to the shared scrollback.
@@ -784,7 +772,7 @@ function restore_repl_prompt(session::SyncSession, has_repl::Bool)
             put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
         end
     else
-        try write(session.writesink, " \x7f") catch end
+        try feed_input!(session.input, codeunits(" \x7f")) catch end
     end
 end
 

@@ -365,11 +365,22 @@ pub fn setRawMode(raw: bool) void {
     }
 }
 
-/// Whether a Ctrl-C typed now comes as a byte: raw mode turns off the
-/// terminal's signals.
-pub fn ctrlCIsInput() bool {
+/// Stops this process, as a terminal's Ctrl-Z would, its terminal cooked
+/// meanwhile; returns once it is continued.
+pub fn suspendSelf() void {
+    const was_raw = saved_termios != null;
+    setRawMode(false);
+    posix.raise(.TSTP) catch {};
+    if (was_raw) setRawMode(true);
+}
+
+pub fn inRawMode() bool {
     return saved_termios != null;
 }
+
+/// Whether a Ctrl-C typed now comes as a byte: raw mode turns off the
+/// terminal's signals.
+pub const ctrlCIsInput = inRawMode;
 
 /// The terminal's own line-editing keys, for cooked input emulated in raw mode.
 pub fn lineEditingKeys() LineEditingKeys {

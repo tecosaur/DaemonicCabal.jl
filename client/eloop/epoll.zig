@@ -63,8 +63,9 @@ pub fn run(
                 if (exit_code != null) continue;
                 if (readSome(epfd, posix.STDIN_FILENO, &buf)) |data| {
                     stdin_fwd.forward(data);
+                } else if (stdin_fwd.end()) {
+                    try watch(epfd, posix.STDIN_FILENO, .local_stdin);
                 } else {
-                    platform.sendEof(stdin_fd);
                     stdin_eof = true;
                 }
             },

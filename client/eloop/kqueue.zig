@@ -85,15 +85,18 @@ pub fn run(
                 UDATA_STDIN => {
                     if (exit_code != null or stdin_closed) continue;
                     var remaining: usize = @intCast(ev.data);
+                    var ended = (ev.flags & EV_EOF) != 0;
                     while (remaining > 0) {
                         const want = @min(remaining, stdin_buf.len);
                         const n = posix.read(posix.STDIN_FILENO, stdin_buf[0..want]) catch 0;
-                        if (n == 0) break;
+                        if (n == 0) {
+                            ended = true;
+                            break;
+                        }
                         stdin_fwd.forward(stdin_buf[0..n]);
                         remaining -= n;
                     }
-                    if ((ev.flags & EV_EOF) != 0) {
-                        platform.sendEof(stdin_fd);
+                    if (ended and !stdin_fwd.end()) {
                         stdin_closed = true;
                         unwatch(kq, posix.STDIN_FILENO);
                     }
