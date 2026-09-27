@@ -11,7 +11,7 @@ const STATE = (
     client_tasks = Dict{Int, ClientTask}(),
     lastclient = Ref(time()),
     last_contact = Ref(time()),
-    lock = SpinLock(),
+    lock = ReentrantLock(),  # never held across blocking work: the message loop takes it
     soft_exit = Ref(false),
     conductor_socket = Ref(""),
     standby_sockets = Ref{Union{Nothing, NTuple{4, Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}}}}(nothing),
@@ -63,7 +63,19 @@ isyes(value::AbstractString) = value ∈ ("yes", "true", "1", "")
 
 struct DaemonClientExit <: Exception code::Int end
 
-real_exit(n::Int) = ccall(:jl_exit, Union{}, (Int32,), n)
+function real_exit(n::Int)
+    remove_standby_files()
+    ccall(:jl_exit, Union{}, (Int32,), n)
+end
+
+# A local socket's path is only for a client to connect by, so goes with it;
+# a named pipe, Windows' local socket, goes by itself once closed.
+remove_socket_file(path::AbstractString) = startswith(path, ':') || Sys.iswindows() || rm(path; force=true)
+
+function remove_standby_files()
+    standby = @lock STATE.lock STATE.standby_sockets[]
+    isnothing(standby) || foreach(((_, path),) -> remove_socket_file(path), standby)
+end
 
 # Revise
 
@@ -164,7 +176,8 @@ end
     include("cancellation.jl")
 else
     with_client_scope(f, ::ClientInfo) = f()
-    interrupt_client(::Integer, ::Integer) = nothing  # the conductor's SIGINT does it
+    # The conductor's SIGINT does it, but Windows has none, so it is passed on.
+    interrupt_client(::Integer, ::Integer) = @static if Sys.iswindows() pass_interrupt() end
     const EXECUTING = Task[]  # running a client's code, under `STATE.lock`
     function as_client_code(f)
         task = current_task()
@@ -189,6 +202,19 @@ else
     end
 end
 
+# A client's Ctrl-C reaches whichever task thread 0 runs, perhaps one of the
+# worker's own, which carries on (`f` again), passing it on.
+function uninterrupted(f)
+    while true
+        try
+            return f()
+        catch err
+            err isa InterruptException || rethrow()
+            pass_interrupt()
+        end
+    end
+end
+
 # Closing streams unwinds a task blocked on them, but not one looping on
 # other waits (`sleep`, timers), which needs the exception injected.
 function kill_stuck_clients(active_ids::Set{Int})
@@ -208,7 +234,8 @@ function kill_stuck_clients(active_ids::Set{Int})
     deadline = time() + 2.0
     for ct in stuck
         while !istaskdone(ct.task) && time() < deadline
-            sleep(0.01)
+            # That SIGINT may land here, and the conductor still awaits the reply.
+            uninterrupted(() -> sleep(0.01))
         end
     end
 end
@@ -229,7 +256,7 @@ const SIGNAL_EXIT = 0x01
 const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
 const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
 const SIGNAL_NODELAY = 0x04    # disable Nagle on stdin + signals
-const SIGNAL_EXECUTING = 0x05  # data: 0x00 = at prompt, 0x01 = evaluating
+const SIGNAL_EXECUTING = 0x05  # data: 0x00 = at prompt, 0x01 = evaluating; evaluation number (u32 LE)
 
 # One write per frame: a multi-argument `write` yields between arguments, so
 # concurrent senders could interleave mid-frame.
@@ -288,7 +315,7 @@ end
 # Worker management
 
 function create_socket(port::Integer=0)::Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}
-    if is_tcp_address(STATE.conductor_socket[])
+    if startswith(STATE.conductor_socket[], "tcp://")
         bind_host = get(() -> first(split_host_port(STATE.conductor_socket[])), ENV, "JULIA_DAEMON_BIND")
         server = Sockets.listen(resolve_host(bind_host), port)
         _, actual_port = Sockets.getsockname(server)
@@ -317,13 +344,19 @@ function get_client_sockets(port_set::Int)::NTuple{4, Pair{Union{Sockets.PipeSer
     if isnothing(sockets) ntuple(_ -> create_socket(), 4) else sockets end
 end
 # None with a managed port range: the port set is unknown until `client_run`.
+# Made outside the lock, as a name may need resolving.
 function ensure_standby_sockets()
     PORT_BASE > 0 && return
-    @lock STATE.lock begin
-        if isnothing(STATE.standby_sockets[])
-            STATE.standby_sockets[] = ntuple(_ -> create_socket(), 4)
+    (@lock STATE.lock isnothing(STATE.standby_sockets[])) || return
+    sockets = ntuple(_ -> create_socket(), 4)
+    installed = @lock STATE.lock begin
+        vacant = isnothing(STATE.standby_sockets[])
+        if vacant
+            STATE.standby_sockets[] = sockets
         end
+        vacant
     end
+    installed || foreach(close ∘ first, sockets)
 end
 
 function sync_session_label(client::ClientInfo)
@@ -583,9 +616,9 @@ function accept_client_sockets(servers, key::UInt64)
     try
         map(servers) do srv
             while true
-                sock = accept(srv)
+                sock = uninterrupted(() -> accept(srv))
                 push!(accepted, sock)
-                read(sock, UInt64) == key && return sock
+                uninterrupted(() -> read(sock, UInt64)) == key && return sock
                 @warn "Dropped a client socket connection without its client's key"
                 close(sock)
             end
@@ -618,6 +651,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         rethrow()
     finally
         foreach(close, (stdin_srv, stdout_srv, stderr_srv, signals_srv))
+        foreach(remove_socket_file, (stdin_path, stdout_path, stderr_path, signals_path))
     end
     if is_tcp
         # A client gone without closing would otherwise hold its session forever.
@@ -646,7 +680,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
     end
 end
 
-# Clients are interrupted by the conductor's SIGINT alone; there is no message.
+# A client's Ctrl-C arrives as `cancel_client` (before 1.14, with the conductor's SIGINT).
 function serve_message(conn::IO, header::MessageHeader)
     if header.msg_type == MSG_TYPE.ping
         seq = read(conn, UInt8)
@@ -689,19 +723,17 @@ function serve_message(conn::IO, header::MessageHeader)
                 # the next message header and desync the stream for good.
                 replied[] || send_error(conn, ERR_CODE.internal_error,
                                         "Failed to start client: $(sprint(showerror, err))")
-                @error "Failed to start client" exception=(err, catch_backtrace())
+                if err isa InterruptException
+                    pass_interrupt()
+                else
+                    @error "Failed to start client" exception=(err, catch_backtrace())
+                end
             end
         end
-    elseif header.msg_type == MSG_TYPE.query_state
-        active, last_ts, soft_exit = @lock STATE.lock (
-            length(STATE.clients),
-            round(Int, STATE.lastclient[]),
-            STATE.soft_exit[]
-        )
-        send_state(conn, active, last_ts, soft_exit)
     elseif header.msg_type == MSG_TYPE.soft_exit
         @lock STATE.lock begin
             if isempty(STATE.clients)
+                remove_standby_files()
                 ccall(:_exit, Cvoid, (Cint,), 0)
             else
                 STATE.soft_exit[] = true
@@ -745,7 +777,7 @@ function runworker(socketpath::String, conductor_address::String, worker_id::Int
     STATE.conductor_socket[] = conductor_address
     CONDUCTOR_WORKER_ID[] = worker_id
     Profile.peek_report[] = send_peek_report
-    global RUNTIME_DIR = if is_tcp_address(STATE.conductor_socket[]) "" else dirname(socketpath) end
+    global RUNTIME_DIR = if startswith(STATE.conductor_socket[], "tcp://") "" else dirname(socketpath) end
     global MAX_CLIENTS = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS", "1"))
     max_ttl = parse(Int, get(ENV, "JULIA_DAEMON_MAX_TTL",
                              get(ENV, "JULIA_DAEMON_WORKER_TTL", "7200")))

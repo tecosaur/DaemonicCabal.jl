@@ -39,10 +39,13 @@ function get_module()::Module
     if isnothing(mod) create_module() else mod end
 end
 
+# Made outside the lock, as `using` waits on any package a client is loading.
 function ensure_standby_module()
+    (@lock STATE.lock isnothing(STATE.standby_module[])) || return
+    mod = create_module()
     @lock STATE.lock begin
         if isnothing(STATE.standby_module[])
-            STATE.standby_module[] = create_module()
+            STATE.standby_module[] = mod
         end
     end
 end

@@ -18,7 +18,7 @@ for each of `clients` (client id => task), then the whole, by task. Cut to
 
 The profile samples what each thread runs, so a client waiting (on I/O, a
 lock, `sleep`) has none: its section is then where it waits, from a brief
-sample of every task (Julia 1.12 and later), headed `(waiting)`.
+sample of every task (Julia 1.13 and later), headed `(waiting)`.
 """
 function peek_report(clients)
     # Rendered before any resampling replaces the samples, and only as many
@@ -128,7 +128,8 @@ const WAITING_SAMPLE_S = 0.1
 
 # Replaces the samples taken, which the report has already rendered.
 function waiting_profiles(waiting)
-    @static if VERSION >= v"1.12"
+    # 1.12's wall-time profile never samples a waiting task.
+    @static if VERSION >= v"1.13-"
         Profile.clear()
         Profile.start_timer(true)
         sleep(WAITING_SAMPLE_S)
@@ -138,7 +139,7 @@ function waiting_profiles(waiting)
         end
         Dict(id => waited(task) for (id, task) in waiting)
     else
-        Dict(id => " (waiting)\nIt was waiting, not running; its stack needs Julia 1.12 or later.\n"
+        Dict(id => " (waiting)\nIt was waiting, not running; its stack needs Julia 1.13 or later.\n"
              for (id, _) in waiting)
     end
 end

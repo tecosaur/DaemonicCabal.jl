@@ -10,7 +10,6 @@ let
     proj = "/tmp/test"
     write(buf, UInt8(MSG_TYPE.set_project), UInt32(4 + ncodeunits(proj)))
     write_string(buf, proj)
-    write(buf, UInt8(MSG_TYPE.query_state), UInt32(0))
     cr = IOBuffer()
     write(cr, UInt8(0x00))                        # flags: tty=false, force=false
     write(cr, UInt32(7))                          # client id
@@ -39,7 +38,6 @@ let
     read(buf, UInt8)
     h = read_header(buf)                          # set_project
     read_string(buf)
-    read_header(buf)                              # query_state
     h = read_header(buf)                          # client_run
     client = read_client_run(buf)
     read_header(buf)                              # sync_clients
@@ -49,12 +47,10 @@ let
     out = IOBuffer()
     send_pong(out, 0x01, 0)
     send_sockets(out, "/a", "/b", "/c", "/d", 1)
-    send_state(out, 0, round(Int, time()), false)
-    send_state(out, 1, round(Int, time()), true)
     send_error(out, ERR_CODE.unknown, "test error")
     write_header(out, MSG_TYPE.project_ok, 0)
     write_header(out, MSG_TYPE.ack, 2)
-    write_string(out, "test")
+    write(out, UInt16(0))
     send_signal(out, SIGNAL_EXIT, UInt8[0])
     send_signal(out, SIGNAL_RAW_MODE, UInt8[true])
     send_signal(out, SIGNAL_QUERY_SIZE, UInt8[])
@@ -63,8 +59,7 @@ let
     getval(client.switches, "--missing", "default")
     getval(client.env, "TERM", "")
     getval(client.env, "MISSING", "fallback")
-    is_tcp_address("127.0.0.1:8080")
-    is_tcp_address("/tmp/test.sock")
+    split_host_port("tcp://127.0.0.1:8080")
     sync_session_label(client)
     # create_module/prepare_module/runclient can't run here: Core.eval is forbidden.
     # -- BroadcastWriter + Transcript ------------------------------------------
@@ -132,7 +127,6 @@ precompile(write_header, (Base.PipeEndpoint, UInt8, Int))
 precompile(write_string, (Base.PipeEndpoint, String))
 precompile(send_pong, (Base.PipeEndpoint, UInt8, Int))
 precompile(send_sockets, (Base.PipeEndpoint, String, String, String, String, Int))
-precompile(send_state, (Base.PipeEndpoint, Int, Int, Bool))
 precompile(send_error, (Base.PipeEndpoint, UInt16, String))
 precompile(send_signal, (Base.PipeEndpoint, UInt8, Vector{UInt8}))
 precompile(send_signal, (Sockets.TCPSocket, UInt8, Vector{UInt8}))

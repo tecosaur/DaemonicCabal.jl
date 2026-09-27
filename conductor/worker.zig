@@ -214,10 +214,19 @@ pub const Worker = struct {
         errdefer setup.close(io);
         const channel_copy: ?[]const u8 = if (julia_channel) |ch| try allocator.dupe(u8, ch) else null;
         errdefer if (channel_copy) |ch| allocator.free(ch);
+        // The worker takes a TCP address only in full, so it needn't parse ours.
+        var address_buf: [protocol.max_socket_path + 16]u8 = undefined;
+        const conductor_address = if (cfg.transport == .tcp) blk: {
+            const target = try protocol.splitHostPort(cfg.socket_path);
+            const bracketed = std.mem.indexOfScalar(u8, target.host, ':') != null;
+            break :blk std.fmt.bufPrint(&address_buf, "tcp://{s}{s}{s}:{d}", .{
+                if (bracketed) "[" else "", target.host, if (bracketed) "]" else "", target.port,
+            }) catch return error.PathTooLong;
+        } else cfg.socket_path;
         const eval_expr = try std.fmt.allocPrint(
             allocator,
             "using DaemonWorker; DaemonWorker.runworker({f}, {f}, {d})",
-            .{ juliaString(setup.addr()), juliaString(cfg.socket_path), id },
+            .{ juliaString(setup.addr()), juliaString(conductor_address), id },
         );
         defer allocator.free(eval_expr);
         // Passed after worker_args so a client's request wins.

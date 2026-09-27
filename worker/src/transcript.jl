@@ -28,10 +28,12 @@ function capture!(h::OutputHistory, data)
     iszero(cap) && return
     n = min(nb, cap)  # only the last cap bytes of an oversized write survive
     soff = lastindex(data) - n + 1
-    first_run = min(n, cap - h.pos)
-    copyto!(h.bytes, h.pos + 1, data, soff, first_run)
+    # Where they'd have landed, so a byte's slot stays its offset mod `cap`.
+    start = (h.pos + nb - n) % cap
+    first_run = min(n, cap - start)
+    copyto!(h.bytes, start + 1, data, soff, first_run)
     first_run < n && copyto!(h.bytes, 1, data, soff + first_run, n - first_run)
-    h.pos = (h.pos + n) % cap
+    h.pos = (start + n) % cap
     h.total += nb
     nothing
 end
@@ -250,7 +252,7 @@ function Base.write(io::RecordedOutput, byte::UInt8)
     write(io.sink, byte)
 end
 
-for f in (:flush, :close, :closewrite, :isopen, :iswritable, :reseteof)
+for f in (:flush, :close, :closewrite, :isopen, :iswritable, :reseteof, :lock, :unlock)
     @eval Base.$f(io::RecordedOutput) = $f(io.sink)
 end
 Base.isreadable(::RecordedOutput) = false
@@ -333,19 +335,6 @@ function watch_session(label::String, format::String, out::IO;
         end
     end
     0
-end
-
-# A client's Ctrl-C reaches whichever task thread 0 runs, perhaps a watch's,
-# but a watcher's own never reaches the worker: a watch carries on, `f` again.
-function uninterrupted(f)
-    while true
-        try
-            return f()
-        catch err
-            err isa InterruptException || rethrow()
-            pass_interrupt()
-        end
-    end
 end
 
 # Nothing while a plain destination's output is still held. Every other event

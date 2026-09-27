@@ -17,8 +17,6 @@ const MSG_TYPE = (
     project_ok  = 0x11,
     client_run  = 0x20,
     sockets     = 0x21,
-    query_state = 0x30,
-    state       = 0x31,
     query_clients = 0x32,
     clients     = 0x33,
     soft_exit   = 0x40,
@@ -80,12 +78,9 @@ end
 
 # --- Dual transport ---
 
-is_tcp_address(addr::AbstractString) =
-    !startswith(addr, '/') && !startswith(addr, '\\') && !startswith(addr, '.') &&
-    !contains(addr, '/') && !contains(addr, '\\') && contains(addr, ':')
-
+# The conductor passes `tcp://host:port`, an IPv6 host bracketed, or a local path.
 function split_host_port(address::AbstractString)
-    host, port = rsplit(address, ':', limit=2)
+    host, port = rsplit(chopprefix(address, "tcp://"), ':', limit=2)
     String(strip(host, ('[', ']'))), parse(Int, port)
 end
 
@@ -99,7 +94,7 @@ function resolve_host(host::AbstractString)
 end
 
 function connect_to(address::AbstractString)
-    if is_tcp_address(address)
+    if startswith(address, "tcp://")
         host, port = split_host_port(address)
         sock = Sockets.connect(resolve_host(host), port)
         Sockets.nagle(sock, false)
@@ -131,14 +126,6 @@ function send_sockets(conn::IO, stdin_path::AbstractString, stdout_path::Abstrac
     write_string(conn, stdout_path)
     write_string(conn, stderr_path)
     write_string(conn, signals_path)
-    flush(conn)
-end
-
-function send_state(conn::IO, active_clients::Integer, last_client_ts::Integer, soft_exit::Bool)
-    write_header(conn, MSG_TYPE.state, 13)
-    write(conn, UInt32(active_clients))
-    write(conn, UInt64(last_client_ts))
-    write(conn, UInt8(ifelse(soft_exit, 1, 0)))
     flush(conn)
 end
 
