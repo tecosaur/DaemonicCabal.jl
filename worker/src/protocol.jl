@@ -118,14 +118,10 @@ end
 function send_sockets(conn::IO, stdin_path::AbstractString, stdout_path::AbstractString,
                       stderr_path::AbstractString, signals_path::AbstractString,
                       active_clients::Integer)
-    payload_len = 4 + 4 + ncodeunits(stdin_path) + 4 + ncodeunits(stdout_path) +
-                      4 + ncodeunits(stderr_path) + 4 + ncodeunits(signals_path)
-    write_header(conn, MSG_TYPE.sockets, payload_len)
+    paths = (stdin_path, stdout_path, stderr_path, signals_path)
+    write_header(conn, MSG_TYPE.sockets, 4 + sum(p -> 4 + ncodeunits(p), paths))
     write(conn, UInt32(active_clients))
-    write_string(conn, stdin_path)
-    write_string(conn, stdout_path)
-    write_string(conn, stderr_path)
-    write_string(conn, signals_path)
+    foreach(p -> write_string(conn, p), paths)
     flush(conn)
 end
 
@@ -140,7 +136,7 @@ end
 struct ClientInfo
     tty::Bool
     color::Bool
-    force::Bool  # bypass capacity (labeled sessions)
+    force::Bool  # bypass capacity (labelled sessions, watchers)
     id::Int      # conductor-assigned
     key::UInt64  # which it gives on each of its stdio connections
     cwd::String
@@ -153,37 +149,15 @@ end
 
 function read_client_run(conn::IO)
     flags = read(conn, UInt8)
-    tty = (flags & 0x01) != 0
-    color = (flags & 0x02) != 0
-    force = (flags & 0x04) != 0
     id = Int(read(conn, UInt32))
     key = read(conn, UInt64)
     cwd = read_string(conn)
-    env_count = read(conn, UInt32)
-    env = Vector{Pair{String, String}}(undef, env_count)
-    for i in 1:env_count
-        name = read_string(conn)
-        env[i] = name => read_string(conn)
-    end
-    switch_count = read(conn, UInt32)
-    switches = Vector{Tuple{String, String}}(undef, switch_count)
-    for i in 1:switch_count
-        name = read_string(conn)
-        value = read_string(conn)
-        switches[i] = (name, value)
-    end
-    has_pf = read(conn, UInt8)
-    programfile = if has_pf != 0
-        read_string(conn)
-    else
-        nothing
-    end
-    arg_count = read(conn, UInt32)
-    args = Vector{String}(undef, arg_count)
-    for i in 1:arg_count
-        args[i] = read_string(conn)
-    end
+    env = Pair{String, String}[read_string(conn) => read_string(conn) for _ in 1:read(conn, UInt32)]
+    switches = Tuple{String, String}[(read_string(conn), read_string(conn)) for _ in 1:read(conn, UInt32)]
+    programfile = if read(conn, UInt8) != 0 read_string(conn) end
+    args = String[read_string(conn) for _ in 1:read(conn, UInt32)]
     port_set = Int(read(conn, UInt16))
-    ClientInfo(tty, color, force, id, key, cwd, env, switches, programfile, args, port_set)
+    ClientInfo((flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0,
+               id, key, cwd, env, switches, programfile, args, port_set)
 end
 

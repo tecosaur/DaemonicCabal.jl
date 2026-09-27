@@ -36,7 +36,9 @@ end
     # which records the line in its mode, as history does.
     @eval function REPL.prepare_next(repl::REPL.LineEditREPL)
         recording = CLIENT_RECORDING[]
-        isnothing(recording) || (recording.editing = true)
+        if !isnothing(recording)
+            recording.editing = true
+        end
         println(REPL.terminal(repl))
     end
     @eval function REPL.LineEdit.commit_line(s::REPL.LineEdit.MIState)

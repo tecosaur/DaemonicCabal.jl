@@ -16,11 +16,9 @@ let
     write(cr, UInt64(12345))                      # key
     write_string(cr, "/tmp")                               # cwd
     write(cr, UInt32(2))                          # env_count
-    write_string(cr, "TERM"); write_string(cr, "xterm-256color")
-    write_string(cr, "HOME"); write_string(cr, "/home/test")
+    foreach(s -> write_string(cr, s), ("TERM", "xterm-256color", "HOME", "/home/test"))
     write(cr, UInt32(2))                          # switch_count
-    write_string(cr, "--eval"); write_string(cr, "1+1")
-    write_string(cr, "--color"); write_string(cr, "yes")
+    foreach(s -> write_string(cr, s), ("--eval", "1+1", "--color", "yes"))
     write(cr, UInt8(0))                           # has_programfile=false
     write(cr, UInt32(1))                          # arg_count
     write_string(cr, "arg1")
@@ -36,12 +34,13 @@ let
     read_greeting(buf)
     read_header(buf)                              # ping
     read(buf, UInt8)
-    h = read_header(buf)                          # set_project
+    read_header(buf)                              # set_project
     read_string(buf)
-    h = read_header(buf)                          # client_run
+    read_header(buf)                              # client_run
     client = read_client_run(buf)
     read_header(buf)                              # sync_clients
-    read(buf, UInt16); read(buf, UInt32)
+    read(buf, UInt16)
+    read(buf, UInt32)
     read_header(buf)                              # soft_exit
     # -- Protocol writing ------------------------------------------------------
     out = IOBuffer()
@@ -68,7 +67,7 @@ let
     start_recording!(transcript)
     screen = Recording(transcript, 1, time(), "--sync")
     bw = BroadcastWriter(IO[IOBuffer(), IOBuffer()], screen, :stdout)
-    iswritable(bw); isopen(bw); isreadable(bw); bytesavailable(bw)
+    foreach(f -> f(bw), (iswritable, isopen, isreadable, bytesavailable))
     write(bw, UInt8(0x41))
     Base.unsafe_write(bw, pointer("test\n"), UInt(5))
     flush(bw)
@@ -84,7 +83,12 @@ let
     # -- Printing into buffers, recompiled against `get(::GenericIOBuffer, …)` --
     # Through a barrier, as user code reaches them: dynamically, so widened.
     let T = Base.inferencebarrier(ClientInfo), x = Base.inferencebarrier(client)
-        repr(T); string(T); string("", T); repr(x); string(x); string([x])
+        for v in (T, x)
+            repr(v)
+            string(v)
+        end
+        string("", T)
+        string([x])
     end
     # -- ScopedIO --------------------------------------------------------------
     @static if VERSION >= v"1.11"

@@ -202,13 +202,10 @@ end
 
 function queue_orphan_check()
     ORPHAN_FAILSAFE > 0 || return
-    Timer(perform_orphan_check, ORPHAN_FAILSAFE; interval = ORPHAN_FAILSAFE)
-end
-
-function perform_orphan_check(::Timer)
-    ORPHAN_FAILSAFE > 0 || return
-    if time() - (@lock STATE.lock STATE.last_contact[]) >= ORPHAN_FAILSAFE
-        real_exit(0)
+    Timer(ORPHAN_FAILSAFE; interval = ORPHAN_FAILSAFE) do _
+        if time() - (@lock STATE.lock STATE.last_contact[]) >= ORPHAN_FAILSAFE
+            real_exit(0)
+        end
     end
 end
 
@@ -245,11 +242,8 @@ else
     shielded(f) = Base.disable_sigint(f)
     function pass_interrupt()
         for task in @lock STATE.lock copy(EXECUTING)
-            # Injecting into a task on another thread is fatal, and a task not
-            # held to thread 0 (the REPL pre-warm's) is none a Ctrl-C was for.
-            task.sticky && Threads.threadid(task) == Threads.threadid() || continue
-            task === current_task() && continue
-            try schedule(task, InterruptException(); error=true) catch end
+            # A task not held to thread 0 (the REPL pre-warm's) is none a Ctrl-C was for.
+            task.sticky && task !== current_task() && inject_interrupt(task)
         end
     end
 end
@@ -267,6 +261,12 @@ function uninterrupted(f)
     end
 end
 
+# Injecting into a task on another thread is fatal.
+function inject_interrupt(task::Task)
+    Threads.threadid(task) == Threads.threadid() || return
+    try schedule(task, InterruptException(); error=true) catch end
+end
+
 # Closing streams unwinds a task blocked on them, but not one looping on
 # other waits (`sleep`, timers), which needs the exception injected.
 function kill_stuck_clients(active_ids::Set{Int})
@@ -278,9 +278,7 @@ function kill_stuck_clients(active_ids::Set{Int})
         try close(io) catch end
     end
     for ct in stuck
-        # Injecting into a task on another thread is fatal.
-        Threads.threadid(ct.task) == Threads.threadid() || continue
-        try schedule(ct.task, InterruptException(); error=true) catch end
+        inject_interrupt(ct.task)
     end
     # A CPU-bound task only dies to the conductor's SIGINT, so bound the wait.
     deadline = time() + 2.0
@@ -296,8 +294,8 @@ function register_client!(id::Int, task::Task, streams::StreamIO...)
     @lock STATE.lock STATE.client_tasks[id] = ClientTask(task, streams)
 end
 
-# Pre-1.11 stand-ins for ACTIVE_TERM's signals and stdin, and
-# CLIENT_INTERACTIVE; that path is single-client.
+# Pre-1.11 stand-ins for the scoped values scopedio.jl defines; that path is
+# single-client.
 @static if VERSION < v"1.11"
     const CLIENT_SIGNALS = Ref{Union{Nothing, StreamIO}}(nothing)
     const CLIENT_INPUT = Ref{Union{Nothing, StreamIO, TerminalInput}}(nothing)
@@ -329,6 +327,17 @@ function send_signal(io::IO, id::UInt8, data::Vector{UInt8})
     frame[1], frame[2] = id, length(data)
     copyto!(frame, 3, data)
     write(io, frame)
+end
+
+# Closed before the exit is sent, so the client has all its output. Any of
+# them may be gone already, with the client.
+function release_client(stdout::IO, stderr::IO, signals::IO, code::Integer)
+    try close(stdout) catch end
+    try close(stderr) catch end
+    try
+        send_signal(signals, SIGNAL_EXIT, UInt8[code % UInt8])
+        close(signals)
+    catch end
 end
 
 function send_executing(signals::StreamIO, executing::Bool, evaluation::UInt32)
@@ -400,27 +409,41 @@ function get_client_sockets(port_set::Int)::NTuple{4, Pair{Union{Sockets.PipeSer
     if port_set != PORT_SET_NONE
         return ntuple(i -> create_socket(PORT_BASE + 4port_set + i - 1), 4)
     end
-    sockets = @lock STATE.lock begin
-        s = STATE.standby_sockets[]
-        STATE.standby_sockets[] = nothing
-        s
-    end
-    if isnothing(sockets) ntuple(_ -> create_socket(), 4) else sockets end
+    @something(take_standby!(STATE.standby_sockets), ntuple(_ -> create_socket(), 4))
 end
+
 # None with a managed port range: the port set is unknown until `client_run`.
 # Made outside the lock, as a name may need resolving.
 function ensure_standby_sockets()
     PORT_BASE > 0 && return
-    (@lock STATE.lock isnothing(STATE.standby_sockets[])) || return
-    sockets = ntuple(_ -> create_socket(), 4)
+    fill_standby!(() -> ntuple(_ -> create_socket(), 4), STATE.standby_sockets) do sockets
+        foreach(close ∘ first, sockets)
+    end
+end
+
+# A standby, made ahead so that no client waits on it, is taken whole.
+function take_standby!(slot::Ref)
+    @lock STATE.lock begin
+        taken = slot[]
+        slot[] = nothing
+        taken
+    end
+end
+
+# Made outside `STATE.lock`, which the message loop takes; should another
+# fill `slot` meanwhile, this one is `discard`ed.
+function fill_standby!(discard::Function, make::Function, slot::Ref)
+    (@lock STATE.lock isnothing(slot[])) || return
+    made = make()
     installed = @lock STATE.lock begin
-        vacant = isnothing(STATE.standby_sockets[])
+        vacant = isnothing(slot[])
         if vacant
-            STATE.standby_sockets[] = sockets
+            slot[] = made
         end
         vacant
     end
-    installed || foreach(close ∘ first, sockets)
+    installed || discard(made)
+    nothing
 end
 
 function sync_session_label(client::ClientInfo)
@@ -436,12 +459,7 @@ function sync_client_disconnect!(client::ClientInfo, client_stdin::StreamIO,
     detach!(session, participant)
     # The terminal is raw, so end the line ourselves.
     try write(participant.stdout, "\r\n") catch end
-    try close(participant.stdout) catch end
-    try close(participant.stderr) catch end
-    try
-        send_signal(participant.signals, SIGNAL_EXIT, UInt8[0])
-        close(participant.signals)
-    catch end
+    release_client(participant.stdout, participant.stderr, participant.signals, 0)
     try close(client_stdin) catch end
     unregister_client!(client)
 end
@@ -468,13 +486,7 @@ function end_sync_session!(session::SyncSession, code::Int)
         taken
     end
     for p in participants
-        # Any may be gone already.
-        try close(p.stdout) catch end
-        try close(p.stderr) catch end
-        try
-            send_signal(p.signals, SIGNAL_EXIT, UInt8[code % UInt8])
-            close(p.signals)
-        catch end
+        release_client(p.stdout, p.stderr, p.signals, code)
     end
 end
 
@@ -703,7 +715,7 @@ function join_sync_repl(session::SyncSession, p::Participant, pages::Int)
         # Leaves the cursor where the REPL's is, for its refresh to redraw the line.
         replay_history(p.stdout, session.screen, participant_size(p), pages)
         attach!(session, p)
-        is_input_open(session.input) || return end_sync_session!(session, 0)
+        @lock(session.input.lock, isopen(session.input.writer)) || return end_sync_session!(session, 0)
         @lock p.replied p.acks_due += 1
         send_signal(p.signals, SIGNAL_RAW_MODE, UInt8[@lock session.input.lock session.input.raw])
         await_replies(q -> q.acks_due, (p,))
@@ -715,17 +727,28 @@ function join_sync_repl(session::SyncSession, p::Participant, pages::Int)
         return
     end
     # A REPL yet to start draws its prompt for all as it does.
-    isassigned(session.repl) || return
-    mi = session.repl[].mistate
-    # Taken only at a prompt, so after any evaluation running.
-    isnothing(mi) || put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
+    mi = repl_mistate(session)
+    isnothing(mi) || redraw_prompt(mi)
+end
+
+# The shared REPL's line editing, once it has started.
+function repl_mistate(session::SyncSession)
+    isassigned(session.repl) || return nothing
+    session.repl[].mistate
+end
+
+# Taken only at a prompt, so after any evaluation running.
+function redraw_prompt(mi::REPL.LineEdit.MIState)
+    put!(mi.async_channel, function (s)
+        REPL.LineEdit.refresh_line(s)
+        :ok
+    end)
 end
 
 # Whether the shared REPL's line is empty, where a Ctrl-D is a participant
 # leaving, not a key deleting forward.
 function is_line_empty(session::SyncSession)
-    isassigned(session.repl) || return true
-    mi = session.repl[].mistate
+    mi = repl_mistate(session)
     isnothing(mi) || REPL.LineEdit.buffer(mi).size == 0
 end
 
@@ -733,11 +756,11 @@ end
 function spawn_eval_sync_client!(client::ClientInfo, client_stdin::StreamIO,
                                  client_stdout::StreamIO, client_stderr::StreamIO,
                                  signals::StreamIO, session::SyncSession)
-    has_repl = isassigned(session.repl) && session.repl[].mistate !== nothing
+    mi = repl_mistate(session)
     task = errormonitor(@async begin # thread 0 for Ctrl-C; see `spawn_client!`
         # Only the shared screen's tidiness rides on these; the run goes ahead.
         try
-            clear_repl_input(session, has_repl)
+            clear_repl_input(session, mi)
             sync_echo_expressions(session, client)
         catch err
             @error "Failed to echo a client's code to its sync session" exception=(err, catch_backtrace())
@@ -749,14 +772,13 @@ function spawn_eval_sync_client!(client::ClientInfo, client_stdin::StreamIO,
             isopen(client_stdout) && rethrow()
         end
         write(session.out, "\n")
-        restore_repl_prompt(session, has_repl)
+        restore_repl_prompt(session, mi)
     end)
     register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals)
 end
 
-function clear_repl_input(session::SyncSession, has_repl::Bool)
-    has_repl || return
-    mi = session.repl[].mistate::REPL.LineEdit.MIState
+function clear_repl_input(session::SyncSession, mi::Union{Nothing, REPL.LineEdit.MIState})
+    isnothing(mi) && return
     # Whatever the mode, a history search included.
     state = mi.mode_state[mi.current_mode]
     hasfield(typeof(state), :ias) || return
@@ -766,20 +788,17 @@ function clear_repl_input(session::SyncSession, has_repl::Bool)
 end
 
 # Without a live REPL, nudge a redraw through the merged input.
-function restore_repl_prompt(session::SyncSession, has_repl::Bool)
-    if has_repl
-        let mi = session.repl[].mistate::REPL.LineEdit.MIState
-            put!(mi.async_channel, s -> (REPL.LineEdit.refresh_line(s); :ok))
-        end
-    else
+function restore_repl_prompt(session::SyncSession, mi::Union{Nothing, REPL.LineEdit.MIState})
+    if isnothing(mi)
         try feed_input!(session.input, codeunits(" \x7f")) catch end
+    else
+        redraw_prompt(mi)
     end
 end
 
 function unregister_client!(client::ClientInfo)
     idle = @lock STATE.lock begin
-        idx = findfirst(c -> c === client, STATE.clients)
-        !isnothing(idx) && deleteat!(STATE.clients, idx)
+        filter!(c -> c !== client, STATE.clients)
         delete!(STATE.client_tasks, client.id)
         STATE.lastclient[] = time()
         isempty(STATE.clients)
@@ -842,30 +861,30 @@ function accept_client_sockets(servers, key::UInt64)
 end
 
 function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
-    (stdin_srv, stdin_path), (stdout_srv, stdout_path),
-        (stderr_srv, stderr_path), (signals_srv, signals_path) = get_client_sockets(client.port_set)
+    sockets = get_client_sockets(client.port_set)
+    servers, paths = first.(sockets), last.(sockets)
     active_count = @lock STATE.lock begin
         push!(STATE.clients, client)
         length(STATE.clients)
     end
-    send_sockets(conn, stdin_path, stdout_path, stderr_path, signals_path, active_count)
+    send_sockets(conn, paths..., active_count)
     replied[] = true
-    is_tcp = stdin_srv isa Sockets.TCPServer
     t0 = time_ns()
-    client_stdin, client_stdout, client_stderr, signals = try
-        accept_client_sockets((stdin_srv, stdout_srv, stderr_srv, signals_srv), client.key)
+    streams = try
+        accept_client_sockets(servers, client.key)
     catch
         @lock STATE.lock filter!(c -> c !== client, STATE.clients)
         # Or the conductor keeps counting it, port set and all.
         send_notification(STATE.conductor_socket[], NOTIF_TYPE.client_done, UInt32(client.id))
         rethrow()
     finally
-        foreach(close, (stdin_srv, stdout_srv, stderr_srv, signals_srv))
-        foreach(remove_socket_file, (stdin_path, stdout_path, stderr_path, signals_path))
+        foreach(close, servers)
+        foreach(remove_socket_file, paths)
     end
-    if is_tcp
+    client_stdin, client_stdout, client_stderr, signals = streams
+    if first(servers) isa Sockets.TCPServer
         # A client gone without closing would otherwise hold its session forever.
-        for sock in (client_stdin, client_stdout, client_stderr, signals)
+        for sock in streams
             ccall(:uv_tcp_keepalive, Cint, (Ptr{Cvoid}, Cint, Cuint), sock.handle, 1, TCP_KEEPALIVE_IDLE_S)
         end
         Sockets.nagle(signals, false)
@@ -884,9 +903,45 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         catch
             isopen(client_stdout) && rethrow()
         end)
-        register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals)
+        register_client!(client.id, task, streams...)
     else
-        spawn_sync_client!(client, client_stdin, client_stdout, client_stderr, signals, label)
+        spawn_sync_client!(client, streams..., label)
+    end
+end
+
+function serve_client_run(conn::IO)
+    client = read_client_run(conn)
+    @static if VERSION >= v"1.11"
+        WORKER_TERM.have_color = client.color  # our own stdio is piped
+    end
+    # A watcher takes no capacity, but the reply's count, which the conductor
+    # keeps, includes them.
+    active_count, working, draining = @lock STATE.lock (
+        length(STATE.clients),
+        count(c -> isnothing(getval(c.switches, "--watch", nothing)), STATE.clients),
+        STATE.soft_exit[])
+    # force bypasses capacity (labelled sessions, watchers) but never the drain.
+    stale = stale_files(client)
+    if draining || (!client.force && MAX_CLIENTS > 0 && working >= MAX_CLIENTS)
+        send_sockets(conn, "", "", "", "", active_count)  # reject: empty paths + count
+    elseif !isempty(stale) && !client.force
+        # The conductor retires this worker and starts a fresh one.
+        send_error(conn, ERR_CODE.stale_code, "changed on disk since loaded: " * join(stale, ", "))
+    else
+        replied = Ref(false)
+        try
+            spawn_client!(conn, client, replied)
+        catch err
+            # `sockets` is a complete reply; a trailing `err` would be read as
+            # the next message header and desync the stream for good.
+            replied[] || send_error(conn, ERR_CODE.internal_error,
+                                    "Failed to start client: $(sprint(showerror, err))")
+            if err isa InterruptException
+                pass_interrupt()
+            else
+                @error "Failed to start client" exception=(err, catch_backtrace())
+            end
+        end
     end
 end
 
@@ -907,39 +962,7 @@ function serve_message(conn::IO, header::MessageHeader)
                        "Failed to set project: $(sprint(showerror, err))")
         end
     elseif header.msg_type == MSG_TYPE.client_run
-        client = read_client_run(conn)
-        @static if VERSION >= v"1.11"
-            WORKER_TERM.have_color = client.color  # our own stdio is piped
-        end
-        # A watcher takes no capacity, but the reply's count, which the conductor
-        # keeps, includes them.
-        active_count, working, draining = @lock STATE.lock (
-            length(STATE.clients),
-            count(c -> isnothing(getval(c.switches, "--watch", nothing)), STATE.clients),
-            STATE.soft_exit[])
-        # force bypasses capacity (labelled sessions, watchers) but never the drain.
-        stale = stale_files(client)
-        if draining || (!client.force && MAX_CLIENTS > 0 && working >= MAX_CLIENTS)
-            send_sockets(conn, "", "", "", "", active_count)  # reject: empty paths + count
-        elseif !isempty(stale) && !client.force
-            # The conductor retires this worker and starts a fresh one.
-            send_error(conn, ERR_CODE.stale_code, "changed on disk since loaded: " * join(stale, ", "))
-        else
-            replied = Ref(false)
-            try
-                spawn_client!(conn, client, replied)
-            catch err
-                # `sockets` is a complete reply; a trailing `err` would be read as
-                # the next message header and desync the stream for good.
-                replied[] || send_error(conn, ERR_CODE.internal_error,
-                                        "Failed to start client: $(sprint(showerror, err))")
-                if err isa InterruptException
-                    pass_interrupt()
-                else
-                    @error "Failed to start client" exception=(err, catch_backtrace())
-                end
-            end
-        end
+        serve_client_run(conn)
     elseif header.msg_type == MSG_TYPE.soft_exit
         @lock STATE.lock begin
             if isempty(STATE.clients)
@@ -950,12 +973,7 @@ function serve_message(conn::IO, header::MessageHeader)
             end
         end
     elseif header.msg_type == MSG_TYPE.sync_clients
-        id_count = read(conn, UInt16)
-        active_ids = Set{Int}()
-        for _ in 1:id_count
-            push!(active_ids, Int(read(conn, UInt32)))
-        end
-        kill_stuck_clients(active_ids)
+        kill_stuck_clients(Set{Int}(read(conn, UInt32) for _ in 1:read(conn, UInt16)))
         remaining = @lock STATE.lock length(STATE.clients)
         write_header(conn, MSG_TYPE.ack, 2)
         write(conn, UInt16(remaining))

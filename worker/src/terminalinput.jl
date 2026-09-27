@@ -65,16 +65,12 @@ function close_input!(input::TerminalInput)
     @lock input.lock close(input.writer)
 end
 
-is_input_open(input::TerminalInput) = @lock input.lock isopen(input.writer)
-
 current_reader(input::TerminalInput) = @lock input.lock input.reader
 current_reader(stream::StreamIO) = stream
 
-# Copies `source` into `input` until it ends, then ends `input` for good. A
-# shared input, a --sync session's, outlives its participants: `leaves` says
-# whether a lone Ctrl-D where it ends no one's input, at the prompt, is this
-# one leaving.
-function copy_input(source::StreamIO, input::TerminalInput; leaves::Union{Nothing, Function}=nothing)
+# Copies `source` into `input` until it ends, or `leaves` says a lone Ctrl-D
+# where it ends no one's input (at a shared input's prompt) is this one leaving.
+function copy_input(source::StreamIO, input::TerminalInput; leaves::Function=Returns(false))
     buf = Vector{UInt8}(undef, 64 * 1024)
     try
         while true
@@ -87,12 +83,10 @@ function copy_input(source::StreamIO, input::TerminalInput; leaves::Union{Nothin
             GC.@preserve buf unsafe_read(source, pointer(buf), n)
             # Before 1.11 a REPL's stdin is fixed, so its input can't go on past an end.
             ctrl_d = n == 1 && buf[1] == 0x04 && (input.raw || VERSION < v"1.11")
-            ctrl_d && !isnothing(leaves) && leaves() && break
+            ctrl_d && leaves() && break
             feed_input!(input, @view buf[1:n])
         end
     catch err
         err isa Base.IOError || err isa EOFError || rethrow()
-    finally
-        isnothing(leaves) && close_input!(input)
     end
 end

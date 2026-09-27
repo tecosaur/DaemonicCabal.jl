@@ -68,7 +68,11 @@ function arm_deadline!(o::BufferedOutput)
     end
 end
 
-Base.close(o::BufferedOutput) = (flush(o); close(o.sink); nothing)
+function Base.close(o::BufferedOutput)
+    flush(o)
+    close(o.sink)
+    nothing
+end
 Base.isopen(o::BufferedOutput) = isopen(o.sink)
 Base.displaysize(o::BufferedOutput) = displaysize(o.sink)
 Base.get(o::BufferedOutput, key::Symbol, default) = get(o.sink, key, default)

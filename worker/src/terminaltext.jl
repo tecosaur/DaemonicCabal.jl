@@ -141,13 +141,17 @@ function step!(t::TerminalText, byte::UInt8)
     elseif byte == 0x1b  # ends a string too, as the start of its ST
         t.state = :escape
     elseif state === :string
-        byte == 0x07 && (t.state = :ground)
+        if byte == 0x07
+            t.state = :ground
+        end
     elseif byte < 0x20 || byte == 0x7f  # controls act within a sequence
         control!(t, byte)
     elseif state === :escape
         t.state = escape!(t, byte)
     elseif state === :escape_intermediate
-        byte >= 0x30 && (t.state = :ground)
+        if byte >= 0x30
+            t.state = :ground
+        end
     elseif byte >= 0x40  # a CSI's final byte
         if state === :csi
             csi!(t, Char(byte))
@@ -317,7 +321,9 @@ function csi!(t::TerminalText, final::Char)
     n = get(t.params, 1, 0)
     count = max(n, 1)
     line = t.rows[t.row]
-    final in "KJ" && (t.edited_top = min(t.edited_top, t.released + t.row))
+    if final in "KJ"
+        t.edited_top = min(t.edited_top, t.released + t.row)
+    end
     if final == 'K'  # erase in the row: to its end (0), from its start (1), all (2)
         if n == 0
             resize!(line, min(length(line), t.column))
@@ -335,10 +341,14 @@ function csi!(t::TerminalText, final::Char)
         end
     elseif final == 'A' || final == 'F'  # up, previous line
         t.row = max(1, t.row - count)
-        final == 'F' && (t.column = 0)
+        if final == 'F'
+            t.column = 0
+        end
     elseif final == 'B' || final == 'E'  # down, next line
         t.row = min(length(t.rows), t.row + count)
-        final == 'E' && (t.column = 0)
+        if final == 'E'
+            t.column = 0
+        end
     elseif final == 'C'
         t.column += count
     elseif final == 'D'
@@ -356,7 +366,9 @@ function csi!(t::TerminalText, final::Char)
         restore_cursor!(t)
     end
     # Past the margin is a pending wrap, which moving the cursor ends.
-    t.columns > 0 && final != 'm' && (t.column = min(t.column, t.columns - 1))
+    if t.columns > 0 && final != 'm'
+        t.column = min(t.column, t.columns - 1)
+    end
 end
 
 # Select Graphic Rendition: its parameters, in order, change the style.

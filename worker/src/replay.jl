@@ -149,7 +149,9 @@ function allot_rows(sizes, budget::Int)
             min.(needs, floor.(Int, spare .* weights ./ sum(weights)))
         end
         # Shares too small to be a row go to the newest.
-        all(iszero, grants) && (grants[1] = 1)
+        if all(iszero, grants)
+            grants[1] = 1
+        end
         allowances[wanting] .+= grants
         spare -= sum(grants)
         filter!(i -> allowances[i] < outputs[i], wanting)
