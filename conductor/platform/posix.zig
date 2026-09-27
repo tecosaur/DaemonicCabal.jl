@@ -327,7 +327,8 @@ pub fn setTcpNodelay(socket: posix.fd_t) void {
     _ = posix.system.setsockopt(socket, 6, 1, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int)); // IPPROTO_TCP, TCP_NODELAY
 }
 
-// Terminal raw mode
+// Terminal raw mode. Switched once output drains, keeping input typed ahead
+// (as libuv does): a REPL toggles it around each evaluation.
 var saved_termios: ?posix.termios = null;
 pub fn setRawMode(raw: bool) void {
     const stdin = impl.STDIN_HANDLE;
@@ -336,9 +337,9 @@ pub fn setRawMode(raw: bool) void {
         if (saved_termios == null) saved_termios = termios;
         termios.lflag.ECHO = false;
         termios.lflag.ICANON = false;
-        posix.tcsetattr(stdin, .FLUSH, termios) catch {};
+        posix.tcsetattr(stdin, .DRAIN, termios) catch {};
     } else if (saved_termios) |termios| {
-        posix.tcsetattr(stdin, .FLUSH, termios) catch {};
+        posix.tcsetattr(stdin, .DRAIN, termios) catch {};
         saved_termios = null;
     }
 }
