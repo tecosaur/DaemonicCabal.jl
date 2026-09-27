@@ -157,8 +157,9 @@ end
     end
 end
 
+# The last given, as Julia takes a repeated switch.
 function getval(pairlist, key, default)
-    index = findfirst(p -> first(p) == key, pairlist)
+    index = findlast(p -> first(p) == key, pairlist)
     if isnothing(index) default else last(pairlist[index]) end
 end
 
@@ -174,13 +175,13 @@ end
 
 function is_repl_client(client::ClientInfo)
     switches = (s for (s, _) in client.switches)
-    "-i" ∈ switches || (isnothing(client.programfile) && "--eval" ∉ switches && "--print" ∉ switches)
+    "--interactive" ∈ switches || (isnothing(client.programfile) && "--eval" ∉ switches && "--print" ∉ switches)
 end
 
 function command_line(client::ClientInfo)
     words = String[]
     for (name, value) in client.switches
-        name ∈ ("--session", "--watch") && continue
+        name ∈ ("--session", "--watch", "--address") && continue
         push!(words, name)
         isempty(value) || push!(words, value)
     end
@@ -217,7 +218,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     end
     hascolor = clienthascolor(client)
     # As Julia's: -i, or a REPL at a terminal.
-    interactive = any(s -> first(s) == "-i", client.switches) || (client.tty && is_repl_client(client))
+    interactive = any(s -> first(s) == "--interactive", client.switches) || (client.tty && is_repl_client(client))
     # Pre-1.11 output goes through redirected fds, which cannot be copied. A
     # sync session's broadcast writers record its screen as one shared run.
     session = getval(client.switches, "--session", nothing)  # "" when unlabelled
@@ -470,7 +471,7 @@ end
 function run_terminal_repl(client::ClientInfo, stdout::IO)
     interactiveinput = client.tty
     hascolor = get(stdout, :color, clienthascolor(client))
-    quiet = any(((s, _),) -> s ∈ ("-q", "--quiet"), client.switches)
+    quiet = any(((s, _),) -> s == "--quiet", client.switches)
     # The atreplinit hook prints the banner itself when replaying.
     banner = if VERSION >= v"1.11" && REPLAY_TARGET[] !== nothing
         :no

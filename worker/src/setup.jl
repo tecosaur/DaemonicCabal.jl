@@ -328,9 +328,7 @@ end
 
 function sync_session_label(client::ClientInfo)
     any(p -> first(p) == "--sync", client.switches) || return nothing
-    idx = findfirst(p -> first(p) == "--session", client.switches)
-    isnothing(idx) && return nothing
-    label = last(client.switches[idx])
+    label = getval(client.switches, "--session", "")
     if !isempty(label) label end
 end
 
