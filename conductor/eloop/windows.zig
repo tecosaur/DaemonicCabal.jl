@@ -124,6 +124,10 @@ pub const EventLoop = struct {
         g_console_iocp = null;
     }
 
+    pub fn logResolution(_: *const EventLoop) void {
+        std.debug.print(" - Event loop: IOCP\n", .{});
+    }
+
     pub fn watchFd(self: *EventLoop, tag: usize, fd: posix.fd_t) void {
         const w = std.heap.page_allocator.create(Watch) catch return;
         w.* = .{ .op = undefined, .tag = tag, .fd = fd, .cancelled = false };
