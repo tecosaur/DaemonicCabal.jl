@@ -359,10 +359,11 @@ pub const Worker = struct {
 
         /// Null when nothing was waiting or an unexpected process connected:
         /// anything reaching the runtime directory could pose as the worker.
-        /// The listener is left for the caller to close.
+        /// The worker returned takes over what `self.worker` owns, but not
+        /// the listener.
         pub fn accept(self: *Spawn, io: Io, cfg: *const config.Config) !?Worker {
             const socket = (try self.listener.acceptTimeout(io, 0)) orelse return null;
-            var w = self.worker;
+            const w = &self.worker;
             if (!isExpectedWorker(socket, w.launch, self.client_ns, w.process.id)) {
                 w.log("dropped a setup connection from an unexpected process", .{});
                 platform.close(socket);
@@ -384,12 +385,13 @@ pub const Worker = struct {
             var magic_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
             platform.write(socket, &magic_buf);
-            self.worker.julia_channel = null; // moved into `w`
             w.socket = socket;
             w.created_at = Io.Clock.now(.awake, io).toSeconds();
             w.last_active = w.created_at;
             w.last_pinged = w.created_at;
-            return w;
+            const connected = w.*;
+            self.worker.julia_channel = null; // moved into `connected`
+            return connected;
         }
 
         /// A client-launched worker is not our child; its client's socket turning
@@ -653,8 +655,8 @@ pub const Worker = struct {
         platform.write(self.socket, &buf);
     }
 
-    /// The worker drops clients not in `pids`; returns its remaining count.
-    /// Returns the worker's count of clients still running.
+    /// The worker drops clients not in `ids`; returns its count of clients
+    /// still running.
     pub fn syncClients(self: *Worker, ids: []const u32) !u16 {
         const payload_len: u16 = 2 + @as(u16, @intCast(ids.len)) * 4;
         self.writeHeader(.sync_clients, payload_len);

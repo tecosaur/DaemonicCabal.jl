@@ -177,9 +177,10 @@ pub const signals = struct {
     pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating (+ its number, u32)
 };
 
-// Event keys >= 0x1000 are pointers with tag bits. Bit 2: pending connection.
-// Else bit 1: pending spawn (bit 0: waiting client, not setup listener). Else a
-// worker (bit 0: health check, not pong).
+// Event keys >= 0x1000 are pointers with tag bits: a pending record's (a
+// connection, spawn, stderr pipe or view) is 2-7 in the low three, as
+// `Conductor` names them; a worker's is bit 0 alone, set for a health check
+// rather than its pong.
 pub const EventLocation = enum(u64) {
     accept = 0,
     signal = 1,

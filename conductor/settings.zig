@@ -355,11 +355,20 @@ pub const Conflict = union(enum) {
 };
 
 pub fn conflict(values: Values) ?Conflict {
+    // At 0 a ping timer would spin, and every ping or spawn would fail at once.
+    const positive = [_]usize{
+        Setting.index("JULIA_DAEMON_MIN_TTL"),
+        Setting.index("JULIA_DAEMON_PING_INTERVAL"),
+        Setting.index("JULIA_DAEMON_PING_TIMEOUT"),
+        Setting.index("JULIA_DAEMON_SPAWN_TIMEOUT"),
+    };
+    for (positive) |i| {
+        if ((parseDuration(resolved(values, i)) catch 0) == 0) return .{ .positive = i };
+    }
     const min = Setting.index("JULIA_DAEMON_MIN_TTL");
     const max = Setting.index("JULIA_DAEMON_MAX_TTL");
     const ttl_min = parseDuration(resolved(values, min)) catch 0;
     const ttl_max = parseDuration(resolved(values, max)) catch 0;
-    if (ttl_min == 0) return .{ .positive = min };
     if (ttl_min >= ttl_max) return .{ .ordered = .{ .below = min, .above = max } };
     const low = Setting.index("JULIA_DAEMON_MEMFREE_LOW");
     const high = Setting.index("JULIA_DAEMON_MEMFREE_HIGH");
@@ -597,9 +606,15 @@ test "display picks a duration's largest whole unit" {
     try std.testing.expectEqualStrings("Julia's default", display(threads, null, &buf));
 }
 
-test "the TTLs and free-memory levels must stay ordered" {
+test "timings stay positive, and the TTLs and free-memory levels ordered" {
     var values = [_]?[]const u8{null} ** all.len;
     try std.testing.expect(conflict(&values) == null);
+    inline for (.{ "JULIA_DAEMON_PING_INTERVAL", "JULIA_DAEMON_PING_TIMEOUT", "JULIA_DAEMON_SPAWN_TIMEOUT" }) |key| {
+        const i = Setting.index(key);
+        values[i] = "0";
+        try std.testing.expectEqual(i, conflict(&values).?.positive);
+        values[i] = null;
+    }
     values[Setting.index("JULIA_DAEMON_MIN_TTL")] = "0";
     try std.testing.expectEqual(Setting.index("JULIA_DAEMON_MIN_TTL"), conflict(&values).?.positive);
     values[Setting.index("JULIA_DAEMON_MIN_TTL")] = "7200";
