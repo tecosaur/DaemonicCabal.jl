@@ -6,7 +6,7 @@ using Base.ScopedValues
 const OutputIO = Union{Base.PipeEndpoint, Sockets.TCPSocket, BroadcastWriter{StreamIO}, BufferedOutput{Base.PipeEndpoint}, BufferedOutput{Sockets.TCPSocket}, RecordedOutput, BufferedOutput{RecordedOutput}}
 
 mutable struct VirtualTerm
-    const stdin::StreamIO
+    const stdin::Union{StreamIO, TerminalInput}
     const stdout::OutputIO
     const stderr::OutputIO
     const signals::StreamIO
@@ -80,7 +80,15 @@ struct ScopedStdin <: Base.AbstractPipe end
 struct ScopedStdout <: Base.AbstractPipe end
 struct ScopedStderr <: Base.AbstractPipe end
 
-Base.pipe_reader(::ScopedStdin) = @something(ACTIVE_TERM[].redirect_in, ACTIVE_TERM[].stdin)
+Base.pipe_reader(::ScopedStdin) = @something(ACTIVE_TERM[].redirect_in, current_reader(ACTIVE_TERM[].stdin))
+
+# As a TTY's, a terminal's input goes on past a Ctrl-D.
+function Base.reseteof(::ScopedStdin)
+    input = ACTIVE_TERM[].stdin
+    if input isa TerminalInput
+        reset_input!(input)
+    end
+end
 Base.pipe_writer(::ScopedStdout) = @something(ACTIVE_TERM[].redirect_out, ACTIVE_TERM[].stdout)
 Base.pipe_writer(::ScopedStderr) = @something(ACTIVE_TERM[].redirect_err, ACTIVE_TERM[].stderr)
 

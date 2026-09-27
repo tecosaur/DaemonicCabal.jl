@@ -19,6 +19,7 @@ include("terminaltext.jl")
 include("transcript.jl")
 include("broadcastio.jl")
 include("replay.jl")
+include("terminalinput.jl")
 
 # How a client's run asked to end: `exit`'s code, which a `catch` can't take
 # back, and its `atexit` hooks, newest first, run as it ends.
@@ -43,8 +44,7 @@ end
 
 mutable struct SyncSession
     const label::String
-    const mergedin::Base.PipeEndpoint
-    const writesink::Base.PipeEndpoint
+    const input::TerminalInput  # its participants' input, merged
     const out::BroadcastWriter{StreamIO}
     const err::BroadcastWriter{StreamIO}
     @atomic participants::Vector{Participant}  # replaced whole, under `STATE.lock`
@@ -52,6 +52,7 @@ mutable struct SyncSession
     const repl::Base.RefValue{REPL.LineEditREPL}
     const executing::Base.RefValue{Tuple{Bool, UInt32}}  # the REPL's evaluation, as its clients are told
     const executing_lock::ReentrantLock  # held telling them, so a joiner is told in order
+    repl_started::Bool  # by its first interactive client, before `repl` is set; message loop only
 end
 
 include("bufferedio.jl")

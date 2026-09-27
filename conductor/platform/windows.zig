@@ -1424,6 +1424,13 @@ pub fn setWorkerExecuting(executing: bool) void {
     worker_executing = executing;
 }
 
+/// A console process can't be stopped.
+pub fn suspendSelf() void {}
+
+pub fn inRawMode() bool {
+    return saved_mode != null;
+}
+
 /// Processed input stays on, so Ctrl-C is always a console event.
 pub fn ctrlCIsInput() bool {
     return false;

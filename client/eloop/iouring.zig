@@ -78,12 +78,10 @@ pub fn run(
                     _ = try ring.read(@intFromEnum(Location.worker_stderr), stderr_fd, .{ .buffer = &worker_stderr_buf }, 0);
                 },
                 @intFromEnum(Location.local_stdin) => {
-                    if (cqe.res <= 0) {
-                        platform.sendEof(stdin_fd);
-                        continue;
-                    }
                     if (exit_code != null) continue;
-                    stdin_fwd.forward(local_stdin_buf[0..len]);
+                    if (cqe.res <= 0) {
+                        if (!stdin_fwd.end()) continue;
+                    } else stdin_fwd.forward(local_stdin_buf[0..len]);
                     _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, at_file_position);
                 },
                 @intFromEnum(Location.signals) => {

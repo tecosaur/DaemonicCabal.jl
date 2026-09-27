@@ -92,6 +92,9 @@ end
         if !isnothing(term.sync_session)
             switch_raw_mode!(term.sync_session, raw)
         elseif isopen(term.signals)
+            if term.stdin isa TerminalInput
+                @lock term.stdin.lock term.stdin.raw = raw
+            end
             send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
             read(term.signals, 2) # ack
         end
@@ -100,6 +103,10 @@ end
 else
     @eval function REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool)
         sig = CLIENT_SIGNALS[]
+        input = CLIENT_INPUT[]
+        if input isa TerminalInput
+            @lock input.lock input.raw = raw
+        end
         if sig !== nothing && isopen(sig)
             try
                 send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
@@ -166,6 +173,32 @@ end
             end
         end
     end
+end
+
+# Ctrl-Z stops the client, as julia stops itself, not the worker its clients
+# share; the prompt is drawn afresh once it runs again. A shared REPL's
+# participants aren't stopped.
+REPL.LineEdit.default_keymap["^Z"] = function (s::REPL.LineEdit.MIState, o...)
+    LE = REPL.LineEdit
+    suspend_client()
+    LE.state(s).ias = LE.InputAreaState(0, 0)
+    LE.refresh_line(s)
+    :ignore
+end
+
+function suspend_client()
+    sig = @static if VERSION >= v"1.11"
+        isnothing(ACTIVE_TERM[].sync_session) || return
+        ACTIVE_TERM[].signals
+    else
+        CLIENT_SIGNALS[]
+    end
+    if isnothing(sig) || !isopen(sig)
+        return
+    end
+    send_signal(sig, SIGNAL_SUSPEND, UInt8[])
+    read(sig, 2) # ack
+    nothing
 end
 
 @eval Base.exit(n) = $exit_client(n)

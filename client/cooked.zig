@@ -31,6 +31,18 @@ pub const StdinForwarder = struct {
         self.pass(rest);
     }
 
+    /// At the end of local input, returns whether it goes on: a terminal's,
+    /// in cooked mode, is a Ctrl-D, which the worker takes as a TTY does, as
+    /// the end of input so far.
+    pub fn end(self: *StdinForwarder) bool {
+        if (platform.isatty(platform.getStdinHandle()) and !platform.inRawMode()) {
+            platform.write(self.dst, "\x04");
+            return true;
+        }
+        platform.sendEof(self.dst);
+        return false;
+    }
+
     fn pass(self: *StdinForwarder, bytes: []const u8) void {
         if (self.isCooked()) {
             for (bytes) |byte| self.cooked.process(byte, self.dst);
@@ -61,8 +73,9 @@ pub const CookedState = struct {
             self.send(stdin_fd);
             platform.socketWrite(stdin_fd, "\n");
         } else if (byte == keys.eof) {
-            // Ends input on an empty line, else sends the line so far.
-            if (self.line_len == 0) platform.sendEof(stdin_fd) else self.send(stdin_fd);
+            // Ends input on an empty line, as the worker takes a lone 0x04
+            // while cooked, else sends the line so far.
+            if (self.line_len == 0) platform.socketWrite(stdin_fd, "\x04") else self.send(stdin_fd);
         } else if (byte == keys.erase) {
             if (self.line_len > 0) self.eraseChar();
         } else if (byte == keys.kill) {

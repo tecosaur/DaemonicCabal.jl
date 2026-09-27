@@ -197,7 +197,7 @@ function command_line(client::ClientInfo)
     Base.shell_escape(words...)
 end
 
-function runclient(client::ClientInfo, client_stdin::StreamIO,
+function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInput},
                    client_stdout::IO, client_stderr::IO,
                    signals::StreamIO;
                    owned_streams::Tuple=(client_stdout, client_stderr),
@@ -256,14 +256,26 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
         stderrx = IOContext(stderrx, :module => mod)
         ending = RunEnd()
         run_code() = run_until_exit(mod, client, ending, run_stdout, stdoutx, stderrx, broadcast)
+        # A terminal's input is read through one a Ctrl-D ends, as a TTY's.
+        input = if client.tty && client_stdin isa StreamIO
+            copied = TerminalInput()
+            errormonitor(@async copy_input(client_stdin, copied))
+            copied
+        else
+            client_stdin
+        end
         enter_environment!(client)
         try
             exit_code = @static if VERSION < v"1.11"
                 CLIENT_SIGNALS[] = signals
+                CLIENT_INPUT[] = input
                 CLIENT_INTERACTIVE[] = interactive
                 CLIENT_END[] = ending
                 try
-                    redirect_stdio(stdin=client_stdin, stdout=stdoutx, stderr=stderrx) do
+                    # An input at its end may be closed already, with no fd to redirect;
+                    # nor can it be taken past a Ctrl-D, as the fd stays the one reader's.
+                    client_in = current_reader(input)
+                    redirect_stdio(stdin=if isopen(client_in) client_in else devnull end, stdout=stdoutx, stderr=stderrx) do
                         # Base's display holds the stdout the worker started with.
                         client_display = TextDisplay(stdoutx)
                         pushdisplay(client_display)
@@ -275,6 +287,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     end
                 finally
                     CLIENT_SIGNALS[] = nothing
+                    CLIENT_INPUT[] = nothing
                     CLIENT_INTERACTIVE[] = false
                     CLIENT_END[] = nothing
                 end
@@ -286,7 +299,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     hascolor
                 end
                 client_vterm = VirtualTerm(
-                    client_stdin, run_stdout, run_stderr, signals,
+                    input, run_stdout, run_stderr, signals,
                     term, sync_session,
                     get(TERMINFOS, term, nothing), color, nothing)
                 @with(ACTIVE_TERM => client_vterm,
@@ -472,7 +485,7 @@ function run_piped_repl(mod::Module)
     end
 end
 
-# A sync REPL task owns no streams; its clients are cleaned up by stdin_copy_loop.
+# A sync REPL task owns no streams; its clients are cleaned up as they leave.
 function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO,
                          client_stderr::IO, signals::IO, owned_streams::Tuple, exit_code::Int)
     @nospecialize client_stdin client_stdout client_stderr signals owned_streams
