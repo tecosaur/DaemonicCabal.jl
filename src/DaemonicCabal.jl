@@ -14,19 +14,10 @@ const EXE = Sys.iswindows() ? ".exe" : ""
 const CLIENT_NAME = "juliaclient$EXE"
 
 const DEFAULTS = (
-    worker_maxclients = 1,
-    worker_args = "--startup-file=no",
-    worker_ttl = 2*60*60, # 2h
-    mode = :sockets,
     conductor_host = "127.0.0.1",
     conductor_port = 9345,
     ports = 35520:37568,
 )
-
-mainsocket() = get(ENV, "JULIA_DAEMON_SERVER",
-                   BaseDirs.runtime("julia-daemon", "conductor.sock"))
-
-julia_env() = [k => v for (k, v) in ENV if startswith(k, "JULIA_")]
 
 # Installation
 
@@ -41,6 +32,8 @@ elseif Sys.isbsd()
 elseif Sys.iswindows()
     include("installers/windows.jl")
 else
+    stop_service() = nothing
+    service_environment() = Dict{String,String}()
     function install_service(::Dict{String,String})
         @error "Service installation is not implemented for $(Sys.KERNEL).\n" *
             "If you're up for it, consider making a PR to add support 🙂"
@@ -55,33 +48,39 @@ end
 BaseDirs.@promise_no_assign @doc """
     DaemonicCabal
 
+Run Julia code in warm, long-lived workers, through `juliaclient`: a drop-in
+replacement for `julia`.
+
 # Setup
 
-Install this package anywhere and run `DaemonicCabal.install()`. Re-run this
-command after updating `DaemonicCabal`, the configuration env vars, or Julia
-itself.
+Install this package anywhere and run `DaemonicCabal.install()`. Re-run it
+after updating `DaemonicCabal` or Julia itself; `DaemonicCabal.uninstall()`
+undoes it.
 
 ## Platform Support
 
-- **Linux**: Installs a systemd user service
-- **macOS**: Installs a launchd user agent (logs to `~/Library/Logs/julia-daemon.log`)
-- **FreeBSD/OpenBSD**: Installs the client and provides manual daemon setup instructions
-- **Windows**: Installs the client and adds it to the startup items
+- **Linux**: a systemd user service
+- **macOS**: a launchd user agent (logging to `~/Library/Logs/julia-daemon.log`)
+- **Windows**: a Task Scheduler logon task, `Julia\\JuliaDaemon`
+- **FreeBSD/OpenBSD**: the client, with instructions to start the daemon by hand
 
 # Configuration
 
-When the daemon starts, it pays attention to the following environmental variables:
-- `JULIA_DAEMON_SERVER` [`$(BaseDirs.runtime("julia-daemon", "conductor.sock"))`] \n
-  The socket to connect to.
-- `JULIA_DAEMON_WORKER_MAXCLIENTS` [default: `$(DEFAULTS.worker_maxclients)`]\n
-  The maximum number of clients a worker may be attached to at once. Set to `0`
-  to disable.
-- `JULIA_DAEMON_WORKER_ARGS` [`$(DEFAULTS.worker_args)`] \n
+The daemon reads `JULIA_DAEMON_*` environment variables, set in its service.
+`juliaclient --reconfigure` lists them all, changes them live, and saves them
+to the service. Among them:
+
+- `JULIA_DAEMON_WORKER_EXECUTABLE` [`julia`, as `install()` finds it] \n
+  The Julia binary workers run.
+- `JULIA_DAEMON_WORKER_ARGS` [`--startup-file=no`] \n
   Arguments passed to the Julia worker processes.
-- `JULIA_DAEMON_WORKER_EXECUTABLE` [`$(something(Sys.which("julia"), joinpath(Sys.BINDIR, "julia")))`] \n
-  Path to the Julia executable used by the workers.
-- `JULIA_DAEMON_WORKER_TTL` [`$(DEFAULTS.worker_ttl)`] \n
-  Number of seconds a worker should be kept alive for after the last client disconnects.
+- `JULIA_DAEMON_WORKER_MAXCLIENTS` [`1`] \n
+  The maximum number of clients a worker serves at once, `0` for no limit.
+- `JULIA_DAEMON_MAX_TTL` [`7200`] \n
+  Seconds after which an idle worker is always culled; one may go sooner when
+  memory is scarce.
+- `JULIA_DAEMON_SERVER` [a local socket] \n
+  Where clients reach the conductor: a socket path, or `tcp://host:port`.
 """ DaemonicCabal
 
 end

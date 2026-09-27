@@ -52,8 +52,28 @@ function install_conductor_bundle()
     """)
 end
 
+xml_escaped(text::AbstractString) = replace(text, '&' => "&amp;", '<' => "&lt;", '>' => "&gt;")
+
+"""
+    service_environment() -> Dict{String,String}
+
+The installed agent's EnvironmentVariables, `--reconfigure`'s changes
+included; empty without an agent.
+"""
+function service_environment()
+    plist = launchd_plist_path()
+    isfile(plist) || return Dict{String,String}()
+    text = read(plist, String)
+    envdict = match(r"<key>EnvironmentVariables</key>\s*<dict>(.*?)</dict>"s, text)
+    isnothing(envdict) && return Dict{String,String}()
+    xml_unescaped(escaped) = replace(escaped, "&lt;" => "<", "&gt;" => ">", "&quot;" => "\"",
+                                     "&apos;" => "'", "&amp;" => "&")
+    Dict{String,String}(xml_unescaped(m[1]) => xml_unescaped(m[2]) for m in
+        eachmatch(r"<key>(.*?)</key>\s*<string>(.*?)</string>"s, envdict[1]))
+end
+
 function launchd_plist_content(env::Dict{String,String})
-    env_entries = join(["        <key>$k</key>\n        <string>$v</string>"
+    env_entries = join(["        <key>$(xml_escaped(k))</key>\n        <string>$(xml_escaped(v))</string>"
                         for (k, v) in env], "\n")
     """
     <?xml version="1.0" encoding="UTF-8"?>
@@ -64,7 +84,7 @@ function launchd_plist_content(env::Dict{String,String})
         <string>$LAUNCHD_LABEL</string>
         <key>ProgramArguments</key>
         <array>
-            <string>$(bundled_conductor())</string>
+            <string>$(xml_escaped(bundled_conductor()))</string>
         </array>
         <key>EnvironmentVariables</key>
         <dict>
@@ -78,17 +98,21 @@ function launchd_plist_content(env::Dict{String,String})
             <false/>
         </dict>
         <key>StandardOutPath</key>
-        <string>$(launchd_log_path())</string>
+        <string>$(xml_escaped(launchd_log_path()))</string>
         <key>StandardErrorPath</key>
-        <string>$(launchd_log_path())</string>
+        <string>$(xml_escaped(launchd_log_path()))</string>
     </dict>
     </plist>
     """
 end
 
-function install_service(env::Dict{String,String})
+function stop_service()
     plist = launchd_plist_path()
     ispath(plist) && run(ignorestatus(`launchctl unload $plist`))
+end
+
+function install_service(env::Dict{String,String})
+    plist = launchd_plist_path()
     @info "Building conductor app bundle"
     install_conductor_bundle()
     @info "Installing launchd agent"
@@ -101,7 +125,7 @@ function uninstall_service()
     plist = launchd_plist_path()
     if ispath(plist)
         @info "Removing launchd agent"
-        run(ignorestatus(`launchctl unload $plist`))
+        stop_service()
         rm(plist)
     end
 end
