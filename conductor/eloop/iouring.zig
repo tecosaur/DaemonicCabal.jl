@@ -18,14 +18,12 @@ const EventLocation = protocol.EventLocation;
 const posix_signals = @import("posix_signals.zig");
 
 const signal_pipe = &posix_signals.signal_pipe;
-const SIGNAL_SHUTDOWN = posix_signals.SIGNAL_SHUTDOWN;
-const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 // A timeout's result on expiry; cancelled, it gives -ECANCELED.
 const etime: i32 = @intFromEnum(linux.E.TIME);
 
-/// A pong poll's user data: a worker's pointer alone could name a poll
-/// cancelled since, whose completion is still to come.
-const PongPoll = struct { w: *worker.Worker };
+/// A pong poll's user data holds its ping's seq above the worker's pointer:
+/// the pointer alone could name a poll cancelled since, still to complete.
+const pong_seq_shift = 56;
 
 // EventLoop
 pub const EventLoop = struct {
@@ -35,9 +33,9 @@ pub const EventLoop = struct {
     live_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
     tick_ts: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
     tick_armed: bool = false,
-    /// The poll each worker's pong is awaited by; any other is stale.
-    pong_polls: std.AutoHashMapUnmanaged(*worker.Worker, *PongPoll) = .empty,
-    pong_pool: std.heap.MemoryPool(PongPoll) = .empty,
+    /// Whether a finished accept is queued again: not while the listener is
+    /// recreated, nor once that failed.
+    accepting: bool = true,
 
     pub fn init(entries: u13) !EventLoop {
         return .{
@@ -48,8 +46,6 @@ pub const EventLoop = struct {
 
     pub fn deinit(self: *EventLoop) void {
         self.ring.deinit();
-        self.pong_polls.deinit(std.heap.page_allocator);
-        self.pong_pool.deinit(std.heap.page_allocator);
     }
 
     pub fn logResolution(_: *const EventLoop) void {
@@ -70,10 +66,8 @@ pub const EventLoop = struct {
             w.log("health check not queued: {}", .{err});
     }
 
-    /// The pong is polled for, not read, so it stays for `onPong` or
-    /// `cancelPendingPing` to read; the poll is linked to a timeout, which
-    /// cancels it on expiry. Unqueued, the ping stays pending, for
-    /// `cancelPendingPing`.
+    /// Polled, so the pong stays to be read; the linked timeout cancels the
+    /// poll. Unqueued, the ping stays pending for `cancelPendingPing`.
     pub fn awaitPong(self: *EventLoop, w: *worker.Worker, timeout_ms: u64) void {
         w.ping_pending = true;
         self.ping_timeout_ts = .{ .sec = @intCast(timeout_ms / 1000), .nsec = @intCast((timeout_ms % 1000) * std.time.ns_per_ms) };
@@ -101,30 +95,29 @@ pub const EventLoop = struct {
     /// The pong poll's completion, should it still arrive, is stale.
     pub fn cancelPendingPing(self: *EventLoop, w: *worker.Worker) void {
         self.queueCancel(@intFromPtr(w) | 1) catch |err| w.log("health check not cancelled: {}", .{err});
-        if (self.pong_polls.fetchRemove(w)) |kv|
-            self.queueCancel(@intFromPtr(kv.value)) catch |err| w.log("pong poll not cancelled: {}", .{err});
         if (!w.ping_pending) return;
+        self.queueCancel(pongTag(w)) catch |err| w.log("pong poll not cancelled: {}", .{err});
         w.skipOwedPong();
+    }
+
+    /// The pending accept holds the old socket open, so it goes first; its
+    /// completion queues the next accept, on the new one.
+    pub fn stopAccepting(self: *EventLoop, _: *protocol.Listener) void {
+        self.queueCancel(@intFromEnum(EventLocation.accept)) catch |err|
+            std.debug.print("io_uring: accept not cancelled: {}\n", .{err});
+        _ = self.ring.submit() catch {};
+        self.accepting = false;
+    }
+
+    pub fn startAccepting(self: *EventLoop, _: *protocol.Listener) void {
+        self.accepting = true;
     }
 
     fn queuePongPoll(self: *EventLoop, w: *worker.Worker) !void {
         const ring = try self.room(2);
-        const poll = try self.pong_pool.create(std.heap.page_allocator);
-        errdefer self.pong_pool.destroy(poll);
-        poll.* = .{ .w = w };
-        try self.pong_polls.put(std.heap.page_allocator, w, poll);
-        const sqe = ring.poll_add(@intFromPtr(poll), w.socket, posix.POLL.IN) catch unreachable;
+        const sqe = ring.poll_add(pongTag(w), w.socket, posix.POLL.IN) catch unreachable;
         sqe.flags |= linux.IOSQE_IO_LINK;
         _ = ring.link_timeout(@intFromEnum(EventLocation.ignored), &self.ping_timeout_ts, 0) catch unreachable;
-    }
-
-    /// Frees `poll`, returning its worker unless it was stale.
-    fn takePongPoll(self: *EventLoop, poll: *PongPoll) ?*worker.Worker {
-        defer self.pong_pool.destroy(poll);
-        const w = poll.w;
-        if (self.pong_polls.get(w) != poll) return null;
-        _ = self.pong_polls.remove(w);
-        return w;
     }
 
     /// The ring, with room for `n` more SQEs: those queued are submitted when
@@ -145,17 +138,20 @@ pub const EventLoop = struct {
     }
 };
 
+fn pongTag(w: *const worker.Worker) u64 {
+    return @intFromPtr(w) | @as(u64, w.ping_seq) << pong_seq_shift;
+}
+
 // Main event loop
 pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener) void {
     const ring = &loop.ring;
     var signal_buf: [16]u8 = undefined;
     var client_addr: std.Io.Threaded.PosixAddress = undefined;
     var client_addr_len: posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
-    var server_fd = listener.fd();
     var ping_timer = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_interval), .nsec = 0 };
     const pressure_active = conductor.pressure_monitor.active();
     var pressure_timer = linux.kernel_timespec{ .sec = @intCast(conductor.pressureIntervalS()), .nsec = 0 };
-    _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC) catch |err| {
+    _ = ring.accept(@intFromEnum(EventLocation.accept), listener.fd(), &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC) catch |err| {
         std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
         return;
     };
@@ -205,8 +201,8 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
                 continue;
             }
             if (user_data >= 0x1000) {
-                const w = loop.takePongPoll(@ptrFromInt(user_data)) orelse continue;
-                if (!conductor.isLiveWorker(w)) continue;
+                const w: *worker.Worker = @ptrFromInt(user_data & ((1 << pong_seq_shift) - 1));
+                if (!conductor.isLiveWorker(w) or user_data >> pong_seq_shift != w.ping_seq) continue;
                 // Negative: cancelled by its timeout, or failed.
                 if (cqe.res > 0) conductor.onPong(w) else conductor.onPongTimeout(w);
                 pool_changed = true;
@@ -226,34 +222,7 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
                     pool_changed = true;
                 },
                 .signal => {
-                    if (cqe.res > 0) {
-                        const len: usize = @intCast(cqe.res);
-                        for (signal_buf[0..len]) |sig| {
-                            switch (sig) {
-                                SIGNAL_SHUTDOWN => {
-                                    std.debug.print("\nShutdown requested, stopping workers...\n", .{});
-                                    conductor.gracefulShutdown();
-                                    return;
-                                },
-                                SIGNAL_RECREATE => {
-                                    std.debug.print("Recreating socket due to SIGUSR1\n", .{});
-                                    // The pending accept holds the old socket open, so it
-                                    // goes first; its completion rearms on the new one.
-                                    loop.queueCancel(@intFromEnum(EventLocation.accept)) catch |err|
-                                        std.debug.print("io_uring: accept not cancelled: {}\n", .{err});
-                                    _ = ring.submit() catch {};
-                                    listener.close(conductor.io);
-                                    server_fd = -1;
-                                    listener.* = conductor.createServer() catch |err| {
-                                        std.debug.print("Failed to recreate socket: {}\n", .{err});
-                                        continue;
-                                    };
-                                    server_fd = listener.fd();
-                                },
-                                else => {},
-                            }
-                        }
-                    }
+                    if (cqe.res > 0 and posix_signals.handle(conductor, loop, listener, signal_buf[0..@intCast(cqe.res)])) return;
                     const signal_ring = loop.room(1) catch |err| {
                         std.debug.print("Fatal: failed to requeue signal read: {}\n", .{err});
                         return;
@@ -280,13 +249,13 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
             }
         }
         if (pool_changed) conductor.noteLiveChange();
-        if (need_rearm_accept and server_fd >= 0) {
+        if (need_rearm_accept and loop.accepting) {
             client_addr_len = @sizeOf(std.Io.Threaded.PosixAddress);
             const accept_ring = loop.room(1) catch |err| {
                 std.debug.print("Fatal: failed to requeue accept: {}\n", .{err});
                 return;
             };
-            _ = accept_ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC) catch unreachable;
+            _ = accept_ring.accept(@intFromEnum(EventLocation.accept), listener.fd(), &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC) catch unreachable;
         }
         if (need_rearm_ping_timer) {
             loop.queueTimeout(@intFromEnum(EventLocation.ping_timer), &ping_timer) catch |err| {

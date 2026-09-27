@@ -8,9 +8,11 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const Io = std.Io;
 const platform = @import("../platform/main.zig");
+const protocol = @import("../protocol.zig");
+const Conductor = @import("../main.zig").Conductor;
 
-pub const SIGNAL_SHUTDOWN: u8 = 'S';
-pub const SIGNAL_RECREATE: u8 = 'R';
+const SIGNAL_SHUTDOWN: u8 = 'S';
+const SIGNAL_RECREATE: u8 = 'R';
 
 pub var signal_pipe: [2]posix.fd_t = .{ -1, -1 };
 
@@ -54,6 +56,41 @@ pub fn installSignalHandlers() !void {
         .flags = 0,
     };
     posix.sigaction(posix.SIG.PIPE, &pipe_sigact, null);
+}
+
+/// Acts on signals read from the pipe, recreating the listener between
+/// `loop`'s `stopAccepting` and `startAccepting`; true once shutdown was
+/// requested.
+pub fn handle(conductor: *Conductor, loop: anytype, listener: *protocol.Listener, signals: []const u8) bool {
+    for (signals) |sig| switch (sig) {
+        SIGNAL_SHUTDOWN => {
+            std.debug.print("\nShutdown requested, stopping workers...\n", .{});
+            conductor.gracefulShutdown();
+            return true;
+        },
+        SIGNAL_RECREATE => {
+            std.debug.print("Recreating socket due to SIGUSR1\n", .{});
+            loop.stopAccepting(listener);
+            listener.close(conductor.io);
+            listener.* = conductor.createServer() catch |err| {
+                std.debug.print("Failed to recreate socket: {}\n", .{err});
+                continue;
+            };
+            loop.startAccepting(listener);
+        },
+        else => {},
+    };
+    return false;
+}
+
+/// `handle`, for the signals the pipe holds.
+pub fn drain(conductor: *Conductor, loop: anytype, listener: *protocol.Listener) bool {
+    var buf: [16]u8 = undefined;
+    const n = posix.read(signal_pipe[0], &buf) catch |err| {
+        std.debug.print("Signal pipe read error: {}\n", .{err});
+        return false;
+    };
+    return handle(conductor, loop, listener, buf[0..n]);
 }
 
 pub fn cleanupSignalHandlers() void {
