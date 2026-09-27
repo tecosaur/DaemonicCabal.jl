@@ -65,6 +65,17 @@ pub fn pidfdSignal(fd: posix.fd_t, sig: SIG) usize {
     return linux.pidfd_send_signal(fd, sig, null, 0);
 }
 
+/// A ring supporting the event loops' operations, the last of which (reads
+/// at the file position) arrived in 5.6 with IORING_FEAT_RW_CUR_POS.
+pub fn initIoUring(entries: u16) !linux.IoUring {
+    var ring = try linux.IoUring.init(entries, 0);
+    if (ring.features & linux.IORING_FEAT_RW_CUR_POS == 0) {
+        ring.deinit();
+        return error.SystemOutdated;
+    }
+    return ring;
+}
+
 fn canExec(path: [*:0]const u8) bool {
     return linux.faccessat(linux.AT.FDCWD, path, linux.X_OK, 0) == 0;
 }

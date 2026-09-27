@@ -53,6 +53,10 @@ pub const EventLoop = struct {
         _ = c.close(self.kq);
     }
 
+    pub fn logResolution(_: *const EventLoop) void {
+        std.debug.print(" - Event loop: kqueue\n", .{});
+    }
+
     pub fn armLiveTimer(self: *EventLoop, delay_ms: u64) void {
         var ch = [1]c.Kevent{makeKevent(TIMER_IDENT_LIVE, c.EVFILT.TIMER, c.EV.ADD | c.EV.ONESHOT, 0, @intCast(delay_ms), UDATA_LIVE_TIMER)};
         _ = keventSubmit(self.kq, &ch);

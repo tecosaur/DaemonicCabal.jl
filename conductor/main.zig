@@ -2474,6 +2474,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(" - Max clients per worker: {d}\n", .{cfg.worker_maxclients});
     std.debug.print(" - Idle TTL: {d}s (min {d}s), orphan failsafe {d}s\n", .{ cfg.max_ttl, cfg.min_ttl, cfg.max_ttl * 4 });
     conductor.pressure_monitor.logResolution(&conductor.cfg);
+    conductor.event_loop.logResolution();
     std.debug.print(" - Transport: {s}\n", .{@tagName(cfg.transport)});
     std.debug.print(" - Address: {s}\n", .{cfg.socket_path});
     if (cfg.port_range) |r| {
