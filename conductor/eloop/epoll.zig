@@ -167,7 +167,7 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
                 const w: *worker.Worker = @ptrFromInt(tag);
                 if (!conductor.isLiveWorker(w)) continue;
                 loop.disarm(tag);
-                conductor.onPong(w, null);
+                conductor.onPong(w);
                 continue;
             }
             switch (@as(EventLocation, @enumFromInt(tag))) {

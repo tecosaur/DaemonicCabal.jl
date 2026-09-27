@@ -212,7 +212,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                     } else {
                         var timer = [1]c.Kevent{makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
                         _ = keventSubmit(kq, &timer);
-                        conductor.onPong(w, null);
+                        conductor.onPong(w);
                     }
                     pool_changed = true;
                 },

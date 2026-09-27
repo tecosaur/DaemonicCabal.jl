@@ -201,6 +201,41 @@ pub fn readExact(fd: std.posix.socket_t, buf: []u8) !void {
     }
 }
 
+/// As `readExact`, but all of it within `timeout_ms`, however slowly the
+/// peer sends.
+pub fn readExactWithin(io: Io, fd: std.posix.socket_t, buf: []u8, timeout_ms: u32) !void {
+    const deadline = Io.Clock.now(.awake, io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const left_ms = @divTrunc(deadline - Io.Clock.now(.awake, io).nanoseconds, std.time.ns_per_ms);
+        if (left_ms <= 0 or !platform.waitReadable(fd, @intCast(left_ms))) return error.Timeout;
+        total += platform.recvNonBlocking(fd, buf[total..]) orelse return error.EndOfStream;
+    }
+}
+
+/// The longest socket path or `:port` a client is sent, and takes.
+pub const max_socket_path = 256;
+
+/// Reads a payload already received, whose lengths are its sender's word.
+pub const SliceReader = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    pub fn take(self: *SliceReader, n: usize) error{Truncated}![]const u8 {
+        if (n > self.bytes.len - self.pos) return error.Truncated;
+        defer self.pos += n;
+        return self.bytes[self.pos..][0..n];
+    }
+
+    pub fn int(self: *SliceReader, comptime T: type) error{Truncated}!T {
+        return std.mem.readInt(T, (try self.take(@sizeOf(T)))[0..@sizeOf(T)], .little);
+    }
+
+    pub fn lenPrefixed(self: *SliceReader, comptime T: type) error{Truncated}![]const u8 {
+        return self.take(try self.int(T));
+    }
+};
+
 pub const BufWriter = struct {
     buf: []u8,
     pos: usize = 0,
