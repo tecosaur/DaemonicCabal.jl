@@ -81,7 +81,8 @@ const Inputs = struct { args: []const []const u8, env: []const []const u8 };
 
 // <id:u8><len:u8><data>, possibly fragmented across reads.
 const SignalParser = struct {
-    buf: [256]u8 = undefined,
+    // Holds a whole frame beside a part: each pass takes some of a read.
+    buf: [2 * (header_size + 255)]u8 = undefined,
     len: usize = 0,
     sync_mode: bool = false,
     worker_wants_raw: bool = false,
@@ -93,14 +94,17 @@ const SignalParser = struct {
     };
 
     pub fn feed(self: *@This(), input: []const u8, fd: posix.socket_t) Result {
-        if (self.len + input.len > self.buf.len) {
-            platform.eprint("[client] signal buffer overflow\n", .{});
-            self.len = 0;
-            return .none;
+        var result: Result = .none;
+        var rest = input;
+        while (rest.len > 0) {
+            const n = @min(rest.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], rest[0..n]);
+            self.len += n;
+            rest = rest[n..];
+            const signal = self.process(fd);
+            if (result != .exit) result = signal; // exit is terminal
         }
-        @memcpy(self.buf[self.len..][0..input.len], input);
-        self.len += input.len;
-        return self.process(fd);
+        return result;
     }
 
     fn process(self: *@This(), fd: posix.socket_t) Result {
@@ -295,7 +299,7 @@ fn run(init: std.process.Init.Minimal) !void {
     var w = SocketWriter{ .handle = conductor };
     // The worker's own terminal knows nothing of ours. Colour follows where
     // output goes, as Julia's does.
-    const color = platform.isatty(platform.getStdoutHandle()) and !hasNoColor(inputs.env);
+    const color = colorWanted(inputs.env) orelse platform.isatty(platform.getStdoutHandle());
     try sendClientInfo(&w, env, is_tty, color, inputs.args);
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers();
@@ -313,9 +317,14 @@ fn collectInputs(a: std.mem.Allocator, init: std.process.Init.Minimal) !Inputs {
     return .{ .args = argv.items, .env = try platform.collectEnviron(a, init.environ) };
 }
 
-fn hasNoColor(env: []const []const u8) bool {
-    for (env) |kv| if (std.mem.startsWith(u8, kv, "NO_COLOR=") and kv.len > "NO_COLOR=".len) return true;
-    return false;
+/// As Julia's `FORCE_COLOR`, over `NO_COLOR`; null for neither.
+fn colorWanted(env: []const []const u8) ?bool {
+    var wanted: ?bool = null;
+    for (env) |kv| {
+        if (std.mem.startsWith(u8, kv, "FORCE_COLOR=") and kv.len > "FORCE_COLOR=".len) return true;
+        if (std.mem.startsWith(u8, kv, "NO_COLOR=") and kv.len > "NO_COLOR=".len) wanted = false;
+    }
+    return wanted;
 }
 
 fn scanEnv(kvs: []const []const u8) EnvInfo {
@@ -328,6 +337,8 @@ fn scanEnv(kvs: []const []const u8) EnvInfo {
     };
     for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // varies per benchmark run
+        // Only a variable is sent, so only one is counted.
+        if (std.mem.indexOfScalar(u8, kv, '=') == null) continue;
         info.count += 1;
         // XOR, so the fingerprint ignores order.
         var h = std.hash.Wyhash.init(kv.len);
