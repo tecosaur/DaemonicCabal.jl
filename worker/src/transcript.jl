@@ -343,6 +343,7 @@ function uninterrupted(f)
             return f()
         catch err
             err isa InterruptException || rethrow()
+            pass_interrupt()
         end
     end
 end

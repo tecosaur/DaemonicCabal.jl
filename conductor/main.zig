@@ -485,9 +485,14 @@ pub const Conductor = struct {
                     if (!w.ping_pending) self.event_loop.scheduleHealthCheck(w);
                 }
             },
-            .client_interrupt => {
-                // Untargeted, but the common worker serves one client.
-                if (self.active_clients.get(subject)) |info| info.worker.signal(platform.SIG.INT);
+            .client_interrupt => if (self.active_clients.get(subject)) |info| {
+                // From Julia 1.14 the message cancels exactly the client's code,
+                // and the SIGINT finds nothing to cancel; before, the SIGINT
+                // interrupts whichever client's code thread 0 runs.
+                var evaluation: [4]u8 = .{ 0, 0, 0, 0 };
+                readExact(socket, &evaluation) catch {};
+                info.worker.cancelClient(subject, std.mem.readInt(u32, &evaluation, .little));
+                info.worker.signal(platform.SIG.INT);
             },
             .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{subject}),
             .peek_report => self.receivePeekReport(socket, subject),

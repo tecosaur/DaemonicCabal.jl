@@ -145,7 +145,7 @@ end
             # Relayed Ctrl-Cs keep landing after the loop breaks: held off while
             # the interrupt they asked for renders, then dropped, being answered.
             try
-                Base.disable_sigint() do
+                shielded() do
                     printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
                     Base.show_exception_stack(IOContext(io, :limit => true), stack)
                     println(io)
@@ -211,7 +211,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
             isopen(client_stderr) && Base.invokelatest(Base.display_error, client_stderr, current_exceptions())
             1
         end
-        return Base.disable_sigint() do
+        return shielded() do
             teardown_client(client, client_stdin, client_stdout, client_stderr, signals, owned_streams, exit_code)
         end
     end
@@ -256,7 +256,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                         client_display = TextDisplay(stdoutx)
                         pushdisplay(client_display)
                         try
-                            runclient(mod, client; stdout=stdoutx, broadcast)
+                            with_client_scope(() -> runclient(mod, client; stdout=stdoutx, broadcast), client)
                         finally
                             popdisplay(client_display)
                         end
@@ -282,7 +282,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                       CLIENT_REPL => repl_ref,
                       CLIENT_RECORDING => recording,
                       REPLAY_TARGET => replay,
-                      runclient(mod, client; stdout=stdoutx, broadcast))
+                      with_client_scope(() -> runclient(mod, client; stdout=stdoutx, broadcast), client))
             end
         finally
             swap_env!(saved_env)
@@ -303,7 +303,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
         end
         # A force-thrown SIGINT mid uv_write would siglongjmp out of libuv and
         # corrupt the task fiber.
-        Base.disable_sigint() do
+        shielded() do
             teardown_client(client, client_stdin, run_stdout, client_stderr,
                             signals, owned_streams, exit_code)
         end
@@ -326,7 +326,15 @@ function scrub_backtrace(stack::Base.ExceptionStack)
     function scrub(bt)
         bt isa Vector{Base.StackTraces.StackFrame} || return bt
         entry = findfirst(f -> String(f.file) == @__FILE__, bt)
-        if isnothing(entry) bt else bt[1:entry-1] end
+        isnothing(entry) && return bt
+        bt = bt[1:entry-1]
+        # As Julia leaves out, from 1.14, the `eval` it runs the code through.
+        @static if isdefined(Base, :is_driver_machinery)
+            while !isempty(bt) && Base.is_driver_machinery(bt[end])
+                pop!(bt)
+            end
+        end
+        bt
     end
     Base.ExceptionStack(Any[(; x.exception, backtrace = scrub(x.backtrace))
                             for x in Base.scrub_repl_backtrace(stack)])
@@ -348,7 +356,7 @@ function run_piped_repl(mod::Module)
                 recording = CLIENT_RECORDING[]
                 isnothing(recording) || record!(recording, :input, "julia\n" * chomp(line))
             end
-            value = Core.eval(mod, ex)
+            value = as_client_code(() -> Core.eval(mod, ex))
             setglobal!(Base.MainInclude, :ans, value)
             isnothing(value) || Base.invokelatest(display, value)
         catch err
@@ -421,31 +429,33 @@ function runclient(mod::Module, client::ClientInfo; @nospecialize(stdout::IO=std
                                       map(f -> "  " * f, stale)], '\n') _module=nothing _file=nothing
     end
     runrepl = is_repl_client(client)
-    for (switch, value) in client.switches
-        if switch == "--eval"
-            Core.eval(mod, Base.parse_input_line(value))
-        elseif switch == "--print"
-            res = Core.eval(mod, Base.parse_input_line(value))
-            Base.invokelatest(show, stdout, res)
-            println(stdout)
-            isnothing(broadcast) || display_result(broadcast, res)
-        elseif switch == "--load"
-            Base.include(mod, value)
-        end
-    end
-    if !isnothing(client.programfile)
-        try
-            if client.programfile == "-"
-                Base.include_string(mod, read(stdin, String), "stdin")
-            else
-                Base.include(mod, client.programfile)
+    as_client_code() do
+        for (switch, value) in client.switches
+            if switch == "--eval"
+                Core.eval(mod, Base.parse_input_line(value))
+            elseif switch == "--print"
+                res = Core.eval(mod, Base.parse_input_line(value))
+                Base.invokelatest(show, stdout, res)
+                println(stdout)
+                isnothing(broadcast) || display_result(broadcast, res)
+            elseif switch == "--load"
+                Base.include(mod, value)
             end
-        catch err
-            # `exit(n)` is not a failure; `include` wraps it on the way out.
-            thrown = if err isa LoadError err.error else err end
-            thrown isa DaemonClientExit && throw(thrown)
-            Base.invokelatest(Base.display_error, scrub_backtrace(current_exceptions()))
-            runrepl || throw(DaemonClientExit(1))
+        end
+        if !isnothing(client.programfile)
+            try
+                if client.programfile == "-"
+                    Base.include_string(mod, read(stdin, String), "stdin")
+                else
+                    Base.include(mod, client.programfile)
+                end
+            catch err
+                # `exit(n)` is not a failure; `include` wraps it on the way out.
+                thrown = if err isa LoadError err.error else err end
+                thrown isa DaemonClientExit && throw(thrown)
+                Base.invokelatest(Base.display_error, scrub_backtrace(current_exceptions()))
+                runrepl || throw(DaemonClientExit(1))
+            end
         end
     end
     if runrepl && !client.tty

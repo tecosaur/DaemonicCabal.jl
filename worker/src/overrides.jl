@@ -116,7 +116,10 @@ else
     end
 end
 
-# `REPL.repl_backend_loop`, retrying a `take!` interrupted by a Ctrl-C still in flight.
+@static isdefined(Base, :sigint_new_episode!) && install_cancellation()
+
+# `REPL.repl_backend_loop`, each evaluation the client's code, retrying a
+# `take!` interrupted by a Ctrl-C still in flight.
 @eval REPL function repl_backend_loop(backend::REPLBackend, get_module::Function)
     # Interpolated only where it exists: `@eval` interpolates before `@static`.
     $(if VERSION >= v"1.11"
@@ -149,12 +152,7 @@ end
                 continue
             end
         end
-        $signal_executing(true)
-        try
-            eval_user_input(ast_or_func, backend, get_module())
-        finally
-            $signal_executing(false)
-        end
+        $as_client_code(() -> eval_user_input(ast_or_func, backend, get_module()))
     end
 end
 

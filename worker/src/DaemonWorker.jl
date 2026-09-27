@@ -27,6 +27,8 @@ struct SyncSession
     signals::Vector{StreamIO}
     screen::Recording  # the shared run, whose output a joiner is replayed
     repl::Base.RefValue{REPL.LineEditREPL}
+    executing::Base.RefValue{Tuple{Bool, UInt32}}  # the REPL's evaluation, as its clients are told
+    executing_lock::ReentrantLock  # held telling them, so a joiner is told in order
 end
 
 include("bufferedio.jl")

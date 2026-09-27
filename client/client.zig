@@ -143,7 +143,8 @@ const SignalParser = struct {
             },
             protocol.signals.executing => blk: {
                 // No ack: a stray one would be taken for the next raw_mode ack.
-                if (data.len == 1) platform.setWorkerExecuting(data[0] != 0);
+                if (data.len >= 1) platform.setWorkerExecuting(data[0] != 0);
+                if (data.len == 5) evaluation = std.mem.readInt(u32, data[1..5], .little);
                 break :blk .none;
             },
             protocol.signals.query_size => blk: {
@@ -535,19 +536,25 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.sock
     return socket;
 }
 
+/// The evaluation the worker last said was executing (0 if unnumbered), which
+/// an interrupt names, so that one read late can't reach a later evaluation.
+var evaluation: u32 = 0;
+
 /// Dials the conductor already reached, never resolving a name again, as
 /// this also runs in signal handlers. Errors are dropped.
 fn notifyConductor(kind: protocol.notification.Type) void {
-    var buf: [9]u8 = undefined;
+    var buf: [13]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
     buf[4] = @intFromEnum(kind);
     std.mem.writeInt(u32, buf[5..9], client_id, .little);
+    std.mem.writeInt(u32, buf[9..13], evaluation, .little);
+    const len: usize = if (kind == .client_interrupt) 13 else 9;
     const fd = switch (transport_mode) {
         .local => platform.connectLocal(conductor_path, protocol.connect_timeout_ms),
         .tcp => platform.connectTcp(conductor_peer orelse return, protocol.connect_timeout_ms),
     } catch return;
     defer platform.close(fd);
-    platform.socketWrite(fd, &buf);
+    platform.socketWrite(fd, buf[0..len]);
 }
 
 fn getTerminalSize() struct { height: u16, width: u16 } {
