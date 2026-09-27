@@ -159,7 +159,6 @@ pub const Worker = struct {
     unresponsive_interrupted: bool = false,
     /// Echoed in the pong, which tells a late pong for an earlier ping from this one's.
     ping_seq: u8 = 0,
-    pong_buf: [protocol.worker.pong_size]u8 = undefined,
     active_clients: u32, // as the worker counts them, watchers included
     watchers: u32 = 0,
     occupancy: Occupancies = .{},
@@ -527,25 +526,34 @@ pub const Worker = struct {
         self.writeHeader(.start_peek, 0);
     }
 
-    fn writeHeader(self: *Worker, msg_type: protocol.worker.MessageType, payload_len: u16) void {
-        var buf: [3]u8 = undefined;
+    fn writeHeader(self: *Worker, msg_type: protocol.worker.MessageType, payload_len: usize) void {
+        var buf: [protocol.worker.header_size]u8 = undefined;
         buf[0] = @intFromEnum(msg_type);
-        std.mem.writeInt(u16, buf[1..3], payload_len, .little);
+        std.mem.writeInt(u32, buf[1..5], @intCast(payload_len), .little);
         platform.write(self.socket, &buf);
+    }
+
+    /// A message whose payload is a string.
+    fn writeString(self: *Worker, msg_type: protocol.worker.MessageType, string: []const u8) void {
+        self.writeHeader(msg_type, 4 + string.len);
+        var len_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, @intCast(string.len), .little);
+        platform.write(self.socket, &len_buf);
+        platform.write(self.socket, string);
     }
 
     const Header = struct {
         msg_type: protocol.worker.MessageType,
-        payload_len: u16,
-        raw: [3]u8,
+        payload_len: u32,
+        raw: [protocol.worker.header_size]u8,
     };
 
     fn readHeader(self: *Worker) !Header {
-        var buf: [3]u8 = undefined;
+        var buf: [protocol.worker.header_size]u8 = undefined;
         try self.readAll(&buf);
         return .{
             .msg_type = std.enums.fromInt(protocol.worker.MessageType, buf[0]) orelse return error.UnexpectedResponse,
-            .payload_len = std.mem.readInt(u16, buf[1..3], .little),
+            .payload_len = std.mem.readInt(u32, buf[1..5], .little),
             .raw = buf,
         };
     }
@@ -560,9 +568,29 @@ pub const Worker = struct {
         while (true) {
             const header = try self.readHeader();
             if (header.msg_type != .pong) return header;
-            var payload: [protocol.worker.pong_size - 3]u8 = undefined;
-            try self.readAll(&payload);
+            _ = try self.readPongPayload();
         }
+    }
+
+    pub const Pong = struct { seq: u8, clients: u16 };
+
+    /// A pong the event loop found readable, read whole within the reply timeout.
+    pub fn readPong(self: *Worker) !Pong {
+        var buf: [protocol.worker.pong_size]u8 = undefined;
+        try self.readAll(&buf);
+        if (buf[0] != @intFromEnum(protocol.worker.MessageType.pong)) return error.UnexpectedResponse;
+        return parsePong(buf[protocol.worker.header_size..]);
+    }
+
+    /// Past its header.
+    fn readPongPayload(self: *Worker) !Pong {
+        var payload: [protocol.worker.pong_size - protocol.worker.header_size]u8 = undefined;
+        try self.readAll(&payload);
+        return parsePong(&payload);
+    }
+
+    fn parsePong(payload: *const [protocol.worker.pong_size - protocol.worker.header_size]u8) Pong {
+        return .{ .seq = payload[0], .clients = std.mem.readInt(u16, payload[1..3], .little) };
     }
 
     pub fn ping(self: *Worker) !void {
@@ -572,9 +600,7 @@ pub const Worker = struct {
             self.log("ping expected pong, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.UnexpectedResponse;
         }
-        var payload: [protocol.worker.pong_size - 3]u8 = undefined;
-        try self.readAll(&payload);
-        if (payload[0] != self.ping_seq) return error.UnexpectedResponse;
+        if ((try self.readPongPayload()).seq != self.ping_seq) return error.UnexpectedResponse;
     }
 
     /// Clients in use of the worker: a watcher only reads a session's transcript.
@@ -604,9 +630,8 @@ pub const Worker = struct {
         while (platform.waitReadable(self.socket, timeout_ms)) {
             const header = self.readHeader() catch return false;
             if (header.msg_type != .pong) return false;
-            var payload: [protocol.worker.pong_size - 3]u8 = undefined;
-            self.readAll(&payload) catch return false;
-            if (payload[0] == self.ping_seq) return true;
+            const pong = self.readPongPayload() catch return false;
+            if (pong.seq == self.ping_seq) return true;
         }
         return false;
     }
@@ -623,11 +648,7 @@ pub const Worker = struct {
 
     /// Takes ownership of `project` on success.
     pub fn setProject(self: *Worker, project: []const u8) !void {
-        self.writeHeader(.set_project, @intCast(2 + project.len));
-        var len_buf: [2]u8 = undefined;
-        std.mem.writeInt(u16, &len_buf, @intCast(project.len), .little);
-        platform.write(self.socket, &len_buf);
-        platform.write(self.socket, project);
+        self.writeString(.set_project, project);
         const header = try self.readReply();
         if (header.msg_type == .err) {
             self.log("setProject got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
@@ -645,11 +666,7 @@ pub const Worker = struct {
     }
 
     pub fn dropSession(self: *Worker, label: []const u8) void {
-        self.writeHeader(.drop_session, @intCast(2 + label.len));
-        var len_buf: [2]u8 = undefined;
-        std.mem.writeInt(u16, &len_buf, @intCast(label.len), .little);
-        platform.write(self.socket, &len_buf);
-        platform.write(self.socket, label);
+        self.writeString(.drop_session, label);
     }
 
     /// A client's Ctrl-C during `evaluation`, which from Julia 1.14 cancels
@@ -665,8 +682,7 @@ pub const Worker = struct {
     /// The worker drops clients not in `ids`; returns its count of clients
     /// still running.
     pub fn syncClients(self: *Worker, ids: []const u32) !u16 {
-        const payload_len: u16 = 2 + @as(u16, @intCast(ids.len)) * 4;
-        self.writeHeader(.sync_clients, payload_len);
+        self.writeHeader(.sync_clients, 2 + ids.len * 4);
         var len_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_buf, @intCast(ids.len), .little);
         platform.write(self.socket, &len_buf);
@@ -718,11 +734,12 @@ pub const Worker = struct {
         allocator: Allocator,
         client_info: *const ClientInfo,
     ) !SocketPaths {
-        const pf_len: usize = if (client_info.programfile) |pf| pf.len + 2 else 0;
-        var payload_size: usize = 1 + 4 + 4 + 2 + client_info.cwd.len + 2 + 2 + 1 + pf_len + 2 + 2;
-        for (client_info.env) |e| payload_size += 4 + e.key.len + e.value.len;
-        for (client_info.switches) |sw| payload_size += 4 + sw.name.len + sw.value.len;
-        for (client_info.args) |arg| payload_size += 2 + arg.len;
+        const pf_len: usize = if (client_info.programfile) |pf| 4 + pf.len else 0;
+        // flags, id, pid, cwd, the three counts, the program file's flag, port set
+        var payload_size: usize = 1 + 4 + 4 + 4 + client_info.cwd.len + 3 * 4 + 1 + pf_len + 2;
+        for (client_info.env) |e| payload_size += 8 + e.key.len + e.value.len;
+        for (client_info.switches) |sw| payload_size += 8 + sw.name.len + sw.value.len;
+        for (client_info.args) |arg| payload_size += 4 + arg.len;
         const send_buf = try allocator.alloc(u8, payload_size);
         defer allocator.free(send_buf);
         var w = BufWriter{ .buf = send_buf };
@@ -731,30 +748,30 @@ pub const Worker = struct {
         // The pid as the worker will see it: a client-launched worker shares
         // the client's pid namespace.
         w.writeInt(u32, if (self.launch == .client) client_info.pid else (client_info.host_pid orelse client_info.pid));
-        w.writeLenPrefixed(u16, client_info.cwd);
-        w.writeInt(u16, @intCast(client_info.env.len));
+        w.writeLenPrefixed(u32, client_info.cwd);
+        w.writeInt(u32, @intCast(client_info.env.len));
         for (client_info.env) |e| {
-            w.writeLenPrefixed(u16, e.key);
-            w.writeLenPrefixed(u16, e.value);
+            w.writeLenPrefixed(u32, e.key);
+            w.writeLenPrefixed(u32, e.value);
         }
-        w.writeInt(u16, @intCast(client_info.switches.len));
+        w.writeInt(u32, @intCast(client_info.switches.len));
         for (client_info.switches) |sw| {
-            w.writeLenPrefixed(u16, sw.name);
-            w.writeLenPrefixed(u16, sw.value);
+            w.writeLenPrefixed(u32, sw.name);
+            w.writeLenPrefixed(u32, sw.value);
         }
         if (client_info.programfile) |pf| {
             w.writeInt(u8, 1);
-            w.writeLenPrefixed(u16, pf);
+            w.writeLenPrefixed(u32, pf);
         } else {
             w.writeInt(u8, 0);
         }
-        w.writeInt(u16, @intCast(client_info.args.len));
+        w.writeInt(u32, @intCast(client_info.args.len));
         for (client_info.args) |arg| {
-            w.writeLenPrefixed(u16, arg);
+            w.writeLenPrefixed(u32, arg);
         }
         w.writeInt(u16, client_info.port_set);
         std.debug.print("Worker {d}: sending client_run ({d} bytes)\n", .{ self.id, payload_size });
-        self.writeHeader(.client_run, @intCast(payload_size));
+        self.writeHeader(.client_run, payload_size);
         platform.write(self.socket, send_buf);
         std.debug.print("Worker {d}: waiting for response...\n", .{self.id});
         const header = try self.readReply();
@@ -769,14 +786,10 @@ pub const Worker = struct {
                 self.readAll(err_payload) catch {
                     return error.WorkerError;
                 };
-                if (header.payload_len >= 4) {
-                    const err_code = std.mem.readInt(u16, err_payload[0..2], .little);
-                    const msg_len = std.mem.readInt(u16, err_payload[2..4], .little);
-                    if (4 + msg_len <= header.payload_len) {
-                        const err_msg = err_payload[4..][0..msg_len];
-                        self.log("error (code {d}): {s}", .{ err_code, err_msg });
-                    }
-                }
+                var r = protocol.SliceReader{ .bytes = err_payload };
+                const err_code = r.int(u16) catch return error.WorkerError;
+                const err_msg = r.lenPrefixed(u32) catch return error.WorkerError;
+                self.log("error (code {d}): {s}", .{ err_code, err_msg });
             }
             return error.WorkerError;
         }
@@ -796,7 +809,7 @@ pub const Worker = struct {
         self.active_clients = r.int(u32) catch return error.UnexpectedResponse;
         var paths: [4][]const u8 = undefined;
         for (&paths, 0..) |*path, i| {
-            path.* = r.lenPrefixed(u16) catch return error.UnexpectedResponse;
+            path.* = r.lenPrefixed(u32) catch return error.UnexpectedResponse;
             // An empty stdin path means the worker is at capacity.
             if (i == 0 and path.len == 0) return error.WorkerBusy;
             if (path.len > protocol.max_socket_path) return error.UnexpectedResponse;

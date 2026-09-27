@@ -6,32 +6,32 @@ let
     # -- Conductor messages ------------------------------------------------------
     buf = IOBuffer()
     write(buf, UInt32(PROTOCOL_MAGIC))
-    write(buf, UInt8(MSG_TYPE.ping), UInt16(1), UInt8(1))
+    write(buf, UInt8(MSG_TYPE.ping), UInt32(1), UInt8(1))
     proj = "/tmp/test"
-    write(buf, UInt8(MSG_TYPE.set_project), UInt16(2 + ncodeunits(proj)))
+    write(buf, UInt8(MSG_TYPE.set_project), UInt32(4 + ncodeunits(proj)))
     write_string(buf, proj)
-    write(buf, UInt8(MSG_TYPE.query_state), UInt16(0))
+    write(buf, UInt8(MSG_TYPE.query_state), UInt32(0))
     cr = IOBuffer()
     write(cr, UInt8(0x00))                        # flags: tty=false, force=false
     write(cr, UInt32(7))                          # client id
     write(cr, UInt32(12345))                      # pid
     write_string(cr, "/tmp")                               # cwd
-    write(cr, UInt16(2))                          # env_count
+    write(cr, UInt32(2))                          # env_count
     write_string(cr, "TERM"); write_string(cr, "xterm-256color")
     write_string(cr, "HOME"); write_string(cr, "/home/test")
-    write(cr, UInt16(2))                          # switch_count
+    write(cr, UInt32(2))                          # switch_count
     write_string(cr, "--eval"); write_string(cr, "1+1")
     write_string(cr, "--color"); write_string(cr, "yes")
     write(cr, UInt8(0))                           # has_programfile=false
-    write(cr, UInt16(1))                          # arg_count
+    write(cr, UInt32(1))                          # arg_count
     write_string(cr, "arg1")
     write(cr, UInt16(0xFFFF))                     # port_set=NONE
     cr_data = take!(cr)
-    write(buf, UInt8(MSG_TYPE.client_run), UInt16(length(cr_data)))
+    write(buf, UInt8(MSG_TYPE.client_run), UInt32(length(cr_data)))
     write(buf, cr_data)
-    write(buf, UInt8(MSG_TYPE.sync_clients), UInt16(2 + 4))
+    write(buf, UInt8(MSG_TYPE.sync_clients), UInt32(2 + 4))
     write(buf, UInt16(1), UInt32(12345))
-    write(buf, UInt8(MSG_TYPE.soft_exit), UInt16(0))
+    write(buf, UInt8(MSG_TYPE.soft_exit), UInt32(0))
     seekstart(buf)
     # -- Protocol reading ------------------------------------------------------
     verify_magic(buf)

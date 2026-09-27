@@ -69,7 +69,7 @@ const SocketSet = struct {
 
 const EnvInfo = struct {
     fingerprint: u64,
-    count: u16,
+    count: u32,
     server_path: ?[]const u8,
     runtime_dir: ?[]const u8,
     xdg_runtime_dir: ?[]const u8,
@@ -406,15 +406,15 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, for
     w.writeInt(u32, @intCast(platform.getpid()));
     w.writeInt(u32, @intCast(platform.getppid()));
     // CWD, read straight into the buffer behind its length
-    if (w.pos + 2 >= w.buf.len) w.flush();
+    if (w.pos + 4 >= w.buf.len) w.flush();
     const len_pos = w.pos;
-    w.pos += 2;
+    w.pos += 4;
     const cwd_len = (try platform.currentDir(w.buf[w.pos..])).len;
-    std.mem.writeInt(u16, w.buf[len_pos..][0..2], @intCast(cwd_len), .little);
+    std.mem.writeInt(u32, w.buf[len_pos..][0..4], @intCast(cwd_len), .little);
     w.pos += cwd_len;
     w.writeInt(u64, env.fingerprint);
-    w.writeInt(u16, @intCast(forwarded.len));
-    for (forwarded) |arg| w.writeLenPrefixed(u16, arg);
+    w.writeInt(u32, @intCast(forwarded.len));
+    for (forwarded) |arg| w.writeLenPrefixed(u32, arg);
     w.flush();
 }
 
@@ -494,12 +494,12 @@ fn takeString(reader: protocol.BufReader, a: std.mem.Allocator) ![:0]u8 {
 }
 
 fn sendFullEnv(w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) void {
-    w.writeInt(u16, env.count);
+    w.writeInt(u32, env.count);
     for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue;
         const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
-        w.writeLenPrefixed(u16, kv[0..eq]);
-        w.writeLenPrefixed(u16, kv[eq + 1 ..]);
+        w.writeLenPrefixed(u32, kv[0..eq]);
+        w.writeLenPrefixed(u32, kv[eq + 1 ..]);
     }
     w.flush();
 }
