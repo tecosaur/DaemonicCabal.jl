@@ -153,7 +153,10 @@ fn relay(src: posix.fd_t, dst: posix.fd_t, buf: []u8, ev: c.Kevent) bool {
     while (remaining > 0) {
         const n = posix.read(src, buf[0..@min(remaining, buf.len)]) catch return true;
         if (n == 0) return true;
-        platform.write(dst, buf[0..n]);
+        if (!platform.writeOutput(dst, buf[0..n])) {
+            platform.close(src);
+            return true;
+        }
         remaining -= n;
     }
     return (ev.flags & EV_EOF) != 0 or ev.data == 0;

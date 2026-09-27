@@ -58,7 +58,11 @@ pub fn run(
                         stdout_eof = true;
                         continue;
                     }
-                    platform.write(posix.STDOUT_FILENO, worker_stdout_buf[0..len]);
+                    if (!platform.writeOutput(posix.STDOUT_FILENO, worker_stdout_buf[0..len])) {
+                        platform.close(stdout_fd);
+                        stdout_eof = true;
+                        continue;
+                    }
                     _ = try ring.read(@intFromEnum(Location.worker_stdout), stdout_fd, .{ .buffer = &worker_stdout_buf }, 0);
                 },
                 @intFromEnum(Location.worker_stderr) => {
@@ -66,7 +70,11 @@ pub fn run(
                         stderr_eof = true;
                         continue;
                     }
-                    platform.write(posix.STDERR_FILENO, worker_stderr_buf[0..len]);
+                    if (!platform.writeOutput(posix.STDERR_FILENO, worker_stderr_buf[0..len])) {
+                        platform.close(stderr_fd);
+                        stderr_eof = true;
+                        continue;
+                    }
                     _ = try ring.read(@intFromEnum(Location.worker_stderr), stderr_fd, .{ .buffer = &worker_stderr_buf }, 0);
                 },
                 @intFromEnum(Location.local_stdin) => {

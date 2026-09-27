@@ -57,16 +57,8 @@ pub fn run(
             count += 1;
         }
         for (events[0..count]) |ev| switch (@as(Location, @enumFromInt(ev.data.u64))) {
-            .worker_stdout => if (readSome(epfd, stdout_fd, &buf)) |data| {
-                platform.write(posix.STDOUT_FILENO, data);
-            } else {
-                stdout_eof = true;
-            },
-            .worker_stderr => if (readSome(epfd, stderr_fd, &buf)) |data| {
-                platform.write(posix.STDERR_FILENO, data);
-            } else {
-                stderr_eof = true;
-            },
+            .worker_stdout => stdout_eof = !relay(epfd, stdout_fd, posix.STDOUT_FILENO, &buf),
+            .worker_stderr => stderr_eof = !relay(epfd, stderr_fd, posix.STDERR_FILENO, &buf),
             .local_stdin => {
                 if (exit_code != null) continue;
                 if (readSome(epfd, posix.STDIN_FILENO, &buf)) |data| {
@@ -89,6 +81,15 @@ pub fn run(
         };
     }
     return exit_code.?;
+}
+
+/// Passes on what `src` holds; returns whether it goes on.
+fn relay(epfd: i32, src: posix.fd_t, dst: posix.fd_t, buf: []u8) bool {
+    const data = readSome(epfd, src, buf) orelse return false;
+    if (platform.writeOutput(dst, data)) return true;
+    unwatch(epfd, src);
+    platform.close(src);
+    return false;
 }
 
 fn watch(epfd: i32, fd: posix.fd_t, location: Location) !void {

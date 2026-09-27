@@ -26,20 +26,32 @@ pub const geteuid = linux.geteuid;
 
 // I/O
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
+    if (!writeAll(fd, buf)) shared.eprint("write error on fd {d}\n", .{fd});
+}
+
+/// Whether all of `buf` was written: false once `fd` refuses it, its reader
+/// gone, say. Waits out a non-blocking `fd` that is full.
+pub fn writeAll(fd: posix.fd_t, buf: []const u8) bool {
     var written: usize = 0;
     while (written < buf.len) {
         const rc = linux.write(fd, buf.ptr + written, buf.len - written);
         const signed: isize = @bitCast(rc);
         if (signed < 0) {
             @branchHint(.cold);
-            const e = @as(linux.E, @enumFromInt(@as(u16, @intCast(-signed))));
-            if (e == .INTR) continue;
-            shared.eprint("write error on fd {d}: errno {d}\n", .{ fd, @intFromEnum(e) });
-            return;
+            switch (@as(linux.E, @enumFromInt(@as(u16, @intCast(-signed))))) {
+                .INTR => continue,
+                .AGAIN => {
+                    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                    _ = posix.poll(&pfd, -1) catch return false;
+                    continue;
+                },
+                else => return false,
+            }
         }
-        if (signed == 0) return; // no progress; avoid spinning
+        if (signed == 0) return false; // no progress; avoid spinning
         written += @intCast(signed);
     }
+    return true;
 }
 
 // Raw primitives
