@@ -151,6 +151,15 @@ fn handleKind(fd: HANDLE) HandleKind {
     return handle_kinds.get(@intFromPtr(fd)) orelse .afd;
 }
 
+/// Probes a handle outside the registry: a child's stdio pipe, which Io closes
+/// unseen, so a registry entry would outlive it to mislabel its number's reuse.
+fn readinessKind(fd: HANDLE) HandleKind {
+    lockRegistry();
+    const kind = handle_kinds.get(@intFromPtr(fd));
+    unlockRegistry();
+    return kind orelse if (pipeState(fd) != null) .pipe else .afd;
+}
+
 fn setKind(fd: HANDLE, kind: HandleKind) void {
     lockRegistry();
     defer unlockRegistry();
@@ -163,12 +172,15 @@ fn isAssociated(fd: HANDLE) bool {
     return associated.contains(@intFromPtr(fd));
 }
 
+/// Records only a registered handle, for the reason `readinessKind` gives; an
+/// unrecorded one is found already associated by the port's refusal.
 pub fn associate(port: HANDLE, fd: HANDLE) !void {
     if (isAssociated(fd)) return;
-    if (CreateIoCompletionPort(fd, port, 0, 0) == null) return error.IocpAssociateFailed;
+    if (CreateIoCompletionPort(fd, port, 0, 0) == null and win32.GetLastError() != .INVALID_PARAMETER)
+        return error.IocpAssociateFailed;
     lockRegistry();
     defer unlockRegistry();
-    associated.put(std.heap.page_allocator, @intFromPtr(fd), {}) catch {};
+    if (handle_kinds.contains(@intFromPtr(fd))) associated.put(std.heap.page_allocator, @intFromPtr(fd), {}) catch {};
 }
 
 pub fn markAssociated(fd: HANDLE) void {
@@ -328,43 +340,33 @@ fn pipeSyncOp(h: HANDLE, read: bool, buf: []const u8) !usize {
         return error.OutOfMemory;
     };
     unlockRegistry();
-    const disown = struct {
-        fn f(t: *IoStatusToken) void {
-            lockRegistry();
-            _ = sync_tokens.remove(@intFromPtr(&t.iosb));
-            unlockRegistry();
-            std.heap.page_allocator.destroy(t);
-        }
-    }.f;
-    const stat = if (read)
+    const issued = if (read)
         ntdll.NtReadFile(h, ev, null, @ptrCast(&tok.iosb), &tok.iosb, @ptrCast(@constCast(buf.ptr)), @intCast(buf.len), null, null)
     else
         ntdll.NtWriteFile(h, ev, null, @ptrCast(&tok.iosb), &tok.iosb, @ptrCast(buf.ptr), @intCast(buf.len), null, null);
-    switch (stat) {
-        .SUCCESS, .PENDING => {},
-        .PIPE_BROKEN, .PIPE_DISCONNECTED, .PIPE_CLOSING, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => {
-            disown(tok);
-            return 0;
-        },
-        else => {
-            disown(tok);
-            return win32.unexpectedStatus(stat);
-        },
+    if (issued != .SUCCESS and issued != .PENDING) {
+        // No IRP, so no packet: the token is ours again.
+        lockRegistry();
+        _ = sync_tokens.remove(@intFromPtr(&tok.iosb));
+        unlockRegistry();
+        std.heap.page_allocator.destroy(tok);
+        return pipeResult(issued, 0);
     }
-    if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED) {
-        disown(tok);
-        return error.EventWaitFailed;
-    }
-    const result: usize = switch (tok.iosb.u.Status) {
-        .SUCCESS => tok.iosb.Information,
-        .PIPE_BROKEN, .PIPE_DISCONNECTED, .PIPE_CLOSING, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => 0,
-        else => {
-            disown(tok);
-            return win32.unexpectedStatus(tok.iosb.u.Status);
-        },
-    };
+    // The IRP may still write the token, so it stays.
+    if (WaitForSingleObject(ev, INFINITE) == WAIT_FAILED) return error.EventWaitFailed;
+    const status = tok.iosb.u.Status;
+    const transferred = tok.iosb.Information;
+    // An associated handle's packet is still to come, and the loop frees the token with it.
     if (!is_assoc) std.heap.page_allocator.destroy(tok);
-    return result;
+    return pipeResult(status, transferred);
+}
+
+fn pipeResult(status: win32.NTSTATUS, transferred: usize) !usize {
+    return switch (status) {
+        .SUCCESS => transferred,
+        .PIPE_BROKEN, .PIPE_DISCONNECTED, .PIPE_CLOSING, .END_OF_FILE, .GRACEFUL_DISCONNECT, .REMOTE_DISCONNECT, .CONNECTION_RESET => 0,
+        else => win32.unexpectedStatus(status),
+    };
 }
 
 /// std.debug.print without its stderr locking and terminal handling, which
@@ -446,6 +448,12 @@ fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
         if (!(pollReadable(fd, @intCast(timeout_ms)) catch return 0)) return 0;
         return afdRecv(fd, buf) catch 0;
     }
+    return pipeRead(fd, buf, timeout_ms);
+}
+
+/// Posts no completion packet, so reads any pipe, on a port or not, without
+/// the registry. 0 on timeout, EOF or error.
+fn pipeRead(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
     // The IRP writes into this frame, so an expired read is cancelled and waited out.
     var iosb: win32.IO_STATUS_BLOCK = undefined;
     const ev = ensureEvent() catch return 0;
@@ -468,7 +476,7 @@ fn socketReadTimeout(fd: HANDLE, buf: []u8, timeout_ms: u32) usize {
         .SUCCESS => iosb.Information,
         .CANCELLED, .PIPE_BROKEN, .PIPE_DISCONNECTED, .END_OF_FILE => 0,
         else => |status| blk: {
-            eprint("socketReadTimeout: NTSTATUS 0x{x}\n", .{@intFromEnum(status)});
+            eprint("pipeRead: NTSTATUS 0x{x}\n", .{@intFromEnum(status)});
             break :blk 0;
         },
     };
@@ -661,6 +669,7 @@ const FILE_FLAG_FIRST_PIPE_INSTANCE: DWORD = 0x00080000;
 const PIPE_UNLIMITED_INSTANCES: DWORD = 255;
 const DUPLICATE_SAME_ACCESS: DWORD = 2;
 const SDDL_REVISION_1: DWORD = 1;
+const FILE_PIPE_CONNECTED_STATE: ULONG = 3;
 
 fn comptimeWide(comptime name: []const u8) [name.len:0]u16 {
     var out: [name.len:0]u16 = undefined;
@@ -734,7 +743,8 @@ fn issuePipeListen(h: HANDLE, iosb: *win32.IO_STATUS_BLOCK) !void {
     }
 }
 
-fn pipeConnected(h: HANDLE) bool {
+/// Null when `h` is no named pipe.
+fn pipeState(h: HANDLE) ?ULONG {
     const LocalInfo = extern struct {
         NamedPipeType: ULONG,
         NamedPipeConfiguration: ULONG,
@@ -749,8 +759,8 @@ fn pipeConnected(h: HANDLE) bool {
     };
     var info: LocalInfo = undefined;
     var iosb: win32.IO_STATUS_BLOCK = undefined;
-    if (ntdll.NtQueryInformationFile(h, &iosb, &info, @sizeOf(LocalInfo), .PipeLocal) != .SUCCESS) return false;
-    return info.NamedPipeState == 3; // FILE_PIPE_CONNECTED_STATE
+    if (ntdll.NtQueryInformationFile(h, &iosb, &info, @sizeOf(LocalInfo), .PipeLocal) != .SUCCESS) return null;
+    return info.NamedPipeState;
 }
 
 fn awaitPipeClient(h: HANDLE, timeout_ms: u32) !bool {
@@ -886,7 +896,7 @@ pub const Listener = struct {
     pub fn acceptTimeout(self: *Listener, io: Io, timeout_ms: i32) !?HANDLE {
         switch (self.backing) {
             .pipe => |instance| {
-                if (!pipeConnected(instance)) {
+                if (pipeState(instance) != FILE_PIPE_CONNECTED_STATE) {
                     if (timeout_ms == 0) return null;
                     if (!try awaitPipeClient(instance, @intCast(timeout_ms))) return null;
                 }
@@ -956,7 +966,7 @@ var zero_read_buf: [1]u8 = undefined; // a zero-length read still wants a buffer
 
 /// True when no packet will follow, so the caller posts one itself.
 pub fn issueReadiness(poll_device: HANDLE, port: HANDLE, fd: HANDLE, op: *ReadinessOp) bool {
-    switch (handleKind(fd)) {
+    switch (readinessKind(fd)) {
         .afd => {
             op.poll = pollInfo(fd, -1);
             const status = ntdll.NtDeviceIoControlFile(poll_device, null, null, @ptrCast(&op.iosb), &op.iosb, win32.IOCTL.AFD.POLL, std.mem.asBytes(&op.poll), @sizeOf(PollInfo), std.mem.asBytes(&op.poll), @sizeOf(PollInfo));
@@ -978,7 +988,7 @@ pub fn issueReadiness(poll_device: HANDLE, port: HANDLE, fd: HANDLE, op: *Readin
 /// Its packet still arrives, cancelled.
 pub fn cancelReadiness(poll_device: HANDLE, fd: HANDLE, op: *ReadinessOp) void {
     var scratch: win32.IO_STATUS_BLOCK = undefined;
-    const issued_on = if (handleKind(fd) == .afd) poll_device else fd;
+    const issued_on = if (readinessKind(fd) == .afd) poll_device else fd;
     _ = ntdll.NtCancelIoFileEx(issued_on, &op.iosb, &scratch);
 }
 
@@ -1019,7 +1029,8 @@ pub fn issueRecv(h: HANDLE, buf: []u8) ?*RecvCtx {
 // Processes. A `pid` here is a process handle (std's Child.Id).
 // =============================================================================
 
-/// TERM and KILL both terminate; USR1 is a no-op.
+/// TERM and KILL both terminate; INT and USR1 are no-ops, as no signal can
+/// interrupt a worker's code (a Ctrl-C reaches it as a `cancel_client`).
 pub const SIG = enum { INT, TERM, KILL, USR1 };
 /// Julia takes no signal for a profile here; the worker is asked instead.
 pub const peek_signal: ?SIG = null;
@@ -1034,7 +1045,7 @@ pub fn getppid() DWORD {
 }
 
 pub fn kill(pid: posix.pid_t, sig: SIG) usize {
-    if (sig == .USR1) return 0;
+    if (sig == .INT or sig == .USR1) return 0;
     return if (TerminateProcess(pid, 1).toBool()) 0 else 1;
 }
 
@@ -1050,21 +1061,27 @@ pub fn spawnWorker(io: Io, argv: []const []const u8, environ_map: *const std.pro
     return child;
 }
 
-/// Never, as a worker's stderr is read once it has exited (`dumpChildStderr`).
-pub fn readAvailable(_: HANDLE, _: []u8) ?usize {
-    return null;
+/// What a child's stdio pipe holds, without waiting: 0 when nothing; null
+/// once it has ended.
+pub fn readAvailable(pipe: HANDLE, buf: []u8) ?usize {
+    var available: DWORD = 0;
+    if (!PeekNamedPipe(pipe, null, 0, null, &available, null).toBool()) return null;
+    if (available == 0) return 0;
+    const n = pipeRead(pipe, buf[0..@min(buf.len, available)], INFINITE);
+    return if (n == 0) null else n;
 }
 
 /// The worker must have exited: the read runs to EOF.
-pub fn dumpChildStderr(io: Io, allocator: Allocator, child: *std.process.Child, id: u32) void {
-    var f = child.stderr orelse return;
+pub fn dumpChildStderr(_: Io, _: Allocator, child: *std.process.Child, id: u32) void {
+    const f = child.stderr orelse return;
     child.stderr = null;
-    defer f.close(io);
+    defer win32.CloseHandle(f.handle);
     var buf: [8192]u8 = undefined;
-    var fr = f.reader(io, &buf);
-    const data = fr.interface.allocRemaining(allocator, .limited(1 << 20)) catch return;
-    defer allocator.free(data);
-    if (data.len > 0) eprint("Worker {d} stderr:\n{s}\n", .{ id, data });
+    var n = pipeRead(f.handle, &buf, INFINITE);
+    if (n == 0) return;
+    eprint("Worker {d} stderr:\n", .{id});
+    while (n > 0) : (n = pipeRead(f.handle, &buf, INFINITE)) writeFile(getStderrHandle(), buf[0..n]);
+    writeFile(getStderrHandle(), "\n");
 }
 
 pub fn pidNumber(pid: posix.pid_t) u32 {
