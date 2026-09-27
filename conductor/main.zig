@@ -58,7 +58,6 @@ else if (builtin.os.tag == .windows)
 else
     @compileError("unsupported OS");
 
-const readExact = protocol.readExact;
 const EventLocation = protocol.EventLocation;
 
 
@@ -191,10 +190,7 @@ pub const Conductor = struct {
     pub fn deinit(self: *Conductor) void {
         self.abandonSpawns();
         self.pending_spawns.deinit(self.allocator);
-        while (self.pending_connections.pop()) |pc| {
-            platform.close(pc.socket);
-            self.allocator.destroy(pc);
-        }
+        while (self.pending_connections.pop()) |pc| self.discardConnection(pc);
         self.pending_connections.deinit(self.allocator);
         live.deinit(self);
         reconfigure.deinit(self);
@@ -303,7 +299,19 @@ pub const Conductor = struct {
     /// `held`: the socket stays open for a client waiting on a starting worker.
     pub const Outcome = enum { done, held };
 
-    pub const PendingConnection = struct { socket: posix.socket_t, peer: PeerInfo, deadline: i64 };
+    /// Read as it arrives, however slowly, all within `request_timeout_s`.
+    pub const PendingConnection = struct {
+        socket: posix.socket_t,
+        peer: PeerInfo,
+        deadline: i64,
+        received: std.ArrayList(u8) = .empty,
+        /// Where the client's environment begins, once it was asked for.
+        env_at: ?usize = null,
+    };
+
+    /// Whatever a peer may send: a request with its arguments and
+    /// environment, or a notification with a profile report.
+    const max_message_bytes = 64 << 20;
 
     // Event tags: a pending record's pointer, its low bits naming what turned readable.
     const tag_spawn_listener: usize = 2;
@@ -336,13 +344,14 @@ pub const Conductor = struct {
             },
             tag_connection => {
                 const pc: *PendingConnection = @ptrFromInt(addr);
-                if (!removePending(&self.pending_connections, pc)) return;
-                defer self.allocator.destroy(pc);
-                const outcome = self.handleConnectionFd(pc.socket, &pc.peer) catch |err| blk: {
-                    std.debug.print("Client handling failed: {}\n", .{err});
+                if (!isPending(&self.pending_connections, pc)) return;
+                const outcome = self.receive(pc) catch |err| blk: {
+                    std.debug.print("Connection dropped: {}\n", .{err});
                     break :blk .done;
-                };
-                if (outcome == .done) platform.close(pc.socket);
+                } orelse return self.event_loop.watchFd(tag, pc.socket);
+                _ = removePending(&self.pending_connections, pc);
+                if (outcome == .held) pc.socket = platform.no_socket;
+                self.discardConnection(pc);
             },
             tag_worker_stderr => {
                 const w: *worker.Worker = @ptrFromInt(addr);
@@ -409,11 +418,10 @@ pub const Conductor = struct {
                 i += 1;
                 continue;
             }
-            std.debug.print("Connection sent no request within {d}s; dropped\n", .{request_timeout_s});
+            std.debug.print("Connection sent no whole message within {d}s; dropped\n", .{request_timeout_s});
             _ = self.pending_connections.swapRemove(i);
             self.event_loop.unwatchFd(@intFromPtr(pc) | tag_connection, pc.socket);
-            platform.close(pc.socket);
-            self.allocator.destroy(pc);
+            self.discardConnection(pc);
         }
         i = 0;
         while (i < self.pending_spawns.items.len) {
@@ -437,38 +445,44 @@ pub const Conductor = struct {
         return false;
     }
 
-    pub fn handleConnectionFd(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) !Outcome {
-        // Bounds a peer stalling midway; one that never sends is dropped by tickConnections.
-        platform.setRecvTimeout(socket, request_timeout_s);
-        var magic_buf: [4]u8 = undefined;
-        // A silent close is `juliaclient --version` probing.
-        const first = platform.socketRead(socket, &magic_buf);
-        if (first == 0) return .done;
-        readExact(socket, magic_buf[first..]) catch |err| {
-            std.debug.print("Connection sent no request within {d}s ({})\n", .{ request_timeout_s, err });
-            return err;
-        };
-        const magic = std.mem.readInt(u32, &magic_buf, .little);
-        if (magic == protocol.client.magic) {
-            return self.handleClient(socket, peer);
-        } else if (magic == protocol.notification.magic) {
-            self.handleNotification(socket);
-        } else if (magic >> 8 == protocol.client.magic_prefix) {
-            try self.rejectClientVersion(socket, peer, @intCast(magic & 0xFF));
-        } else {
-            std.debug.print("Invalid magic: {x}\n", .{magic});
-            return error.InvalidMagic;
-        }
-        return .done;
+    fn discardConnection(self: *Conductor, pc: *PendingConnection) void {
+        if (pc.socket != platform.no_socket) platform.close(pc.socket);
+        pc.received.deinit(self.allocator);
+        self.allocator.destroy(pc);
     }
 
-    // The body is drained first so the reply isn't lost to a reset; a client too
-    // old for this framing still fails at once.
-    fn rejectClientVersion(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo, theirs: u8) !void {
+    /// Takes what has arrived; null while the message is still incomplete.
+    fn receive(self: *Conductor, pc: *PendingConnection) !?Outcome {
+        var chunk: [16 << 10]u8 = undefined;
+        const n = platform.recvNonBlocking(pc.socket, &chunk) orelse {
+            // A silent close is `juliaclient --version` probing.
+            if (pc.received.items.len == 0) return .done;
+            return error.EndOfStream;
+        };
+        if (n == 0) return null;
+        if (pc.received.items.len + n > max_message_bytes) return error.MessageTooLarge;
+        try pc.received.appendSlice(self.allocator, chunk[0..n]);
+        var r = protocol.SliceReader{ .bytes = pc.received.items };
+        const magic = r.int(u32) catch return null;
+        if (magic == protocol.client.magic) return self.receiveRequest(pc, &r);
+        if (magic == protocol.notification.magic) {
+            const note = parseNotification(&r) catch |err| return if (err == error.Truncated) null else err;
+            self.handleNotification(note);
+            return .done;
+        }
+        if (magic >> 8 == protocol.client.magic_prefix) {
+            try self.rejectClientVersion(pc.socket, @intCast(magic & 0xFF));
+            return .done;
+        }
+        std.debug.print("Invalid magic: {x}\n", .{magic});
+        return error.InvalidMagic;
+    }
+
+    // Its request is left unread: however it is framed, the reply's opening
+    // (a socket_paths frame) is the same.
+    fn rejectClientVersion(self: *Conductor, socket: posix.socket_t, theirs: u8) !void {
         const ours = protocol.client.version;
         std.debug.print("Client speaks protocol v{d}, this daemon v{d}; rejecting\n", .{ theirs, ours });
-        var request = try self.readClientRequest(socket, peer.isRemote(self.cfg.transport));
-        defer request.deinit(self.allocator);
         var buf: [256]u8 = undefined;
         const msg = try std.fmt.bufPrint(&buf, "This juliaclient speaks protocol v{d} but the daemon speaks v{d}: {s}.\n", .{
             theirs, ours, if (theirs < ours) "rebuild or reinstall juliaclient to match the daemon" else "restart the daemon so it runs the newly installed version",
@@ -476,18 +490,33 @@ pub const Conductor = struct {
         try self.serveString(socket, msg, 1);
     }
 
-    fn handleNotification(self: *Conductor, socket: posix.socket_t) void {
-        var buf: [5]u8 = undefined;
-        readExact(socket, &buf) catch |err| {
-            std.debug.print("Notification read error: {}\n", .{err});
-            return;
+    const Notification = struct {
+        kind: protocol.notification.Type,
+        subject: u32, // client id, or worker pid/id
+        evaluation: u32 = 0, // an interrupt's
+        report: []const u8 = "", // a peek's, in the connection's buffer
+    };
+
+    fn parseNotification(r: *protocol.SliceReader) !Notification {
+        const kind = std.enums.fromInt(protocol.notification.Type, try r.int(u8)) orelse return error.UnknownNotification;
+        const subject = try r.int(u32);
+        return switch (kind) {
+            .client_interrupt => .{ .kind = kind, .subject = subject, .evaluation = try r.int(u32) },
+            .peek_report => blk: {
+                const len = try r.int(u32);
+                if (len > max_peek_report_bytes) return error.ReportTooLarge;
+                break :blk .{ .kind = kind, .subject = subject, .report = try r.take(len) };
+            },
+            else => .{ .kind = kind, .subject = subject },
         };
-        const subject = std.mem.readInt(u32, buf[1..5], .little); // client id, or worker pid/id
-        const ntype = @as(protocol.notification.Type, @enumFromInt(buf[0]));
+    }
+
+    fn handleNotification(self: *Conductor, note: Notification) void {
+        const subject = note.subject;
         // A view's client was never assigned a worker.
-        if ((ntype == .client_exit or ntype == .client_interrupt) and
+        if ((note.kind == .client_exit or note.kind == .client_interrupt) and
             (live.dropById(self, subject) or reconfigure.dropById(self, subject))) return;
-        switch (ntype) {
+        switch (note.kind) {
             .client_done => _ = self.clientDone(subject),
             .client_exit => {
                 if (self.clientDone(subject)) |w| {
@@ -498,13 +527,14 @@ pub const Conductor = struct {
                 // From Julia 1.14 the message cancels exactly the client's code,
                 // and the SIGINT finds nothing to cancel; before, the SIGINT
                 // interrupts whichever client's code thread 0 runs.
-                var evaluation: [4]u8 = .{ 0, 0, 0, 0 };
-                readExact(socket, &evaluation) catch {};
-                info.worker.cancelClient(subject, std.mem.readInt(u32, &evaluation, .little));
+                info.worker.cancelClient(subject, note.evaluation);
                 info.worker.signal(platform.SIG.INT);
             },
             .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{subject}),
-            .peek_report => self.receivePeekReport(socket, subject),
+            .peek_report => {
+                const w = self.findWorkerById(subject) orelse return;
+                live.onProfile(self, w, self.allocator.dupe(u8, note.report) catch return);
+            },
             .worker_exit => {
                 if (self.findWorkerByPid(subject)) |w| {
                     std.debug.print("Worker {d} exiting (TTL expired)\n", .{w.id});
@@ -516,26 +546,118 @@ pub const Conductor = struct {
         }
     }
 
-    // The worker writes it whole before closing, but a stalled one must not
-    // hold the conductor: its read is bounded.
-    fn receivePeekReport(self: *Conductor, socket: posix.socket_t, worker_id: u32) void {
-        const w = self.findWorkerById(worker_id) orelse return;
-        platform.setRecvTimeout(socket, 1);
-        var len_buf: [4]u8 = undefined;
-        readExact(socket, &len_buf) catch return;
-        const len = std.mem.readInt(u32, &len_buf, .little);
-        if (len > max_peek_report_bytes) return w.log("a {d}-byte profile report is too large; dropped", .{len});
-        const report = self.allocator.alloc(u8, len) catch return;
-        readExact(socket, report) catch |err| {
-            w.log("profile report cut short: {}", .{err});
-            return self.allocator.free(report);
+    /// A request's fixed part, its lengths checked against what has arrived.
+    const RequestHead = struct {
+        flags: protocol.client.Flags,
+        pid: u32, // self-reported
+        ppid: u32,
+        cwd: []const u8,
+        fingerprint: u64,
+        args: protocol.SliceReader, // at their count
+    };
+
+    fn parseRequestHead(r: *protocol.SliceReader) !RequestHead {
+        // flags(1) + reserved(3) + pid(4) + ppid(4)
+        const fixed = try r.take(12);
+        const cwd = try r.lenPrefixed(u16);
+        const fingerprint = try r.int(u64);
+        const args_at = r.*;
+        for (0..try r.int(u16)) |_| _ = try r.lenPrefixed(u16);
+        return .{
+            .flags = @bitCast(fixed[0]),
+            .pid = std.mem.readInt(u32, fixed[4..8], .little),
+            .ppid = std.mem.readInt(u32, fixed[8..12], .little),
+            .cwd = cwd,
+            .fingerprint = fingerprint,
+            .args = args_at,
         };
-        live.onProfile(self, w, report);
     }
 
-    fn handleClient(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) !Outcome {
+    /// A local client's environment comes from the cache, where its first
+    /// request leaves it; the rest are asked for theirs.
+    fn receiveRequest(self: *Conductor, pc: *PendingConnection, r: *protocol.SliceReader) !?Outcome {
+        const head = parseRequestHead(r) catch |err| return if (err == error.Truncated) null else err;
+        const is_remote = pc.peer.isRemote(self.cfg.transport);
+        // The cache is this machine's: a remote client's environment would
+        // only evict local ones.
+        const cached = if (is_remote or pc.env_at != null) null else self.cache.lookup(head.fingerprint);
+        if (cached == null and pc.env_at == null) {
+            pc.env_at = r.pos;
+            platform.write(pc.socket, &[_]u8{protocol.client.env_request});
+            return null;
+        }
+        var owned_env: ?[]worker.EnvVar = null;
+        const env = cached orelse blk: {
+            var er = protocol.SliceReader{ .bytes = r.bytes, .pos = pc.env_at.? };
+            const full = self.copyEnv(&er) catch |err| return if (err == error.Truncated) null else err;
+            if (!is_remote) break :blk self.cache.insert(head.fingerprint, full);
+            owned_env = full;
+            break :blk env_cache.EnvCache.LookupResult{ .env = full, .julia_project = null };
+        };
+        // Its parts are freed here only until handleClient owns them.
+        const request: ClientRequest = request: {
+            errdefer if (owned_env) |e| freeEnv(self.allocator, e, e);
+            var args_reader = head.args;
+            const raw_args = try self.copyArgs(&args_reader);
+            errdefer {
+                for (raw_args) |a| self.allocator.free(a);
+                self.allocator.free(raw_args);
+            }
+            const cwd = try self.allocator.dupe(u8, head.cwd);
+            errdefer self.allocator.free(cwd);
+            var parsed = try args.parse(self.allocator, raw_args);
+            errdefer parsed.deinit();
+            // A remote client's filesystem isn't ours.
+            const proj = if (is_remote) null else try project.resolve(self.allocator, self.io, &parsed, env.julia_project, self.environ_map.get("HOME") orelse "", cwd);
+            break :request .{
+                .flags = head.flags,
+                .pid = head.pid,
+                .host_pid = if (platform.peerPid(pc.socket)) |p| platform.pidNumber(p) else null,
+                .ppid = head.ppid,
+                .cwd = cwd,
+                .env = env.env,
+                .parsed = parsed,
+                .project = proj,
+                .raw_args = raw_args,
+                .owned_env = owned_env,
+            };
+        };
+        return try self.handleClient(pc.socket, &pc.peer, request);
+    }
+
+    // `r`'s lengths are already checked.
+    fn copyArgs(self: *Conductor, r: *protocol.SliceReader) ![][]const u8 {
+        const client_args = try self.allocator.alloc([]const u8, try r.int(u16));
+        errdefer self.allocator.free(client_args);
+        var copied: usize = 0;
+        errdefer for (client_args[0..copied]) |arg| self.allocator.free(arg);
+        for (client_args) |*arg| {
+            arg.* = try self.allocator.dupe(u8, try r.lenPrefixed(u16));
+            copied += 1;
+        }
+        return client_args;
+    }
+
+    fn copyEnv(self: *Conductor, r: *protocol.SliceReader) ![]worker.EnvVar {
+        const env = try self.allocator.alloc(worker.EnvVar, try r.int(u16));
+        var copied: usize = 0;
+        errdefer freeEnv(self.allocator, env[0..copied], env);
+        for (env) |*e| {
+            const key = try r.lenPrefixed(u16);
+            const value = try r.lenPrefixed(u16);
+            e.key = try self.allocator.dupe(u8, key);
+            e.value = self.allocator.dupe(u8, value) catch |err| {
+                self.allocator.free(e.key);
+                return err;
+            };
+            copied += 1;
+        }
+        return env;
+    }
+
+    fn handleClient(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo, received: ClientRequest) !Outcome {
         const is_remote = peer.isRemote(self.cfg.transport);
-        var request = try self.readClientRequest(socket, is_remote);
+        var request = received;
         var request_held = false; // moved into a HeldClient while its worker starts
         defer if (!request_held) request.deinit(self.allocator);
         self.client_counter += 1;
@@ -740,96 +862,6 @@ pub const Conductor = struct {
             allocator.free(self.raw_args);
         }
     };
-
-    fn readClientRequest(self: *Conductor, socket: posix.socket_t, is_remote: bool) !ClientRequest {
-        var r = protocol.BufReader{ .fd = socket };
-        // Fixed header: flags(1) + reserved(3) + pid(4) + ppid(4) = 12 bytes
-        var hdr: [12]u8 = undefined;
-        try r.readSlice(&hdr);
-        const flags: protocol.client.Flags = @bitCast(hdr[0]);
-        const pid = std.mem.readInt(u32, hdr[4..8], .little);
-        const ppid = std.mem.readInt(u32, hdr[8..12], .little);
-        const cwd = try r.readLenPrefixed(u16, self.allocator);
-        errdefer self.allocator.free(cwd);
-        const fingerprint = try r.readInt(u64);
-        const client_args = try self.readClientArgs(&r);
-        // Switches slice into client_args; request.deinit() frees them.
-        errdefer {
-            for (client_args) |a| self.allocator.free(a);
-            self.allocator.free(client_args);
-        }
-        // The fingerprint cache is this machine's: a remote client's environment
-        // is its own, and would only evict local ones.
-        if (is_remote) {
-            platform.write(socket, &[_]u8{protocol.client.env_request});
-            const full_env = try self.readFullEnv(&r);
-            errdefer freeEnv(self.allocator, full_env, full_env);
-            return .{
-                .flags = flags,
-                .pid = pid,
-                .host_pid = null,
-                .ppid = ppid,
-                .cwd = cwd,
-                .env = full_env,
-                .parsed = try args.parse(self.allocator, client_args),
-                .project = null, // its filesystem isn't ours
-                .raw_args = client_args,
-                .owned_env = full_env,
-            };
-        }
-        const cached = self.cache.lookup(fingerprint) orelse blk: {
-            platform.write(socket, &[_]u8{protocol.client.env_request});
-            const full_env = try self.readFullEnv(&r);
-            break :blk self.cache.insert(fingerprint, full_env);
-        };
-        var parsed = try args.parse(self.allocator, client_args);
-        errdefer parsed.deinit();
-        const home_dir = self.environ_map.get("HOME") orelse "";
-        const proj = try project.resolve(self.allocator, self.io, &parsed, cached.julia_project, home_dir, cwd);
-        return .{
-            .flags = flags,
-            .pid = pid,
-            .host_pid = if (platform.peerPid(socket)) |p| platform.pidNumber(p) else null,
-            .ppid = ppid,
-            .cwd = cwd,
-            .env = cached.env,
-            .parsed = parsed,
-            .project = proj,
-            .raw_args = client_args,
-        };
-    }
-
-    fn readClientArgs(self: *Conductor, r: *protocol.BufReader) ![][]const u8 {
-        const arg_count = try r.readInt(u16);
-        const client_args = try self.allocator.alloc([]const u8, arg_count);
-        errdefer self.allocator.free(client_args);
-        var allocated: usize = 0;
-        errdefer for (client_args[0..allocated]) |arg| self.allocator.free(arg);
-        for (0..arg_count) |i| {
-            client_args[i] = try r.readLenPrefixed(u16, self.allocator);
-            allocated += 1;
-        }
-        return client_args;
-    }
-
-    fn readFullEnv(self: *Conductor, r: *protocol.BufReader) ![]worker.EnvVar {
-        const count = try r.readInt(u16);
-        const env = try self.allocator.alloc(worker.EnvVar, count);
-        errdefer self.allocator.free(env);
-        var allocated: usize = 0;
-        errdefer for (env[0..allocated]) |e| {
-            self.allocator.free(e.key);
-            self.allocator.free(e.value);
-        };
-        for (0..count) |i| {
-            const key = try r.readLenPrefixed(u16, self.allocator);
-            errdefer self.allocator.free(key);
-            const val = try r.readLenPrefixed(u16, self.allocator);
-            env[i] = .{ .key = key, .value = val };
-            allocated += 1;
-        }
-        return env;
-    }
 
     pub const SandboxKind = union(enum) {
         none,
@@ -2260,19 +2292,13 @@ pub const Conductor = struct {
             self.queuePing(w);
     }
 
-    /// `read`: pong bytes the loop already read into `w.pong_buf` (0 at EOF or
-    /// error), or null for a readiness loop, whose socket is read here.
-    pub fn onPong(self: *Conductor, w: *worker.Worker, read: ?usize) void {
+    /// The worker's socket turned readable while its ping was pending.
+    pub fn onPong(self: *Conductor, w: *worker.Worker) void {
         // A timeout in the same batch may have settled this ping already.
         if (!w.ping_pending) return;
         w.ping_pending = false;
-        const n = read orelse platform.socketRead(w.socket, &w.pong_buf);
-        if (n == 0) {
-            w.log("connection closed", .{});
-            return self.retireWorker(w);
-        }
-        if (n < w.pong_buf.len) readExact(w.socket, w.pong_buf[n..]) catch {
-            w.log("pong short read", .{});
+        protocol.readExactWithin(self.io, w.socket, &w.pong_buf, w.reply_timeout_ms) catch |err| {
+            w.log("no pong read: {}", .{err});
             return self.retireWorker(w);
         };
         // Late for a ping whose timeout was let pass; this one's is still to come.
@@ -2436,7 +2462,7 @@ pub const Conductor = struct {
         }
         var streams = try self.openClientStreams(client_socket);
         std.debug.print("Client {d}: --reconfigure\n", .{self.client_id});
-        try reconfigure.subscribe(self, streams, probePalette(&streams));
+        try reconfigure.subscribe(self, streams, self.probePalette(&streams));
     }
 
     fn isLiveStatus(format: ?[]const u8) bool {
@@ -2450,7 +2476,7 @@ pub const Conductor = struct {
         var held = false;
         defer if (!held) streams.deinit();
         const is_live = tty and isLiveStatus(format);
-        const palette: ?pal.Palette = if (tty and (format == null or is_live)) probePalette(&streams) else null;
+        const palette: ?pal.Palette = if (tty and (format == null or is_live)) self.probePalette(&streams) else null;
         if (is_live or (tty and format == null)) {
             try live.subscribe(self, streams, palette, scope, !is_live);
             held = true;
@@ -2489,20 +2515,19 @@ pub const Conductor = struct {
 
     // Read raw until the CSI 5n sentinel or a byte cap; the client's exit restores
     // cooked mode.
-    fn probePalette(streams: *ClientStreams) ?pal.Palette {
+    fn probePalette(self: *Conductor, streams: *ClientStreams) ?pal.Palette {
         const stdin = streams.fd(.stdin);
         const signals = streams.fd(.signals);
         platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
         platform.write(streams.fd(.stdout), pal.queries);
-        // This read blocks the event loop.
-        platform.setRecvTimeout(stdin, palette_probe_timeout_s);
-        defer platform.setRecvTimeout(stdin, 0);
+        // This read blocks the event loop, so is bounded as a whole.
+        const deadline = self.nowNs() + palette_probe_timeout_s * std.time.ns_per_s;
         var buf: [4096]u8 = undefined;
         var len: usize = 0;
         while (len < buf.len) {
-            const n = platform.socketRead(stdin, buf[len..]);
-            if (n == 0) break;
-            len += n;
+            const left_ms = @divTrunc(deadline - self.nowNs(), std.time.ns_per_ms);
+            if (left_ms <= 0 or !platform.waitReadable(stdin, @intCast(left_ms))) break;
+            len += platform.recvNonBlocking(stdin, buf[len..]) orelse break;
             if (std.mem.indexOf(u8, buf[0..len], pal.sentinel) != null) break;
         }
         var palette: pal.Palette = .{};
@@ -2510,8 +2535,10 @@ pub const Conductor = struct {
         return if (palette.isPopulated()) palette else null;
     }
 
+    /// Each path is at most `protocol.max_socket_path` long, as `runClient`
+    /// and `createListener` ensure.
     fn sendSocketPaths(self: *Conductor, socket: posix.socket_t, paths: worker.Worker.SocketPaths) void {
-        var buf: [1024]u8 = undefined;
+        var buf: [1 + 4 + 4 * (2 + protocol.max_socket_path)]u8 = undefined;
         var w = protocol.BufWriter{ .buf = &buf };
         w.writeInt(u8, protocol.client.socket_paths);
         w.writeInt(u32, self.client_id);

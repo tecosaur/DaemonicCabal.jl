@@ -210,7 +210,7 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
                 const w = loop.takePongPoll(@ptrFromInt(user_data)) orelse continue;
                 if (!conductor.isLiveWorker(w)) continue;
                 // Negative: cancelled by its timeout, or failed.
-                if (cqe.res > 0) conductor.onPong(w, null) else conductor.onPongTimeout(w);
+                if (cqe.res > 0) conductor.onPong(w) else conductor.onPongTimeout(w);
                 pool_changed = true;
                 continue;
             }

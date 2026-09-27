@@ -19,7 +19,6 @@ pub const sandbox = if (builtin.os.tag == .linux) @import("sandbox.zig") else st
 };
 
 const BufWriter = protocol.BufWriter;
-const readExact = protocol.readExact;
 
 const max_recent_ppids = 32;
 const daemon_env_prefix = "JULIA_DAEMON_";
@@ -174,7 +173,10 @@ pub const Worker = struct {
     recent_ppids_next: usize = 0,
     stderr_scan: peek.Scanner = .{}, // for the stacks a snapshot writes there
     recent: logring.LogRing = .{}, // its stderr and our lines about it, for the live view
-    io: ?Io = null, // for `recent`'s clock
+    io: ?Io = null, // for `recent`'s clock, and replies' deadlines
+    /// How long a reply may take in all: a sandboxed worker runs a remote
+    /// client's code, and must not hold the conductor by trickling one out.
+    reply_timeout_ms: u32 = 5000,
 
     pub const Launch = union(enum) {
         direct,
@@ -382,6 +384,7 @@ pub const Worker = struct {
                 };
             }
             platform.setRecvTimeout(socket, @intCast(cfg.ping_timeout));
+            w.reply_timeout_ms = @intCast(cfg.ping_timeout * 1000);
             var magic_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
             platform.write(socket, &magic_buf);
@@ -539,12 +542,16 @@ pub const Worker = struct {
 
     fn readHeader(self: *Worker) !Header {
         var buf: [3]u8 = undefined;
-        try readExact(self.socket, &buf);
+        try self.readAll(&buf);
         return .{
-            .msg_type = @enumFromInt(buf[0]),
+            .msg_type = std.enums.fromInt(protocol.worker.MessageType, buf[0]) orelse return error.UnexpectedResponse,
             .payload_len = std.mem.readInt(u16, buf[1..3], .little),
             .raw = buf,
         };
+    }
+
+    fn readAll(self: *Worker, buf: []u8) !void {
+        return protocol.readExactWithin(self.io.?, self.socket, buf, self.reply_timeout_ms);
     }
 
     /// The reply to a request, past any pong still owed for a ping whose
@@ -554,7 +561,7 @@ pub const Worker = struct {
             const header = try self.readHeader();
             if (header.msg_type != .pong) return header;
             var payload: [protocol.worker.pong_size - 3]u8 = undefined;
-            try readExact(self.socket, &payload);
+            try self.readAll(&payload);
         }
     }
 
@@ -566,7 +573,7 @@ pub const Worker = struct {
             return error.UnexpectedResponse;
         }
         var payload: [protocol.worker.pong_size - 3]u8 = undefined;
-        try readExact(self.socket, &payload);
+        try self.readAll(&payload);
         if (payload[0] != self.ping_seq) return error.UnexpectedResponse;
     }
 
@@ -598,7 +605,7 @@ pub const Worker = struct {
             const header = self.readHeader() catch return false;
             if (header.msg_type != .pong) return false;
             var payload: [protocol.worker.pong_size - 3]u8 = undefined;
-            readExact(self.socket, &payload) catch return false;
+            self.readAll(&payload) catch return false;
             if (payload[0] == self.ping_seq) return true;
         }
         return false;
@@ -674,7 +681,7 @@ pub const Worker = struct {
             return error.UnexpectedResponse;
         }
         var count_buf: [2]u8 = undefined;
-        try readExact(self.socket, &count_buf);
+        try self.readAll(&count_buf);
         return std.mem.readInt(u16, &count_buf, .little);
     }
 
@@ -688,20 +695,15 @@ pub const Worker = struct {
             return error.UnexpectedResponse;
         }
         var count_buf: [2]u8 = undefined;
-        try readExact(self.socket, &count_buf);
+        try self.readAll(&count_buf);
         const count = std.mem.readInt(u16, &count_buf, .little);
-        // Drain the full list even when over capacity, or the stream desyncs.
-        var n: usize = 0;
-        for (0..count) |_| {
-            var pid_buf: [4]u8 = undefined;
-            try readExact(self.socket, &pid_buf);
-            if (n < buf.len) {
-                buf[n] = std.mem.readInt(u32, &pid_buf, .little);
-                n += 1;
-            }
-        }
+        // Read whole even when over capacity, or the stream desyncs.
+        const ids = try self.allocator.alloc(u8, @as(usize, count) * 4);
+        defer self.allocator.free(ids);
+        try self.readAll(ids);
         if (count > buf.len) return error.TooManyClients;
-        return buf[0..n];
+        for (buf[0..count], 0..) |*id, i| id.* = std.mem.readInt(u32, ids[i * 4 ..][0..4], .little);
+        return buf[0..count];
     }
 
     pub const SocketPaths = struct {
@@ -764,7 +766,7 @@ pub const Worker = struct {
                     return error.WorkerError;
                 };
                 defer allocator.free(err_payload);
-                readExact(self.socket, err_payload) catch {
+                self.readAll(err_payload) catch {
                     return error.WorkerError;
                 };
                 if (header.payload_len >= 4) {
@@ -782,33 +784,30 @@ pub const Worker = struct {
             self.log("runClient expected sockets, got {s} ({s})", .{ @tagName(header.msg_type), &std.fmt.bytesToHex(header.raw, .lower) });
             return error.UnexpectedResponse;
         }
+        // Its count and four paths; a sandboxed worker's length is untrusted.
+        if (header.payload_len > 4 + 4 * (4 + protocol.max_socket_path)) {
+            self.log("runClient expected sockets of at most four paths, got {d} bytes", .{header.payload_len});
+            return error.UnexpectedResponse;
+        }
         const payload = try allocator.alloc(u8, header.payload_len);
         defer allocator.free(payload);
-        try readExact(self.socket, payload);
-        var rpos: usize = 0;
-        self.active_clients = std.mem.readInt(u32, payload[rpos..][0..4], .little);
-        rpos += 4;
-        const stdin_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
-        rpos += 2;
-        // An empty stdin path means the worker is at capacity.
-        if (stdin_len == 0) return error.WorkerBusy;
-        const stdin_path = try allocator.dupe(u8, payload[rpos..][0..stdin_len]);
+        try self.readAll(payload);
+        var r = protocol.SliceReader{ .bytes = payload };
+        self.active_clients = r.int(u32) catch return error.UnexpectedResponse;
+        var paths: [4][]const u8 = undefined;
+        for (&paths, 0..) |*path, i| {
+            path.* = r.lenPrefixed(u16) catch return error.UnexpectedResponse;
+            // An empty stdin path means the worker is at capacity.
+            if (i == 0 and path.len == 0) return error.WorkerBusy;
+            if (path.len > protocol.max_socket_path) return error.UnexpectedResponse;
+        }
+        const stdin_path = try allocator.dupe(u8, paths[0]);
         errdefer allocator.free(stdin_path);
-        rpos += stdin_len;
-        const stdout_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
-        rpos += 2;
-        const stdout_path = try allocator.dupe(u8, payload[rpos..][0..stdout_len]);
+        const stdout_path = try allocator.dupe(u8, paths[1]);
         errdefer allocator.free(stdout_path);
-        rpos += stdout_len;
-        const stderr_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
-        rpos += 2;
-        const stderr_path = try allocator.dupe(u8, payload[rpos..][0..stderr_len]);
+        const stderr_path = try allocator.dupe(u8, paths[2]);
         errdefer allocator.free(stderr_path);
-        rpos += stderr_len;
-        const signals_len = std.mem.readInt(u16, payload[rpos..][0..2], .little);
-        rpos += 2;
-        const signals_path = try allocator.dupe(u8, payload[rpos..][0..signals_len]);
-        return .{ .stdin = stdin_path, .stdout = stdout_path, .stderr = stderr_path, .signals = signals_path };
+        return .{ .stdin = stdin_path, .stdout = stdout_path, .stderr = stderr_path, .signals = try allocator.dupe(u8, paths[3]) };
     }
 };
 

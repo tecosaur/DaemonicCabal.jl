@@ -239,7 +239,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 const wk: *worker.Worker = @ptrFromInt(w.tag);
                 if (conductor.isLiveWorker(wk)) {
                     loop.disarm(@intFromPtr(wk));
-                    conductor.onPong(wk, null);
+                    conductor.onPong(wk);
                 }
             }
         } else if (key == @intFromEnum(EventLocation.signal)) {
