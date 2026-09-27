@@ -52,9 +52,9 @@ pub const Service = struct {
     }
 
     /// Where saved changes are written.
-    pub fn target(self: Service, buf: []u8) []const u8 {
+    pub fn target(self: Service, buf: []u8) error{NameTooLong}![]const u8 {
         return switch (self.kind) {
-            .systemd => std.fmt.bufPrint(buf, "{s}.d/" ++ drop_in, .{self.path}) catch self.path,
+            .systemd => std.fmt.bufPrint(buf, "{s}.d/" ++ drop_in, .{self.path}) catch error.NameTooLong,
             .launchd, .powershell => self.path,
         };
     }
@@ -110,10 +110,7 @@ pub fn load(gpa: Allocator, io: Io, service: Service, out: *Declared) !void {
     try parse(gpa, service.kind, text, out);
     if (service.kind != .systemd) return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const extra = readFile(gpa, io, service.target(&buf)) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
+    const extra = try readIfThere(gpa, io, try service.target(&buf)) orelse return;
     defer gpa.free(extra);
     try parse(gpa, .systemd, extra, out);
 }
@@ -123,7 +120,7 @@ pub fn load(gpa: Allocator, io: Io, service: Service, out: *Declared) !void {
 pub fn save(gpa: Allocator, io: Io, service: Service, changes: []const Change) !void {
     for (changes) |change| if (change.value) |v| if (std.mem.indexOfAny(u8, v, "\r\n") != null) return error.Unwritable;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = service.target(&buf);
+    const path = try service.target(&buf);
     const rewritten = switch (service.kind) {
         .systemd => blk: {
             const text = try readFile(gpa, io, service.path);
@@ -133,10 +130,10 @@ pub fn save(gpa: Allocator, io: Io, service: Service, changes: []const Change) !
             try parse(gpa, .systemd, text, &unit);
             var overrides = Declared.init(gpa);
             defer overrides.deinit();
-            if (readFile(gpa, io, path)) |existing| {
+            if (try readIfThere(gpa, io, path)) |existing| {
                 defer gpa.free(existing);
                 try parse(gpa, .systemd, existing, &overrides);
-            } else |err| if (err != error.FileNotFound) return err;
+            }
             for (changes) |change| try overrides.put(change.key, change.value);
             try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
             break :blk try dropIn(gpa, &unit.set, &overrides);
@@ -173,14 +170,13 @@ pub fn rewrite(gpa: Allocator, kind: Kind, text: []const u8, changes: []const Ch
 }
 
 /// A drop-in declaring `overrides`, but for what `unit` sets the same.
-pub fn dropIn(gpa: Allocator, unit: *const Environ.Map, overrides: *const Declared) Error![]u8 {
+pub fn dropIn(gpa: Allocator, unit: *const Environ.Map, overrides: *const Declared) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     try out.appendSlice(gpa, "# Written by juliaclient --reconfigure\n[Service]\n");
     var it = overrides.set.iterator();
     while (it.next()) |entry| {
         const value = entry.value_ptr.*;
-        if (std.mem.indexOfAny(u8, value, "\r\n") != null) return error.Unwritable;
         const same = if (unit.get(entry.key_ptr.*)) |was| std.mem.eql(u8, was, value) else false;
         if (same) continue;
         try out.appendSlice(gpa, "Environment=\"");
@@ -464,26 +460,42 @@ fn readFile(gpa: Allocator, io: Io, path: []const u8) ![]u8 {
     return Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
 }
 
-// Through a temporary file beside it, so a failure leaves the old whole;
-// through a symbolic link, the file it names, so the link stays.
+// A drop-in not yet written is none.
+fn readIfThere(gpa: Allocator, io: Io, path: []const u8) !?[]u8 {
+    return readFile(gpa, io, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+// Through a temporary file beside it, so a failure (or a crash) leaves the
+// old whole; through a symbolic link, the file it names, so the link stays.
 fn replaceFile(io: Io, link: []const u8, data: []const u8) !void {
+    const cwd = Io.Dir.cwd();
     var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = if (Io.Dir.cwd().realPathFile(io, link, &real_buf)) |n| real_buf[0..n] else |err| switch (err) {
+    const path = if (cwd.realPathFile(io, link, &real_buf)) |n| real_buf[0..n] else |err| switch (err) {
         error.FileNotFound => link,
         else => return err,
     };
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const temporary = try std.fmt.bufPrint(&buf, "{s}.new", .{path});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = temporary, .data = data });
-    errdefer Io.Dir.cwd().deleteFile(io, temporary) catch {};
-    try Io.Dir.rename(Io.Dir.cwd(), temporary, Io.Dir.cwd(), path, io);
+    const file = try cwd.createFile(io, temporary, .{});
+    errdefer cwd.deleteFile(io, temporary) catch {};
+    {
+        defer file.close(io);
+        try file.writeStreamingAll(io, data);
+        try file.sync(io); // on disk before the rename can be
+    }
+    try Io.Dir.rename(cwd, temporary, cwd, path, io);
 }
 
 test "a service is named by kind and path" {
     const s = Service.parse("systemd:/home/u/.config/systemd/user/julia-daemon.service").?;
     try std.testing.expectEqual(Kind.systemd, s.kind);
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("/home/u/.config/systemd/user/julia-daemon.service.d/reconfigure.conf", s.target(&buf));
+    try std.testing.expectEqualStrings("/home/u/.config/systemd/user/julia-daemon.service.d/reconfigure.conf", try s.target(&buf));
+    // Never the unit itself, where its drop-in's path doesn't fit.
+    try std.testing.expectError(error.NameTooLong, s.target(buf[0..64]));
     try std.testing.expect(Service.parse("upstart:/x") == null);
     try std.testing.expect(Service.parse("launchd:") == null);
     try std.testing.expect(Service.parse("nothing") == null);

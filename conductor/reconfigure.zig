@@ -465,7 +465,10 @@ fn save(c: *Conductor, v: *Viewer) bool {
         return false;
     };
     var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = svc.target(&target_buf);
+    const target = svc.target(&target_buf) catch {
+        v.message.set(.problem, "Couldn't save: a drop-in beside {s} would have too long a path.", .{svc.path});
+        return false;
+    };
     var shown_buf: [std.fs.max_path_bytes]u8 = undefined;
     const shown = homeRelative(c, target, &shown_buf);
     service.save(c.allocator, c.io, svc, to_save) catch |err| {
@@ -694,7 +697,9 @@ fn farewell(c: *const Conductor, v: *const Viewer, buf: []u8) []const u8 {
     if (unsaved == 0) {
         var target_buf: [std.fs.max_path_bytes]u8 = undefined;
         var shown_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (svc) |s| w.print(", saved to {s}", .{homeRelative(c, s.target(&target_buf), &shown_buf)}) catch {};
+        if (svc) |s| if (s.target(&target_buf)) |target| {
+            w.print(", saved to {s}", .{homeRelative(c, target, &shown_buf)}) catch {};
+        } else |_| {};
     } else if (svc == null) {
         w.writeAll(" (no service to save them to)") catch {};
     } else if (unsaved == n) {
