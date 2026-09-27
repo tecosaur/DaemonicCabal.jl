@@ -90,13 +90,7 @@ end
     @eval function REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool)
         term = ACTIVE_TERM[]
         if !isnothing(term.sync_session)
-            for sig in term.sync_session.signals
-                isopen(sig) || continue
-                try
-                    send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
-                    read(sig, 2) # ack
-                catch end
-            end
+            switch_raw_mode!(term.sync_session, raw)
         elseif isopen(term.signals)
             send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
             read(term.signals, 2) # ack

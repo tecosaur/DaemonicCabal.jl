@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-struct BroadcastWriter{T} <: IO
-    writers::Vector{T}
-    screen::Recording  # the sync session's shared run
-    stream::Symbol
+mutable struct BroadcastWriter{T} <: IO
+    @atomic writers::Vector{T}  # replaced whole, so iterated safely while it changes
+    const screen::Recording  # the sync session's shared run
+    const stream::Symbol
 end
 
-Base.iswritable(b::BroadcastWriter) = any(iswritable, b.writers)
-Base.isopen(b::BroadcastWriter) = any(isopen, b.writers)
+Base.iswritable(b::BroadcastWriter) = any(iswritable, @atomic b.writers)
+Base.isopen(b::BroadcastWriter) = any(isopen, @atomic b.writers)
 Base.isreadable(::BroadcastWriter) = false
 Base.bytesavailable(::BroadcastWriter) = 0
 
@@ -25,7 +25,7 @@ end
 
 function broadcast_to_writers(op::F, io::BroadcastWriter, args...) where {F}
     ret = nothing
-    for w in io.writers
+    for w in @atomic io.writers
         try
             ret = op(w, args...)
         catch e

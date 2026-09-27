@@ -179,35 +179,19 @@ Base.get(::Base.GenericIOBuffer, key::Symbol, default::Module) = client_module_d
 client_module_default(key::Symbol, default) =
     if key === :module && default === Main CLIENT_MODULE[] else default end
 
-const DEFAULT_DISPLAYSIZE = (24, 80)
-
 function query_displaysize(signals::StreamIO)
     send_signal(signals, SIGNAL_QUERY_SIZE, UInt8[])
     # Response: id(1) + len(1) + height(2) + width(2)
     resp = read(signals, 6)
     length(resp) == 6 || return DEFAULT_DISPLAYSIZE
-    height = reinterpret(UInt16, resp[3:4])[1]
-    width = reinterpret(UInt16, resp[5:6])[1]
-    (if iszero(height) first(DEFAULT_DISPLAYSIZE) else Int(height) end,
-     if iszero(width) last(DEFAULT_DISPLAYSIZE) else Int(width) end)
+    answered_size(resp[3:6])
 end
-# A sync session takes the smallest of its clients' sizes, like tmux.
+
 function Base.displaysize(::Union{ScopedStdout, ScopedStderr, TerminalStdout})
     term = ACTIVE_TERM[]
     session = term.sync_session
     if !isnothing(session)
-        min_h, min_w = typemax(Int), typemax(Int)
-        for sig in session.signals
-            isopen(sig) || continue
-            h, w = try query_displaysize(sig) catch; continue end
-            min_h = min(min_h, h)
-            min_w = min(min_w, w)
-        end
-        if min_h == typemax(Int)
-            DEFAULT_DISPLAYSIZE
-        else
-            (min_h, min_w)
-        end
+        session_displaysize(session)
     else
         term === WORKER_TERM && return DEFAULT_DISPLAYSIZE # no client to ask
         isopen(term.signals) || return DEFAULT_DISPLAYSIZE
