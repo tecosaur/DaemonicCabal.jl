@@ -12,6 +12,7 @@ const changes = @import("changes.zig");
 const pal = @import("palette.zig");
 const status = @import("status.zig");
 const terminal = @import("terminal.zig");
+const tui = @import("tui.zig");
 
 const Setting = settings.Setting;
 const all = settings.all;
@@ -326,7 +327,7 @@ const Frame = struct {
         else
             kindColour(s, value orelse s.default.?);
         try self.print("{s}{s}\x1b[39m", .{ colour, shown });
-        const note_at = @max(columns(shown), row.value_cols);
+        const note_at = @max(tui.textWidth(shown), row.value_cols);
         var note_buf: [192]u8 = undefined;
         var note = std.Io.Writer.fixed(&note_buf);
         const at_default = changes.alike(i, value, null);
@@ -343,9 +344,9 @@ const Frame = struct {
             note.print("{s}default {s}", .{ if (was_default) "was " else "", settings.display(s, d, &default_buf) }) catch {};
         } else if (value != null) note.print("unset: {s}", .{s.unset}) catch {};
         const text = note.buffered();
-        const cols = columns(text) + if (marked) "default".len else 0;
-        if (cols == 0) return columns(shown);
-        try self.pad(note_at - columns(shown));
+        const cols = tui.textWidth(text) + if (marked) "default".len else 0;
+        if (cols == 0) return tui.textWidth(shown);
+        try self.pad(note_at - tui.textWidth(shown));
         try self.print("  {s}{s}{s}\x1b[39m", .{ if (row.used()) self.muted() else "", text, if (marked) dim ++ "default\x1b[22m" else "" });
         if (!row.used()) try self.write(dim);
         return note_at + 2 + cols;
@@ -358,14 +359,14 @@ const Frame = struct {
         var buf: [256]u8 = undefined;
         const valid = if (settings.normalise(&all[i], e.text, &buf)) |_| true else |_| false;
         try self.print("{s}{s}{s}", .{ self.scene.styles.field.get(), if (valid) "" else problem_colour, e.text });
-        const text_cols = columns(e.text);
+        const text_cols = tui.textWidth(e.text);
         const cols = @max(field_cols, text_cols + 1);
         try self.pad(cols - text_cols);
         try self.write(reset);
-        self.cursor = .{ .line = self.line(), .col = value_col + columns(e.text[0..e.cursor]) };
+        self.cursor = .{ .line = self.line(), .col = value_col + tui.textWidth(e.text[0..e.cursor]) };
         if (!settings.steps(all[i].kind)) return cols;
         try self.print("  " ++ bold ++ "↑↓\x1b[22m {s}adjust value" ++ reset, .{self.muted()});
-        return cols + 2 + comptime columns("↑↓ adjust value");
+        return cols + 2 + comptime tui.textWidth("↑↓ adjust value");
     }
 
     fn writeStatus(self: *Frame, i: usize, used: bool) !void {
@@ -431,7 +432,7 @@ const Frame = struct {
         var words = std.mem.tokenizeScalar(u8, text, ' ');
         var cols: usize = 0;
         while (words.next()) |word| {
-            const len = columns(word);
+            const len = tui.textWidth(word);
             if (cols > 0 and cols + 1 + len > width) {
                 try self.write(reset ++ "\n");
                 cols = 0;
@@ -528,7 +529,7 @@ fn valueCols(items: []const Item, values: *const changes.Values) usize {
     for (items) |item| {
         const i = item.setting orelse continue;
         var buf: [128]u8 = undefined;
-        const cols = columns(settings.display(&all[i], values[i], &buf));
+        const cols = tui.textWidth(settings.display(&all[i], values[i], &buf));
         if (cols <= max_value_cols) widest = @max(widest, cols);
     }
     return widest;
@@ -558,10 +559,6 @@ fn moreAt(items: []const Item, k: usize, level: usize) bool {
         if (later.depth < level) break false;
         if (later.depth == level) break true;
     } else false;
-}
-
-fn columns(text: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(text) catch text.len;
 }
 
 // --- Tests ---
@@ -656,4 +653,24 @@ test "a change workers missed is marked on its row" {
     defer gpa.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "unsaved · new workers") != null);
     try testing.expect(std.mem.indexOf(u8, text, "1 change unsaved · 1 only for new workers: r restarts the idle ones") != null);
+}
+
+test "the editor's cursor is placed past wide characters' two columns" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const styles = Styles.of(null);
+    const args = Setting.index("JULIA_DAEMON_WORKER_ARGS");
+    const check: Check = .{};
+    var scene = sceneOf(&state, &staged, &styles, 0, args);
+    scene.editor = .{ .text = "世界x", .cursor = "世界".len, .check = &check };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    _ = try draw(gpa, &out, &scene, 0);
+    var expected: [16]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, out.items, try std.fmt.bufPrint(&expected, "\x1b[{d}G", .{value_col + 5})) != null);
 }
