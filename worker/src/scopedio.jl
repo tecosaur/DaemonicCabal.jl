@@ -72,6 +72,7 @@ const CLIENT_MODULE = ScopedValue{Module}(Main)
 const CLIENT_INTERACTIVE = ScopedValue(false)
 const CLIENT_REPL = ScopedValue(Ref{REPL.LineEditREPL}())
 const CLIENT_RECORDING = ScopedValue{Union{Nothing, Recording}}(nothing)
+const CLIENT_END = ScopedValue{Union{Nothing, RunEnd}}(nothing)
 # `replay_history`'s arguments, for the client starting a sync session's REPL.
 const REPLAY_TARGET = ScopedValue{Union{Nothing, Tuple{StreamIO, Recording, Tuple{Int, Int}, Int}}}(nothing)
 

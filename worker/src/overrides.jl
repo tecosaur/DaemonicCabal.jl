@@ -168,11 +168,13 @@ end
     end
 end
 
-@eval Base.exit(n) = throw(DaemonClientExit(n))
+@eval Base.exit(n) = $exit_client(n)
+@eval Base.atexit(f::Function) = $register_atexit(f)
 
 # Fds 0/1/2 are the conductor's; a closed stdin would fail a spawn with EINVAL.
 function spawn_stdin()
-    reader = Base.pipe_reader(Base.stdin)
+    # Before 1.11 it is the client's own stream, not a scoped stand-in.
+    reader = if Base.stdin isa Base.AbstractPipe Base.pipe_reader(Base.stdin) else Base.stdin end
     if reader isa Base.PipeEndpoint && reader.status == Base.StatusClosed
         return devnull
     end

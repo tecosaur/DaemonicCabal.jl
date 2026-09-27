@@ -172,6 +172,9 @@ precompile(replay_history, (Base.PipeEndpoint, Recording, Tuple{Int, Int}, Int))
     end
 end
 precompile(record_package_sources, (Base.PkgId,))
+precompile(exit_client, (Int,))
+precompile(register_atexit, (Function,))
+precompile(run_exit_hooks!, (RunEnd,))
 precompile(accept_client_sockets, (NTuple{4, Sockets.PipeServer}, Int))
 precompile(register_client!, (Int, Task, Base.PipeEndpoint, Base.PipeEndpoint, Base.PipeEndpoint, Base.PipeEndpoint))
 precompile(runclient, (ClientInfo, Base.PipeEndpoint, Base.PipeEndpoint, Base.PipeEndpoint, Base.PipeEndpoint))

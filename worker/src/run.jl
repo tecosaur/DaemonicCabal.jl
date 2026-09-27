@@ -86,16 +86,14 @@ function prepare_module(client::ClientInfo)
     else
         get_module()
     end
-    Core.eval(mod, :(cd($(client.cwd))))
-    if !isempty(client.args)
-        Core.eval(mod, :(ARGS = $(client.args)))
-    end
-    # A client module's shadows Base's. Main (a session) sets Base's: 1.10 and
+    # A client module's own shadow Base's. Main (a session) sets Base's: 1.10 and
     # 1.11 won't let Main assign a name it has taken from Base.
-    program = something(client.programfile, "")
+    program = something(client.programfile, getval(client.switches, "--module", ""))
     if mod === Main
+        append!(empty!(Base.ARGS), client.args)
         setglobal!(Base, :PROGRAM_FILE, program)
-    elseif !isempty(program)
+    else
+        Core.eval(mod, :(ARGS = $(copy(client.args))))
         Core.eval(mod, :(PROGRAM_FILE = $program))
     end
     mod
@@ -128,22 +126,8 @@ end
     # `Base.display_error`, as the worker overrides it.
     function display_client_error(@nospecialize(io::IO), stack::Base.ExceptionStack)
         if !isempty(stack) && first(stack).exception isa DaemonClientExit
-            exit = first(stack).exception
-            term = ACTIVE_TERM[]
-            try close(term.stdout) catch end
-            try close(term.stderr) catch end
-            # The REPL still prints its next prompt, which the closed streams would fail.
-            term.redirect_out = devnull
-            term.redirect_err = devnull
-            session = term.sync_session
-            if !isnothing(session)
-                for p in @atomic session.participants
-                    try send_signal(p.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8]) catch end
-                end
-            else
-                send_signal(term.signals, SIGNAL_EXIT, UInt8[exit.code % UInt8])
-            end
-            Base.invokelatest(display, exit)
+            # `exit_client` has let the client go, so the REPL just stops.
+            Base.invokelatest(display, first(stack).exception)
         else
             # Relayed Ctrl-Cs keep landing after the loop breaks: held off while
             # the interrupt they asked for renders, then dropped, being answered.
@@ -157,6 +141,26 @@ end
                 err isa InterruptException || rethrow()
             end
         end
+    end
+
+    # As its process would end, whatever the run's code goes on to do, its
+    # output going nowhere.
+    function let_client_go(code::Int)
+        term = ACTIVE_TERM[]
+        term.redirect_out = devnull
+        term.redirect_err = devnull
+        session = term.sync_session
+        if !isnothing(session)
+            return end_sync_session!(session, code)
+        end
+        # Closed before the exit is sent, so the client has all its output.
+        # Any of them may be gone already, with the client.
+        try close(term.stdout) catch end
+        try close(term.stderr) catch end
+        try
+            send_signal(term.signals, SIGNAL_EXIT, UInt8[code % UInt8])
+            close(term.signals)
+        catch end
     end
 end
 
@@ -178,7 +182,7 @@ end
 
 function is_repl_client(client::ClientInfo)
     switches = (s for (s, _) in client.switches)
-    "--interactive" ∈ switches || (isnothing(client.programfile) && "--eval" ∉ switches && "--print" ∉ switches)
+    "--interactive" ∈ switches || (isnothing(client.programfile) && isdisjoint(("--eval", "--print", "--module"), switches))
 end
 
 function command_line(client::ClientInfo)
@@ -215,9 +219,10 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
             isopen(client_stderr) && Base.invokelatest(Base.display_error, client_stderr, current_exceptions())
             1
         end
-        return shielded() do
+        shielded() do
             teardown_client(client, client_stdin, client_stdout, client_stderr, signals, owned_streams, exit_code)
         end
+        return exit_code
     end
     hascolor = clienthascolor(client)
     # As Julia's: -i, or a REPL at a terminal.
@@ -246,21 +251,24 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     try
         mod = prepare_module(client)
         # Base qualifies names not visible from `:module`. Within the client's scope
-        # the worker's `get`s answer for it, but the error display below is outside.
+        # the worker's `get`s answer for it, but its errors are shown through these.
         stdoutx = IOContext(stdoutx, :module => mod)
         stderrx = IOContext(stderrx, :module => mod)
-        saved_env = swap_env!(client.env)
+        ending = RunEnd()
+        run_code() = run_until_exit(mod, client, ending, run_stdout, stdoutx, stderrx, broadcast)
+        enter_environment!(client)
         try
-            @static if VERSION < v"1.11"
+            exit_code = @static if VERSION < v"1.11"
                 CLIENT_SIGNALS[] = signals
                 CLIENT_INTERACTIVE[] = interactive
+                CLIENT_END[] = ending
                 try
                     redirect_stdio(stdin=client_stdin, stdout=stdoutx, stderr=stderrx) do
                         # Base's display holds the stdout the worker started with.
                         client_display = TextDisplay(stdoutx)
                         pushdisplay(client_display)
                         try
-                            with_client_scope(() -> runclient(mod, client; stdout=stdoutx, broadcast), client)
+                            with_client_scope(run_code, client)
                         finally
                             popdisplay(client_display)
                         end
@@ -268,6 +276,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                 finally
                     CLIENT_SIGNALS[] = nothing
                     CLIENT_INTERACTIVE[] = false
+                    CLIENT_END[] = nothing
                 end
             else
                 term = get(ENV, "TERM", @static if Sys.iswindows() "" else "dumb" end)
@@ -286,19 +295,19 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                       CLIENT_REPL => repl_ref,
                       CLIENT_RECORDING => recording,
                       REPLAY_TARGET => replay,
-                      with_client_scope(() -> runclient(mod, client; stdout=stdoutx, broadcast), client))
+                      CLIENT_END => ending,
+                      with_client_scope(run_code, client))
             end
         finally
-            swap_env!(saved_env)
+            leave_environment!(client)
         end
-    catch err
-        if err isa DaemonClientExit
-            exit_code = err.code
-        elseif isopen(client_stdout)
+    catch
+        # The worker's own failure to run it.
+        if isopen(client_stdout)
             try flush(run_stdout) catch end
             Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
-            exit_code = 1
         end
+        exit_code = 1
     finally
         # After the run's last output, which may still be buffered.
         if !isnothing(recording)
@@ -312,16 +321,107 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                             signals, owned_streams, exit_code)
         end
     end
+    exit_code
 end
 
-# Sets `env` (`nothing` unsets), returning what it replaced. Unlike `withenv`'s
-# splat, a call is dispatched statically, so precompiled.
-function swap_env!(env::Vector{<:Pair{String}})
-    replaced = [key => get(ENV, key, nothing) for (key, _) in env]
-    for (key, value) in env
-        if isnothing(value) delete!(ENV, key) else ENV[key] = value end
+# A run's code, then its `atexit` hooks, as stock julia runs them on its way
+# out; its exit code.
+function run_until_exit(mod::Module, client::ClientInfo, ending::RunEnd, run_stdout::IO,
+                        stdoutx::IO, stderrx::IO, broadcast::Union{Nothing, BroadcastWriter{StreamIO}})
+    code = try
+        runclient(mod, client; stdout=stdoutx, broadcast)
+        0
+    catch err
+        if err isa DaemonClientExit
+            err.code
+        else
+            if isopen(run_stdout)
+                try flush(run_stdout) catch end
+                Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
+            end
+            1
+        end
     end
-    replaced
+    # An `exit` caught on the way stands.
+    @lock ending.lock begin
+        if isnothing(ending.code)
+            ending.code = code
+        end
+    end
+    ending.ended || run_exit_hooks!(ending)
+    something(ending.code)
+end
+
+# As stock julia's `_atexit`: newest first, each given the exit code if it
+# takes one, and an error shown before the next; an `exit` in one sets the code.
+function run_exit_hooks!(ending::RunEnd)
+    while true
+        hook = @lock ending.lock begin
+            if isempty(ending.hooks)
+                ending.ended = true
+                nothing
+            else
+                popfirst!(ending.hooks)
+            end
+        end
+        isnothing(hook) && return
+        try
+            code = Cint(something(ending.code, 0))
+            # In the latest world, as the hook is newer than this frame.
+            if hasmethod(hook, Tuple{Cint}; world=Base.get_world_counter())
+                Base.invokelatest(hook, code)
+            else
+                Base.invokelatest(hook)
+            end
+        catch err
+            err isa DaemonClientExit && continue
+            (; exception, backtrace) = last(scrub_backtrace(current_exceptions()))
+            showerror(stderr, exception)
+            Base.show_backtrace(stderr, backtrace)
+            println(stderr)
+        end
+    end
+end
+
+# The process's cwd and ENV, which its clients' runs share. Each run's are set
+# as it starts; as it ends, its variables and the cwd go to the latest run still
+# going, else back to what they were before any set them.
+const ENVIRONS = (
+    lock = ReentrantLock(),
+    runs = ClientInfo[],  # oldest first
+    cwd = Ref(""),  # before the runs
+    env = Dict{String, Union{Nothing, String}}())  # the runs' variables before them; `nothing` unset
+
+function enter_environment!(client::ClientInfo)
+    @lock ENVIRONS.lock begin
+        if isempty(ENVIRONS.runs)
+            ENVIRONS.cwd[] = pwd()
+        end
+        cd(client.cwd)
+        for (key, value) in client.env
+            get!(() -> get(ENV, key, nothing), ENVIRONS.env, key)
+            ENV[key] = value
+        end
+        push!(ENVIRONS.runs, client)
+    end
+end
+
+function leave_environment!(client::ClientInfo)
+    @lock ENVIRONS.lock begin
+        filter!(run -> run !== client, ENVIRONS.runs)
+        for (key, _) in client.env
+            holder = findlast(run -> any(((k, _),) -> k == key, run.env), ENVIRONS.runs)
+            value = if isnothing(holder) ENVIRONS.env[key] else getval(ENVIRONS.runs[holder].env, key, nothing) end
+            if isnothing(value) delete!(ENV, key) else ENV[key] = value end
+        end
+        dir = if isempty(ENVIRONS.runs) ENVIRONS.cwd[] else last(ENVIRONS.runs).cwd end
+        isempty(ENVIRONS.runs) && empty!(ENVIRONS.env)
+        try
+            cd(dir)
+        catch err
+            @warn "Could not return to $dir after a client's run" exception=err
+        end
+    end
 end
 
 # Stock julia's trace ends where it entered user code; ours would run on
@@ -444,6 +544,13 @@ function runclient(mod::Module, client::ClientInfo; @nospecialize(stdout::IO=std
                 isnothing(broadcast) || display_result(broadcast, res)
             elseif switch == "--load"
                 Base.include(mod, value)
+            elseif switch == "--module"
+                # As julia's -m: its package's `main`, which must be its entry point.
+                Core.eval(mod, Expr(:import, Expr(:., Symbol.(split(value, "."))..., :main)))
+                if isnothing(Base.invokelatest(main_entrypoint, mod))
+                    error("`main` in `$value` not declared as entry point (use `@main` to do so)")
+                end
+                break
             end
         end
         if !isnothing(client.programfile)
@@ -461,11 +568,38 @@ function runclient(mod::Module, client::ClientInfo; @nospecialize(stdout::IO=std
                 runrepl || throw(DaemonClientExit(1))
             end
         end
+        # As julia runs an `@main` its code defined, unless interactive.
+        entrypoint = Base.invokelatest(main_entrypoint, mod)
+        if !isnothing(entrypoint) && !isinteractive()
+            code = main_exit_code(Base.invokelatest(entrypoint, Base.invokelatest(getglobal, mod, :ARGS)))
+            code == 0 || throw(DaemonClientExit(code))
+        end
     end
     if runrepl && !client.tty
         run_piped_repl(mod)
     elseif runrepl
         Base.invokelatest(run_terminal_repl, client, stdout)
+    end
+end
+
+# The `main` marked by `@main` that `mod` sees, if any.
+function main_entrypoint(mod::Module)
+    isdefined(mod, :main) || return nothing
+    owner = Base.binding_module(mod, :main)
+    flag = Symbol("#__main_is_entrypoint__#")
+    if isdefined(owner, flag) && getglobal(owner, flag) === true
+        getglobal(mod, :main)
+    end
+end
+
+# As julia's: `nothing` is 0, and anything not a `Cint` an error.
+function main_exit_code(ret)
+    isnothing(ret) && return 0
+    try
+        Int(Cint(ret))
+    catch
+        @error "The return value of `main` should be `nothing` or convertible to `Cint`"
+        1
     end
 end
 
