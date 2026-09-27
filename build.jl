@@ -14,7 +14,7 @@ while !isempty(ARGS)
     elseif arg == "--release"
         global release = true
     elseif startswith(arg, "--rev=")
-        global rev = split(arg, "=", limit=2)[2]
+        global rev = chopprefix(arg, "--rev=")
     elseif arg == "--rev"
         if isempty(ARGS)
             @error "Expected a revision after --rev"
@@ -22,13 +22,15 @@ while !isempty(ARGS)
         end
         global rev = popfirst!(ARGS)
     elseif arg ∈ ("--help", "-h")
-        println("Usage: build.jl [OPTIONS]")
-        println("Options:")
-        println("  --staged           Use a staged worktree for building")
-        println("  --release          Build release binaries")
-        println("  --rev=REV          Build from a specific git revision")
-        println("  --rev REV          Build from a specific git revision")
-        println("  -h, --help         Show this help message and exit")
+        print("""
+            Usage: build.jl [OPTIONS]
+            Options:
+              --staged           Use a staged worktree for building
+              --release          Build release binaries
+              --rev=REV          Build from a specific git revision
+              --rev REV          Build from a specific git revision
+              -h, --help         Show this help message and exit
+            """)
         exit(0)
     else
         @error "Unknown argument: $arg"
@@ -55,38 +57,32 @@ const SERVICE_FILE = joinpath(get(ENV, "XDG_CONFIG_HOME",
     "systemd", "user", "$SERVICE_NAME.service")
 
 function with_srcdir(f)
+    staged || !isnothing(rev) || return f(@__DIR__)
+    repo = @__DIR__
     if staged
-        original_head = readchomp(`git -C $(@__DIR__) rev-parse HEAD`)
-        run(`git -C $(@__DIR__) commit --allow-empty -m "tmp staged build"`)
-        tmpdir = mktempdir()
-        try
-            run(`git -C $(@__DIR__) worktree add $tmpdir HEAD --detach`)
-            return f(tmpdir)
-        finally
-            run(`git -C $(@__DIR__) worktree remove --force $tmpdir`)
-            run(`git -C $(@__DIR__) reset --soft $original_head`)
-        end
-    elseif !isnothing(rev)
-        resolved = readchomp(`git -C $(@__DIR__) rev-parse $rev`)
-        tmpdir = mktempdir()
-        try
-            run(`git -C $(@__DIR__) worktree add $tmpdir $resolved --detach`)
-            return f(tmpdir)
-        finally
-            run(`git -C $(@__DIR__) worktree remove --force $tmpdir`)
-        end
-    else
-        return f(@__DIR__)
+        original_head = readchomp(`git -C $repo rev-parse HEAD`)
+        run(`git -C $repo commit --allow-empty -m "tmp staged build"`)
+    end
+    commit = readchomp(`git -C $repo rev-parse $(something(rev, "HEAD"))`)
+    tmpdir = mktempdir()
+    try
+        run(`git -C $repo worktree add $tmpdir $commit --detach`)
+        return f(tmpdir)
+    finally
+        run(`git -C $repo worktree remove --force $tmpdir`)
+        staged && run(`git -C $repo reset --soft $original_head`)
     end
 end
 
-function build_binaries(srcdir; outdir=".", flags, exe=Sys.iswindows() ? ".exe" : "", runner=run)
+function build_binaries(srcdir; outdir, flags, exe=Sys.iswindows() ? ".exe" : "", runner=run)
     map(BINARIES) do (name, src)
         runner(`$ZIG build-exe $flags -femit-bin=$outdir/$name$exe --name $name $srcdir/$src`)
     end
 end
 
-const manage_service = Sys.islinux() && !release && isfile(SERVICE_FILE)
+# Only a service pointed at this checkout's conductor runs a debug build.
+const manage_service = Sys.islinux() && !release && isfile(SERVICE_FILE) &&
+    occursin(joinpath(@__DIR__, "julia-conductor"), read(SERVICE_FILE, String))
 
 function stop_service()
     manage_service || return
@@ -94,7 +90,6 @@ function stop_service()
 end
 
 function start_service_with_worker(srcdir)
-    manage_service || return
     # A build worktree is removed once with_srcdir returns.
     worker_project = joinpath(srcdir, "worker")
     if srcdir != @__DIR__
@@ -120,9 +115,14 @@ function build()
             @info "native (debug)"
             stop_service()
             flags = [BASE_FLAGS; "-O"; "Debug"]
-            results = build_binaries(srcdir; flags,
+            results = build_binaries(srcdir; outdir=@__DIR__, flags,
                 runner=cmd -> success(pipeline(cmd; stdout, stderr)))
-            start_service_with_worker(srcdir)
+            if manage_service
+                start_service_with_worker(srcdir)
+            else
+                @info "To run this build, point a service's ExecStart at $(joinpath(@__DIR__, "julia-conductor")), \
+                       or install a release with DaemonicCabal.install()"
+            end
             return Int(any(!, results))
         end
         # Release build
@@ -130,7 +130,7 @@ function build()
         version = open(TOML.parse, joinpath(@__DIR__, "Project.toml"))["version"]
         builddir = mkpath(joinpath(@__DIR__, "builds"))
         @info "native"
-        build_binaries(srcdir; flags=[flags; "-flto"])
+        build_binaries(srcdir; outdir=mkpath(joinpath(builddir, "native")), flags=[flags; "-flto"])
         BUILD_SPECS = [
             ("linux",   "x86_64",  ["-flto"]),
             ("linux",   "aarch64", ["-flto"]),
