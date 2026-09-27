@@ -18,7 +18,7 @@ else if (builtin.os.tag == .windows)
 else
     @compileError("unsupported OS");
 
-const max_socket_path = 256;
+const max_socket_path = protocol.max_socket_path;
 
 const restart_hint = switch (builtin.os.tag) {
     .linux => "systemctl --user restart julia-daemon",
@@ -218,12 +218,12 @@ fn signalStopWatching() void {
     exitClient(130);
 }
 
-fn registerSignalHandlers() void {
+fn registerSignalHandlers(on_interrupt: *const fn () void) void {
     platform.registerSignalHandlers(.{
         .sockets_ptr = @ptrCast(&sockets),
         .write_fn = &signalWriteStdin,
         .notify_exit_fn = &signalNotifyExit,
-        .notify_interrupt_fn = if (watching) &signalStopWatching else &signalNotifyInterrupt,
+        .notify_interrupt_fn = on_interrupt,
     });
 }
 
@@ -292,12 +292,7 @@ fn run(init: std.process.Init.Minimal) !void {
     defer platform.restoreConsoleIo(console);
     defer platform.setRawMode(false);
     // Until a worker is reached, a Ctrl-C gives up, as Julia's does starting.
-    platform.registerSignalHandlers(.{
-        .sockets_ptr = @ptrCast(&sockets),
-        .write_fn = &signalWriteStdin,
-        .notify_exit_fn = &signalNotifyExit,
-        .notify_interrupt_fn = &signalGiveUp,
-    });
+    registerSignalHandlers(&signalGiveUp);
     const conductor = try connectToConductor(env);
     if (transport_mode == .tcp) platform.setTcpNodelay(conductor);
     defer notifyConductor(.client_exit);
@@ -307,7 +302,7 @@ fn run(init: std.process.Init.Minimal) !void {
     const color = colorWanted(inputs.env) orelse platform.isatty(platform.getStdoutHandle());
     try sendClientInfo(&w, env, is_tty, color, inputs.args);
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
-    registerSignalHandlers();
+    registerSignalHandlers(if (watching) &signalStopWatching else &signalNotifyInterrupt);
     signal_parser.sync_mode = sync;
     // Cooked, as Julia's terminal is, until a REPL asks for raw; a --sync
     // client's and a view's are raw throughout.
@@ -483,19 +478,17 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
         else => replyFailure(error.BadReply),
     };
     client_id = try reader.readInt(u32);
-    var paths: [4 * (max_socket_path + 1)]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&paths);
-    const stdin_path = try takeString(reader, fba.allocator());
-    const stdout_path = try takeString(reader, fba.allocator());
-    const stderr_path = try takeString(reader, fba.allocator());
-    const signals_path = try takeString(reader, fba.allocator());
+    var paths_buf: [4 * (max_socket_path + 1)]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&paths_buf);
+    var paths: [4][]const u8 = undefined;
+    for (&paths) |*path| path.* = try takeString(reader, fba.allocator());
     client_key = try reader.readInt(u64);
     platform.close(conductor);
     const result = SocketSet{
-        .stdin = connectToWorkerSocket(stdin_path, "stdin"),
-        .stdout = connectToWorkerSocket(stdout_path, "stdout"),
-        .stderr = connectToWorkerSocket(stderr_path, "stderr"),
-        .signals = connectToWorkerSocket(signals_path, "signals"),
+        .stdin = connectToWorkerSocket(paths[0], "stdin"),
+        .stdout = connectToWorkerSocket(paths[1], "stdout"),
+        .stderr = connectToWorkerSocket(paths[2], "stderr"),
+        .signals = connectToWorkerSocket(paths[3], "signals"),
     };
     if (transport_mode == .tcp) platform.setTcpNodelay(result.signals);
     return result;

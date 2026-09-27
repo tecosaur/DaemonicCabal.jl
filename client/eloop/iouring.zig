@@ -30,20 +30,14 @@ pub fn run(
     signal_parser: anytype,
     sync_mode: bool,
 ) !u8 {
-    const buf_size = 1024;
-    var local_stdin_buf: [buf_size]u8 = undefined;
-    var worker_stdout_buf: [buf_size]u8 = undefined;
-    var worker_stderr_buf: [buf_size]u8 = undefined;
-    var signals_buf: [buf_size]u8 = undefined;
+    // Each indexed by its Location.
+    const srcs = [4]posix.fd_t{ posix.STDIN_FILENO, stdout_fd, stderr_fd, signals_fd };
+    var bufs: [4][1024]u8 = undefined;
+    var ended = [4]bool{ false, false, false, false };
     var stdin_fwd = cooked.StdinForwarder{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw };
-    _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, at_file_position);
-    _ = try ring.read(@intFromEnum(Location.worker_stdout), stdout_fd, .{ .buffer = &worker_stdout_buf }, 0);
-    _ = try ring.read(@intFromEnum(Location.worker_stderr), stderr_fd, .{ .buffer = &worker_stderr_buf }, 0);
-    _ = try ring.read(@intFromEnum(Location.signals), signals_fd, .{ .buffer = &signals_buf }, 0);
+    for (0..srcs.len) |i| try queueRead(ring, @enumFromInt(i), srcs[i], &bufs[i]);
     // Signals EOF without an exit code means the worker crashed.
     var exit_code: ?u8 = null;
-    var stdout_eof = false;
-    var stderr_eof = false;
     while (true) {
         _ = ring.submit_and_wait(1) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -51,56 +45,50 @@ pub fn run(
         };
         while (ring.cq_ready() > 0) {
             const cqe = try ring.copy_cqe();
-            const len: usize = @intCast(@max(0, cqe.res));
-            switch (cqe.user_data) {
-                @intFromEnum(Location.worker_stdout) => {
+            const loc = std.enums.fromInt(Location, cqe.user_data) orelse continue;
+            const i = @intFromEnum(loc);
+            const data = bufs[i][0..@intCast(@max(0, cqe.res))];
+            switch (loc) {
+                .worker_stdout, .worker_stderr => {
                     if (cqe.res <= 0) {
-                        stdout_eof = true;
+                        ended[i] = true;
                         continue;
                     }
-                    if (!platform.writeOutput(posix.STDOUT_FILENO, worker_stdout_buf[0..len])) {
-                        platform.close(stdout_fd);
-                        stdout_eof = true;
+                    if (!platform.writeOutput(if (loc == .worker_stdout) posix.STDOUT_FILENO else posix.STDERR_FILENO, data)) {
+                        platform.close(srcs[i]);
+                        ended[i] = true;
                         continue;
                     }
-                    _ = try ring.read(@intFromEnum(Location.worker_stdout), stdout_fd, .{ .buffer = &worker_stdout_buf }, 0);
                 },
-                @intFromEnum(Location.worker_stderr) => {
-                    if (cqe.res <= 0) {
-                        stderr_eof = true;
-                        continue;
-                    }
-                    if (!platform.writeOutput(posix.STDERR_FILENO, worker_stderr_buf[0..len])) {
-                        platform.close(stderr_fd);
-                        stderr_eof = true;
-                        continue;
-                    }
-                    _ = try ring.read(@intFromEnum(Location.worker_stderr), stderr_fd, .{ .buffer = &worker_stderr_buf }, 0);
-                },
-                @intFromEnum(Location.local_stdin) => {
+                .local_stdin => {
                     if (exit_code != null) continue;
                     if (cqe.res <= 0) {
                         if (!stdin_fwd.end()) continue;
-                    } else stdin_fwd.forward(local_stdin_buf[0..len]);
-                    _ = try ring.read(@intFromEnum(Location.local_stdin), posix.STDIN_FILENO, .{ .buffer = &local_stdin_buf }, at_file_position);
+                    } else stdin_fwd.forward(data);
                 },
-                @intFromEnum(Location.signals) => {
+                .signals => {
                     if (cqe.res <= 0) {
                         if (exit_code == null) exit_code = 1;
                         continue;
                     }
-                    switch (signal_parser.feed(signals_buf[0..len], signals_fd)) {
+                    switch (signal_parser.feed(data, signals_fd)) {
                         .exit => |code| {
                             exit_code = code;
+                            continue;
                         },
-                        .none => _ = try ring.read(@intFromEnum(Location.signals), signals_fd, .{ .buffer = &signals_buf }, 0),
+                        .none => {},
                     }
                 },
-                else => {},
             }
+            try queueRead(ring, loc, srcs[i], &bufs[i]);
         }
-        if (exit_code != null and stdout_eof and stderr_eof) {
-            return exit_code.?;
-        }
+        const worker_stdout = @intFromEnum(Location.worker_stdout);
+        const worker_stderr = @intFromEnum(Location.worker_stderr);
+        if (exit_code != null and ended[worker_stdout] and ended[worker_stderr]) return exit_code.?;
     }
+}
+
+fn queueRead(ring: *linux.IoUring, loc: Location, fd: posix.fd_t, buf: []u8) !void {
+    const offset = if (loc == .local_stdin) at_file_position else 0;
+    _ = try ring.read(@intFromEnum(loc), fd, .{ .buffer = buf }, offset);
 }

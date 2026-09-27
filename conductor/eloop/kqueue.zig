@@ -19,8 +19,6 @@ const posix_signals = @import("posix_signals.zig");
 pub const installSignalHandlers = posix_signals.installSignalHandlers;
 pub const cleanupSignalHandlers = posix_signals.cleanupSignalHandlers;
 const signal_pipe = &posix_signals.signal_pipe;
-const SIGNAL_SHUTDOWN = posix_signals.SIGNAL_SHUTDOWN;
-const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 
 const EV_ERROR = bsd.EV_ERROR;
 const makeKevent = bsd.makeKevent;
@@ -108,6 +106,16 @@ pub const EventLoop = struct {
         self.tick_armed = false;
     }
 
+    pub fn stopAccepting(self: *EventLoop, listener: *protocol.Listener) void {
+        var ch = [1]c.Kevent{makeKevent(@intCast(listener.fd()), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
+        _ = keventSubmit(self.kq, &ch);
+    }
+
+    pub fn startAccepting(self: *EventLoop, listener: *protocol.Listener) void {
+        var ch = [1]c.Kevent{makeKevent(@intCast(listener.fd()), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT)};
+        _ = keventSubmit(self.kq, &ch);
+    }
+
     /// isLiveWorker rejects any stale event.
     pub fn cancelPendingPing(self: *EventLoop, w: *worker.Worker) void {
         var hc = [1]c.Kevent{makeKevent(@intFromPtr(w) | 1, c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
@@ -125,10 +133,8 @@ pub const EventLoop = struct {
 // Main event loop
 pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     const kq = conductor.event_loop.kq;
-    var server_fd: posix.fd_t = listener.fd();
-    var signal_buf: [16]u8 = undefined;
     var init_changes: [3]c.Kevent = .{
-        makeKevent(@intCast(server_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT),
+        makeKevent(@intCast(listener.fd()), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT),
         makeKevent(@intCast(signal_pipe[0]), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_SIGNAL),
         makeKevent(
             TIMER_IDENT_PING,
@@ -170,11 +176,11 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
             const udata = ev.udata;
             switch (udata) {
                 UDATA_ACCEPT => {
-                    handleAccept(conductor, server_fd);
+                    handleAccept(conductor, listener.fd());
                     pool_changed = true;
                 },
                 UDATA_SIGNAL => {
-                    if (handleSignal(conductor, listener, &server_fd, kq, &signal_buf)) return;
+                    if (posix_signals.drain(conductor, &conductor.event_loop, listener)) return;
                     pool_changed = true;
                 },
                 UDATA_PING_TIMER => {
@@ -235,44 +241,6 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
     _ = c.fcntl(client_fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
     const peer = main.PeerInfo.fromSockaddr(&client_addr);
     conductor.admitConnection(client_fd, &peer);
-}
-
-/// True when shutdown was requested.
-fn handleSignal(
-    conductor: *Conductor,
-    listener: *protocol.Listener,
-    server_fd: *posix.fd_t,
-    kq: posix.fd_t,
-    signal_buf: *[16]u8,
-) bool {
-    const n = posix.read(signal_pipe[0], signal_buf) catch |err| {
-        std.debug.print("Signal pipe read error: {}\n", .{err});
-        return false;
-    };
-    for (signal_buf[0..n]) |sig| {
-        switch (sig) {
-            SIGNAL_SHUTDOWN => {
-                std.debug.print("\nShutdown requested, stopping workers...\n", .{});
-                conductor.gracefulShutdown();
-                return true;
-            },
-            SIGNAL_RECREATE => {
-                std.debug.print("Recreating socket due to SIGUSR1\n", .{});
-                var del_changes = [1]c.Kevent{makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
-                _ = keventSubmit(kq, &del_changes);
-                listener.close(conductor.io);
-                listener.* = conductor.createServer() catch |err| {
-                    std.debug.print("Failed to recreate socket: {}\n", .{err});
-                    continue;
-                };
-                server_fd.* = listener.fd();
-                var add_changes = [1]c.Kevent{makeKevent(@intCast(server_fd.*), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_ACCEPT)};
-                _ = keventSubmit(kq, &add_changes);
-            },
-            else => {},
-        }
-    }
-    return false;
 }
 
 // Helpers

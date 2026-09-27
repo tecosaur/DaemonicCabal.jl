@@ -18,8 +18,6 @@ const EventLocation = protocol.EventLocation;
 const posix_signals = @import("posix_signals.zig");
 
 const signal_pipe = &posix_signals.signal_pipe;
-const SIGNAL_SHUTDOWN = posix_signals.SIGNAL_SHUTDOWN;
-const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 
 // Tags are an EventLocation, or a pointer (>= 0x1000): to a worker (as a
 // timer, bit 0 marks a health check), or with bits 1-2 set a pending record.
@@ -84,6 +82,14 @@ pub const EventLoop = struct {
         w.skipOwedPong();
     }
 
+    pub fn stopAccepting(self: *EventLoop, listener: *protocol.Listener) void {
+        self.unwatchFd(@intFromEnum(EventLocation.accept), listener.fd());
+    }
+
+    pub fn startAccepting(self: *EventLoop, listener: *protocol.Listener) void {
+        self.watch(@intFromEnum(EventLocation.accept), listener.fd(), linux.EPOLL.IN) catch {};
+    }
+
     /// A one-shot watch stays registered once fired, so rewatching modifies it.
     fn watch(self: *EventLoop, tag: usize, fd: posix.fd_t, events: u32) !void {
         var ev = linux.epoll_event{ .events = events, .data = .{ .u64 = tag } };
@@ -132,14 +138,12 @@ pub const EventLoop = struct {
 
 // Main event loop
 pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener) void {
-    var server_fd = listener.fd();
-    loop.watch(@intFromEnum(EventLocation.accept), server_fd, linux.EPOLL.IN) catch return;
+    loop.watch(@intFromEnum(EventLocation.accept), listener.fd(), linux.EPOLL.IN) catch return;
     loop.watch(@intFromEnum(EventLocation.signal), signal_pipe[0], linux.EPOLL.IN) catch return;
     const ping_interval_ms = conductor.cfg.ping_interval * 1000;
     const pressure_interval_ms = conductor.pressureIntervalS() * 1000;
     loop.arm(@intFromEnum(EventLocation.ping_timer), ping_interval_ms);
     if (conductor.pressure_monitor.active()) loop.arm(@intFromEnum(EventLocation.pressure_timer), pressure_interval_ms);
-    var signal_buf: [16]u8 = undefined;
     var events: [32]linux.epoll_event = undefined;
     while (true) {
         const rc = linux.epoll_wait(loop.epfd, &events, events.len, loop.waitMs());
@@ -170,11 +174,11 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
             }
             switch (@as(EventLocation, @enumFromInt(tag))) {
                 .accept => {
-                    handleAccept(conductor, server_fd);
+                    handleAccept(conductor, listener.fd());
                     pool_changed = true;
                 },
                 .signal => {
-                    if (handleSignal(conductor, loop, listener, &server_fd, &signal_buf)) return;
+                    if (posix_signals.drain(conductor, loop, listener)) return;
                     pool_changed = true;
                 },
                 else => {},
@@ -236,42 +240,6 @@ fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
     }
     const peer = main.PeerInfo.fromSockaddr(&client_addr);
     conductor.admitConnection(@intCast(rc), &peer);
-}
-
-/// True when shutdown was requested.
-fn handleSignal(
-    conductor: *Conductor,
-    loop: *EventLoop,
-    listener: *protocol.Listener,
-    server_fd: *posix.fd_t,
-    signal_buf: *[16]u8,
-) bool {
-    const n = posix.read(signal_pipe[0], signal_buf) catch |err| {
-        std.debug.print("Signal pipe read error: {}\n", .{err});
-        return false;
-    };
-    for (signal_buf[0..n]) |sig| {
-        switch (sig) {
-            SIGNAL_SHUTDOWN => {
-                std.debug.print("\nShutdown requested, stopping workers...\n", .{});
-                conductor.gracefulShutdown();
-                return true;
-            },
-            SIGNAL_RECREATE => {
-                std.debug.print("Recreating socket due to SIGUSR1\n", .{});
-                loop.unwatchFd(@intFromEnum(EventLocation.accept), server_fd.*);
-                listener.close(conductor.io);
-                listener.* = conductor.createServer() catch |err| {
-                    std.debug.print("Failed to recreate socket: {}\n", .{err});
-                    continue;
-                };
-                server_fd.* = listener.fd();
-                loop.watch(@intFromEnum(EventLocation.accept), server_fd.*, linux.EPOLL.IN) catch {};
-            },
-            else => {},
-        }
-    }
-    return false;
 }
 
 // Helpers

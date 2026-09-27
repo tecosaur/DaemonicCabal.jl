@@ -10,7 +10,6 @@ const Io = std.Io;
 const protocol = @import("../protocol.zig");
 const impl = if (builtin.os.tag == .linux) @import("linux.zig") else @import("bsd.zig");
 
-/// Into an allocator (owned slice) or a `[]u8` buffer (sub-slice).
 /// std.debug.print without its stderr locking and terminal handling, which
 /// cost the client ~110 KB. Truncates past 1 KiB.
 pub fn eprint(comptime fmt: []const u8, args: anytype) void {
@@ -20,6 +19,7 @@ pub fn eprint(comptime fmt: []const u8, args: anytype) void {
     _ = posix.system.write(posix.STDERR_FILENO, w.buffered().ptr, w.buffered().len);
 }
 
+/// Into an allocator (owned slice) or a `[]u8` buffer (sub-slice).
 pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
     if (@TypeOf(out) == std.mem.Allocator)
         return std.fmt.allocPrint(out, fmt, args)
