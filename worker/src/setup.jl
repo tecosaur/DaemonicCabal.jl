@@ -86,8 +86,10 @@ function load_revise()
     end
 end
 
-wants_revise(client::ClientInfo) = isyes(getval(client.switches, "--revise",
-    getval(client.env, "JULIA_DAEMON_REVISE", get(ENV, "JULIA_DAEMON_REVISE", "no"))))
+# Never in a sandbox the conductor built, whose filesystem is ephemeral.
+wants_revise(client::ClientInfo) = !haskey(ENV, "JULIA_DAEMON_SANDBOXED") &&
+    isyes(getval(client.switches, "--revise",
+        getval(client.env, "JULIA_DAEMON_REVISE", get(ENV, "JULIA_DAEMON_REVISE", "no"))))
 
 # Staleness: a reused worker must not run code that differs from what is on
 # disk, as a fresh `julia` never would.
