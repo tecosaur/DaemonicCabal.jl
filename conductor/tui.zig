@@ -27,7 +27,9 @@ pub const Key = union(enum) {
 };
 
 /// The keys in one chunk of terminal input. An ESC ending its chunk is the
-/// Escape key: a terminal sends a whole sequence at once.
+/// Escape key, and one before another key is Alt with it, which nothing
+/// takes: a terminal sends a key's bytes at once, and a person presses keys
+/// apart.
 pub const KeyIterator = struct {
     bytes: []const u8,
     pos: usize = 0,
@@ -58,10 +60,16 @@ pub const KeyIterator = struct {
         return null;
     }
 
-    // After an ESC: a CSI or SS3 sequence, else the Escape key alone.
+    // After an ESC: the Escape key alone, a CSI or SS3 sequence, or Alt
+    // with the key that follows (a character past ASCII whole), skipped.
     fn escape(self: *KeyIterator) ?Key {
         const rest = self.bytes[self.pos..];
-        if (rest.len == 0 or (rest[0] != '[' and rest[0] != 'O')) return .escape;
+        if (rest.len == 0) return .escape;
+        if (rest[0] != '[' and rest[0] != 'O') {
+            const len = @min(std.unicode.utf8ByteSequenceLength(rest[0]) catch 1, rest.len);
+            self.pos += len;
+            return self.next();
+        }
         var i: usize = 1;
         var param: u16 = 0;
         var modified = false; // as with Ctrl, which nothing here takes
@@ -133,6 +141,24 @@ pub fn lastLines(text: []const u8, out: [][]const u8) [][]const u8 {
         rest = if (cut) |i| rest[0..i] else break;
     }
     return out[out.len - n ..];
+}
+
+/// The first of a frame's `total` lines to show in `height`, so that its
+/// lines `keep_start..keep_end` show as far as they fit: the top, unless
+/// they would fall below.
+pub fn scrollTop(total: usize, height: usize, keep_start: usize, keep_end: usize) usize {
+    if (total <= height) return 0;
+    return @min(keep_start, keep_end -| height, total - height);
+}
+
+/// Lines `first..first + count` of `text`, each of whose lines ends in a
+/// newline.
+pub fn lineRange(text: []const u8, first: usize, count: usize) []const u8 {
+    var start: usize = 0;
+    for (0..first) |_| start = (std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return "") + 1;
+    var end = start;
+    for (0..count) |_| end = (std.mem.indexOfScalarPos(u8, text, end, '\n') orelse return text[start..]) + 1;
+    return text[start..end];
 }
 
 pub const tab_width = 8;
@@ -220,8 +246,8 @@ pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const
     var style: u8 = 0;
     for (row.cells[0..row.len], 0..) |cell, k| {
         if (colour and cell.style != style) {
-            try out.appendSlice(gpa, "\x1b[0m");
-            try out.appendSlice(gpa, row.styles.get(cell.style));
+            var buf: [Sgr.max_bytes]u8 = undefined;
+            try out.appendSlice(gpa, row.styles.get(cell.style).sequence(&buf));
             style = cell.style;
         }
         try out.appendSlice(gpa, row.shown(k));
@@ -415,40 +441,136 @@ const Row = struct {
     }
 };
 
-/// The distinct colours of a row, as the SGR sequences that set them from a
-/// reset; 0 is none. A row with more than fit keeps drawing in the last.
+/// The distinct styles of a row, by id; 0 is the default. Past the last id,
+/// a change keeps the style it was made in.
 const Styles = struct {
-    const max_styles = 32;
-    const max_bytes = 48;
+    const max_styles = 256;
 
-    bytes: [max_styles][max_bytes]u8 = undefined,
-    lens: [max_styles]u8 = .{0} ** max_styles,
-    count: u8 = 1,
+    states: [max_styles]Sgr = undefined,
+    count: usize = 1,
 
-    fn get(self: *const Styles, id: u8) []const u8 {
-        return self.bytes[id][0..self.lens[id]];
+    fn get(self: *const Styles, id: u8) Sgr {
+        return if (id == 0) .{} else self.states[id];
     }
 
     // The style after `ESC [ params m` in style `from`.
     fn apply(self: *Styles, from: u8, params: []const u8) u8 {
-        var reset = params.len == 0;
-        var it = std.mem.splitAny(u8, params, ";:");
-        while (it.next()) |p| {
-            if (p.len == 0 or std.mem.eql(u8, p, "0")) reset = true;
-        }
-        var buf: [max_bytes]u8 = undefined;
-        const base = if (reset) "" else self.get(from);
-        const next = std.fmt.bufPrint(&buf, "{s}\x1b[{s}m", .{ base, params }) catch return from;
-        const state = if (reset and std.mem.eql(u8, params, "0") or params.len == 0) "" else next;
+        var state = self.get(from);
+        state.apply(params);
         for (0..self.count) |id| {
-            if (std.mem.eql(u8, self.get(@intCast(id)), state)) return @intCast(id);
+            if (std.meta.eql(self.get(@intCast(id)), state)) return @intCast(id);
         }
         if (self.count == max_styles) return from;
-        const id = self.count;
-        @memcpy(self.bytes[id][0..state.len], state);
-        self.lens[id] = @intCast(state.len);
+        self.states[self.count] = state;
         self.count += 1;
-        return id;
+        return @intCast(self.count - 1);
+    }
+};
+
+/// What SGR sequences leave set, however many drew it: the attributes,
+/// the foreground and background. Underline styles and colours are taken
+/// as plain underline and dropped.
+const Sgr = struct {
+    const max_bytes = 64;
+    const Colour = union(enum) { default, index: u8, rgb: [3]u8 };
+
+    attributes: u9 = 0, // SGR 1 to 9, bit n - 1 for n
+    fg: Colour = .default,
+    bg: Colour = .default,
+
+    fn apply(self: *Sgr, params: []const u8) void {
+        var groups = std.mem.splitScalar(u8, params, ';');
+        while (groups.next()) |group| {
+            if (std.mem.indexOfScalar(u8, group, ':') != null) {
+                self.applyColon(group);
+                continue;
+            }
+            const code = std.fmt.parseInt(u8, group, 10) catch if (group.len == 0) 0 else continue;
+            switch (code) {
+                38, 48 => {
+                    const colour: ?Colour = switch (number(groups.next())) {
+                        5 => .{ .index = number(groups.next()) },
+                        2 => .{ .rgb = .{ number(groups.next()), number(groups.next()), number(groups.next()) } },
+                        else => null,
+                    };
+                    if (colour) |c| if (code == 38) {
+                        self.fg = c;
+                    } else {
+                        self.bg = c;
+                    };
+                },
+                else => self.applyCode(code),
+            }
+        }
+    }
+
+    fn applyCode(self: *Sgr, code: u8) void {
+        switch (code) {
+            0 => self.* = .{},
+            1...9 => self.attributes |= bit(code),
+            21 => self.attributes |= bit(4),
+            22 => self.attributes &= ~(bit(1) | bit(2)),
+            23, 24 => self.attributes &= ~bit(code - 20),
+            25 => self.attributes &= ~(bit(5) | bit(6)),
+            27...29 => self.attributes &= ~bit(code - 20),
+            30...37 => self.fg = .{ .index = code - 30 },
+            39 => self.fg = .default,
+            40...47 => self.bg = .{ .index = code - 40 },
+            49 => self.bg = .default,
+            90...97 => self.fg = .{ .index = code - 90 + 8 },
+            100...107 => self.bg = .{ .index = code - 100 + 8 },
+            else => {},
+        }
+    }
+
+    // ITU T.416's form, `38:2:[space]:r:g:b` or `38:5:n`, and `4:n`
+    // underline styles.
+    fn applyColon(self: *Sgr, group: []const u8) void {
+        var fields: [6]u8 = @splat(0);
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, group, ':');
+        while (it.next()) |field| : (n += 1) {
+            if (n < fields.len) fields[n] = number(field);
+        }
+        switch (fields[0]) {
+            4 => if (fields[1] == 0) self.applyCode(24) else self.applyCode(4),
+            38, 48 => {
+                const colour: Colour = switch (fields[1]) {
+                    5 => .{ .index = fields[2] },
+                    2 => .{ .rgb = if (n >= 6) fields[3..6].* else fields[2..5].* },
+                    else => return,
+                };
+                if (fields[0] == 38) self.fg = colour else self.bg = colour;
+            },
+            else => {},
+        }
+    }
+
+    // From a reset, so a cell's style never depends on the one before.
+    fn sequence(self: Sgr, buf: *[max_bytes]u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        w.writeAll("\x1b[0") catch unreachable;
+        for (1..10) |code| if (self.attributes & bit(@intCast(code)) != 0) w.print(";{d}", .{code}) catch unreachable;
+        for ([_]Colour{ self.fg, self.bg }, [_]u8{ 30, 40 }) |colour, base| switch (colour) {
+            .default => {},
+            .index => |i| if (i < 8)
+                w.print(";{d}", .{base + i}) catch unreachable
+            else if (i < 16)
+                w.print(";{d}", .{base + 60 + i - 8}) catch unreachable
+            else
+                w.print(";{d};5;{d}", .{ base + 8, i }) catch unreachable,
+            .rgb => |c| w.print(";{d};2;{d};{d};{d}", .{ base + 8, c[0], c[1], c[2] }) catch unreachable,
+        };
+        w.writeByte('m') catch unreachable;
+        return w.buffered();
+    }
+
+    fn bit(code: u8) u9 {
+        return @as(u9, 1) << @intCast(code - 1);
+    }
+
+    fn number(field: ?[]const u8) u8 {
+        return std.fmt.parseInt(u8, field orelse return 0, 10) catch 0;
     }
 };
 
@@ -523,9 +645,13 @@ test "keys: unknown and cut-short sequences leave nothing" {
     var it = KeyIterator{ .bytes = "\x1b[1;5Cx\x1b[99~\x1b[" };
     try std.testing.expectEqual(Key{ .char = 'x' }, it.next().?);
     try std.testing.expectEqual(@as(?Key, null), it.next());
-    var alt = KeyIterator{ .bytes = "\x1bx" };
-    try std.testing.expectEqual(Key.escape, alt.next().?);
-    try std.testing.expectEqual(Key{ .char = 'x' }, alt.next().?);
+}
+
+test "keys: an ESC before another key is Alt with it, skipped, not Escape" {
+    var it = KeyIterator{ .bytes = "\x1bx\x1b\x7f\x1bé\x1b\x1bq\x1b" };
+    try std.testing.expectEqual(Key{ .char = 'q' }, it.next().?);
+    try std.testing.expectEqual(Key.escape, it.next().?);
+    try std.testing.expectEqual(@as(?Key, null), it.next());
 }
 
 test "focus moves down from none and lets go up from the first" {
@@ -547,6 +673,18 @@ test "a vanished focus passes to the client at its row" {
     try std.testing.expectEqual(@as(?u32, 9), keepFocus(&order, 3, 5));
     try std.testing.expectEqual(@as(?u32, null), keepFocus(&.{}, 3, 0));
     try std.testing.expectEqual(@as(?u32, null), keepFocus(&order, null, 0));
+}
+
+test "a frame taller than the screen scrolls only to keep the focus in view" {
+    try std.testing.expectEqual(@as(usize, 0), scrollTop(10, 20, 15, 16));
+    try std.testing.expectEqual(@as(usize, 0), scrollTop(30, 20, 5, 10));
+    try std.testing.expectEqual(@as(usize, 6), scrollTop(30, 20, 20, 26));
+    try std.testing.expectEqual(@as(usize, 10), scrollTop(30, 20, 28, 30));
+    try std.testing.expectEqual(@as(usize, 22), scrollTop(40, 5, 22, 30)); // taller than the screen itself: its top
+    const text = "a\nb\nc\nd\n";
+    try std.testing.expectEqualStrings("b\nc\n", lineRange(text, 1, 2));
+    try std.testing.expectEqualStrings("d\n", lineRange(text, 3, 5));
+    try std.testing.expectEqualStrings("", lineRange(text, 6, 1));
 }
 
 test "last lines: the tail, blank lines kept" {
@@ -632,10 +770,24 @@ test "columns: colour kept, other sequences dropped, redrawn lines last" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 7), try appendColumns(&out, gpa, "\x1b]0;title\x07\x1b[31mred\x1b[0m ok!\x1b[?25l", 20, true));
-    try std.testing.expectEqualStrings("\x1b[0m\x1b[31mred\x1b[0m ok!", out.items);
+    try std.testing.expectEqualStrings("\x1b[0;31mred\x1b[0m ok!", out.items);
     out.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 4), try appendColumns(&out, gpa, "50%...\r100%\x1b[K", 20, true));
     try std.testing.expectEqualStrings("100%", out.items);
+}
+
+test "colour: however many changes a line makes, each cell keeps its own" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(gpa);
+    // Colours set without a reset between them, as a progress bar does.
+    for (0..40) |i| try line.print(gpa, "\x1b[38;5;{d}m\x1b[1m#", .{i + 16});
+    try line.appendSlice(gpa, "\x1b[22;38:2::1:2:3;48;2;4;5;6m$\x1b[4:3;7;49;39;27;24m%");
+    _ = try appendColumns(&out, gpa, line.items, 80, true);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[0;1;38;5;55m#") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, "\x1b[0;38;2;1;2;3;48;2;4;5;6m$\x1b[0m%"));
 }
 
 test "cursor: marked where nothing is drawn, not over text" {
@@ -646,7 +798,7 @@ test "cursor: marked where nothing is drawn, not over text" {
     try std.testing.expectEqualStrings("julia> ▎", out.items);
     out.clearRetainingCapacity();
     _ = try appendLine(&out, gpa, "julia> ", 40, true, "90");
-    try std.testing.expectEqualStrings("julia> \x1b[0m\x1b[90m▎\x1b[0m", out.items);
+    try std.testing.expectEqualStrings("julia> \x1b[0;90m▎\x1b[0m", out.items);
     out.clearRetainingCapacity();
     _ = try appendLine(&out, gpa, "julia> 1+1\x1b[2D", 40, false, "90");
     try std.testing.expectEqualStrings("julia> 1+1", out.items);
@@ -669,7 +821,7 @@ test "columns: a REPL's line editing draws its prompt and input" {
     try std.testing.expectEqualStrings("julia> 1+1", out.items);
     out.clearRetainingCapacity();
     _ = try appendColumns(&out, gpa, drawn, 40, true);
-    try std.testing.expectEqualStrings("\x1b[0m\x1b[32m\x1b[1mjulia> \x1b[0m1+1", out.items);
+    try std.testing.expectEqualStrings("\x1b[0;1;32mjulia> \x1b[0m1+1", out.items);
 }
 
 test "pane: an aside at the top border's end, the title cut for it" {

@@ -2519,7 +2519,9 @@ pub const Conductor = struct {
 
     // A TTY client is colour-probed first; a non-answering terminal gets the flat report.
     // A styled TTY one-shot waits a beat so its CPU meter resolves.
-    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool, scope: status.Scope) !void {
+    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, switch_value: ?[]const u8, tty: bool, scope: status.Scope) !void {
+        // A bare `--status` has an empty value.
+        const format = if (switch_value) |v| (if (v.len > 0) v else null) else null;
         var streams = try self.openClientStreams(client_socket, true);
         var held = false;
         defer if (!held) streams.deinit();

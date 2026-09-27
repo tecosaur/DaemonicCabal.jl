@@ -40,10 +40,6 @@ const max_tail_bytes = 64 << 10;
 const max_pane_rows = 16; // a preview: ⏎ shows the whole
 const note_s = 4; // how long an action's outcome stays in the pane's border
 const resample_s = 5; // a snapshot still sampling is not asked for again sooner
-// Without autowrap a row wider than the terminal is cut, not wrapped, so the
-// frame's height is its line count, which the redraw moves back over.
-const view_start = "\x1b[?25l\x1b[?7l";
-const view_end = "\x1b[?7h\x1b[?25h";
 const alternate_screen = "\x1b[?7h\x1b[?1049h\x1b[H\x1b[2J";
 const main_screen = "\x1b[0m\x1b[?1049l\x1b[?7l";
 
@@ -142,7 +138,7 @@ const Note = struct {
 pub fn subscribe(c: *Conductor, streams: ClientStreams, palette: ?pal.Palette, scope: status.Scope, oneshot: bool) !void {
     const sub = try c.allocator.create(Subscriber);
     errdefer c.allocator.destroy(sub);
-    sub.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_counter }, .scope = scope, .oneshot = oneshot };
+    sub.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_id }, .scope = scope, .oneshot = oneshot };
     try c.live.list.append(c.allocator, sub);
     if (oneshot) {
         c.refreshStats(null); // first reading; the deferred fire takes the second
@@ -151,7 +147,6 @@ pub fn subscribe(c: *Conductor, streams: ClientStreams, palette: ?pal.Palette, s
         return;
     }
     sub.term.open(c);
-    send(c, sub, view_start);
     repaint(c, sub);
     if (!c.live.armed) {
         c.event_loop.armLiveTimer(heartbeat_ms);
@@ -207,7 +202,7 @@ pub fn onProfile(c: *Conductor, w: *const worker.Worker, report: []u8) void {
 
 // A worker's snapshot, begun here when it was asked for elsewhere.
 fn snapshotOf(c: *Conductor, worker_id: u32) ?*Snapshot {
-    for (c.live.snapshots.items) |*snap| if (snap.worker_id == worker_id) return snap;
+    if (findSnapshot(c, worker_id)) |snap| return snap;
     c.live.snapshots.append(c.allocator, .{ .worker_id = worker_id, .taken_at = c.currentTime() }) catch return null;
     return &c.live.snapshots.items[c.live.snapshots.items.len - 1];
 }
@@ -328,6 +323,8 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     defer report.deinit(c.allocator);
     try out.appendSlice(c.allocator, "\x1b[?2026h");
     if (sub.term.lines_last_printed > 0) try out.print(c.allocator, "\x1b[{d}F\x1b[0J", .{sub.term.lines_last_printed});
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(c.allocator);
     var lines = report.lines;
     const placed = if (sub.focus) |focus| placed: {
         sub.focus_row = std.mem.indexOfScalar(u32, report.clients, focus) orelse 0;
@@ -335,23 +332,32 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     } else null;
     // The pane encloses the focused row, its top border; the frame stays a
     // row short of the screen, so it never scrolls.
+    const height = if (sub.oneshot) lines else @as(usize, sub.term.size.rows) -| 1;
     const full = sub.view != .transcript or (sub.preview == .transcript and sub.tail.items.len > 0);
     const wanted: usize = if (full) max_pane_rows else tui.min_pane_rows;
-    const rows = @min(wanted, @as(usize, sub.term.size.rows) -| 1 -| lines +| 1);
-    if (placed != null and rows >= tui.min_pane_rows) {
-        const at = placed.?;
-        try out.appendSlice(c.allocator, report.bytes[0..at.start]);
-        try writePane(c, sub, sub.focus.?, out, at, report, rows);
-        try out.appendSlice(c.allocator, report.bytes[at.end..]);
-        lines += rows - 1;
+    const rows = @min(wanted, height -| lines +| 1);
+    var focus_lines: [2]usize = .{ 0, 0 };
+    if (placed) |at| {
+        const line = std.mem.count(u8, report.bytes[0..at.start], "\n");
+        const pane = rows >= tui.min_pane_rows;
+        focus_lines = .{ line, line + if (pane) rows else 1 };
+        try frame.appendSlice(c.allocator, report.bytes[0..at.start]);
+        if (pane) try writePane(c, sub, sub.focus.?, &frame, at, report, rows) else try frame.appendSlice(c.allocator, report.bytes[at.start..at.end]);
+        try frame.appendSlice(c.allocator, report.bytes[at.end..]);
+        if (pane) lines += rows - 1;
     } else {
-        try out.appendSlice(c.allocator, report.bytes);
+        try frame.appendSlice(c.allocator, report.bytes);
     }
+    // Taller than the screen, the tree is cut to it, scrolled to the focus.
+    const top = tui.scrollTop(lines, height, focus_lines[0], focus_lines[1]);
+    const shown = @min(lines, height);
+    try out.appendSlice(c.allocator, tui.lineRange(frame.items, top, shown));
+    if (shown < lines) try out.appendSlice(c.allocator, "\x1b[0m"); // a style open across the cut
     try out.appendSlice(c.allocator, "\x1b[?2026l");
     c.allocator.free(sub.order);
     sub.order = report.clients;
     report.clients = &.{};
-    return lines;
+    return shown;
 }
 
 // `row` is the focused client's, as the tree drew it: the pane's title.
@@ -504,16 +510,19 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     }
 }
 
-// As a client's Ctrl-C: SIGINT to the worker, which reaches whichever of its
-// clients is running.
+// As a client's Ctrl-C: from Julia 1.14 the worker cancels the focused
+// client's code, and the SIGINT finds nothing; before, the SIGINT reaches
+// whichever of its clients runs.
 fn interrupt(c: *Conductor, sub: *Subscriber, focus: u32) void {
-    const w = (c.active_clients.get(focus) orelse return).worker;
+    const info = c.active_clients.get(focus) orelse return;
+    const w = info.worker;
+    w.cancelClient(focus, 0); // 0: whichever evaluation is current
     w.signal(platform.SIG.INT);
     const now = c.currentTime();
     if (w.busyClients() > 1)
-        sub.note.set(now, "interrupted worker #{d}, reaching whichever of its {d} clients runs", .{ w.id, w.busyClients() })
+        sub.note.set(now, "interrupted client {d}; before Julia 1.14, whichever of the worker's {d} runs", .{ info.pid, w.busyClients() })
     else
-        sub.note.set(now, "interrupted client {d}", .{(c.active_clients.get(focus) orelse return).pid});
+        sub.note.set(now, "interrupted client {d}", .{info.pid});
     repaint(c, sub);
 }
 
@@ -1017,7 +1026,8 @@ fn sweep(c: *Conductor) void {
         _ = c.live.list.swapRemove(i);
         if (!sub.oneshot) detach(c, sub);
         const full_screen = sub.following or sub.paging;
-        sub.term.close(c, if (sub.oneshot) null else if (full_screen) main_screen ++ "\r\n" ++ view_end else "\r\n" ++ view_end);
+        // A pager cut short may have left its scroll region.
+        sub.term.close(c, if (sub.oneshot) null else if (full_screen) "\x1b[r" ++ main_screen ++ "\r\n" else "\r\n");
         sub.tail.deinit(c.allocator);
         c.allocator.free(sub.order);
         c.allocator.destroy(sub);
