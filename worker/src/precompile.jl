@@ -86,6 +86,11 @@ let
         write(text, "\e[1mbold\e[m\r\e[Kplain\n")
         finish!(text)
     end
+    # -- Printing into buffers, recompiled against `get(::GenericIOBuffer, …)` --
+    # Through a barrier, as user code reaches them: dynamically, so widened.
+    let T = Base.inferencebarrier(ClientInfo), x = Base.inferencebarrier(client)
+        repr(T); string(T); string("", T); repr(x); string(x); string([x])
+    end
     # -- ScopedIO --------------------------------------------------------------
     @static if VERSION >= v"1.11"
         scoped_out = ScopedStdout()

@@ -82,6 +82,20 @@ Base.pipe_reader(::ScopedStdin) = @something(ACTIVE_TERM[].redirect_in, ACTIVE_T
 Base.pipe_writer(::ScopedStdout) = @something(ACTIVE_TERM[].redirect_out, ACTIVE_TERM[].stdout)
 Base.pipe_writer(::ScopedStderr) = @something(ACTIVE_TERM[].redirect_err, ACTIVE_TERM[].stderr)
 
+# Stderr is unbuffered, so it would overtake what stdout still holds.
+function flush_pending_stdout()
+    out = ACTIVE_TERM[].stdout
+    out isa BufferedOutput && out.pos > 0 && flush(out)
+end
+function Base.unsafe_write(io::ScopedStderr, p::Ptr{UInt8}, n::UInt)
+    flush_pending_stdout()
+    unsafe_write(Base.pipe_writer(io), p, n)
+end
+function Base.write(io::ScopedStderr, byte::UInt8)
+    flush_pending_stdout()
+    write(Base.pipe_writer(io), byte)
+end
+
 # A recorded REPL's terminal writes stdout through this, so its line editing
 # can be told from the output of other tasks.
 struct TerminalStdout <: Base.AbstractPipe end
@@ -142,9 +156,20 @@ function Base.get(::Union{ScopedStdout, ScopedStderr, TerminalStdout}, key::Symb
             something(ACTIVE_TERM[].have_color, false)
         end
     else
-        default
+        client_module_default(key, default)
     end
 end
+
+# Base prints a name qualified unless it is visible from the printing IO's
+# `:module`, by default the worker's Main: for the client, that is its own.
+# These answer an `IOContext` (through its dictionary) and a bare buffer, as
+# `repr` and `string` use; the scoped streams answer in `get` above.
+function Base.get(d::Base.ImmutableDict{Symbol, Any}, key::Symbol, default::Module)
+    invoke(get, Tuple{Base.ImmutableDict, Any, Any}, d, key, client_module_default(key, default))
+end
+Base.get(::Base.GenericIOBuffer, key::Symbol, default::Module) = client_module_default(key, default)
+client_module_default(key::Symbol, default) =
+    if key === :module && default === Main CLIENT_MODULE[] else default end
 
 const DEFAULT_DISPLAYSIZE = (24, 80)
 

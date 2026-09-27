@@ -87,6 +87,14 @@ function prepare_module(client::ClientInfo)
     if !isempty(client.args)
         Core.eval(mod, :(ARGS = $(client.args)))
     end
+    # A client module's shadows Base's. Main (a session) sets Base's: 1.10 and
+    # 1.11 won't let Main assign a name it has taken from Base.
+    program = something(client.programfile, "")
+    if mod === Main
+        setglobal!(Base, :PROGRAM_FILE, program)
+    elseif !isempty(program)
+        Core.eval(mod, :(PROGRAM_FILE = $program))
+    end
     mod
 end
 
@@ -233,6 +241,10 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     exit_code = 0
     try
         mod = prepare_module(client)
+        # Base qualifies names not visible from `:module`. Within the client's scope
+        # the worker's `get`s answer for it, but the error display below is outside.
+        stdoutx = IOContext(stdoutx, :module => mod)
+        stderrx = IOContext(stderrx, :module => mod)
         saved_env = swap_env!(client.env)
         try
             @static if VERSION < v"1.11"
@@ -279,6 +291,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
         if err isa DaemonClientExit
             exit_code = err.code
         elseif isopen(client_stdout)
+            try flush(run_stdout) catch end
             Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
             exit_code = 1
         end
