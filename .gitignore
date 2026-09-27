@@ -1,5 +1,21 @@
 Manifest.toml
-builds/
-client/client
-client/client.o
-client/client.tar.gz
+Manifest-v*.toml
+.DS_Store
+# The vendored Zig toolchain, and its cache
+/zig/
+.zig-cache/
+# Release output (build.jl --release)
+/builds/
+# Built binaries, at the root or beside their sources
+juliaclient
+julia-conductor
+*.exe
+*.pdb
+*.o
+/sandbox
+test_activity
+test_args
+test_io
+test_spawn
+test_status
+test_sandbox
