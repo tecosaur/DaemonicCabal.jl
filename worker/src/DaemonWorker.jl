@@ -20,6 +20,15 @@ include("transcript.jl")
 include("broadcastio.jl")
 include("replay.jl")
 
+# How a client's run asked to end: `exit`'s code, which a `catch` can't take
+# back, and its `atexit` hooks, newest first, run as it ends.
+mutable struct RunEnd
+    const lock::ReentrantLock
+    const hooks::Vector{Function}
+    code::Union{Nothing, Int}
+    ended::Bool  # its hooks have run
+end
+
 # A --sync client. One task reads its answers (`read_replies`), so waiting on
 # them can be bounded: one slow to answer holds up only itself.
 mutable struct Participant

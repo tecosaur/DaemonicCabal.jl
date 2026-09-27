@@ -77,6 +77,58 @@ function remove_standby_files()
     isnothing(standby) || foreach(((_, path),) -> remove_socket_file(path), standby)
 end
 
+RunEnd() = RunEnd(ReentrantLock(), Function[], nothing, false)
+
+"""
+    exit_client(code)
+
+`exit`, as the worker overrides it. Within a client's run, the run ends with
+`code` (the first asked, or a hook's), its `atexit` hooks run, and its client
+is let go at once, whatever its code does after catching the thrown
+`DaemonClientExit`; before 1.11, such a client waits for the run to end.
+"""
+function exit_client(code)
+    ending = CLIENT_END[]
+    if !isnothing(ending)
+        first = @lock ending.lock begin
+            asked = isnothing(ending.code)
+            if !ending.ended
+                ending.code = code
+            end
+            asked
+        end
+        if first
+            run_exit_hooks!(ending)
+            @static if VERSION >= v"1.11"
+                let_client_go(something(ending.code))
+            end
+        end
+    end
+    throw(DaemonClientExit(code))
+end
+
+# `atexit`, as the worker overrides it: within a run, the hook runs as the run
+# ends, as stock julia's does as its process ends. A package's `__init__`
+# registers the worker's, the package being loaded for good.
+function register_atexit(hook::Function)
+    ending = CLIENT_END[]
+    loading = !isnothing(ending) && @lock Base.require_lock begin
+        any(((_, (task, _)),) -> task === current_task(), Base.package_locks)
+    end
+    if isnothing(ending) || loading
+        @lock Base._atexit_hooks_lock begin
+            Base._atexit_hooks_finished && error("cannot register new atexit hook; already exiting.")
+            pushfirst!(Base.atexit_hooks, hook)
+        end
+    else
+        @lock ending.lock begin
+            ending.ended && error("cannot register new atexit hook; already exiting.")
+            pushfirst!(ending.hooks, hook)
+        end
+    end
+    nothing
+end
+
 # Revise
 
 const REVISE_PKG =
@@ -249,6 +301,7 @@ end
 @static if VERSION < v"1.11"
     const CLIENT_SIGNALS = Ref{Union{Nothing, StreamIO}}(nothing)
     const CLIENT_INTERACTIVE = Ref(false)
+    const CLIENT_END = Ref{Union{Nothing, RunEnd}}(nothing)
 end
 
 # Signal protocol (Worker → Client)
@@ -391,13 +444,36 @@ function sync_client_disconnect!(client::ClientInfo, client_stdin::StreamIO,
     unregister_client!(client)
 end
 
-# Closing the merged input ends the session's REPL.
 function teardown_session!(label::String)
     drop_transcript!(label)
     session = @lock STATE.lock get(STATE.sync_sessions, label, nothing)
-    isnothing(session) && return
+    isnothing(session) || end_sync_session!(session, 0)
+end
+
+# The session ends with its REPL, its participants let go with `code`, and a
+# later --sync starts afresh. Closing the merged input ends the REPL, and tells
+# a joiner attaching late that the session is over.
+function end_sync_session!(session::SyncSession, code::Int)
+    @lock STATE.lock begin
+        if get(STATE.sync_sessions, session.label, nothing) === session
+            delete!(STATE.sync_sessions, session.label)
+        end
+    end
     try close(session.writesink) catch end
-    @lock STATE.lock delete!(STATE.sync_sessions, label)
+    participants = @lock STATE.lock begin
+        taken = @atomic session.participants
+        set_participants!(session, Participant[])
+        taken
+    end
+    for p in participants
+        # Any may be gone already.
+        try close(p.stdout) catch end
+        try close(p.stderr) catch end
+        try
+            send_signal(p.signals, SIGNAL_EXIT, UInt8[code % UInt8])
+            close(p.signals)
+        catch end
+    end
 end
 
 function sync_echo_expressions(session::SyncSession, client::ClientInfo)
@@ -627,8 +703,13 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
         attach!(session, participant)
         errormonitor(@async begin # thread 0 for Ctrl-C; see `spawn_client!`
             replay = (client_stdout, session.screen, participant_size(participant), pages)
-            runclient(client, session.mergedin, session.out, session.err, signals;
-                      owned_streams=(), sync_session=session, repl_ref=session.repl, replay)
+            code = 1
+            try
+                code = runclient(client, session.mergedin, session.out, session.err, signals;
+                                 owned_streams=(), sync_session=session, repl_ref=session.repl, replay)
+            finally
+                end_sync_session!(session, code)
+            end
         end)
     end
     task = Threads.@spawn begin
@@ -644,6 +725,7 @@ function join_sync_repl(session::SyncSession, p::Participant, pages::Int)
         # Leaves the cursor where the REPL's is, for its refresh to redraw the line.
         replay_history(p.stdout, session.screen, participant_size(p), pages)
         attach!(session, p)
+        isopen(session.writesink) || return end_sync_session!(session, 0)
         @lock p.replied p.acks_due += 1
         send_signal(p.signals, SIGNAL_RAW_MODE, UInt8[true])
         await_replies(q -> q.acks_due, (p,))
