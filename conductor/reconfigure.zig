@@ -250,6 +250,8 @@ fn onKeys(c: *Conductor, v: *Viewer, bytes: []const u8) void {
 fn browseKey(c: *Conductor, v: *Viewer, key: tui.Key) void {
     const model = &c.settings.model;
     const i = v.focus[v.tab];
+    const p = pendingOf(c, v);
+    const can = changes.actions(model, &v.staged, p, i);
     switch (key) {
         .left, .back_tab => v.tab = (v.tab + tabs.len - 1) % tabs.len,
         .right, .tab => v.tab = (v.tab + 1) % tabs.len,
@@ -258,13 +260,15 @@ fn browseKey(c: *Conductor, v: *Viewer, key: tui.Key) void {
         .enter => edit(c, v, i),
         .char => |ch| switch (ch) {
             ' ' => edit(c, v, i),
-            'd' => v.staged.stage(c.allocator, model, i, null) catch {},
-            'u' => v.staged.undo(c.allocator, model, i) catch {},
-            'a' => _ = apply(c, v),
-            'w' => if (apply(c, v)) {
+            'd' => if (can.default) v.staged.stage(c.allocator, model, i, null) catch {},
+            'u' => if (can.undo) v.staged.undo(c.allocator, model, i) catch {},
+            'a' => if (can.apply) {
+                _ = apply(c, v);
+            },
+            'w' => if (can.save and apply(c, v)) {
                 _ = save(c, v);
             },
-            'r' => if (pendingOf(c, v).retirable) {
+            'r' => if (p.retirable) {
                 const n = c.retireIdleWorkers(model.workers_changed_ns);
                 v.message.set(.note, "Retired {d} idle worker{s} with the old settings: those that follow have the new.", .{ n, if (n == 1) "" else "s" });
             },
@@ -684,7 +688,7 @@ fn farewell(c: *const Conductor, v: *const Viewer, buf: []u8) []const u8 {
     var it = v.applied.iterator(.{});
     while (it.next()) |i| {
         if (model.isUnsaved(i)) unsaved += 1;
-        if (all[i].effect == .restart and !changes.same(model.applied[i], model.running[i])) restart += 1;
+        if (model.awaitsRestart(i)) restart += 1;
     }
     w.print("Applied {d} change{s}", .{ n, if (n == 1) "" else "s" }) catch {};
     const svc = c.settings.service;
