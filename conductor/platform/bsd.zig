@@ -47,6 +47,20 @@ pub fn write(fd: posix.fd_t, buf: []const u8) void {
     }
 }
 
+// kqueue, for the event loops
+// Some BSDs lack these in Zig's bindings.
+pub const EV_EOF: u16 = if (@hasDecl(c.EV, "EOF")) c.EV.EOF else 0x8000;
+pub const EV_ERROR: u16 = if (@hasDecl(c.EV, "ERROR")) c.EV.ERROR else 0x4000;
+
+pub fn makeKevent(ident: usize, filter: i16, flags: u16, fflags: u32, data: isize, udata: usize) c.Kevent {
+    return .{ .ident = ident, .filter = filter, .flags = flags, .fflags = fflags, .data = data, .udata = udata };
+}
+
+/// -1 on error; a null `timeout` waits indefinitely.
+pub fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent, timeout: ?*const c.timespec) c_int {
+    return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), timeout);
+}
+
 // Raw primitives
 pub fn kill(pid: posix.pid_t, sig: SIG) usize {
     const ret = c.kill(pid, sig);

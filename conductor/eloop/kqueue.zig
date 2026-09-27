@@ -10,10 +10,10 @@ const posix = std.posix;
 
 const main = @import("../main.zig");
 const Conductor = main.Conductor;
-const platform = @import("../platform/main.zig");
 const protocol = @import("../protocol.zig");
 const worker = @import("../worker.zig");
 
+const bsd = @import("../platform/bsd.zig");
 const posix_signals = @import("posix_signals.zig");
 
 pub const installSignalHandlers = posix_signals.installSignalHandlers;
@@ -22,8 +22,8 @@ const signal_pipe = &posix_signals.signal_pipe;
 const SIGNAL_SHUTDOWN = posix_signals.SIGNAL_SHUTDOWN;
 const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 
-// Some BSDs lack it in Zig's bindings.
-const EV_ERROR: u16 = if (@hasDecl(c.EV, "ERROR")) c.EV.ERROR else 0x4000;
+const EV_ERROR = bsd.EV_ERROR;
+const makeKevent = bsd.makeKevent;
 
 // Worker pointers are >= 0x1000.
 const UDATA_ACCEPT: usize = 0;
@@ -154,7 +154,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     var events: [32]c.Kevent = undefined;
     var no_changes: [0]c.Kevent = undefined;
     while (true) {
-        const nevents = keventCall(kq, &no_changes, &events);
+        const nevents = bsd.keventCall(kq, &no_changes, &events, null);
         if (nevents < 0) {
             const err: posix.E = @enumFromInt(c._errno().*);
             if (err == .INTR) continue;
@@ -279,28 +279,8 @@ fn handleSignal(
 
 // Helpers
 
-fn makeKevent(
-    ident: usize,
-    filter: i16,
-    flags: u16,
-    fflags: u32,
-    data: isize,
-    udata: usize,
-) c.Kevent {
-    return .{
-        .ident = ident,
-        .filter = filter,
-        .flags = flags,
-        .fflags = fflags,
-        .data = data,
-        .udata = udata,
-    };
-}
-fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent) c_int {
-    return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), null);
-}
 /// -1 on error.
 fn keventSubmit(kq: posix.fd_t, changelist: []const c.Kevent) c_int {
     var dummy: [0]c.Kevent = undefined;
-    return keventCall(kq, changelist, &dummy);
+    return bsd.keventCall(kq, changelist, &dummy, null);
 }
