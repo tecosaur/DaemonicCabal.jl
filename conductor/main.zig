@@ -2546,6 +2546,9 @@ pub const Conductor = struct {
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
+    // The log is UTF-8, which a console shows as such only in its code page.
+    const console = platform.setupConsoleIo(platform.getStderrHandle(), platform.getStderrHandle());
+    defer platform.restoreConsoleIo(console);
     const cfg = try config.Config.load(allocator, init.environ_map);
     var conductor = try Conductor.init(io, allocator, cfg, init.environ_map);
     defer conductor.deinit();

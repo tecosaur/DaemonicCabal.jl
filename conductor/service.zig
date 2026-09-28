@@ -648,6 +648,7 @@ const script_text =
     \\$env:JULIA_DAEMON_WORKER_TTL = '7200'
     \\$env:JULIA_DAEMON_WORKER_ARGS = 'it''s'
     \\
+    \\[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
     \\& "C:\julia-daemon\julia-conductor.exe" *>> "C:\julia-daemon\conductor.log"
     \\
 ;
@@ -668,6 +669,7 @@ test "a script's $env: lines are set, removed and added" {
         \\$env:JULIA_DAEMON_WORKER_ARGS = '-O3'
         \\$env:JULIA_DAEMON_MAX_TTL = 'a''b'
         \\
+        \\[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
         \\& "C:\julia-daemon\julia-conductor.exe" *>> "C:\julia-daemon\conductor.log"
         \\
     , text);
