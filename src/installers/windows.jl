@@ -32,9 +32,11 @@ function powershell_script_content(env::Dict{String,String})
     envs = join(["\$env:$k = $(powershell_quoted(v))" for (k, v) in env], "\n")
     # Within double quotes, a backtick escapes and `$` expands.
     escape_expandable(path) = replace(path, '`' => "``", '$' => "`\$")
+    # PowerShell would otherwise decode the conductor's UTF-8 log in the console's code page.
     """
     $envs
 
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
     & "$(escape_expandable(installed_conductor()))" *>> "$(escape_expandable(joinpath(install_dir(), "conductor.log")))"
     """
 end
