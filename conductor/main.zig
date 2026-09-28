@@ -667,12 +667,16 @@ pub const Conductor = struct {
                 for (raw_args) |a| self.allocator.free(a);
                 self.allocator.free(raw_args);
             }
-            const cwd = try self.allocator.dupe(u8, head.cwd);
-            errdefer self.allocator.free(cwd);
             var parsed = try args.parse(self.allocator, raw_args);
             errdefer parsed.deinit();
-            // A remote client's filesystem isn't ours.
-            const proj = if (is_remote) null else try project.resolve(self.allocator, self.io, &parsed, env.julia_project, self.environ_map.get("HOME") orelse "", cwd);
+            // A remote client's filesystem isn't ours: it names a project of ours
+            // only by --project, and starts in its directory, else in our home.
+            const home = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/";
+            const proj = try project.resolve(self.allocator, self.io, &parsed, if (is_remote) null else env.julia_project, self.cfg.host_home, if (is_remote) home else head.cwd);
+            errdefer if (proj) |p| self.allocator.free(p);
+            const project_dir = if (proj) |p| (if (p[0] == '@') home else if (std.mem.endsWith(u8, p, ".toml")) std.fs.path.dirname(p) orelse home else p) else home;
+            const cwd = try self.allocator.dupe(u8, if (is_remote) project_dir else head.cwd);
+            errdefer self.allocator.free(cwd);
             break :request .{
                 .flags = head.flags,
                 .pid = head.pid,
@@ -717,6 +721,11 @@ pub const Conductor = struct {
         self.client_counter += 1;
         self.client_id = self.client_counter;
         const sandbox = try self.sandboxFor(socket, is_remote, &request) orelse return .done;
+        // A sandbox binds its project, which a remote client could name as any path of ours.
+        if (sandbox == .remote) if (request.project) |p| {
+            self.allocator.free(p);
+            request.project = null;
+        };
         if (request.parsed.hasSwitch("--reconfigure")) {
             try self.serveReconfigure(socket, request.flags.tty, !is_remote and sandbox == .none);
             return .done;
@@ -1119,8 +1128,6 @@ pub const Conductor = struct {
         const port_set = try self.allocatePortSet();
         var info = self.clientInfo(request, port_set);
         info.force = info.force or watcher;
-        // The remote cwd doesn't exist here.
-        info.cwd = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/";
         // A watch runs no code, so it carries no environment: whatever reaches a
         // worker is readable by the session's own code.
         if (watcher) info.env = &.{};
