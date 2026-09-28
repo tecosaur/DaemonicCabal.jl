@@ -1240,7 +1240,8 @@ pub fn collectEnviron(allocator: Allocator, environ: std.process.Environ) ![]con
     while (block[i] != 0) {
         const start = i;
         while (block[i] != 0) : (i += 1) {}
-        try kvs.append(allocator, try std.unicode.wtf16LeToWtf8Alloc(allocator, block[start..i]));
+        // Hidden entries, such as cmd.exe's drive cwds (=C:=C:\dir), have no name.
+        if (block[start] != '=') try kvs.append(allocator, try std.unicode.wtf16LeToWtf8Alloc(allocator, block[start..i]));
         i += 1;
     }
     return kvs.items;
