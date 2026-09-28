@@ -718,7 +718,7 @@ pub const Conductor = struct {
         self.client_id = self.client_counter;
         const sandbox = try self.sandboxFor(socket, is_remote, &request) orelse return .done;
         if (request.parsed.hasSwitch("--reconfigure")) {
-            try self.serveReconfigure(socket, request.flags.tty, sandbox == .none and self.cfg.transport == .local);
+            try self.serveReconfigure(socket, request.flags.tty, !is_remote and sandbox == .none);
             return .done;
         }
         if (request.parsed.hasSwitch("--status")) {
