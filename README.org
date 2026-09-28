@@ -139,7 +139,9 @@ project:
 The daemon can also serve other machines over TCP, sandboxing each remote
 client in a worker of its own with a read-only depot, no view of your home
 directory, and optional memory and CPU limits. Platforms other than Linux
-refuse remote clients. To serve over TCP, install with
+refuse remote clients, unless "Refuse remote clients" is turned off in
+=juliaclient --reconfigure=, which runs them unsandboxed as your user. To serve
+over TCP, install with
 
 #+begin_src julia
 DaemonicCabal.install(mode=:tcp, conductor_host="0.0.0.0")  # port 9345, every address
