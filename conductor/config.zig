@@ -96,7 +96,7 @@ pub const Config = struct {
             .transport = transport,
             .bind_address = bind_address,
             .port_range = port_range,
-            .host_home = env.get("HOME") orelse "",
+            .host_home = env.get("HOME") orelse env.get("USERPROFILE") orelse "",
         };
         var cfg: Config = undefined;
         inline for (@typeInfo(Config).@"struct".fields) |f| {
