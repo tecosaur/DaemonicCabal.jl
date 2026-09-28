@@ -31,7 +31,8 @@ pub const Tab = enum {
 };
 
 /// The sandbox is Linux's alone.
-pub const tabs: []const Tab = if (builtin.os.tag == .linux)
+const has_sandbox = builtin.os.tag == .linux;
+pub const tabs: []const Tab = if (has_sandbox)
     std.enums.values(Tab)
 else
     &.{ .workers, .sessions, .lifetime, .memory, .network };
@@ -129,7 +130,8 @@ pub const all = [_]Setting{
     .{ .key = "JULIA_DAEMON_BIND", .label = "bind address", .tab = .network, .depth = 1, .kind = .text, .default = null, .unset = "the server's host", .effect = .restart, .used = tcp, .about = "The address the conductor and its workers listen on, such as 0.0.0.0." },
     .{ .key = "JULIA_DAEMON_PORTS", .label = "worker ports", .tab = .network, .depth = 1, .kind = .ports, .default = null, .unset = "any free", .effect = .restart, .used = tcp, .about = "The ports workers listen on for their clients, such as 10000-10100." },
     .{ .key = "JULIA_DAEMON_RUNTIME", .label = "Runtime directory", .tab = .network, .kind = .{ .path = .directory }, .default = null, .unset = "the platform's", .effect = .restart, .about = "Where the conductor keeps its sockets and pid file." },
-    .{ .key = "JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS", .label = "Sandbox remote clients", .tab = .sandbox, .kind = .flag, .default = "1", .effect = .now, .field = "sandbox_remote_clients", .about = "Run the clients of other hosts in a sandbox of their own." },
+    // Without a sandbox, the same setting refuses what it would sandbox.
+    .{ .key = "JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS", .label = if (has_sandbox) "Sandbox remote clients" else "Refuse remote clients", .tab = if (has_sandbox) .sandbox else .network, .kind = .flag, .default = "1", .effect = .now, .field = "sandbox_remote_clients", .about = if (has_sandbox) "Run the clients of other hosts in a sandbox of their own." else "Refuse the clients of other hosts; off, they run unsandboxed, as the daemon's user." },
     .{ .key = "JULIA_DAEMON_SANDBOX_MAX_MEMORY", .label = "memory limit", .tab = .sandbox, .depth = 1, .kind = .bytes, .default = null, .unset = "none", .effect = .restart, .field = "sandbox_max_memory", .used = sandboxing, .about = "Each sandbox's memory limit. Limits need a delegated cgroup, as the installed service has." },
     .{ .key = "JULIA_DAEMON_SANDBOX_MAX_CPU", .label = "CPU limit", .tab = .sandbox, .depth = 1, .kind = .count, .default = null, .unset = "none", .effect = .restart, .field = "sandbox_max_cpu", .used = sandboxing, .about = "Each sandbox's CPU limit, as a percentage: 200 is two cores." },
     .{ .key = "JULIA_DAEMON_SANDBOX_SESSION_BYPASS", .label = "session bypass", .tab = .sandbox, .depth = 1, .kind = .flag, .default = "0", .effect = .now, .field = "sandbox_session_bypass", .used = sandboxing, .about = "Let a remote client's --session=<label> join a local, unsandboxed worker." },

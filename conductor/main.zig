@@ -786,8 +786,9 @@ pub const Conductor = struct {
         if (sandbox == .none) return sandbox;
         if (comptime builtin.os.tag != .linux) {
             const msg = if (sandbox == .remote)
-                "Sandboxed workers are only available on Linux. " ++
-                    "Remote TCP clients from non-loopback addresses are rejected.\n"
+                "Remote clients are refused: sandboxed workers are only available on Linux.\n" ++
+                    "To run them unsandboxed, as the daemon's user, turn off \"Refuse remote clients\"\n" ++
+                    "in juliaclient --reconfigure (JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS=0).\n"
             else
                 "--sandbox requires Linux (user namespaces).\n";
             std.debug.print("Client {d}: sandbox rejected (Linux only)\n", .{self.client_id});
