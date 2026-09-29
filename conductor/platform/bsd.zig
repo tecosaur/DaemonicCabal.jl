@@ -180,8 +180,56 @@ pub fn readMemInfo() ?MemInfo {
     };
 }
 
-pub fn getParentName(_: posix.pid_t, _: []u8) ?[]const u8 {
-    return null;
+pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
+    if (builtin.os.tag != .macos) return null;
+    const ppid = (darwinBsdInfo(pid) orelse return null).pbi_ppid;
+    if (ppid == 0) return null;
+    const parent = darwinBsdInfo(@intCast(ppid)) orelse return null;
+    // The full name, where the command is cut at MAXCOMLEN.
+    const field = if (parent.pbi_name[0] != 0) &parent.pbi_name else &parent.pbi_comm;
+    const name = std.mem.sliceTo(field, 0);
+    const n = @min(name.len, out.len);
+    @memcpy(out[0..n], name[0..n]);
+    return out[0..n];
+}
+
+// <sys/proc_info.h>; PROC_PIDTBSDINFO_SIZE is 136.
+const PROC_PIDTBSDINFO: c_int = 3;
+const proc_bsdinfo = extern struct {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: u32,
+    pbi_gid: u32,
+    pbi_ruid: u32,
+    pbi_rgid: u32,
+    pbi_svuid: u32,
+    pbi_svgid: u32,
+    rfu_1: u32,
+    pbi_comm: [16]u8,
+    pbi_name: [32]u8,
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    pbi_start_tvsec: u64,
+    pbi_start_tvusec: u64,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(proc_bsdinfo) == 136);
+}
+
+extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *anyopaque, buffersize: c_int) c_int;
+
+fn darwinBsdInfo(pid: posix.pid_t) ?proc_bsdinfo {
+    var info: proc_bsdinfo = undefined;
+    if (proc_pidinfo(@intCast(pid), PROC_PIDTBSDINFO, 0, @ptrCast(&info), @sizeOf(proc_bsdinfo)) != @sizeOf(proc_bsdinfo)) return null;
+    return info;
 }
 pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {
     const ret = c.ioctl(fd, @intCast(request), arg);
