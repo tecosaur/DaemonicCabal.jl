@@ -484,6 +484,12 @@ pub const Worker = struct {
         }
     }
 
+    /// Waits to reap a child of ours: only where one stuck dying may hold us up.
+    pub fn killAndReap(self: *const Worker) void {
+        self.signal(platform.SIG.KILL);
+        if (self.pidfd == null) if (self.process.id) |pid| platform.waitForExit(pid);
+    }
+
     /// For session affinity; 0 marks an empty slot.
     pub fn recordPpid(self: *Worker, ppid: u32, max_history: u32) void {
         const cap = if (max_history == 0) max_recent_ppids else @min(max_history, max_recent_ppids);
