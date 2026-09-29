@@ -5,6 +5,7 @@
 // the threshold from flapping in and out of eviction episodes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("platform/main.zig");
 const config = @import("config.zig");
 
@@ -32,7 +33,10 @@ pub const Monitor = struct {
         }
         switch (self.source) {
             .psi => std.debug.print(" - Memory pressure: PSI /proc/pressure/memory, some avg10 >= {d}%\n", .{cfg.psi_threshold}),
-            .memfree => std.debug.print(" - Memory pressure: free-memory level (PSI unavailable, normal on stock Linux)\n", .{}),
+            .memfree => if (builtin.os.tag == .linux)
+                std.debug.print(" - Memory pressure: free-memory level (PSI unavailable, normal on stock Linux)\n", .{})
+            else
+                std.debug.print(" - Memory pressure: free-memory level\n", .{}),
             .none => std.debug.print(" - Memory pressure: no readable signal on this platform; running TTL-only\n", .{}),
         }
     }

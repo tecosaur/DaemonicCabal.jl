@@ -161,9 +161,15 @@ pub fn readPsiSomeAvg10() ?f64 {
 
 pub fn readMemInfo() ?MemInfo {
     return switch (builtin.os.tag) {
-        .macos => darwinMemInfo(),
+        // The kernel's own free-memory percentage, as `memory_pressure` reports it:
+        // page counts double-count file-backed pages sitting inactive.
+        .macos => blk: {
+            const level = sysctlUint("kern.memorystatus_level") orelse break :blk null;
+            const total = sysctlUint("hw.memsize") orelse break :blk null;
+            break :blk MemInfo{ .available = total / 100 * @min(level, 100), .total = total };
+        },
         .freebsd => blk: {
-            const page = shared_page_size();
+            const page = std.heap.pageSize();
             const free = sysctlUint("vm.stats.vm.v_free_count") orelse break :blk null;
             const inactive = sysctlUint("vm.stats.vm.v_inactive_count") orelse 0;
             const cache = sysctlUint("vm.stats.vm.v_cache_count") orelse 0;
@@ -174,50 +180,6 @@ pub fn readMemInfo() ?MemInfo {
     };
 }
 
-const shared_page_size = std.heap.pageSize;
-
-// macOS keeps little truly free, so count inactive, purgeable and external too.
-const HOST_VM_INFO64: c_int = 4;
-// <mach/vm_statistics.h>; @sizeOf/4 must equal HOST_VM_INFO64_COUNT (38).
-const vm_statistics64 = extern struct {
-    free_count: u32,
-    active_count: u32,
-    inactive_count: u32,
-    wire_count: u32,
-    zero_fill_count: u64,
-    reactivations: u64,
-    pageins: u64,
-    pageouts: u64,
-    faults: u64,
-    cow_faults: u64,
-    lookups: u64,
-    hits: u64,
-    purges: u64,
-    purgeable_count: u32,
-    speculative_count: u32,
-    decompressions: u64,
-    compressions: u64,
-    swapins: u64,
-    swapouts: u64,
-    compressor_page_count: u32,
-    throttled_count: u32,
-    external_page_count: u32,
-    internal_page_count: u32,
-    total_uncompressed_pages_in_compressor: u64,
-};
-
-extern "c" fn host_statistics64(host: c.mach_port_t, flavor: c_int, info: *anyopaque, count: *c.mach_msg_type_number_t) c.kern_return_t;
-
-fn darwinMemInfo() ?MemInfo {
-    if (builtin.os.tag != .macos) return null;
-    var vm: vm_statistics64 = undefined;
-    var count: c.mach_msg_type_number_t = @sizeOf(vm_statistics64) / @sizeOf(u32);
-    if (host_statistics64(c.mach_host_self(), HOST_VM_INFO64, @ptrCast(&vm), &count) != 0) return null;
-    const total = sysctlUint("hw.memsize") orelse return null;
-    const page = shared_page_size();
-    const reclaimable = @as(u64, vm.free_count) + vm.inactive_count + vm.purgeable_count + vm.external_page_count;
-    return .{ .available = reclaimable * page, .total = total };
-}
 pub fn getParentName(_: posix.pid_t, _: []u8) ?[]const u8 {
     return null;
 }
