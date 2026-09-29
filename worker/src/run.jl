@@ -610,11 +610,12 @@ function run_terminal_repl(client::ClientInfo, stdout::IO)
     interactiveinput = client.tty
     hascolor = get(stdout, :color, clienthascolor(client))
     quiet = any(((s, _),) -> s == "--quiet", client.switches)
+    requested = Symbol(getval(client.switches, "--banner", if interactiveinput && !quiet "yes" else "no" end))
     # The atreplinit hook prints the banner itself when replaying.
     banner = if VERSION >= v"1.11" && REPLAY_TARGET[] !== nothing
         :no
     else
-        Symbol(getval(client.switches, "--banner", if interactiveinput && !quiet "yes" else "no" end))
+        requested
     end
     histfile = getval(client.switches, "--history-file", "yes") != "no"
     @static if VERSION < v"1.11"
@@ -622,7 +623,7 @@ function run_terminal_repl(client::ClientInfo, stdout::IO)
         Base.run_main_repl(interactiveinput, quiet, banner != :no, histfile, hascolor)
     else
         try
-            @static if VERSION < v"1.12"
+            @with REPLAY_BANNER => requested @static if VERSION < v"1.12"
                 Base.run_main_repl(interactiveinput, quiet, banner, histfile, hascolor)
             else
                 Base.run_main_repl(interactiveinput, quiet, banner, histfile)

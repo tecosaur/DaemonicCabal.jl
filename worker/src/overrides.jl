@@ -77,7 +77,10 @@ end
         CLIENT_REPL[][] = repl
         target = REPLAY_TARGET[]
         if target !== nothing
-            REPL.banner(IOContext(first(target), :color => something(ACTIVE_TERM[].have_color, false)))
+            banner = REPLAY_BANNER[]
+            banner == :no ||
+                REPL.banner(IOContext(first(target), :color => something(ACTIVE_TERM[].have_color, false));
+                            short = banner == :short)
             replay_history(target...)
         end
         recording = CLIENT_RECORDING[]

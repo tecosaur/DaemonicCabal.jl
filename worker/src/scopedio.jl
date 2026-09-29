@@ -54,6 +54,8 @@ const CLIENT_RECORDING = ScopedValue{Union{Nothing, Recording}}(nothing)
 const CLIENT_END = ScopedValue{Union{Nothing, RunEnd}}(nothing)
 # `replay_history`'s arguments, for the client starting a sync session's REPL.
 const REPLAY_TARGET = ScopedValue{Union{Nothing, Tuple{StreamIO, Recording, Tuple{Int, Int}, Int}}}(nothing)
+# The `--banner` that client asked for, which the replay prints before the history.
+const REPLAY_BANNER = ScopedValue(:yes)
 
 struct ScopedStdin <: Base.AbstractPipe end
 struct ScopedStdout <: Base.AbstractPipe end
