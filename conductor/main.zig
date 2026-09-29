@@ -101,7 +101,7 @@ pub const PendingConnectionList = std.array_list.Aligned(*Conductor.PendingConne
 /// Owns the `Worker` until reaped.
 pub const PendingKill = struct {
     w: *worker.Worker,
-    stage: enum { soft, term },
+    stage: enum { soft, term, kill },
     deadline: i64,
 };
 
@@ -198,7 +198,7 @@ pub const Conductor = struct {
         self.cache.deinit();
         self.active_clients.deinit();
         for (self.pending_kills.items) |pk| {
-            pk.w.signal(platform.SIG.KILL);
+            pk.w.killAndReap();
             self.cleanupWorker(pk.w);
         }
         self.pending_kills.deinit(self.allocator);
@@ -1438,7 +1438,7 @@ pub const Conductor = struct {
         p.spawn.listener.close(self.io);
         const w = self.allocator.create(worker.Worker) catch |err| {
             var lost = connected;
-            lost.signal(platform.SIG.KILL);
+            lost.killAndReap();
             lost.deinit();
             return self.settleSpawn(p, .{ .refuse = err });
         };
@@ -1684,7 +1684,7 @@ pub const Conductor = struct {
         self.pending_kills.append(self.allocator, .{
             .w = w, .stage = .soft, .deadline = self.currentTime() + retire_grace_s,
         }) catch {
-            w.signal(platform.SIG.KILL);
+            w.killAndReap();
             self.cleanupWorker(w);
         };
     }
@@ -1929,12 +1929,12 @@ pub const Conductor = struct {
                     pk.stage = .term;
                     pk.deadline = now + retire_grace_s;
                 },
+                // Reaped by `exited` above: one wedged past SIGTERM may be slow to die.
                 .term => {
                     pk.w.signal(platform.SIG.KILL);
-                    self.cleanupWorker(pk.w);
-                    _ = self.pending_kills.swapRemove(i);
-                    continue;
+                    pk.stage = .kill;
                 },
+                .kill => {},
             };
             i += 1;
         }
