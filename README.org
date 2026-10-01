@@ -160,3 +160,10 @@ To avoid filling up system memory with idle workers, system memory usage is
 monitored and idle workers reaped before they can cause an out-of-memory kill.
 More actively and recently used workers are kept for longer, and the particular
 behaviour is configurable.
+
+* Differences from =julia=
+
+A worker's own stdout and stderr belong to the daemon, so what code writes to
+them directly, below Julia's streams (a C library's =printf=, say), goes to the
+daemon's log rather than your terminal, and =redirect_stdout= and
+=redirect_stderr= can't capture it.
