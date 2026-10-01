@@ -251,6 +251,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 }
 
 fn run(init: std.process.Init.Minimal) !void {
+    platform.openClosedStdio();
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const inputs = try collectInputs(arena.allocator(), init);

@@ -130,6 +130,9 @@ pub const ctrlCIsKey = shared.ctrlCIsKey;
 pub const interrupt = shared.interrupt;
 pub const lineEditingKeys = shared.lineEditingKeys;
 pub const LineEditingKeys = shared.LineEditingKeys;
+pub const openClosedStdio = if (os != .windows) shared.openClosedStdio else struct {
+    fn f() void {}
+}.f;
 pub const setupConsoleIo = if (os == .windows) impl.setupConsoleIo else struct {
     fn f(_: std.posix.fd_t, _: std.posix.fd_t) ?*anyopaque { return null; }
 }.f;
