@@ -2237,11 +2237,12 @@ pub const Conductor = struct {
         return false;
     }
 
+    // Only the living: anyWorkerAlive reaped the rest, whose pids may be reused.
     fn signalAllWorkers(self: *Conductor, sig: platform.SIG) void {
         var it = self.liveWorkers();
-        while (it.next()) |w| w.signal(sig);
+        while (it.next()) |w| if (!w.exited()) w.signal(sig);
         // Workers mid-retirement are no longer in the pool but still dying.
-        for (self.pending_kills.items) |pk| pk.w.signal(sig);
+        for (self.pending_kills.items) |pk| if (!pk.w.exited()) pk.w.signal(sig);
     }
 
     fn anyWorkerAlive(self: *Conductor) bool {
