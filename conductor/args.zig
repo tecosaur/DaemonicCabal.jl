@@ -30,6 +30,8 @@ const Option = struct {
     needs_own_julia: bool = false,
     /// The client's, not Julia's: an abbreviation is of Julia's first.
     own: bool = false,
+    /// An optional value left bare, as Julia takes it.
+    bare: []const u8 = "",
 
     pub fn format(self: *const Option, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.short) |c| try w.print("-{c}/", .{c});
@@ -61,7 +63,7 @@ const options = [_]Option{
     .{ .long = "--threads", .short = 't', .arity = .required, .honoured = .always },
     .{ .long = "--gcthreads", .arity = .required },
     .{ .long = "--machine-file", .arity = .required },
-    .{ .long = "--project", .short = 'P', .arity = .optional, .honoured = .always },
+    .{ .long = "--project", .short = 'P', .arity = .optional, .honoured = .always, .bare = "@." },
     .{ .long = "--color", .arity = .required, .honoured = .always, .choices = "yes|no|auto" },
     .{ .long = "--history-file", .arity = .required, .honoured = .always, .choices = "yes|no" },
     .{ .long = "--startup-file", .arity = .required, .honoured = .only_as_no, .choices = "yes|no" },
@@ -291,7 +293,7 @@ fn scanSwitches(switches: *SwitchList, argv: []const []const u8, first: usize) A
                 if (option.arity == .none) return .{ .invalid = .{ .unexpected_value = option } };
                 break :blk arg[e + 1 ..];
             } else if (option.arity != .required)
-                ""
+                option.bare
             else
                 nextWord(argv, &i) orelse return .{ .invalid = .{ .missing_value = option } };
             if (try accept(switches, option, value, index, i)) |end| return end;
@@ -306,7 +308,7 @@ fn scanSwitches(switches: *SwitchList, argv: []const []const u8, first: usize) A
             else if (after < arg.len)
                 arg[after..]
             else
-                nextWord(argv, &i) orelse if (option.arity == .optional) "" else return .{ .invalid = .{ .missing_value = option } };
+                nextWord(argv, &i) orelse if (option.arity == .optional) option.bare else return .{ .invalid = .{ .missing_value = option } };
             if (try accept(switches, option, value, index, i)) |end| return end;
             if (option.arity != .none) break;
         }
