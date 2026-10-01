@@ -62,6 +62,12 @@ struct ScopedStdout <: Base.AbstractPipe end
 struct ScopedStderr <: Base.AbstractPipe end
 
 Base.pipe_reader(::ScopedStdin) = @something(ACTIVE_TERM[].redirect_in, current_reader(ACTIVE_TERM[].stdin))
+# Base's would ask the writer, which input has none of.
+Base.isopen(io::ScopedStdin) = isopen(Base.pipe_reader(io))
+Base.close(io::ScopedStdin) = close(Base.pipe_reader(io))
+Base.wait_close(io::ScopedStdin) = wait_close(Base.pipe_reader(io))
+Base.iswritable(::ScopedStdin) = false
+Base.flush(::ScopedStdin) = nothing
 
 # As a TTY's, a terminal's input goes on past a Ctrl-D.
 function Base.reseteof(::ScopedStdin)
