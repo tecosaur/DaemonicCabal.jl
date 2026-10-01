@@ -70,8 +70,12 @@ pub fn handle(conductor: *Conductor, loop: anytype, listener: *protocol.Listener
         },
         SIGNAL_RECREATE => {
             std.debug.print("Recreating socket due to SIGUSR1\n", .{});
-            loop.stopAccepting(listener);
-            listener.close(conductor.io);
+            // A failed recreate leaves it closed, marked so.
+            if (listener.fd() != platform.no_socket) {
+                loop.stopAccepting(listener);
+                listener.close(conductor.io);
+                listener.server.socket.handle = platform.no_socket;
+            }
             listener.* = conductor.createServer() catch |err| {
                 std.debug.print("Failed to recreate socket: {}\n", .{err});
                 continue;
