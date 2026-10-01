@@ -109,16 +109,22 @@ Base.unlock(::Union{ScopedStdout, TerminalStdout}) = unlock(ACTIVE_TERM[].stdout
 Base.lock(::ScopedStderr) = lock(ACTIVE_TERM[].stderr)
 Base.unlock(::ScopedStderr) = unlock(ACTIVE_TERM[].stderr)
 
-# A `ScopedStd*` argument is the worker installing its own globals, not a client
-# redirect, so it clears the slot.
-function set_redirect!(f::Base.RedirectStdStream, io)
-    slot, wrapper = if f.unix_fd == 0
+# The `VirtualTerm` field holding a redirect of `f`'s stream, and the worker's
+# global standing for that stream.
+function redirect_slot(f::Base.RedirectStdStream)
+    if f.unix_fd == 0
         :redirect_in, ScopedStdin
     elseif f.unix_fd == 1
         :redirect_out, ScopedStdout
     else
         :redirect_err, ScopedStderr
     end
+end
+
+# A `ScopedStd*` argument is the worker installing its own globals, not a client
+# redirect, so it clears the slot.
+function set_redirect!(f::Base.RedirectStdStream, io)
+    slot, wrapper = redirect_slot(f)
     setfield!(ACTIVE_TERM[], slot, io isa wrapper ? nothing : io)
     io
 end
