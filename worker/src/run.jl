@@ -264,10 +264,13 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
                 else
                     hascolor
                 end
+                # The client's colour is whether its stdout is a terminal, unless its environment chose.
+                stdout_is_terminal = client.color ||
+                    any(((key, value),) -> key ∈ ("FORCE_COLOR", "NO_COLOR") && !isempty(value), client.env)
                 client_vterm = VirtualTerm(
                     input, run_stdout, run_stderr, signals,
                     term, sync_session,
-                    get(TERMINFOS, term, nothing), color, nothing)
+                    get(TERMINFOS, term, nothing), color, nothing; stdout_is_terminal)
                 @with(ACTIVE_TERM => client_vterm,
                       CLIENT_MODULE => mod,
                       CLIENT_INTERACTIVE => interactive,
