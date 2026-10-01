@@ -40,6 +40,8 @@ const TIMER_IDENT_TICK: usize = 0xFFFF_0004;
 pub const EventLoop = struct {
     kq: posix.fd_t,
     tick_armed: bool = false,
+    /// Out of descriptors or memory: the listener is unwatched until the tick.
+    accept_paused: bool = false,
 
     pub fn init(_: u13) !EventLoop {
         const kq = c.kqueue();
@@ -107,6 +109,7 @@ pub const EventLoop = struct {
     }
 
     pub fn stopAccepting(self: *EventLoop, listener: *protocol.Listener) void {
+        self.accept_paused = false;
         var ch = [1]c.Kevent{makeKevent(@intCast(listener.fd()), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
         _ = keventSubmit(self.kq, &ch);
     }
@@ -176,7 +179,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
             const udata = ev.udata;
             switch (udata) {
                 UDATA_ACCEPT => {
-                    handleAccept(conductor, listener.fd());
+                    handleAccept(conductor, listener);
                     pool_changed = true;
                 },
                 UDATA_SIGNAL => {
@@ -193,6 +196,8 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 },
                 UDATA_LIVE_TIMER => conductor.onLiveTimer(),
                 UDATA_TICK_TIMER => {
+                    if (conductor.event_loop.accept_paused) conductor.event_loop.startAccepting(listener);
+                    conductor.event_loop.accept_paused = false;
                     if (!conductor.tick()) conductor.event_loop.stopTick();
                     pool_changed = true;
                 },
@@ -228,14 +233,21 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
 
 // Event handlers
 
-fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
+fn handleAccept(conductor: *Conductor, listener: *protocol.Listener) void {
     // Level-triggered, so never re-armed.
     var client_addr: std.Io.Threaded.PosixAddress = undefined;
     var client_addr_len: posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
-    const client_fd = c.accept(server_fd, &client_addr.any, &client_addr_len);
+    const client_fd = c.accept(listener.fd(), &client_addr.any, &client_addr_len);
     if (client_fd < 0) {
-        const err: posix.E = @enumFromInt(c._errno().*);
-        std.debug.print("Accept error: {}\n", .{err});
+        switch (@as(posix.E, @enumFromInt(c._errno().*))) {
+            .MFILE, .NFILE, .NOMEM, .NOBUFS => |err| {
+                const loop = &conductor.event_loop;
+                loop.stopAccepting(listener);
+                loop.accept_paused = true;
+                conductor.onAcceptStarved(err);
+            },
+            else => |err| std.debug.print("Accept error: {}\n", .{err}),
+        }
         return;
     }
     _ = c.fcntl(client_fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));

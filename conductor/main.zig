@@ -151,6 +151,8 @@ pub const Conductor = struct {
     secret: [16]u8,
     /// Kept in the runtime dir, which no sandbox sees.
     host_key: protocol.client.HostKey,
+    /// Accepts are failing for want of descriptors or memory, until one succeeds.
+    accept_starved: bool = false,
 
     // --- Lifecycle ---
 
@@ -365,6 +367,8 @@ pub const Conductor = struct {
 
     /// Read once readable, or dropped after `request_timeout_s`.
     pub fn admitConnection(self: *Conductor, socket: posix.socket_t, peer: *const PeerInfo) void {
+        if (self.accept_starved) std.debug.print("Accepting connections again\n", .{});
+        self.accept_starved = false;
         if (self.cfg.transport == .tcp) platform.setTcpNodelay(socket);
         const pc = self.allocator.create(PendingConnection) catch return platform.close(socket);
         pc.* = .{ .socket = socket, .peer = peer.*, .deadline = self.currentTime() + request_timeout_s };
@@ -373,6 +377,14 @@ pub const Conductor = struct {
             return platform.close(socket);
         };
         self.event_loop.watchFd(@intFromPtr(pc) | tag_connection, socket);
+        self.event_loop.armTick();
+    }
+
+    /// Logs the first failure of a run, and arms the tick on which the loop
+    /// resumes accepting.
+    pub fn onAcceptStarved(self: *Conductor, err: anytype) void {
+        if (!self.accept_starved) std.debug.print("Accept error: {t}; retrying each second until one succeeds\n", .{err});
+        self.accept_starved = true;
         self.event_loop.armTick();
     }
 

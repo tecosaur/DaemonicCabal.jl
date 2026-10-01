@@ -29,6 +29,8 @@ pub const EventLoop = struct {
     io_uring_error: anyerror,
     timers: std.ArrayList(Timer) = .empty,
     tick_armed: bool = false,
+    /// Out of descriptors or memory: the listener is unwatched until the tick.
+    accept_paused: bool = false,
 
     pub fn init(io_uring_error: anyerror) !EventLoop {
         const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
@@ -83,6 +85,7 @@ pub const EventLoop = struct {
     }
 
     pub fn stopAccepting(self: *EventLoop, listener: *protocol.Listener) void {
+        self.accept_paused = false;
         self.unwatchFd(@intFromEnum(EventLocation.accept), listener.fd());
     }
 
@@ -174,7 +177,7 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
             }
             switch (@as(EventLocation, @enumFromInt(tag))) {
                 .accept => {
-                    handleAccept(conductor, listener.fd());
+                    handleAccept(conductor, loop, listener);
                     pool_changed = true;
                 },
                 .signal => {
@@ -213,6 +216,8 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
                 .live_timer => conductor.onLiveTimer(),
                 .tick_timer => {
                     loop.tick_armed = false;
+                    if (loop.accept_paused) loop.startAccepting(listener);
+                    loop.accept_paused = false;
                     if (conductor.tick()) loop.armTick();
                     pool_changed = true;
                 },
@@ -225,14 +230,20 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
 
 // Event handlers
 
-fn handleAccept(conductor: *Conductor, server_fd: posix.fd_t) void {
+fn handleAccept(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener) void {
     // Level-triggered, so never re-armed.
     var client_addr: std.Io.Threaded.PosixAddress = undefined;
     var client_addr_len: posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
-    const rc = linux.accept4(server_fd, &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC);
+    const rc = linux.accept4(listener.fd(), &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .INTR, .AGAIN, .CONNABORTED => return,
+        .MFILE, .NFILE, .NOMEM, .NOBUFS => |err| {
+            loop.stopAccepting(listener);
+            loop.accept_paused = true;
+            conductor.onAcceptStarved(err);
+            return;
+        },
         else => |err| {
             std.debug.print("Accept error: {t}\n", .{err});
             return;
