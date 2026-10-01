@@ -1871,10 +1871,11 @@ pub const Conductor = struct {
         if (w.session_label != null and !self.isLabelExpired(w, now)) return null;
         return @intCast(@max(0, now - w.last_active));
     }
-    // Past budget is expired instead: enforceMaxTtl culls it regardless.
+    // Past budget is expired instead: enforceMaxTtl culls it regardless. The
+    // reserve, exempt from the budget, has no such end.
     fn inPressureBand(self: *Conductor, w: *worker.Worker, key: []const u8, now: i64) bool {
         const age = self.cullableAge(w, now) orelse return false;
-        return age >= self.cfg.min_ttl and age < self.idleBudget(w, key);
+        return age >= self.cfg.min_ttl and (self.reserve == w or age < self.idleBudget(w, key));
     }
     // Idle seconds before TTL culls a worker, the larger of two earned terms:
     //  • cadence: the key's expected next-summon time (RFC 6298 RTO), scaled by a
