@@ -181,6 +181,7 @@ pub const SandboxError = error{
     ChdirFailed,
     ExecFailed,
     CgroupSetupFailed,
+    PrivilegeDropFailed,
     PathTooLong,
 };
 
@@ -219,7 +220,7 @@ pub fn execInSandbox(
     posix.sigaddset(&relayed, .TERM);
     posix.sigaddset(&relayed, .USR1); // a snapshot's; also replaces the conductor's handler
     posix.sigprocmask(posix.SIG.BLOCK, &relayed, null);
-    setupNamespaces(orig_uid, orig_gid) catch |err|
+    setupNamespaces(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWUSER, orig_uid, orig_gid) catch |err|
         fatalChild("namespace setup", err);
     const pid2 = callFork() orelse
         fatalChild("inner fork", SandboxError.ForkFailed);
@@ -240,6 +241,12 @@ pub fn execInSandbox(
     posix.sigprocmask(posix.SIG.UNBLOCK, &relayed, null);
     setupFilesystem(config) catch |err|
         fatalChild("filesystem setup", err);
+    // Copied into a mount namespace of a less privileged user namespace, every
+    // mount is locked: its flags cannot be changed, nor can it be unmounted.
+    setupNamespaces(CLONE_NEWNS | CLONE_NEWUSER, 0, 0) catch |err|
+        fatalChild("locking the mounts", err);
+    dropPrivileges() catch |err|
+        fatalChild("dropping privileges", err);
     const exe = argv[0].?;
     std.debug.print("Sandbox: execve {s}\n", .{std.mem.span(exe)});
     const rc = linux.execve(exe, argv, envp);
@@ -264,8 +271,9 @@ pub fn envAllowed(key: []const u8) bool {
 
 // --- Namespace setup ---
 
-fn setupNamespaces(orig_uid: linux.uid_t, orig_gid: linux.gid_t) SandboxError!void {
-    if (errnoFromRc(linux.unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWUSER))) |e| {
+/// `flags` must include `CLONE_NEWUSER`, whose root becomes `orig_uid`/`orig_gid`.
+fn setupNamespaces(flags: usize, orig_uid: linux.uid_t, orig_gid: linux.gid_t) SandboxError!void {
+    if (errnoFromRc(linux.unshare(flags))) |e| {
         logErrno("unshare", e);
         return SandboxError.UnshareFailed;
     }
@@ -279,6 +287,23 @@ fn setupNamespaces(orig_uid: linux.uid_t, orig_gid: linux.gid_t) SandboxError!vo
     const gid_map = std.fmt.bufPrint(&gid_buf, "0 {d} 1\n", .{orig_gid}) catch
         return SandboxError.GidMapFailed;
     writeFile("/proc/self/gid_map", gid_map) catch return SandboxError.GidMapFailed;
+}
+
+/// An empty bounding set leaves the exec'd root without capabilities, as a
+/// fresh user namespace's inheritable and ambient sets are already empty.
+fn dropPrivileges() SandboxError!void {
+    var cap: usize = 0;
+    while (true) : (cap += 1) {
+        const e = errnoFromRc(linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), cap, 0, 0, 0)) orelse continue;
+        // EINVAL marks the first capability past the kernel's last.
+        if (e == .INVAL and cap > 0) break;
+        logErrno("PR_CAPBSET_DROP", e);
+        return SandboxError.PrivilegeDropFailed;
+    }
+    if (errnoFromRc(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0))) |e| {
+        logErrno("PR_SET_NO_NEW_PRIVS", e);
+        return SandboxError.PrivilegeDropFailed;
+    }
 }
 
 // --- Filesystem construction ---
@@ -316,7 +341,11 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
         return SandboxError.PivotRootFailed;
     }
     if (errnoFromRc(linux.chdir("/"))) |_| return SandboxError.ChdirFailed;
-    _ = linux.umount2(".", MNT_DETACH);
+    // The host's root lies over ours until detached.
+    if (errnoFromRc(linux.umount2(".", MNT_DETACH))) |e| {
+        logErrno("detaching the old root", e);
+        return SandboxError.PivotRootFailed;
+    }
     _ = linux.chdir("/home/sandbox");
 }
 
