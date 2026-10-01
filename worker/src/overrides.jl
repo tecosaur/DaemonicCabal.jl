@@ -241,6 +241,18 @@ end
     for T in (:IO, :(Union{Base.LibuvStream, IOStream}), :(Base.AbstractPipe), :(Base.DevNull))
         @eval (f::Base.RedirectStdStream)(io::$T) = set_redirect!(f, io)
     end
+    # Base's restores the global it saw, which names no client redirect.
+    @eval function (f::Base.RedirectStdStream)(thunk::Function, io)
+        term = ACTIVE_TERM[]
+        slot, _ = redirect_slot(f)
+        previous = getfield(term, slot)
+        f(io)
+        try
+            thunk()
+        finally
+            setfield!(term, slot, previous)
+        end
+    end
     @eval function (f::Base.RedirectStdStream)(p::Base.Pipe)
         if p.in.status == Base.StatusInit && p.out.status == Base.StatusInit
             Base.link_pipe!(p)
