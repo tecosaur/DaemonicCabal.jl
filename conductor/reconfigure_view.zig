@@ -121,7 +121,9 @@ pub fn draw(gpa: Allocator, out: *std.ArrayList(u8), scene: *const Scene, from: 
         return height;
     };
     const line = at.line - top;
-    try out.print(gpa, "\x1b[{d}A\x1b[{d}G\x1b[?25h\x1b[?2026l", .{ height - line, at.col + 1 });
+    // A terminal reads a cursor-up of 0 as 1.
+    if (height > line) try out.print(gpa, "\x1b[{d}A", .{height - line});
+    try out.print(gpa, "\x1b[{d}G\x1b[?25h\x1b[?2026l", .{at.col + 1});
     return line;
 }
 
@@ -674,4 +676,24 @@ test "the editor's cursor is placed past wide characters' two columns" {
     _ = try draw(gpa, &out, &scene, 0);
     var expected: [16]u8 = undefined;
     try testing.expect(std.mem.indexOf(u8, out.items, try std.fmt.bufPrint(&expected, "\x1b[{d}G", .{value_col + 5})) != null);
+}
+
+test "a terminal a row high gets no cursor-up of 0, which moves one" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const styles = Styles.of(null);
+    const args = Setting.index("JULIA_DAEMON_WORKER_ARGS");
+    const check: Check = .{};
+    var scene = sceneOf(&state, &staged, &styles, 0, args);
+    scene.rows = 1;
+    scene.editor = .{ .text = "-O3", .cursor = 1, .check = &check };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), try draw(gpa, &out, &scene, 0));
+    try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[0A") == null);
 }
