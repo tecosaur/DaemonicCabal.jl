@@ -333,7 +333,11 @@ end
 function display_run_error(run_stdout::IO, stderrx::IO)
     isopen(run_stdout) || return
     try flush(run_stdout) catch end
-    Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
+    try
+        Base.invokelatest(Base.display_error, stderrx, scrub_backtrace(current_exceptions()))
+    catch err
+        err isa Base.IOError || rethrow()
+    end
 end
 
 # A run's code, then its `atexit` hooks, as stock julia runs them on its way
@@ -498,6 +502,9 @@ function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO
             send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
             close(signals)
         end
+    catch err
+        err isa Base.IOError || rethrow()
+        close(signals)
     finally
         unregister_client!(client)
     end
