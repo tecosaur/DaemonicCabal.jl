@@ -570,15 +570,22 @@ fn exitClient(code: u8) noreturn {
     std.process.exit(code);
 }
 
+/// `raw` is relayed from the worker, which may be sandboxed: only an address
+/// of the conductor's own transport is dialled.
 fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.socket_t {
-    const connected = if (raw.len > 0 and raw[0] == ':') blk: {
-        // A worker sends just `:port`, a port on the conductor's host.
-        var ip = conductor_peer orelse break :blk error.NoConductorAddress;
-        ip.setPort(std.fmt.parseInt(u16, raw[1..], 10) catch break :blk error.InvalidAddress);
-        break :blk platform.connectTcp(ip, protocol.connect_timeout_ms);
-    } else switch ((protocol.parseAddress(raw) catch unreachable).mode) {
-        .local => platform.connectLocalOnce(raw),
-        .tcp => if (protocol.connectAddress(.tcp, raw, protocol.connect_timeout_ms)) |c| c.socket else |e| e,
+    const connected = switch (transport_mode) {
+        // Just `:port`, a port on the conductor's host.
+        .tcp => blk: {
+            if (raw.len == 0 or raw[0] != ':') break :blk error.InvalidAddress;
+            var ip = conductor_peer orelse break :blk error.NoConductorAddress;
+            ip.setPort(std.fmt.parseInt(u16, raw[1..], 10) catch break :blk error.InvalidAddress);
+            break :blk platform.connectTcp(ip, protocol.connect_timeout_ms);
+        },
+        .local => blk: {
+            const address = protocol.parseAddress(raw) catch break :blk error.InvalidAddress;
+            if (address.mode != .local) break :blk error.InvalidAddress;
+            break :blk platform.connectLocalOnce(raw);
+        },
     };
     const socket = connected catch |e| {
         platform.eprint("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ raw, e });
