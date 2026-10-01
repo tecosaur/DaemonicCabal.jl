@@ -203,7 +203,8 @@ end
 function queue_orphan_check()
     ORPHAN_FAILSAFE > 0 || return
     Timer(ORPHAN_FAILSAFE; interval = ORPHAN_FAILSAFE) do _
-        if time() - (@lock STATE.lock STATE.last_contact[]) >= ORPHAN_FAILSAFE
+        # A client's code may hold thread 0 past the failsafe, its pings unread.
+        if @lock STATE.lock isempty(STATE.clients) && time() - STATE.last_contact[] >= ORPHAN_FAILSAFE
             real_exit(0)
         end
     end
