@@ -226,6 +226,15 @@ end
     extra::Base.Redirectable...,
 ) = Base.Redirectable[in, out, err, extra...]
 
+# Base writes Core's streams to fds 1 and 2, the conductor's. `Core.print` still
+# does, for Base's last-resort errors.
+@static if VERSION >= v"1.11"
+    for (core, base) in ((Core.CoreSTDOUT, :stdout), (Core.CoreSTDERR, :stderr))
+        @eval Base.unsafe_write(::$core, p::Ptr{UInt8}, n::UInt) = unsafe_write(Base.$base, p, n)
+        @eval Base.write(::$core, byte::UInt8) = write(Base.$base, byte)
+    end
+end
+
 # `redirect_std*` must not dup onto the conductor's fds 0/1/2. Every Base
 # signature needs an override, or its more specific method wins.
 @static if VERSION >= v"1.11"
