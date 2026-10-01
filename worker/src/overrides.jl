@@ -100,8 +100,10 @@ end
             if term.stdin isa TerminalInput
                 @lock term.stdin.lock term.stdin.raw = raw
             end
-            send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
-            read(term.signals, 2) # ack
+            @lock term.signals begin
+                send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
+                read(term.signals, 2) # ack
+            end
         end
         true
     end
@@ -114,8 +116,10 @@ else
         end
         if sig !== nothing && isopen(sig)
             try
-                send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
-                read(sig, 2) # ack
+                @lock sig begin
+                    send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
+                    read(sig, 2) # ack
+                end
             catch end
         end
         true
@@ -201,8 +205,10 @@ function suspend_client()
     if isnothing(sig) || !isopen(sig)
         return
     end
-    send_signal(sig, SIGNAL_SUSPEND, UInt8[])
-    read(sig, 2) # ack
+    @lock sig begin
+        send_signal(sig, SIGNAL_SUSPEND, UInt8[])
+        read(sig, 2) # ack
+    end
     nothing
 end
 

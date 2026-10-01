@@ -305,6 +305,7 @@ end
 end
 
 # Signal protocol (Worker → Client)
+# A lone client's replies are read inline, the stream locked from request to reply.
 const SIGNAL_EXIT = 0x01
 const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
 const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
