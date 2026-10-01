@@ -33,9 +33,10 @@ pub const EventLoop = struct {
     live_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
     tick_ts: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
     tick_armed: bool = false,
-    /// Whether a finished accept is queued again: not while the listener is
-    /// recreated, nor once that failed.
+    /// Whether an accept is queued: not while the listener is recreated,
+    /// nor once that failed.
     accepting: bool = true,
+    accept_queued: bool = false,
 
     pub fn init(entries: u13) !EventLoop {
         return .{
@@ -109,6 +110,7 @@ pub const EventLoop = struct {
         self.accepting = false;
     }
 
+    /// The run loop queues the accept, once none is.
     pub fn startAccepting(self: *EventLoop, _: *protocol.Listener) void {
         self.accepting = true;
     }
@@ -155,6 +157,7 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
         std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
         return;
     };
+    loop.accept_queued = true;
     _ = ring.read(@intFromEnum(EventLocation.signal), signal_pipe[0], .{ .buffer = &signal_buf }, 0) catch |err| {
         std.debug.print("Fatal: failed to queue signal read: {}\n", .{err});
         return;
@@ -175,7 +178,6 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
             std.debug.print("Fatal: io_uring submit_and_wait failed: {}\n", .{err});
             return;
         };
-        var need_rearm_accept = false;
         var need_rearm_ping_timer = false;
         var need_rearm_pressure_timer = false;
         // Whether a live `--status` view needs a repaint, once per batch.
@@ -210,6 +212,7 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
             }
             switch (@as(EventLocation, @enumFromInt(user_data))) {
                 .accept => {
+                    loop.accept_queued = false;
                     if (cqe.res >= 0) {
                         const client_fd: posix.fd_t = @intCast(cqe.res);
                         const peer = main.PeerInfo.fromSockaddr(&client_addr);
@@ -218,7 +221,6 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
                         .BADF, .CANCELED => {},
                         else => |err| std.debug.print("Accept error: {t}\n", .{err}),
                     }
-                    need_rearm_accept = true;
                     pool_changed = true;
                 },
                 .signal => {
@@ -249,13 +251,14 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
             }
         }
         if (pool_changed) conductor.noteLiveChange();
-        if (need_rearm_accept and loop.accepting) {
+        if (loop.accepting and !loop.accept_queued) {
             client_addr_len = @sizeOf(std.Io.Threaded.PosixAddress);
             const accept_ring = loop.room(1) catch |err| {
                 std.debug.print("Fatal: failed to requeue accept: {}\n", .{err});
                 return;
             };
             _ = accept_ring.accept(@intFromEnum(EventLocation.accept), listener.fd(), &client_addr.any, &client_addr_len, posix.SOCK.CLOEXEC) catch unreachable;
+            loop.accept_queued = true;
         }
         if (need_rearm_ping_timer) {
             loop.queueTimeout(@intFromEnum(EventLocation.ping_timer), &ping_timer) catch |err| {

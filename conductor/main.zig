@@ -286,7 +286,7 @@ pub const Conductor = struct {
         };
         if (self.cfg.transport == .tcp) try self.writeHostKey();
         var listener = try self.createServer();
-        defer listener.close(self.io);
+        defer if (listener.fd() != platform.no_socket) listener.close(self.io); // a failed recreate closed it
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
         if (self.cfg.reserve_worker) self.beginReserveSpawn() catch |err| {
             std.debug.print("Failed to start a reserve worker: {}\n", .{err});
