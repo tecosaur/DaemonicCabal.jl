@@ -28,6 +28,14 @@ pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 
 }
 
 // I/O
+/// Opens /dev/null onto any of fds 0-2 that are closed, so that no socket
+/// later takes one of their numbers.
+pub fn openClosedStdio() void {
+    for (0..3) |fd| {
+        if (posix.errno(posix.system.fcntl(@intCast(fd), posix.F.GETFD, @as(usize, 0))) != .BADF) continue;
+        _ = posix.openatZ(posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR }, 0) catch return;
+    }
+}
 pub fn socketWrite(fd: posix.socket_t, buf: []const u8) void { impl.write(fd, buf); }
 pub fn close(fd: posix.fd_t) void { impl.rawClose(fd); }
 pub fn shutdownWrite(fd: posix.socket_t) void {
