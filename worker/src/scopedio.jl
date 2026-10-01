@@ -184,9 +184,11 @@ client_module_default(key::Symbol, default) =
     if key === :module && default === Main CLIENT_MODULE[] else default end
 
 function query_displaysize(signals::StreamIO)
-    send_signal(signals, SIGNAL_QUERY_SIZE, UInt8[])
     # Response: id(1) + len(1) + height(2) + width(2)
-    resp = read(signals, 6)
+    resp = @lock signals begin
+        send_signal(signals, SIGNAL_QUERY_SIZE, UInt8[])
+        read(signals, 6)
+    end
     length(resp) == 6 || return DEFAULT_DISPLAYSIZE
     answered_size(resp[3:6])
 end
