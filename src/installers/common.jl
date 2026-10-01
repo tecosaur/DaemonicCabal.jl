@@ -76,32 +76,38 @@ end
 
 function install_files()
     dest = install_dir()
-    if isdir(dest)
-        # On Windows, chmod rewrites the DACL and strips the owner's delete rights.
-        if !Sys.iswindows()
-            for (root, _, _) in walkdir(dest; topdown=true)
-                chmod(root, 0o755)
-            end
-        end
-        rm(dest; recursive=true, force=true)
-    end
+    uninstall_files()
     @info "Installing to $dest"
     mkpath(dest)
     cp(SOURCE_WORKER_PROJECT, installed_worker_project())
     make_tree_readonly(installed_worker_project())
-    hardlink(joinpath(artifact"execbundle", "julia-conductor$EXE"), installed_conductor())
-    hardlink(joinpath(artifact"execbundle", "juliaclient$EXE"), installed_client())
+    for (name, path) in (("julia-conductor$EXE", installed_conductor()), ("juliaclient$EXE", installed_client()))
+        bundled = joinpath(artifact"execbundle", name)
+        try
+            hardlink(bundled, path)
+        catch err
+            err isa Base.IOError && err.code == Base.UV_EXDEV || rethrow()
+            cp(bundled, path)
+        end
+    end
 end
 
 function uninstall_files()
     dest = install_dir()
     isdir(dest) || return
+    # On Windows, chmod rewrites the DACL and strips the owner's delete rights.
+    if !Sys.iswindows()
+        for (root, _, _) in walkdir(dest; topdown=true)
+            chmod(root, 0o755)
+        end
+    end
     @info "Removing $dest"
     rm(dest; recursive=true)
 end
 
 function install_client_symlink()
     binpath = client_symlink_path()
+    mkpath(dirname(binpath))
     rm(binpath; force=true)
     @static if Sys.iswindows()
         # Unprivileged symlinks need developer mode; both paths share a drive.
