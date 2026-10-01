@@ -279,9 +279,10 @@ pub const Conductor = struct {
         defer eventLoopImpl.cleanupSignalHandlers();
         if (self.cfg.transport == .local) {
             g_pid_path = try std.fmt.allocPrintSentinel(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir}, 0);
-            self.writePidFile();
         }
-        defer if (self.cfg.transport == .local) {
+        const pid_file = if (self.cfg.transport == .local) self.writePidFile() else null;
+        defer if (pid_file) |file| {
+            file.close(self.io);
             Io.Dir.deleteFileAbsolute(self.io, g_pid_path) catch {};
         };
         if (self.cfg.transport == .tcp) try self.writeHostKey();
@@ -2362,17 +2363,18 @@ pub const Conductor = struct {
         try file.writeStreamingAll(self.io, &self.host_key);
     }
 
-    fn writePidFile(self: *Conductor) void {
+    /// Held locked while the conductor lives, so a client signals no stale pid.
+    fn writePidFile(self: *Conductor) ?Io.File {
         var buf: [16]u8 = undefined;
         const pid_str = std.fmt.bufPrint(&buf, "{d}", .{platform.getpid()}) catch unreachable;
-        var file = Io.Dir.createFileAbsolute(self.io, g_pid_path, .{}) catch |err| {
+        const file = Io.Dir.createFileAbsolute(self.io, g_pid_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |err| {
             std.debug.print("Warning: failed to create PID file: {}\n", .{err});
-            return;
+            return null;
         };
-        defer file.close(self.io);
         file.writePositionalAll(self.io, pid_str, 0) catch |err| {
             std.debug.print("Warning: failed to write PID file: {}\n", .{err});
         };
+        return file;
     }
 
     pub const Stream = enum(usize) { stdin, stdout, stderr, signals };
