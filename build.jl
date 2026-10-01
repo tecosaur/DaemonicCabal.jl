@@ -162,6 +162,8 @@ function build()
                         "sha256" => sha)])
             end
         end
+        # Pkg reads an entry without libc as glibc's; the binaries are static.
+        append!(artifacts, [merge(a, Dict("libc" => "musl")) for a in artifacts if a["os"] == "linux"])
         open(joinpath(@__DIR__, "Artifacts.toml"), "w") do io
             TOML.print(io, Dict("execbundle" => artifacts))
         end
