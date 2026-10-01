@@ -672,7 +672,13 @@ pub const Conductor = struct {
             // A remote client's filesystem isn't ours: it names a project of ours
             // only by --project, and starts in its directory, else in our home.
             const home = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/";
-            const proj = try project.resolve(self.allocator, self.io, &parsed, if (is_remote) null else env.julia_project, self.cfg.host_home, if (is_remote) home else head.cwd);
+            const proj = project.resolve(self.allocator, self.io, &parsed, if (is_remote) null else env.julia_project, self.cfg.host_home, if (is_remote) home else head.cwd) catch |err| {
+                if (err == error.CurrentDirUnavailable) {
+                    self.client_id = 0;
+                    try self.serveString(pc.socket, "The project is named relative to the working directory, which no longer exists.\n", 1);
+                }
+                return err;
+            };
             errdefer if (proj) |p| self.allocator.free(p);
             const project_dir = if (proj) |p| (if (p[0] == '@') home else if (std.mem.endsWith(u8, p, ".toml")) std.fs.path.dirname(p) orelse home else p) else home;
             const cwd = try self.allocator.dupe(u8, if (is_remote) project_dir else head.cwd);
@@ -790,7 +796,12 @@ pub const Conductor = struct {
             const cwd = trimTrailingSlashes(request.cwd);
             const proj = trimTrailingSlashes(request.project orelse "");
             const has_local_project = proj.len > 0 and proj[0] != '@';
-            break :blk .{ .local = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd };
+            const local = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd;
+            if (local.len == 0) {
+                try self.serveString(socket, "--sandbox: the working directory no longer exists, so there is nothing to bind.\n", 1);
+                return null;
+            }
+            break :blk .{ .local = local };
         } else .none;
         if (sandbox == .none) return sandbox;
         if (comptime builtin.os.tag != .linux) {
