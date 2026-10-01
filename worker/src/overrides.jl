@@ -103,7 +103,7 @@ end
             send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
             read(term.signals, 2) # ack
         end
-        raw
+        true
     end
 else
     @eval function REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool)
@@ -118,7 +118,7 @@ else
                 read(sig, 2) # ack
             catch end
         end
-        raw
+        true
     end
 end
 
