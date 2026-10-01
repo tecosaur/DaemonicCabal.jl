@@ -255,12 +255,14 @@ pub fn collectEnviron(allocator: std.mem.Allocator, environ: std.process.Environ
     for (environ.block.slice, entries) |entry, *kv| kv.* = std.mem.span(entry.?);
     return entries;
 }
-/// Signal the conductor whose pid `pid_path` holds (its SIGUSR1 handler).
+/// Signal the conductor whose pid `pid_path` holds (its SIGUSR1 handler),
+/// if it lives: it holds the file locked.
 pub fn requestSocketRecreate(pid_path: []const u8) bool {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{pid_path}) catch return false;
-    const fd = posix.openatZ(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    const fd = posix.openatZ(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return false;
     defer impl.rawClose(fd);
+    if (posix.errno(posix.system.flock(fd, posix.LOCK.SH | posix.LOCK.NB)) != .AGAIN) return false;
     var buf: [16]u8 = undefined;
     const n = posix.read(fd, &buf) catch return false;
     const pid = std.fmt.parseInt(posix.pid_t, std.mem.trimEnd(u8, buf[0..n], "\n\r "), 10) catch return false;
