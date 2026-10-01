@@ -84,6 +84,8 @@ pub const EventLoop = struct {
     timers: std.AutoHashMapUnmanaged(usize, *TimerCtx) = .empty,
     timer_generation: DWORD = 0,
     tick_armed: bool = false,
+    /// Out of handles or memory: the listener is unwatched until the tick.
+    accept_paused: bool = false,
 
     pub fn init(_: u13) !EventLoop {
         const port = win.CreateIoCompletionPort(win32.INVALID_HANDLE_VALUE, null, 0, 0) orelse return error.IocpCreateFailed;
@@ -225,12 +227,15 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
             const w = loop.takeWatch(o) orelse continue;
             defer std.heap.page_allocator.destroy(w);
             if (w.tag == tag_accept) {
-                if (!handleAccept(conductor, listener)) {
-                    std.debug.print("Fatal: the listener is gone, shutting down\n", .{});
-                    conductor.gracefulShutdown();
-                    return;
+                switch (handleAccept(conductor, listener)) {
+                    .gone => {
+                        std.debug.print("Fatal: the listener is gone, shutting down\n", .{});
+                        conductor.gracefulShutdown();
+                        return;
+                    },
+                    .starved => loop.accept_paused = true,
+                    .rewatch => loop.watchFd(tag_accept, listener.fd()),
                 }
-                loop.watchFd(tag_accept, listener.fd());
             } else if ((w.tag & 6) != 0) {
                 conductor.onReadable(w.tag);
             } else {
@@ -270,6 +275,8 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
             },
             .tick_timer => {
                 loop.tick_armed = false;
+                if (loop.accept_paused) loop.watchFd(tag_accept, listener.fd());
+                loop.accept_paused = false;
                 if (conductor.tick()) loop.armTick();
             },
             else => pool_changed = false,
@@ -278,12 +285,22 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
     }
 }
 
-fn handleAccept(conductor: *Conductor, listener: *protocol.Listener) bool {
-    const accepted = listener.accept(conductor.io) catch |err| {
-        std.debug.print("Accept error: {}\n", .{err});
-        return err != error.PipeCreateFailed;
+fn handleAccept(conductor: *Conductor, listener: *protocol.Listener) enum { rewatch, starved, gone } {
+    const accepted = listener.accept(conductor.io) catch |err| switch (err) {
+        error.PipeCreateFailed => {
+            std.debug.print("Accept error: {}\n", .{err});
+            return .gone;
+        },
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources, error.DuplicateHandleFailed => {
+            conductor.onAcceptStarved(err);
+            return .starved;
+        },
+        else => {
+            std.debug.print("Accept error: {}\n", .{err});
+            return .rewatch;
+        },
     };
     const peer = main.PeerInfo{ .address = accepted.peer };
     conductor.admitConnection(accepted.socket, &peer);
-    return true;
+    return .rewatch;
 }

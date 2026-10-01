@@ -37,6 +37,8 @@ pub const EventLoop = struct {
     /// nor once that failed.
     accepting: bool = true,
     accept_queued: bool = false,
+    /// Out of descriptors or memory: no accept is queued until the tick.
+    accept_paused: bool = false,
 
     pub fn init(entries: u13) !EventLoop {
         return .{
@@ -219,6 +221,10 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
                         conductor.admitConnection(client_fd, &peer);
                     } else switch (@as(linux.E, @enumFromInt(@as(u16, @intCast(-cqe.res))))) {
                         .BADF, .CANCELED => {},
+                        .MFILE, .NFILE, .NOMEM, .NOBUFS => |err| {
+                            loop.accept_paused = true;
+                            conductor.onAcceptStarved(err);
+                        },
                         else => |err| std.debug.print("Accept error: {t}\n", .{err}),
                     }
                     pool_changed = true;
@@ -244,6 +250,7 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
                 .live_timer => if (cqe.res == -etime) conductor.onLiveTimer(),
                 .tick_timer => {
                     loop.tick_armed = false;
+                    loop.accept_paused = false;
                     if (conductor.tick()) loop.armTick();
                     pool_changed = true;
                 },
@@ -251,7 +258,7 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
             }
         }
         if (pool_changed) conductor.noteLiveChange();
-        if (loop.accepting and !loop.accept_queued) {
+        if (loop.accepting and !loop.accept_paused and !loop.accept_queued) {
             client_addr_len = @sizeOf(std.Io.Threaded.PosixAddress);
             const accept_ring = loop.room(1) catch |err| {
                 std.debug.print("Fatal: failed to requeue accept: {}\n", .{err});
