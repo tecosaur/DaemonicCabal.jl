@@ -18,10 +18,12 @@ pub fn resolve(
     // Empty is the default environment; a bare --project is `@.`.
     const project = parsed.getSwitch("--project") orelse julia_project orelse return null;
     if (project.len == 0) return null;
-    if (std.mem.eql(u8, project, "@.")) return findProjectToml(allocator, io, cwd, home_dir);
+    // A deleted cwd (sent empty) has no project above it, nor paths from it.
+    if (std.mem.eql(u8, project, "@.")) return if (cwd.len == 0) null else findProjectToml(allocator, io, cwd, home_dir);
     if (std.mem.startsWith(u8, project, "@")) return try allocator.dupe(u8, project);
     if ((std.mem.eql(u8, project, "~") or std.mem.startsWith(u8, project, "~/")) and home_dir.len > 0)
         return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home_dir, project[1..] });
+    if (cwd.len == 0 and !std.fs.path.isAbsolute(project)) return error.CurrentDirUnavailable;
     return try std.fs.path.resolve(allocator, &.{ cwd, project });
 }
 
@@ -80,6 +82,27 @@ test "a project names a path from the client's cwd, or an environment" {
         const got = try resolve(gpa, std.testing.io, &parsed, case.julia_project, "/home/me", "/work/app");
         defer if (got) |g| gpa.free(g);
         if (case.want) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);
+    }
+}
+
+test "a deleted cwd, sent empty, names no project" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { argv: []const []const u8, want: anyerror!?[]const u8 }{
+        .{ .argv = &.{ "julia", "--project", "-e", "1" }, .want = null },
+        .{ .argv = &.{ "julia", "--project=/srv/x", "-e", "1" }, .want = "/srv/x" },
+        .{ .argv = &.{ "julia", "--project=~/p", "-e", "1" }, .want = "/home/me/p" },
+        .{ .argv = &.{ "julia", "--project=.", "-e", "1" }, .want = error.CurrentDirUnavailable },
+    };
+    for (cases) |case| {
+        var parsed = try args.parse(gpa, case.argv);
+        defer parsed.deinit();
+        const got = resolve(gpa, std.testing.io, &parsed, null, "/home/me", "");
+        defer if (got) |g| if (g) |p| gpa.free(p) else {} else |_| {};
+        const want = case.want catch |err| {
+            try std.testing.expectError(err, got);
+            continue;
+        };
+        if (want) |w| try std.testing.expectEqualStrings(w, (try got).?) else try std.testing.expect((try got) == null);
     }
 }
 

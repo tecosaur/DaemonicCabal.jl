@@ -410,7 +410,8 @@ function enter_environment!(client::ClientInfo)
         if isempty(ENVIRONS.runs)
             ENVIRONS.cwd[] = pwd()
         end
-        cd(client.cwd)
+        # A client whose cwd was deleted sends it empty.
+        isempty(client.cwd) || cd(client.cwd)
         for (key, value) in client.env
             get!(() -> get(ENV, key, nothing), ENVIRONS.env, key)
             ENV[key] = value
@@ -430,7 +431,7 @@ function leave_environment!(client::ClientInfo)
         dir = if isempty(ENVIRONS.runs) ENVIRONS.cwd[] else last(ENVIRONS.runs).cwd end
         isempty(ENVIRONS.runs) && empty!(ENVIRONS.env)
         try
-            cd(dir)
+            isempty(dir) || cd(dir)
         catch err
             @warn "Could not return to $dir after a client's run" exception=err
         end

@@ -461,9 +461,11 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, for
     if (w.pos + 4 >= w.buf.len) w.flush();
     const len_pos = w.pos;
     w.pos += 4;
-    const cwd_len = (try platform.currentDir(w.buf[w.pos..])).len;
-    std.mem.writeInt(u32, w.buf[len_pos..][0..4], @intCast(cwd_len), .little);
-    w.pos += cwd_len;
+    // Julia runs on in a deleted directory; the worker stays where it is.
+    const cwd: []const u8 = platform.currentDir(w.buf[w.pos..]) catch |err|
+        if (err == error.CurrentDirUnavailable) "" else return err;
+    std.mem.writeInt(u32, w.buf[len_pos..][0..4], @intCast(cwd.len), .little);
+    w.pos += cwd.len;
     w.writeInt(u64, env.fingerprint);
     w.writeInt(u32, @intCast(forwarded.len));
     for (forwarded) |arg| w.writeLenPrefixed(u32, arg);
