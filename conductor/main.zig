@@ -1222,7 +1222,7 @@ pub const Conductor = struct {
 
     fn tryAssignWorker(self: *Conductor, w: *worker.Worker, client_info: *const worker.ClientInfo, reason: AssignReason) ?WorkerAssignment {
         self.event_loop.cancelPendingPing(w);
-        const paths = w.runClient(self.allocator, client_info) catch |err| {
+        const paths = w.runClient(self.allocator, client_info, if (self.cfg.transport == .local) self.cfg.socket_dir else null) catch |err| {
             _ = self.handleRunClientError(w, err);
             return null;
         };
