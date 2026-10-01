@@ -26,7 +26,7 @@ const daemon_env_prefix = "JULIA_DAEMON_";
 // --- Activity signals ---
 
 fn decay(dt_s: i64, half_life_s: u64) f64 {
-    if (half_life_s == 0) return 0;
+    if (half_life_s == 0) return if (dt_s <= 0) 1 else 0;
     return std.math.exp2(-@as(f64, @floatFromInt(dt_s)) / @as(f64, @floatFromInt(half_life_s)));
 }
 
