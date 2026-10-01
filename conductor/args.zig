@@ -150,6 +150,7 @@ pub const Problem = union(enum) {
     missing_value: *const Option,
     unexpected_value: *const Option,
     invalid_value: struct { option: *const Option, value: []const u8 },
+    invalid_threads: ThreadsRefusal,
     needs_own_julia: *const Option,
 
     pub fn format(self: Problem, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -162,6 +163,11 @@ pub const Problem = union(enum) {
                 try w.print("julia: invalid argument to -{c} ({s})", .{ c, invalid.value })
             else
                 try w.print("julia: invalid argument to {s}={{{s}}} ({s})", .{ invalid.option.long, invalid.option.choices.?, invalid.value }),
+            .invalid_threads => |refusal| try w.writeAll(switch (refusal) {
+                .default => "julia: -t,--threads=<n>[,auto|<m>]; n must be an integer >= 1",
+                .interactive => "julia: -t,--threads=<n>,<m>; m must be an integer >= 0",
+                .auto_interactive => "julia: -t,--threads=auto,<m>; m must be an integer >= 0",
+            }),
             .needs_own_julia => |option| try w.print("option `{s}` needs a Julia process of its own: run it with `julia`", .{option.long}),
         }
     }
@@ -192,14 +198,16 @@ pub const ParsedArgs = struct {
     }
 
     pub fn threadSwitch(self: *const ParsedArgs) Threads {
-        return parseThreads(self.getSwitch("--threads") orelse "");
+        const value = self.getSwitch("--threads") orelse return threads_none;
+        return switchThreads(value).threads; // refused as parsed
     }
 };
 
 /// (default pool, interactive pool) counts. Julia fixes these at startup, so
-/// they are part of a worker's identity.
+/// they are part of a worker's identity. The default is unset only when
+/// both are; an unset interactive count is Julia's to choose.
 pub const Threads = [2]u16;
-pub const threads_unset: u16 = 0;
+pub const threads_unset: u16 = 0xfffe;
 pub const threads_auto: u16 = 0xffff;
 pub const threads_none = Threads{ threads_unset, threads_unset };
 
@@ -207,21 +215,68 @@ pub fn packThreads(spec: Threads) u32 {
     return (@as(u32, spec[0]) << 16) | spec[1];
 }
 
-/// Unrecognised fields fall back to `auto`, leaving the verdict to Julia.
+/// As Julia reads JULIA_NUM_THREADS, which refuses nothing: a default it
+/// can't read is 1, and an interactive count it can't read is left unset.
 pub fn parseThreads(value: []const u8) Threads {
-    const default, const interactive = std.mem.cutScalar(u8, value, ',') orelse .{ value, "" };
-    return .{ parseThreadField(default), parseThreadField(interactive) };
+    var rest = value;
+    const default: u16 = if (std.mem.startsWith(u8, value, "auto")) blk: {
+        rest = value[4..];
+        break :blk threads_auto;
+    } else if (leadingInt(value)) |n| blk: {
+        rest = n.rest;
+        // Julia's int16_t holds what strtol read.
+        const count: i16 = @truncate(n.value);
+        break :blk if (count > 0) @intCast(count) else 1;
+    } else 1;
+    if (rest.len == 0 or rest[0] != ',') return .{ default, threads_unset };
+    const interactive = rest[1..];
+    if (std.mem.startsWith(u8, interactive, "auto")) return .{ default, threads_auto };
+    const m = leadingInt(interactive) orelse return .{ default, threads_unset };
+    const count: i16 = @truncate(m.value);
+    return .{ default, if (count >= 0) @intCast(count) else threads_unset };
 }
 
-fn parseThreadField(field: []const u8) u16 {
-    if (field.len == 0) return threads_unset;
-    if (std.mem.eql(u8, field, "auto")) return threads_auto;
-    return std.fmt.parseInt(u16, field, 10) catch threads_auto;
+/// Why Julia refuses a `--threads` value.
+pub const ThreadsRefusal = enum { default, interactive, auto_interactive };
+
+/// As Julia reads `--threads`: the default count may trail text, which only a
+/// comma then the whole interactive count may follow.
+fn switchThreads(value: []const u8) union(enum) { threads: Threads, refused: ThreadsRefusal } {
+    if (std.mem.startsWith(u8, value, "auto")) {
+        if (value.len == 4 or value[4] != ',') return .{ .threads = .{ threads_auto, threads_unset } };
+        const interactive = interactiveThreads(value[5..]) orelse return .{ .refused = .auto_interactive };
+        return .{ .threads = .{ threads_auto, interactive } };
+    }
+    const n = leadingInt(value) orelse return .{ .refused = .default };
+    if (n.value < 1 or n.value >= std.math.maxInt(i16)) return .{ .refused = .default };
+    const default: u16 = @intCast(n.value);
+    if (n.rest.len == 0 or n.rest[0] != ',') return .{ .threads = .{ default, threads_unset } };
+    const interactive = interactiveThreads(n.rest[1..]) orelse return .{ .refused = .interactive };
+    return .{ .threads = .{ default, interactive } };
+}
+
+fn interactiveThreads(text: []const u8) ?u16 {
+    if (std.mem.startsWith(u8, text, "auto")) return threads_auto;
+    const m = leadingInt(text) orelse return null;
+    if (m.rest.len > 0 or m.value < 0 or m.value >= std.math.maxInt(i16)) return null;
+    return @intCast(m.value);
+}
+
+// As C's strtol: spaces, a sign, then digits, null without any. Out of range
+// reads as maxInt, refused as strtol's ERANGE is.
+fn leadingInt(text: []const u8) ?struct { value: i64, rest: []const u8 } {
+    const number = std.mem.trimStart(u8, text, " \t\n\r\x0b\x0c");
+    const sign: usize = if (number.len > 0 and (number[0] == '+' or number[0] == '-')) 1 else 0;
+    var end = sign;
+    while (end < number.len and std.ascii.isDigit(number[end])) end += 1;
+    if (end == sign) return null;
+    const value = std.fmt.parseInt(i64, number[0..end], 10) catch std.math.maxInt(i64);
+    return .{ .value = value, .rest = number[end..] };
 }
 
 /// Null when unset.
 pub fn renderThreads(allocator: Allocator, spec: Threads) !?[]const u8 {
-    if (spec[0] == threads_unset and spec[1] == threads_unset) return null;
+    if (spec[0] == threads_unset) return null;
     var d_buf: [8]u8 = undefined;
     var i_buf: [8]u8 = undefined;
     const default = threadField(&d_buf, spec[0]);
@@ -230,7 +285,7 @@ pub fn renderThreads(allocator: Allocator, spec: Threads) !?[]const u8 {
 }
 
 fn threadField(buf: []u8, val: u16) []const u8 {
-    if (val == threads_auto or val == threads_unset) return "auto";
+    if (val == threads_auto) return "auto";
     return std.fmt.bufPrint(buf, "{d}", .{val}) catch unreachable;
 }
 
@@ -349,6 +404,10 @@ fn accept(switches: *SwitchList, option: *const Option, value: []const u8, index
         while (allowed.next()) |choice| {
             if (std.mem.eql(u8, choice, value)) break;
         } else return .{ .invalid = .{ .invalid_value = .{ .option = option, .value = value } } };
+    };
+    if (std.mem.eql(u8, option.long, "--threads")) switch (switchThreads(value)) {
+        .threads => {},
+        .refused => |refusal| return .{ .invalid = .{ .invalid_threads = refusal } },
     };
     try switches.append(.{ .name = option.long, .value = value, .index = index, .words = end - index });
     return if (option.stops) .{ .stopped = end } else null;
