@@ -397,15 +397,6 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
             platform.sleepMs(100);
             if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c, runtime_dir) else |_| {}
         }
-        // Alive with no local socket: it may be listening on TCP.
-        if (transport_mode == .local) {
-            const tcp_addr = std.fmt.comptimePrint("localhost:{d}", .{protocol.default_tcp_port});
-            if (protocol.connectAddress(.tcp, tcp_addr, timeout)) |c| {
-                transport_mode = .tcp;
-                conductor_path = tcp_addr;
-                return keepConductor(c, runtime_dir);
-            } else |_| {}
-        }
     }
     if (first_err == error.UnknownHostName) {
         platform.eprint("Cannot resolve the host in {s}.\n", .{addr});
