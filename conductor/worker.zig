@@ -201,15 +201,9 @@ pub const Worker = struct {
         /// The conductor's own, which a direct worker inherits.
         environ_map: *const std.process.Environ.Map,
     ) !Spawn {
-        // A sandbox binds only this subdirectory; the worker puts its stdio
-        // sockets beside its setup socket.
         var subdir_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const socket_dir = if (launch == .sandboxed) blk: {
-            const subdir = std.fmt.bufPrint(&subdir_buf, "{s}/sandbox-{d}", .{ cfg.socket_dir, id }) catch
-                return error.PathTooLong;
-            Io.Dir.createDirAbsolute(io, subdir, .default_dir) catch {};
-            break :blk subdir;
-        } else cfg.socket_dir;
+        const socket_dir = try socketDir(&subdir_buf, cfg.socket_dir, launch, id);
+        if (launch == .sandboxed) Io.Dir.createDirAbsolute(io, socket_dir, .default_dir) catch {};
         var setup = try protocol.createListener(io, .local, socket_dir, "wsetup.sock", "");
         errdefer setup.close(io);
         const channel_copy: ?[]const u8 = if (julia_channel) |ch| try allocator.dupe(u8, ch) else null;
@@ -738,10 +732,13 @@ pub const Worker = struct {
         }
     };
 
+    /// The worker's relayed paths are believed only in its own directory
+    /// under `socket_dir`, the conductor's; null over TCP, where they are ports.
     pub fn runClient(
         self: *Worker,
         allocator: Allocator,
         client_info: *const ClientInfo,
+        socket_dir: ?[]const u8,
     ) !SocketPaths {
         const pf_len: usize = if (client_info.programfile) |pf| 4 + pf.len else 0;
         // flags, id, key, cwd, the three counts, the program file's flag, port set
@@ -804,16 +801,33 @@ pub const Worker = struct {
         try self.readAll(payload);
         var r = protocol.SliceReader{ .bytes = payload };
         self.active_clients = r.int(u32) catch return error.UnexpectedResponse;
+        var own_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const own_dir = if (socket_dir) |d| std.mem.trimEnd(u8, try socketDir(&own_dir_buf, d, self.launch, self.id), "/") else null;
         var paths: [4][]const u8 = undefined;
         for (&paths, 0..) |*path, i| {
             path.* = r.lenPrefixed(u32) catch return error.UnexpectedResponse;
             // An empty stdin path means the worker is at capacity.
             if (i == 0 and path.len == 0) return error.WorkerBusy;
             if (path.len > protocol.max_socket_path) return error.UnexpectedResponse;
+            // A sandboxed worker could otherwise name any socket the client can reach.
+            if (own_dir) |dir| {
+                const name = if (path.len > dir.len and std.mem.startsWith(u8, path.*, dir) and std.fs.path.isSep(path.*[dir.len])) path.*[dir.len + 1 ..] else "";
+                if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\") != null or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+                    self.log("runClient expected sockets in {s}, got {s}", .{ dir, path.* });
+                    return error.UnexpectedResponse;
+                }
+            }
         }
         return .{ .stdin = paths[0], .stdout = paths[1], .stderr = paths[2], .signals = paths[3], .owned = payload };
     }
 };
+
+/// Where a worker makes its stdio sockets, beside its setup socket: a
+/// sandbox binds only a subdirectory of the conductor's `socket_dir`.
+pub fn socketDir(buf: []u8, socket_dir: []const u8, launch: Worker.LaunchKind, id: u32) ![]const u8 {
+    if (launch != .sandboxed) return socket_dir;
+    return std.fmt.bufPrint(buf, "{s}/sandbox-{d}", .{ socket_dir, id }) catch error.PathTooLong;
+}
 
 pub const ClientInfo = struct {
     tty: bool,

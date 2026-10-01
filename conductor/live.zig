@@ -889,7 +889,7 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
         .args = &.{},
         .port_set = port_set,
     };
-    const paths = w.runClient(c.allocator, &info) catch |err| {
+    const paths = w.runClient(c.allocator, &info, if (c.cfg.transport == .local) c.cfg.socket_dir else null) catch |err| {
         _ = c.handleRunClientError(w, err);
         return err;
     };
