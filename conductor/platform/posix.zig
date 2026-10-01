@@ -156,7 +156,6 @@ pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !posix.socket_t {
     const len = Io.Threaded.addressToPosix(&ip, &storage);
     const fd = impl.rawSocket(storage.any.family, posix.SOCK.STREAM) orelse return error.SocketCreateFailed;
     errdefer impl.rawClose(fd);
-    _ = try fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC);
     const flags = try fcntl(fd, posix.F.GETFL, 0);
     const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
     _ = try fcntl(fd, posix.F.SETFL, flags | nonblock);
