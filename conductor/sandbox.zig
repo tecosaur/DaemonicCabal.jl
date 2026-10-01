@@ -28,6 +28,7 @@ const MS_SLAVE: u32 = 0x80000;
 const MS_PRIVATE: u32 = 0x40000;
 const MNT_DETACH: u32 = 0x00000002;
 const CLONE_NEWNS: usize = 0x00020000;
+const CLONE_NEWIPC: usize = 0x08000000;
 const CLONE_NEWPID: usize = 0x20000000;
 const CLONE_NEWUSER: usize = 0x10000000;
 
@@ -264,7 +265,7 @@ pub fn envAllowed(key: []const u8) bool {
 // --- Namespace setup ---
 
 fn setupNamespaces(orig_uid: linux.uid_t, orig_gid: linux.gid_t) SandboxError!void {
-    if (errnoFromRc(linux.unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUSER))) |e| {
+    if (errnoFromRc(linux.unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWUSER))) |e| {
         logErrno("unshare", e);
         return SandboxError.UnshareFailed;
     }
