@@ -238,9 +238,17 @@ pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {
 pub fn rawClose(fd: posix.fd_t) void {
     _ = c.close(fd);
 }
+/// Close-on-exec: macOS takes no SOCK_CLOEXEC, so it is set after. Zig
+/// declares one there for its own wrappers' shim, which libc's socket() refuses.
 pub fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
-    const rc = c.socket(@intCast(family), @intCast(sock_type), 0);
-    return if (rc >= 0) rc else null;
+    const cloexec_flag: u32 = if (@hasDecl(posix.SOCK, "CLOEXEC") and !builtin.target.os.tag.isDarwin()) posix.SOCK.CLOEXEC else 0;
+    const rc = c.socket(@intCast(family), @intCast(sock_type | cloexec_flag), 0);
+    if (rc < 0) return null;
+    if (cloexec_flag == 0 and c.fcntl(rc, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC)) < 0) {
+        _ = c.close(rc);
+        return null;
+    }
+    return rc;
 }
 pub fn fileOwner(fd: posix.fd_t) ?struct { uid: posix.uid_t, mode: u32 } {
     var st: c.Stat = undefined;
