@@ -69,6 +69,9 @@ function prepare_module(client::ClientInfo)
     else
         @something(take_standby!(STATE.standby_module), create_module())
     end
+    # Process-wide, so not left to the next run.
+    setglobal!(Base.MainInclude, :ans, nothing)
+    setglobal!(Base.MainInclude, :err, nothing)
     # A client module's own shadow Base's. Main (a session) sets Base's: 1.10 and
     # 1.11 won't let Main assign a name it has taken from Base.
     program = something(client.programfile, getval(client.switches, "--module", ""))
@@ -288,6 +291,8 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
         display_run_error(run_stdout, stderrx)
         exit_code = 1
     finally
+        # Process-wide, as `runworker` leaves it.
+        Base.exit_on_sigint(false)
         # After the run's last output, which may still be buffered.
         if !isnothing(recording)
             try flush(run_stdout) catch end
