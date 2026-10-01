@@ -12,6 +12,7 @@ mutable struct VirtualTerm
     const signals::StreamIO
     const term::String
     const sync_session::Union{Nothing, SyncSession}
+    const stdout_is_terminal::Bool
     terminfo::Union{Nothing, Base.TermInfo}
     have_color::Union{Nothing, Bool}
     have_truecolor::Union{Nothing, Bool}
@@ -19,8 +20,9 @@ mutable struct VirtualTerm
     redirect_out::Union{Nothing, IO}
     redirect_err::Union{Nothing, IO}
 end
-VirtualTerm(stdin, stdout, stderr, signals, term, sync_session, terminfo, have_color, have_truecolor) =
-    VirtualTerm(stdin, stdout, stderr, signals, term, sync_session,
+VirtualTerm(stdin, stdout, stderr, signals, term, sync_session, terminfo, have_color, have_truecolor;
+            stdout_is_terminal::Bool=true) =
+    VirtualTerm(stdin, stdout, stderr, signals, term, sync_session, stdout_is_terminal,
                 terminfo, have_color, have_truecolor, nothing, nothing, nothing)
 
 function unsafe_pipe!(pipe::Base.PipeEndpoint, stream::Union{Base.TTY, Base.PipeEndpoint})
@@ -189,11 +191,14 @@ function query_displaysize(signals::StreamIO)
     answered_size(resp[3:6])
 end
 
-function Base.displaysize(::Union{ScopedStdout, ScopedStderr, TerminalStdout})
+# As stock julia's, which asks only a terminal, and otherwise takes LINES and COLUMNS.
+function Base.displaysize(io::Union{ScopedStdout, ScopedStderr, TerminalStdout})
     term = ACTIVE_TERM[]
     session = term.sync_session
     if !isnothing(session)
         session_displaysize(session)
+    elseif !(term.stdout_is_terminal || io isa ScopedStderr)
+        displaysize()
     else
         term === WORKER_TERM && return DEFAULT_DISPLAYSIZE # no client to ask
         isopen(term.signals) || return DEFAULT_DISPLAYSIZE
