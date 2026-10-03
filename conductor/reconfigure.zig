@@ -329,7 +329,7 @@ fn editKey(c: *Conductor, v: *Viewer, key: tui.Key) void {
     };
     // Typing over a stepped value starts stepping afresh from what's typed.
     switch (key) {
-        .backspace, .delete, .char, .text => e.stepping = false,
+        .backspace, .delete, .char, .text, .kill_to_end, .kill_to_start => e.stepping = false,
         else => {},
     }
     switch (key) {
@@ -357,6 +357,13 @@ fn editKey(c: *Conductor, v: *Viewer, key: tui.Key) void {
         .right => e.cursor = charAfter(e.text.items, e.cursor),
         .home => e.cursor = 0,
         .end => e.cursor = e.text.items.len,
+        .word_left => e.cursor = tui.wordBefore(e.text.items, e.cursor),
+        .word_right => e.cursor = tui.wordAfter(e.text.items, e.cursor),
+        .kill_to_end => e.text.shrinkRetainingCapacity(e.cursor),
+        .kill_to_start => {
+            e.text.replaceRangeAssumeCapacity(0, e.cursor, &.{});
+            e.cursor = 0;
+        },
         .backspace => if (e.cursor > 0) {
             const start = charBefore(e.text.items, e.cursor);
             e.text.replaceRangeAssumeCapacity(start, e.cursor - start, &.{});

@@ -19,6 +19,10 @@ pub const Key = union(enum) {
     page_down,
     home,
     end,
+    word_left, // Ctrl or Alt with an arrow, or Alt-b
+    word_right, // likewise, or Alt-f
+    kill_to_end, // ^K
+    kill_to_start, // ^U
     enter,
     escape,
     interrupt, // ^C, which a raw client sends as a byte
@@ -41,6 +45,13 @@ pub const KeyIterator = struct {
             switch (byte) {
                 0x1b => return self.escape(),
                 0x03 => return .interrupt,
+                // As readline takes them.
+                0x01 => return .home,
+                0x02 => return .left,
+                0x05 => return .end,
+                0x06 => return .right,
+                0x0b => return .kill_to_end,
+                0x15 => return .kill_to_start,
                 '\r', '\n' => return .enter,
                 '\t' => return .tab,
                 0x7f, 0x08 => return .backspace,
@@ -61,28 +72,42 @@ pub const KeyIterator = struct {
     }
 
     // After an ESC: the Escape key alone, a CSI or SS3 sequence, or Alt
-    // with the key that follows (a character past ASCII whole), skipped.
+    // with the key that follows (a character past ASCII whole), skipped
+    // but for Alt-b and Alt-f.
     fn escape(self: *KeyIterator) ?Key {
         const rest = self.bytes[self.pos..];
         if (rest.len == 0) return .escape;
         if (rest[0] != '[' and rest[0] != 'O') {
             const len = @min(std.unicode.utf8ByteSequenceLength(rest[0]) catch 1, rest.len);
             self.pos += len;
-            return self.next();
+            return switch (rest[0]) {
+                'b' => .word_left,
+                'f' => .word_right,
+                else => self.next(),
+            };
         }
         var i: usize = 1;
         var param: u16 = 0;
-        var modified = false; // as with Ctrl, which nothing here takes
+        // After a `;`, xterm's modifiers, 1 + (Shift 1, Alt 2, Ctrl 4).
+        var modifiers: ?u16 = null;
         while (i < rest.len and rest[i] >= 0x20 and rest[i] < 0x40) : (i += 1) {
-            if (std.ascii.isDigit(rest[i])) param = param *| 10 +| (rest[i] - '0');
-            if (rest[i] == ';') modified = true;
+            if (rest[i] == ';') {
+                modifiers = 0;
+            } else if (std.ascii.isDigit(rest[i])) {
+                if (modifiers) |*m| m.* = m.* *| 10 +| (rest[i] - '0') else param = param *| 10 +| (rest[i] - '0');
+            }
         }
         if (i == rest.len) {
             self.pos = self.bytes.len; // cut short: nothing to act on
             return self.next();
         }
         self.pos += i + 1;
-        if (modified) return self.next();
+        // Alt or Ctrl (or both) with an arrow moves by word; nothing takes the rest.
+        if (modifiers) |m| return if (m >= 3 and m <= 8 and (m - 1) & 0b110 != 0) switch (rest[i]) {
+            'C' => .word_right,
+            'D' => .word_left,
+            else => self.next(),
+        } else self.next();
         return switch (rest[i]) {
             'A' => .up,
             'B' => .down,
@@ -103,6 +128,28 @@ pub const KeyIterator = struct {
         };
     }
 };
+
+/// Where the word before `at` in `text` starts, as readline's backward-word:
+/// past what isn't a word's, then the word. A word is letters and digits,
+/// any character past ASCII among them.
+pub fn wordBefore(text: []const u8, at: usize) usize {
+    var i = at;
+    while (i > 0 and !isWordByte(text[i - 1])) i -= 1;
+    while (i > 0 and isWordByte(text[i - 1])) i -= 1;
+    return i;
+}
+
+/// Where the word from `at` in `text` ends, as readline's forward-word.
+pub fn wordAfter(text: []const u8, at: usize) usize {
+    var i = at;
+    while (i < text.len and !isWordByte(text[i])) i += 1;
+    while (i < text.len and isWordByte(text[i])) i += 1;
+    return i;
+}
+
+fn isWordByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte >= 0x80;
+}
 
 /// The focus after `key` over `order`, the focusable clients top to bottom:
 /// down from none takes the first, up from the first lets go.
@@ -663,8 +710,29 @@ test "keys: characters past ASCII come whole, invalid ones not at all" {
     try std.testing.expectEqual(@as(?Key, null), it.next());
 }
 
+test "keys: as readline takes them" {
+    var it = KeyIterator{ .bytes = "\x01\x02\x05\x06\x0b\x15\x1b[1;5D\x1b[1;5C\x1b[1;3D\x1b[1;3C\x1bb\x1bf" };
+    const expected = [_]Key{ .home, .left, .end, .right, .kill_to_end, .kill_to_start, .word_left, .word_right, .word_left, .word_right, .word_left, .word_right };
+    for (expected) |key| try std.testing.expectEqual(key, it.next().?);
+    try std.testing.expectEqual(@as(?Key, null), it.next());
+}
+
+test "words: back and forward over what isn't a word's" {
+    const text = "/usr/local/bin  julia-1.13";
+    try std.testing.expectEqual(@as(usize, 11), wordBefore(text, 14));
+    try std.testing.expectEqual(@as(usize, 11), wordBefore(text, 13));
+    try std.testing.expectEqual(@as(usize, 0), wordBefore(text, 0));
+    try std.testing.expectEqual(@as(usize, 1), wordBefore(text, 4));
+    try std.testing.expectEqual(@as(usize, 4), wordAfter(text, 0));
+    try std.testing.expectEqual(@as(usize, 21), wordAfter(text, 14));
+    try std.testing.expectEqual(text.len, wordAfter(text, text.len));
+    // A character past ASCII is a word's, whole.
+    try std.testing.expectEqual(@as(usize, 0), wordBefore("世界", "世界".len));
+    try std.testing.expectEqual(@as(usize, "世界".len), wordAfter("世界 x", 0));
+}
+
 test "keys: unknown and cut-short sequences leave nothing" {
-    var it = KeyIterator{ .bytes = "\x1b[1;5Cx\x1b[99~\x1b[" };
+    var it = KeyIterator{ .bytes = "\x1b[1;2Cx\x1b[1;5A\x1b[99~\x1b[" };
     try std.testing.expectEqual(Key{ .char = 'x' }, it.next().?);
     try std.testing.expectEqual(@as(?Key, null), it.next());
 }
