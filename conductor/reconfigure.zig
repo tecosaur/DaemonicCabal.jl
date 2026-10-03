@@ -91,6 +91,9 @@ const Editor = struct {
     stepping: bool = false,
     changed_ns: i64 = 0, // as the text last changed
     settled: bool = true, // unchanged for `settle_ns` since
+    /// Opened on the platform's value for an unset setting, untouched since:
+    /// confirmed, it stays unset, following the platform.
+    implied: bool = false,
     check: view.Check = .{},
 
     fn deinit(self: *Editor, gpa: Allocator) void {
@@ -303,7 +306,9 @@ fn edit(c: *Conductor, v: *Viewer, i: usize) void {
     if (cycled) |next| return v.staged.stage(c.allocator, &c.settings.model, i, next) catch {};
     var editor: Editor = .{};
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const shown = offerExecutable(c, v, i, &buf) orelse
+    const implied = if (value == null and s.default == null) platformValue(c, v, i, &buf) else null;
+    editor.implied = implied != null;
+    const shown = offerExecutable(c, v, i, &buf) orelse implied orelse
         if (value != null or s.default != null) settings.display(s, value, &buf) else "";
     editor.text.appendSlice(c.allocator, shown) catch return;
     editor.cursor = shown.len;
@@ -318,6 +323,7 @@ fn editKey(c: *Conductor, v: *Viewer, key: tui.Key) void {
     defer if (v.editor) |*after| if (std.hash.Wyhash.hash(0, after.text.items) != before) {
         after.changed_ns = c.nowNs();
         after.settled = false;
+        after.implied = false;
         c.event_loop.armTick();
         checkEditor(c, v);
     };
@@ -329,6 +335,7 @@ fn editKey(c: *Conductor, v: *Viewer, key: tui.Key) void {
     switch (key) {
         .escape => closeEditor(c, v),
         .enter => {
+            if (e.implied) return closeEditor(c, v);
             var buf: [256]u8 = undefined;
             const value = settings.normalise(&all[i], e.text.items, &buf) catch return; // its row says why
             closeEditor(c, v);
@@ -552,6 +559,21 @@ fn reason(err: anyerror) []const u8 {
 
 // --- The editor's check ---
 
+// An unset setting's value as the platform works it out, where it does.
+fn platformValue(c: *const Conductor, v: *const Viewer, i: usize, buf: []u8) ?[]const u8 {
+    const key = all[i].key;
+    const xdg = c.environ_map.get("XDG_RUNTIME_DIR");
+    const home = c.environ_map.get("HOME");
+    if (std.mem.eql(u8, key, "JULIA_DAEMON_RUNTIME")) return platform.defaultRuntimeDir(buf, xdg, home) catch null;
+    if (!std.mem.eql(u8, key, "JULIA_DAEMON_SERVER")) return null;
+    var runtime_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const runtime = v.staged.effective(&c.settings.model, settings.Setting.index("JULIA_DAEMON_RUNTIME")) orelse
+        (platform.defaultRuntimeDir(&runtime_buf, xdg, home) catch return null);
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const socket_dir = platform.localSocketDir(&dir_buf, runtime) catch return null;
+    return platform.localSocketPath(buf, socket_dir, "conductor.sock", .{}) catch null;
+}
+
 // An executable that may not do, edited, starts as the one the default
 // names on the daemon's PATH, if it's there: Julia moved or upgraded, say.
 fn offerExecutable(c: *const Conductor, v: *Viewer, i: usize, buf: []u8) ?[]const u8 {
@@ -592,8 +614,10 @@ fn checkEditor(c: *const Conductor, v: *Viewer) void {
         var why_buf: [256]u8 = undefined;
         if (pathWarning(c, s.kind.path, path, e.settled, &why_buf)) |why| return check.set(.warning, "{s}", .{why});
     };
+    if (e.implied) return check.set(.fine, "The platform's: confirmed as it is, it stays unset.", .{});
     var shown_buf: [128]u8 = undefined;
     const shown = settings.display(s, form, &shown_buf);
+    if (form == null) return check.set(.fine, "{s}: {s}.", .{ if (s.default != null) "Default" else "Unset", shown });
     if (std.mem.eql(u8, std.mem.trim(u8, e.text.items, " \t"), shown)) return check.set(.fine, "", .{});
     check.set(.fine, "As {s}.", .{shown});
 }
