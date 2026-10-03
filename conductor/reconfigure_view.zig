@@ -86,7 +86,8 @@ pub const Scene = struct {
     saving: bool, // whether there's a service to save to
     tab: usize,
     focus: usize, // a setting's index, in `tab`
-    editor: ?struct { text: []const u8, cursor: usize, check: *const Check } = null,
+    /// `placeholder`, grey while `text` is empty: what an empty field leaves.
+    editor: ?struct { text: []const u8, cursor: usize, check: *const Check, placeholder: []const u8 = "" } = null,
     message: ?struct { problem: bool, text: []const u8 } = null,
     asking: bool = false, // whether to save before quitting
     /// Paths that may not do (missing, say), marked by their values.
@@ -349,12 +350,14 @@ const Frame = struct {
         const e = self.scene.editor.?;
         var buf: [256]u8 = undefined;
         const valid = if (settings.normalise(&all[i], e.text, &buf)) |_| true else |_| false;
-        try self.print("{s}{s}{s}", .{ self.scene.styles.field.get(), if (valid) "" else problem_colour, e.text });
-        const text_cols = tui.textWidth(e.text);
+        const shown = if (e.text.len == 0) e.placeholder else e.text;
+        // Padded a cell either side; the cursor past the end takes the right one.
+        try self.print("{s} {s}{s}", .{ self.scene.styles.field.get(), if (e.text.len == 0) self.muted() else if (valid) "" else problem_colour, shown });
+        const text_cols = 1 + tui.textWidth(shown);
         const cols = @max(field_cols, text_cols + 1);
         try self.pad(cols - text_cols);
         try self.write(reset);
-        self.cursor = .{ .line = self.line(), .col = value_col + tui.textWidth(e.text[0..e.cursor]) };
+        self.cursor = .{ .line = self.line(), .col = value_col + 1 + tui.textWidth(e.text[0..e.cursor]) };
         if (!settings.steps(all[i].kind)) return cols;
         try self.print("  " ++ bold ++ "↑↓\x1b[22m {s}adjust value" ++ reset, .{self.muted()});
         return cols + 2 + comptime tui.textWidth("↑↓ adjust value");
@@ -683,7 +686,28 @@ test "the editor's cursor is placed past wide characters' two columns" {
     defer out.deinit(gpa);
     _ = try draw(gpa, &out, &scene, 0);
     var expected: [16]u8 = undefined;
-    try testing.expect(std.mem.find(u8, out.items, try std.mem.print(&expected, "\x1b[{d}G", .{value_col + 5})) != null);
+    // Past the field's padding cell, then two columns each: column `value_col + 6`, 1-based.
+    try testing.expect(std.mem.find(u8, out.items, try std.mem.print(&expected, "\x1b[{d}G", .{value_col + 6})) != null);
+}
+
+test "a field pads its text by a cell either side, however long" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const styles = Styles.of(null);
+    const args = Setting.index("JULIA_DAEMON_WORKER_ARGS");
+    const check: Check = .{};
+    var scene = sceneOf(&state, &staged, &styles, 0, args);
+    const text = "--threads=4 --heap-size-hint=2G";
+    scene.editor = .{ .text = text, .cursor = 0, .check = &check };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    _ = try draw(gpa, &out, &scene, 0);
+    try testing.expect(std.mem.find(u8, out.items, " " ++ text ++ " " ++ reset) != null);
 }
 
 test "a terminal a row high gets no cursor-up of 0, which moves one" {
@@ -731,4 +755,31 @@ test "a flagged path is marked after its value" {
     const at = std.mem.find(u8, flagged, "/gone/julia !").?;
     const line_end = std.mem.findScalarPos(u8, flagged, at, '\n').?;
     try testing.expect(std.mem.find(u8, flagged[at..line_end], "was default julia") != null);
+}
+
+test "an empty field shows, greyed, what it leaves" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const limit = Setting.index("JULIA_DAEMON_SANDBOX_MAX_MEMORY");
+    const styles = Styles.of(null);
+    var check: Check = .{};
+    var scene = sceneOf(&state, &staged, &styles, @intFromEnum(all[limit].tab), limit);
+    scene.editor = .{ .text = "", .cursor = 0, .check = &check, .placeholder = "62G" };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    _ = try draw(gpa, &out, &scene, 0);
+    // A cell in, as typed text would be.
+    const greyed = try std.mem.concat(gpa, u8, &.{ styles.field.get(), " ", styles.muted.get(), "62G" });
+    defer gpa.free(greyed);
+    try testing.expect(std.mem.find(u8, out.items, greyed) != null);
+    // Typed over, it's gone.
+    scene.editor = .{ .text = "4G", .cursor = 2, .check = &check, .placeholder = "62G" };
+    out.clearRetainingCapacity();
+    _ = try draw(gpa, &out, &scene, 0);
+    try testing.expect(std.mem.find(u8, out.items, "62G") == null);
 }
