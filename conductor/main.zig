@@ -1429,13 +1429,23 @@ pub const Conductor = struct {
     // keeping, and its waiters select again.
     fn onHeldClientGone(self: *Conductor, hold: *HeldClient) void {
         for (self.pending_spawns.items) |p| {
-            if (p.purpose == .client and p.purpose.client == hold) {
+            const starts = p.purpose == .client and p.purpose.client == hold;
+            const waiting = if (starts) null else std.mem.findScalar(*HeldClient, p.waiters.items, hold);
+            if (!starts and waiting == null) continue;
+            // A held client sends nothing, so only an end is a hangup: a readiness
+            // that finds none is stale, its poll raced by a cancel, perhaps of an
+            // earlier hold at this address.
+            var byte: [1]u8 = undefined;
+            if (platform.recvNonBlocking(hold.socket, &byte)) |got| {
+                if (got > 0) self.event_loop.watchFd(@intFromPtr(hold) | tag_spawn_client, hold.socket);
+                return;
+            }
+            if (starts) {
                 std.debug.print("Client {d}: left while worker {d} was starting\n", .{ hold.id, p.spawn.worker.id });
                 return self.failSpawn(p, error.ClientGone);
             }
-            const i = std.mem.findScalar(*HeldClient, p.waiters.items, hold) orelse continue;
             std.debug.print("Client {d}: left while waiting for worker {d}\n", .{ hold.id, p.spawn.worker.id });
-            _ = p.waiters.orderedRemove(i);
+            _ = p.waiters.orderedRemove(waiting.?);
             self.event_loop.unwatchFd(@intFromPtr(hold) | tag_spawn_client, hold.socket);
             return self.discardHold(hold);
         }
