@@ -914,7 +914,7 @@ pub const Conductor = struct {
         // Julia moved or upgraded since the service was set up, most likely.
         const msg = (if (err == error.FileNotFound)
             std.mem.print(&msg_buf, "Could not run a Julia worker: its executable, {s}, cannot be found.\n" ++
-                "Set JULIA_DAEMON_WORKER_EXECUTABLE in juliaclient --reconfigure, or run DaemonicCabal.install() again.\n", .{self.cfg.worker_executable})
+                "Run juliaclient --reconfigure to set another (Workers, Julia executable), or DaemonicCabal.install() again.\n", .{self.cfg.worker_executable})
         else
             std.mem.print(&msg_buf, "Could not run a Julia worker for this session ({s}).\n{s}", .{
                 @errorName(err), self.spawnFailureHint(err, sandbox),

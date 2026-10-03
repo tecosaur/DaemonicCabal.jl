@@ -302,8 +302,9 @@ fn edit(c: *Conductor, v: *Viewer, i: usize) void {
     };
     if (cycled) |next| return v.staged.stage(c.allocator, &c.settings.model, i, next) catch {};
     var editor: Editor = .{};
-    var buf: [128]u8 = undefined;
-    const shown = if (value != null or s.default != null) settings.display(s, value, &buf) else "";
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const shown = offerExecutable(c, v, i, &buf) orelse
+        if (value != null or s.default != null) settings.display(s, value, &buf) else "";
     editor.text.appendSlice(c.allocator, shown) catch return;
     editor.cursor = shown.len;
     v.editor = editor;
@@ -551,6 +552,19 @@ fn reason(err: anyerror) []const u8 {
 
 // --- The editor's check ---
 
+// An executable that may not do, edited, starts as the one the default
+// names on the daemon's PATH, if it's there: Julia moved or upgraded, say.
+fn offerExecutable(c: *const Conductor, v: *Viewer, i: usize, buf: []u8) ?[]const u8 {
+    const s = &all[i];
+    if (s.kind != .path or s.kind.path != .executable) return null;
+    const now = v.staged.effective(&c.settings.model, i) orelse s.default orelse return null;
+    var why_buf: [256]u8 = undefined;
+    const why = pathWarning(c, .executable, now, true, &why_buf) orelse return null;
+    const found = findOnPath(c, s.default orelse return null, buf) orelse return null;
+    v.message.set(.note, "{s} Offered instead: the {s} on the daemon's PATH.", .{ why, s.default.? });
+    return found;
+}
+
 // How the editor's text stands for the focused setting: its form (shown
 // when not as typed), why it can't be staged, the rule it would break, or,
 // for a path, why it may not do.
@@ -595,7 +609,8 @@ fn pathWarning(c: *const Conductor, kind: settings.Path, path: []const u8, whole
     }
     const bare = std.mem.findAny(u8, path, "/\\") == null;
     if (kind == .executable and bare) {
-        if (!whole or onPath(c, path)) return null;
+        var found_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        if (!whole or findOnPath(c, path, &found_buf) != null) return null;
         return std.mem.print(buf, "{s} isn't on the daemon's PATH.", .{path}) catch null;
     }
     if (std.Io.Dir.path.dirname(path)) |dir| {
@@ -617,17 +632,17 @@ fn pathWarning(c: *const Conductor, kind: settings.Path, path: []const u8, whole
     };
 }
 
-fn onPath(c: *const Conductor, name: []const u8) bool {
-    const path_env = c.environ_map.get("PATH") orelse return false;
+/// Where `name` is found on the daemon's PATH, into `buf`.
+fn findOnPath(c: *const Conductor, name: []const u8, buf: []u8) ?[]const u8 {
+    const path_env = c.environ_map.get("PATH") orelse return null;
     var dirs = std.mem.tokenizeScalar(u8, path_env, std.Io.Dir.path.delimiter);
     while (dirs.next()) |dir| {
         for ([_][]const u8{ "", ".exe" }) |suffix| {
-            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const candidate = std.mem.print(&buf, "{s}{c}{s}{s}", .{ dir, std.Io.Dir.path.sep, name, suffix }) catch continue;
-            if (std.Io.Dir.cwd().access(c.io, candidate, .{ .execute = true })) |_| return true else |_| {}
+            const candidate = std.mem.print(buf, "{s}{c}{s}{s}", .{ dir, std.Io.Dir.path.sep, name, suffix }) catch continue;
+            if (std.Io.Dir.cwd().access(c.io, candidate, .{ .execute = true })) |_| return candidate else |_| {}
         }
     }
-    return false;
+    return null;
 }
 
 // --- Workers ---
@@ -663,6 +678,7 @@ fn repaint(c: *Conductor, v: *Viewer) void {
         .editor = if (v.editor) |*e| .{ .text = e.text.items, .cursor = e.cursor, .check = &e.check } else null,
         .message = if (v.message.kind == .none) null else .{ .problem = v.message.kind == .problem, .text = v.message.bytes[0..v.message.len] },
         .asking = v.asking,
+        .flagged = flaggedPaths(c, v),
         .styles = &v.styles,
         .cols = v.term.size.cols,
         .rows = v.term.size.rows,
@@ -672,6 +688,17 @@ fn repaint(c: *Conductor, v: *Viewer) void {
         return;
     };
     v.term.sendFrame(c.allocator, out.items);
+}
+
+// The path settings whose values, as they would be, may not do.
+fn flaggedPaths(c: *const Conductor, v: *const Viewer) std.StaticBitSet(all.len) {
+    var flagged: std.StaticBitSet(all.len) = .empty;
+    for (&all, 0..) |*s, i| if (s.kind == .path) {
+        const path = v.staged.effective(&c.settings.model, i) orelse s.default orelse continue;
+        var why_buf: [256]u8 = undefined;
+        if (pathWarning(c, s.kind.path, path, true, &why_buf) != null) flagged.set(i);
+    };
+    return flagged;
 }
 
 // What the viewer did, to leave in the frame's place: after a problem
