@@ -200,6 +200,7 @@ pub const notification = struct {
         client_exit = 0x04,
         client_interrupt = 0x05, // then the evaluation it's meant for (u32; 0 if unknown)
         peek_report = 0x06, // the worker's id, then the report: u32 length + bytes
+        interrupted = 0x07, // the worker's id: it read a cancel_client
     };
 };
 

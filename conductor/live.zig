@@ -517,19 +517,11 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     }
 }
 
-// As a client's Ctrl-C: from Julia 1.14 the worker cancels the focused
-// client's code, and the SIGINT finds nothing; before, the SIGINT reaches
-// whichever of its clients runs.
+// As a client's Ctrl-C, for whichever of the focused client's evaluations runs.
 fn interrupt(c: *Conductor, sub: *Subscriber, focus: u32) void {
     const info = c.active_clients.get(focus) orelse return;
-    const w = info.worker;
-    w.cancelClient(focus, 0); // 0: whichever evaluation is current
-    w.signal(platform.SIG.INT);
-    const now = c.currentTime();
-    if (w.busyClients() > 1)
-        sub.note.set(now, "interrupted client {d}; before Julia 1.14, whichever of the worker's {d} runs", .{ info.pid, w.busyClients() })
-    else
-        sub.note.set(now, "interrupted client {d}", .{info.pid});
+    info.worker.interrupt(focus, 0);
+    sub.note.set(c.currentTime(), "interrupted client {d}", .{info.pid});
     repaint(c, sub);
 }
 
