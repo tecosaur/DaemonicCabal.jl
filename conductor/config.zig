@@ -77,6 +77,20 @@ pub const Config = struct {
             parsed.addr;
         errdefer allocator.free(socket_path);
         const transport = parsed.mode;
+        if (transport == .local) {
+            // The longest socket the conductor makes there: a client's reply sockets', `/<16 hex>-signals.sock`.
+            const name_len = "/0123456789abcdef-signals.sock".len;
+            const most = platform.max_local_addr - 1;
+            if (socket_dir.len + name_len > most) {
+                std.debug.print(
+                    \\Error: the runtime directory {s} is too long for the sockets made in it:
+                    \\they would be up to {d} bytes, where this system allows {d}.
+                    \\Set JULIA_DAEMON_RUNTIME to a directory of at most {d} bytes.
+                    \\
+                , .{ socket_dir, socket_dir.len + name_len, most, most - name_len });
+                return error.InvalidConfig;
+            }
+        }
         const bind_address: []const u8 = if (env.get("JULIA_DAEMON_BIND")) |b|
             b
         else if (transport == .tcp)
@@ -200,4 +214,16 @@ test "what a setting takes, Config loads" {
     try std.testing.expectEqual(12.5, cfg.psi_threshold);
     try std.testing.expectEqual(settings.max_seconds, cfg.ping_timeout);
     try std.testing.expectEqual(std.math.maxInt(u32), cfg.worker_maxclients);
+}
+
+test "a runtime directory too long for its sockets is refused" {
+    const name_len = "/0123456789abcdef-signals.sock".len;
+    const longest = "/" ++ @as([platform.max_local_addr - 1 - name_len - 1]u8, @splat('d'));
+    var fits = try testEnv(.{ "JULIA_DAEMON_RUNTIME", longest });
+    defer fits.deinit();
+    const cfg = try Config.load(std.testing.allocator, &fits);
+    cfg.deinit();
+    var too_long = try testEnv(.{ "JULIA_DAEMON_RUNTIME", longest ++ "d" });
+    defer too_long.deinit();
+    try std.testing.expectError(error.InvalidConfig, Config.load(std.testing.allocator, &too_long));
 }

@@ -60,6 +60,7 @@ pub const private_file_permissions = shared.private_file_permissions;
 pub const readSmallFile = shared.readSmallFile;
 pub const localSocketDir = shared.localSocketDir;
 pub const localSocketPath = shared.localSocketPath;
+pub const max_local_addr = shared.max_local_addr;
 pub const listenLocal = shared.listenLocal;
 pub const connectLocal = shared.connectLocal;
 pub const connectLocalOnce = shared.connectLocalOnce;
