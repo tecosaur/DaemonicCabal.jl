@@ -973,7 +973,7 @@ pub fn cancelReadiness(poll_device: HANDLE, fd: HANDLE, op: *ReadinessOp) void {
     _ = ntdll.NtCancelIoFileEx(issued_on, &op.iosb, &scratch);
 }
 
-/// `iosb` comes back as the packet's lpOverlapped; `issueRecv` gives null on a
+/// `iosb` comes back as the packet's lpOverlapped; `issueRecv` gives false on a
 /// dead stream.
 pub const RecvCtx = extern struct {
     iosb: win32.IO_STATUS_BLOCK,
@@ -981,8 +981,7 @@ pub const RecvCtx = extern struct {
     info: win32.AFD.RECV_INFO,
 };
 
-pub fn issueRecv(h: HANDLE, buf: []u8) ?*RecvCtx {
-    const ctx = std.heap.page_allocator.create(RecvCtx) catch return null;
+pub fn issueRecv(h: HANDLE, buf: []u8, ctx: *RecvCtx) bool {
     ctx.* = .{
         .iosb = undefined,
         .iovec = .{.{ .len = @intCast(buf.len), .buf = buf.ptr }},
@@ -997,13 +996,7 @@ pub fn issueRecv(h: HANDLE, buf: []u8) ?*RecvCtx {
         .pipe, .pipe_listener => ntdll.NtReadFile(h, null, null, @ptrCast(&ctx.iosb), &ctx.iosb, buf.ptr, @intCast(buf.len), null, null),
         .afd => ntdll.NtDeviceIoControlFile(h, null, null, @ptrCast(&ctx.iosb), &ctx.iosb, win32.IOCTL.AFD.RECEIVE, std.mem.asBytes(&ctx.info), @intCast(@sizeOf(win32.AFD.RECV_INFO)), null, 0),
     };
-    switch (status) {
-        .SUCCESS, .PENDING => return ctx,
-        else => {
-            std.heap.page_allocator.destroy(ctx);
-            return null;
-        },
-    }
+    return status == .SUCCESS or status == .PENDING;
 }
 
 // =============================================================================
@@ -1229,22 +1222,27 @@ pub fn defaultRuntimeDir(out: anytype, _: ?[]const u8, _: ?[]const u8) ![]const 
     return print(out, "{s}\\julia-daemon", .{appdata});
 }
 
-pub fn collectEnviron(allocator: Allocator, environ: std.process.Environ) ![]const []const u8 {
-    _ = environ;
+/// This process's argv and KEY=VALUE environment, UTF-8: decoded from WTF-16
+/// once, for the process's life.
+pub fn processInputs(init: std.process.Init.Minimal) !struct { args: []const [*:0]const u8, env: []const [*:0]const u8 } {
+    const gpa = std.heap.page_allocator;
+    var args: std.ArrayList([*:0]const u8) = .empty;
+    var it = try std.process.Args.Iterator.initAllocator(init.args, gpa);
+    while (it.next()) |arg| try args.append(gpa, arg.ptr);
     const peb = win32.peb();
     _ = ntdll.RtlEnterCriticalSection(peb.FastPebLock);
     defer _ = ntdll.RtlLeaveCriticalSection(peb.FastPebLock);
-    var kvs: std.ArrayList([]const u8) = .empty;
+    var env: std.ArrayList([*:0]const u8) = .empty;
     const block: [*:0]u16 = peb.ProcessParameters.Environment;
     var i: usize = 0;
     while (block[i] != 0) {
         const start = i;
         while (block[i] != 0) : (i += 1) {}
         // Hidden entries, such as cmd.exe's drive cwds (=C:=C:\dir), have no name.
-        if (block[start] != '=') try kvs.append(allocator, try std.unicode.wtf16LeToWtf8Alloc(allocator, block[start..i]));
+        if (block[start] != '=') try env.append(gpa, (try std.unicode.wtf16LeToWtf8AllocZ(gpa, block[start..i])).ptr);
         i += 1;
     }
-    return kvs.items;
+    return .{ .args = args.items, .env = env.items };
 }
 
 /// Into an allocator (owned slice) or a `[]u8` buffer (sub-slice).

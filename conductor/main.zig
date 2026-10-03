@@ -678,8 +678,7 @@ pub const Conductor = struct {
                 for (raw_args) |a| self.allocator.free(a);
                 self.allocator.free(raw_args);
             }
-            var parsed = try args.parse(self.allocator, raw_args);
-            errdefer parsed.deinit(self.allocator);
+            const parsed = try args.parse(raw_args);
             // A remote client's filesystem isn't ours: it names a project of ours
             // only by --project, and starts in its directory, else in our home.
             const home = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/";
@@ -939,14 +938,13 @@ pub const Conductor = struct {
         env: []const worker.EnvVar,
         parsed: args.ParsedArgs,
         project: ?[]const u8,
-        raw_args: []const []const u8, // Backing storage for parsed.switches slices
+        raw_args: []const []const u8, // what `parsed` reads
         owned_env: ?[]worker.EnvVar = null, // a remote client's, kept out of the cache
 
         fn deinit(self: *ClientRequest, allocator: Allocator) void {
             if (self.owned_env) |env| worker.freeEnv(allocator, env);
             allocator.free(self.cwd);
             if (self.project) |p| allocator.free(p);
-            self.parsed.deinit(allocator);
             for (self.raw_args) |arg| allocator.free(arg);
             allocator.free(self.raw_args);
         }
@@ -985,7 +983,7 @@ pub const Conductor = struct {
             .ppid = request.ppid,
             .cwd = request.cwd,
             .env = request.env,
-            .switches = request.parsed.switches,
+            .switches = request.parsed.switches(),
             .programfile = request.parsed.program_file,
             .args = request.parsed.program_args,
             .port_set = port_set,

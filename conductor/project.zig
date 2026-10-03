@@ -77,8 +77,7 @@ test "a project names a path from the client's cwd, or an environment" {
         .{ .argv = &.{ "julia", "-e", "1" }, .want = null },
     };
     for (cases) |case| {
-        var parsed = try args.parse(gpa, case.argv);
-        defer parsed.deinit(gpa);
+        const parsed = try args.parse(case.argv);
         const got = try resolve(gpa, std.testing.io, &parsed, case.julia_project, "/home/me", "/work/app");
         defer if (got) |g| gpa.free(g);
         if (case.want) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);
@@ -94,8 +93,7 @@ test "a deleted cwd, sent empty, names no project" {
         .{ .argv = &.{ "julia", "--project=.", "-e", "1" }, .want = error.CurrentDirUnavailable },
     };
     for (cases) |case| {
-        var parsed = try args.parse(gpa, case.argv);
-        defer parsed.deinit(gpa);
+        const parsed = try args.parse(case.argv);
         const got = resolve(gpa, std.testing.io, &parsed, null, "/home/me", "");
         defer if (got) |g| if (g) |p| gpa.free(p) else {} else |_| {};
         const want = case.want catch |err| {
@@ -136,8 +134,7 @@ test "@. finds the project above the cwd" {
         .{ .argv = &.{ "julia", "--project=" }, .cwd = src, .want = null },
     };
     for (cases) |case| {
-        var parsed = try args.parse(gpa, case.argv);
-        defer parsed.deinit(gpa);
+        const parsed = try args.parse(case.argv);
         const got = try resolve(gpa, io, &parsed, null, case.home, case.cwd);
         defer if (got) |g| gpa.free(g);
         if (case.want) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);

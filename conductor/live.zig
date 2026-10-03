@@ -871,10 +871,10 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
     c.client_counter += 1;
     const id = c.client_counter;
     const pid: u32 = @intCast(platform.getpid());
-    const switches = [_]args.Switch{
-        .{ .name = "--watch", .value = if (follow) "" else "recorded", .index = 0, .words = 1 },
-        .{ .name = "--session", .value = w.session_label orelse "", .index = 1, .words = 1 },
-    };
+    const session = try c.allocator.print("--session={s}", .{w.session_label orelse ""});
+    defer c.allocator.free(session);
+    const argv = [_][]const u8{ "julia", if (follow) "--watch" else "--watch=recorded", session };
+    const parsed = args.parse(&argv) catch unreachable;
     const info = worker.ClientInfo{
         .tty = true,
         .color = true,
@@ -884,7 +884,7 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
         .ppid = 0,
         .cwd = "/",
         .env = &.{},
-        .switches = &switches,
+        .switches = parsed.switches(),
         .programfile = null,
         .args = &.{},
         .port_set = port_set,
