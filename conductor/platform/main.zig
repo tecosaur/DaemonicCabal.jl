@@ -7,7 +7,7 @@
 const std = @import("std");
 const Io = std.Io;
 const builtin = @import("builtin");
-const os = builtin.os.tag;
+const os = builtin.target.os.tag;
 
 const impl = if (os == .linux)
     @import("linux.zig")

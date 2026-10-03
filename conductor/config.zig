@@ -99,11 +99,11 @@ pub const Config = struct {
             .host_home = env.get("HOME") orelse env.get("USERPROFILE") orelse "",
         };
         var cfg: Config = undefined;
-        inline for (@typeInfo(Config).@"struct".fields) |f| {
-            if (comptime @hasField(@TypeOf(own), f.name))
-                @field(cfg, f.name) = @field(own, f.name)
-            else if (comptime !settings.hasField(f.name))
-                @compileError("nothing sets Config." ++ f.name);
+        inline for (@typeInfo(Config).@"struct".field_names) |name| {
+            if (comptime @hasField(@TypeOf(own), name))
+                @field(cfg, name) = @field(own, name)
+            else if (comptime !settings.hasField(name))
+                @compileError("nothing sets Config." ++ name);
         }
         try cfg.read(env, .all);
         return cfg;

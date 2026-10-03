@@ -9,18 +9,16 @@ const protocol = @import("protocol.zig");
 const args = @import("args.zig");
 const platform = @import("platform/main.zig");
 
-const eloop = if (builtin.os.tag == .linux)
-    @import("eloop/linux.zig")
-else if (builtin.os.tag.isBSD())
-    @import("eloop/kqueue.zig")
-else if (builtin.os.tag == .windows)
-    @import("eloop/windows.zig")
-else
-    @compileError("unsupported OS");
+const eloop = switch (builtin.target.os.tag) {
+    .linux => @import("eloop/linux.zig"),
+    .macos, .freebsd, .openbsd, .netbsd, .dragonfly => @import("eloop/kqueue.zig"),
+    .windows => @import("eloop/windows.zig"),
+    else => @compileError("unsupported OS"),
+};
 
 const max_socket_path = protocol.max_socket_path;
 
-const restart_hint = switch (builtin.os.tag) {
+const restart_hint = switch (builtin.target.os.tag) {
     .linux => "systemctl --user restart julia-daemon",
     .macos => "launchctl kickstart -k gui/$(id -u)/org.julialang.julia-daemon",
     .windows => "taskkill /F /IM julia-conductor.exe & schtasks /run /tn \"Julia\\JuliaDaemon\"",
@@ -122,7 +120,7 @@ const SignalParser = struct {
         if (pos > 0) {
             const remaining = self.len - pos;
             if (remaining > 0) {
-                std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[pos..self.len]);
+                @memmove(self.buf[0..remaining], self.buf[pos..self.len]);
             }
             self.len = remaining;
         }
@@ -279,7 +277,7 @@ fn run(init: std.process.Init.Minimal) !void {
         printVersion(env);
         return;
     }
-    for (parsed.switches.items) |sw| if (!sw.isHonoured()) {
+    for (parsed.switches) |sw| if (!sw.isHonoured()) {
         const words = inputs.args[sw.index..][0..sw.words];
         platform.eprint("juliaclient: ignoring {s}{s}{s}, which only applies as Julia starts (set it for every worker in JULIA_DAEMON_WORKER_ARGS)\n", .{
             words[0], if (words.len > 1) " " else "", if (words.len > 1) words[1] else "",
@@ -339,7 +337,7 @@ fn scanEnv(kvs: []const []const u8) EnvInfo {
     for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // varies per benchmark run
         // Only a variable is sent, so only one is counted.
-        if (std.mem.indexOfScalar(u8, kv, '=') == null) continue;
+        if (std.mem.findScalar(u8, kv, '=') == null) continue;
         info.count += 1;
         // XOR, so the fingerprint ignores order.
         var h = std.hash.Wyhash.init(kv.len);
@@ -389,7 +387,7 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
         .tcp => first_err == error.ConnectionRefused,
         .local => blk: {
             var pid_buf: [max_socket_path]u8 = undefined;
-            break :blk platform.requestSocketRecreate(std.fmt.bufPrint(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong);
+            break :blk platform.requestSocketRecreate(std.mem.print(&pid_buf, "{s}/conductor.pid", .{runtime_dir}) catch return error.NameTooLong);
         },
     };
     if (worth_retrying) {
@@ -422,7 +420,7 @@ fn printVersion(env: EnvInfo) void {
         (if (protocol.probeAddress(located.address.mode, located.address.addr, 1000)) located.address else null)
     else |_| null;
     var line_buf: [2 * max_socket_path]u8 = undefined;
-    const line = if (address) |a| std.fmt.bufPrint(&line_buf, plain ++ ", connected to conductor over {s} {s}\n", .{
+    const line = if (address) |a| std.mem.print(&line_buf, plain ++ ", connected to conductor over {s} {s}\n", .{
         if (a.mode == .tcp) "TCP" else platform.local_transport_name, a.addr,
     }) catch plain ++ "\n" else plain ++ ", no conductor detected\n";
     platform.writeFile(platform.getStdoutHandle(), line);
@@ -433,7 +431,7 @@ fn keepConductor(connection: protocol.Connection, runtime_dir: []const u8) posix
     conductor_peer = connection.peer;
     if (connection.peer) |ip| if (protocol.isLoopback(ip)) {
         var path_buf: [max_socket_path + 16]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "{s}/" ++ protocol.client.host_key_file, .{runtime_dir}) catch "";
+        const path = std.mem.print(&path_buf, "{s}/" ++ protocol.client.host_key_file, .{runtime_dir}) catch "";
         if (platform.readSmallFile(path, &host_key)) |read| {
             if (read.len != host_key.len) host_key = std.mem.zeroes(protocol.client.HostKey);
         }
@@ -515,7 +513,7 @@ fn spawnWorker(reader: protocol.BufReader, kvs: []const []const u8) !void {
     const envc = try reader.readInt(u16);
     const envp = try a.alloc(?[*:0]const u8, envc + kvs.len + 1);
     for (envp[0..envc]) |*entry| entry.* = (try takeString(reader, a)).ptr;
-    for (kvs, envp[envc .. envc + kvs.len]) |kv, *entry| entry.* = (try a.dupeZ(u8, kv)).ptr;
+    for (kvs, envp[envc .. envc + kvs.len]) |kv, *entry| entry.* = (try a.dupeSentinel(u8, kv, 0)).ptr;
     envp[envc + kvs.len] = null;
     platform.spawnDetached(@ptrCast(argv.ptr), @ptrCast(envp.ptr)) catch |err| {
         platform.eprint("Cannot start a Julia worker inside this sandbox: {s} ({s}).\n", .{
@@ -541,7 +539,7 @@ fn sendFullEnv(w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) void {
     w.writeInt(u32, env.count);
     for (kvs) |kv| {
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue;
-        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, kv, '=') orelse continue;
         w.writeLenPrefixed(u32, kv[0..eq]);
         w.writeLenPrefixed(u32, kv[eq + 1 ..]);
     }

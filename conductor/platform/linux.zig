@@ -124,7 +124,7 @@ pub fn spawnDetached(argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*
     if (linux.errno(pid) != .SUCCESS) return error.ForkFailed;
     if (pid != 0) {
         var status: u32 = 0;
-        _ = linux.waitpid(@intCast(pid), &status, 0);
+        _ = linux.waitpid(@intCast(pid), @ptrCast(&status), 0);
         return;
     }
     _ = linux.setsid();
@@ -145,12 +145,12 @@ pub fn childMountNs(child: std.process.Child) ?u64 {
 fn processMountNs(pid: posix.pid_t) ?u64 {
     var path_buf: [64]u8 = undefined;
     var link_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/ns/mnt", .{pid}) catch return null;
+    const path = std.mem.printSentinel(&path_buf, "/proc/{d}/ns/mnt", .{pid}, 0) catch return null;
     const n = linux.readlink(path, &link_buf, link_buf.len);
     if (n == 0 or n > link_buf.len) return null;
     const link = link_buf[0..n];
-    const open = std.mem.indexOfScalar(u8, link, '[') orelse return null;
-    const close = std.mem.indexOfScalar(u8, link, ']') orelse return null;
+    const open = std.mem.findScalar(u8, link, '[') orelse return null;
+    const close = std.mem.findScalar(u8, link, ']') orelse return null;
     return std.fmt.parseInt(u64, link[open + 1 .. close], 10) catch null;
 }
 pub fn rawWaitpid(pid: posix.pid_t, block: bool) posix.pid_t {
@@ -158,7 +158,7 @@ pub fn rawWaitpid(pid: posix.pid_t, block: bool) posix.pid_t {
     return rawWaitpidStatus(pid, block, &status);
 }
 pub fn rawWaitpidStatus(pid: posix.pid_t, block: bool, status: *u32) posix.pid_t {
-    const ret = linux.waitpid(pid, status, if (block) 0 else linux.W.NOHANG);
+    const ret = linux.waitpid(pid, @ptrCast(status), if (block) 0 else linux.W.NOHANG);
     return @intCast(@as(isize, @bitCast(ret)));
 }
 pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {
@@ -191,7 +191,7 @@ fn readFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
 
 fn readProc(comptime fmt: []const u8, pid: posix.pid_t, buf: []u8) ?[]const u8 {
     var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, fmt, .{pid}) catch return null;
+    const path = std.mem.printSentinel(&path_buf, fmt, .{pid}, 0) catch return null;
     return readFile(path.ptr, buf);
 }
 
@@ -205,7 +205,7 @@ pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
 pub fn parentPid(pid: posix.pid_t) ?posix.pid_t {
     var buf: [256]u8 = undefined;
     const content = readProc("/proc/{d}/stat", pid, &buf) orelse return null;
-    const close_paren = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
+    const close_paren = std.mem.findScalarLast(u8, content, ')') orelse return null;
     var fields = std.mem.tokenizeScalar(u8, content[close_paren + 1 ..], ' ');
     _ = fields.next() orelse return null; // field 3: state
     const ppid = std.fmt.parseInt(posix.pid_t, fields.next() orelse return null, 10) catch return null;
@@ -218,7 +218,7 @@ pub const mem_is_reclaimable = false;
 pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
     var buf: [4096]u8 = undefined;
     const content = readProc("/proc/{d}/stat", pid, &buf) orelse return null;
-    const close_paren = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
+    const close_paren = std.mem.findScalarLast(u8, content, ')') orelse return null;
     var fields = std.mem.tokenizeScalar(u8, content[close_paren + 1 ..], ' ');
     var vals: [22]u64 = undefined; // state(field 3) .. rss(field 24)
     var count: usize = 0;
@@ -247,7 +247,7 @@ pub fn processReclaimable(pid: posix.pid_t) ?u64 {
 }
 
 fn fieldKb(content: []const u8, field: []const u8) ?u64 {
-    const start = std.mem.indexOf(u8, content, field) orelse return null;
+    const start = std.mem.find(u8, content, field) orelse return null;
     var toks = std.mem.tokenizeAny(u8, content[start + field.len ..], " \n");
     return std.fmt.parseInt(u64, toks.next() orelse return null, 10) catch null;
 }
@@ -258,7 +258,7 @@ fn fieldKb(content: []const u8, field: []const u8) ?u64 {
 pub fn readPsiSomeAvg10() ?f64 {
     var buf: [256]u8 = undefined;
     const content = readFile("/proc/pressure/memory", &buf) orelse return null;
-    const some = std.mem.indexOf(u8, content, "some avg10=") orelse return null;
+    const some = std.mem.find(u8, content, "some avg10=") orelse return null;
     var toks = std.mem.tokenizeAny(u8, content[some + "some avg10=".len ..], " \n");
     return std.fmt.parseFloat(f64, toks.next() orelse return null) catch null;
 }
@@ -343,7 +343,7 @@ fn getent(database: [*:0]const u8, name: []const u8, out: []u8) !struct { status
     } else false;
     if (!finished) _ = linux.kill(pid, .KILL);
     var status: u32 = 0;
-    _ = linux.waitpid(pid, &status, 0);
+    _ = linux.waitpid(pid, @ptrCast(&status), 0);
     const exited = status & 0x7f == 0;
     return .{ .status = if (finished and exited) @intCast((status >> 8) & 0xff) else 255, .output = out[0..n] };
 }

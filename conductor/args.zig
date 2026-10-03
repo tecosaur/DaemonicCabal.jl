@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const SwitchList = std.array_list.AlignedManaged(Switch, null);
+const SwitchList = std.ArrayList(Switch);
 
 const Arity = enum { none, required, optional };
 
@@ -176,18 +176,18 @@ pub const Problem = union(enum) {
 pub const ParsedArgs = struct {
     julia_channel: ?[]const u8, // JuliaUp's "+1.10"
     /// In argv order, repeats included.
-    switches: SwitchList,
+    switches: []const Switch,
     program_file: ?[]const u8,
     program_args: []const []const u8,
 
-    pub fn deinit(self: *ParsedArgs) void {
-        self.switches.deinit();
+    pub fn deinit(self: *ParsedArgs, allocator: Allocator) void {
+        allocator.free(self.switches);
     }
 
     /// The last occurrence's value, as Julia takes.
     pub fn getSwitch(self: *const ParsedArgs, name: []const u8) ?[]const u8 {
         var result: ?[]const u8 = null;
-        for (self.switches.items) |sw| {
+        for (self.switches) |sw| {
             if (std.mem.eql(u8, sw.name, name)) result = sw.value;
         }
         return result;
@@ -281,12 +281,12 @@ pub fn renderThreads(allocator: Allocator, spec: Threads) !?[]const u8 {
     var i_buf: [8]u8 = undefined;
     const default = threadField(&d_buf, spec[0]);
     if (spec[1] == threads_unset) return try allocator.dupe(u8, default);
-    return try std.fmt.allocPrint(allocator, "{s},{s}", .{ default, threadField(&i_buf, spec[1]) });
+    return try allocator.print("{s},{s}", .{ default, threadField(&i_buf, spec[1]) });
 }
 
 fn threadField(buf: []u8, val: u16) []const u8 {
     if (val == threads_auto) return "auto";
-    return std.fmt.bufPrint(buf, "{d}", .{val}) catch unreachable;
+    return std.mem.print(buf, "{d}", .{val}) catch unreachable;
 }
 
 pub const Error = Allocator.Error || error{InvalidArguments};
@@ -301,9 +301,9 @@ pub fn parse(allocator: Allocator, argv: []const []const u8) Error!ParsedArgs {
 /// On `error.InvalidArguments`, `problem` holds why.
 pub fn parseReporting(allocator: Allocator, argv: []const []const u8, problem: *Problem) Error!ParsedArgs {
     const julia_channel: ?[]const u8 = if (argv.len > 1 and argv[1].len > 0 and argv[1][0] == '+') argv[1] else null;
-    var switches = SwitchList.init(allocator);
-    errdefer switches.deinit();
-    const scan = try scanSwitches(&switches, argv, if (julia_channel == null) 1 else 2);
+    var switches: SwitchList = .empty;
+    defer switches.deinit(allocator);
+    const scan = try scanSwitches(allocator, &switches, argv, if (julia_channel == null) 1 else 2);
     const rest = switch (scan) {
         .invalid => |why| {
             problem.* = why;
@@ -313,7 +313,7 @@ pub fn parseReporting(allocator: Allocator, argv: []const []const u8, problem: *
     };
     var parsed: ParsedArgs = .{
         .julia_channel = julia_channel,
-        .switches = switches,
+        .switches = try switches.toOwnedSlice(allocator),
         .program_file = null,
         .program_args = argv[rest..],
     };
@@ -333,7 +333,7 @@ const Scan = union(enum) {
     invalid: Problem,
 };
 
-fn scanSwitches(switches: *SwitchList, argv: []const []const u8, first: usize) Allocator.Error!Scan {
+fn scanSwitches(allocator: Allocator, switches: *SwitchList, argv: []const []const u8, first: usize) Allocator.Error!Scan {
     var i = first;
     while (i < argv.len) {
         const arg = argv[i];
@@ -342,7 +342,7 @@ fn scanSwitches(switches: *SwitchList, argv: []const []const u8, first: usize) A
         const index = i;
         i += 1;
         if (arg[1] == '-') {
-            const eq = std.mem.indexOfScalar(u8, arg, '=');
+            const eq = std.mem.findScalar(u8, arg, '=');
             const option = findLong(arg[0 .. eq orelse arg.len]) orelse return .{ .invalid = .{ .unknown = arg } };
             const value = if (eq) |e| blk: {
                 if (option.arity == .none) return .{ .invalid = .{ .unexpected_value = option } };
@@ -351,7 +351,7 @@ fn scanSwitches(switches: *SwitchList, argv: []const []const u8, first: usize) A
                 option.bare
             else
                 nextWord(argv, &i) orelse return .{ .invalid = .{ .missing_value = option } };
-            if (try accept(switches, option, value, index, i)) |end| return end;
+            if (try accept(allocator, switches, option, value, index, i)) |end| return end;
             continue;
         }
         for (arg[1..], 2..) |c, after| {
@@ -364,7 +364,7 @@ fn scanSwitches(switches: *SwitchList, argv: []const []const u8, first: usize) A
                 arg[after..]
             else
                 nextWord(argv, &i) orelse if (option.arity == .optional) option.bare else return .{ .invalid = .{ .missing_value = option } };
-            if (try accept(switches, option, value, index, i)) |end| return end;
+            if (try accept(allocator, switches, option, value, index, i)) |end| return end;
             if (option.arity != .none) break;
         }
     }
@@ -397,7 +397,7 @@ fn nextWord(argv: []const []const u8, i: *usize) ?[]const u8 {
 
 /// Records the switch, spanning `argv[index..end]`; the scan's end if Julia
 /// would refuse it or stop there.
-fn accept(switches: *SwitchList, option: *const Option, value: []const u8, index: usize, end: usize) Allocator.Error!?Scan {
+fn accept(allocator: Allocator, switches: *SwitchList, option: *const Option, value: []const u8, index: usize, end: usize) Allocator.Error!?Scan {
     if (option.needs_own_julia) return .{ .invalid = .{ .needs_own_julia = option } };
     if (option.choices) |choices| if (value.len > 0 or option.arity != .optional) {
         var allowed = std.mem.splitScalar(u8, choices, '|');
@@ -409,6 +409,6 @@ fn accept(switches: *SwitchList, option: *const Option, value: []const u8, index
         .threads => {},
         .refused => |refusal| return .{ .invalid = .{ .invalid_threads = refusal } },
     };
-    try switches.append(.{ .name = option.long, .value = value, .index = index, .words = end - index });
+    try switches.append(allocator, .{ .name = option.long, .value = value, .index = index, .words = end - index });
     return if (option.stops) .{ .stopped = end } else null;
 }

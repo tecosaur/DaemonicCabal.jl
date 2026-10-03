@@ -10,12 +10,12 @@ const platform = @import("platform/main.zig");
 pub const VERSION = blk: {
     const project_toml = @embedFile("Project.toml");
     const marker = "\nversion = \"";
-    const start = if (std.mem.indexOf(u8, project_toml, marker)) |i| i + marker.len else unreachable;
-    const end = if (std.mem.indexOfPos(u8, project_toml, start, "\"")) |i| i else unreachable;
+    const start = if (std.mem.find(u8, project_toml, marker)) |i| i + marker.len else unreachable;
+    const end = if (std.mem.findPos(u8, project_toml, start, "\"")) |i| i else unreachable;
     break :blk project_toml[start..end];
 };
 
-pub const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
+pub const DAEMON_MANAGEMENT_HELP = switch (builtin.target.os.tag) {
     .linux =>
         \\Daemon management (systemd):
         \\
@@ -334,14 +334,14 @@ pub fn randomSocketPath(io: Io, socket_dir: []const u8, suffix: []const u8, buf:
 pub const PortPool = struct {
     base: u16,
     count: u16,
-    free: std.StaticBitSet(max_port_sets),
+    free: std.bit_set.Static(max_port_sets),
 
     pub const max_port_sets = 2048;
     pub const none: u16 = 0xFFFF;
 
     pub fn init(base: u16, count: u16) PortPool {
         std.debug.assert(count <= max_port_sets);
-        var free = std.StaticBitSet(max_port_sets).initEmpty();
+        var free = std.bit_set.Static(max_port_sets).empty;
         for (0..count) |i| free.set(i);
         return .{ .base = base, .count = count, .free = free };
     }
@@ -379,13 +379,13 @@ pub const Address = struct {
 /// Paths (containing a separator or starting with `.`) are local; the rest,
 /// with any `tcp://` stripped, are TCP.
 pub fn parseAddress(raw: []const u8) error{UnsupportedScheme}!Address {
-    if (std.mem.indexOf(u8, raw, "://")) |sep| {
+    if (std.mem.find(u8, raw, "://")) |sep| {
         if (std.mem.eql(u8, raw[0..sep], "tcp"))
             return .{ .mode = .tcp, .addr = raw[sep + 3 ..] };
         return error.UnsupportedScheme;
     }
     if (raw.len > 0 and raw[0] != '/' and raw[0] != '\\' and raw[0] != '.' and
-        std.mem.indexOfAny(u8, raw, "/\\") == null)
+        std.mem.findAny(u8, raw, "/\\") == null)
         return .{ .mode = .tcp, .addr = raw };
     return .{ .mode = .local, .addr = raw };
 }
@@ -402,14 +402,14 @@ pub fn splitHostPort(addr: []const u8) !struct { host: []const u8, port: u16 } {
     var host = addr;
     var port_text: ?[]const u8 = null;
     if (addr.len > 0 and addr[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, addr, ']') orelse return error.InvalidAddress;
+        const end = std.mem.findScalar(u8, addr, ']') orelse return error.InvalidAddress;
         host = addr[1..end];
         const rest = addr[end + 1 ..];
         if (rest.len > 0) {
             if (rest[0] != ':') return error.InvalidAddress;
             port_text = rest[1..];
         }
-    } else if (std.mem.lastIndexOfScalar(u8, addr, ':')) |colon| {
+    } else if (std.mem.findScalarLast(u8, addr, ':')) |colon| {
         host = addr[0..colon];
         port_text = addr[colon + 1 ..];
     }
@@ -500,7 +500,7 @@ pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Listene
 pub fn createListener(io_ctx: Io, mode: TransportMode, socket_dir: []const u8, suffix: []const u8, bind_addr: []const u8) !Listener {
     switch (mode) {
         .local => {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             return platform.listenLocal(io_ctx, try randomSocketPath(io_ctx, socket_dir, suffix, &buf));
         },
         .tcp => return listenTcp(io_ctx, bind_addr, 0),
@@ -517,5 +517,5 @@ pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16) !Listener {
         .ip6 => |a| a.port,
     };
     var buf: [8]u8 = undefined;
-    return Listener.fromServer(server, .tcp, try std.fmt.bufPrint(&buf, ":{d}", .{actual_port}));
+    return Listener.fromServer(server, .tcp, try std.mem.print(&buf, ":{d}", .{actual_port}));
 }

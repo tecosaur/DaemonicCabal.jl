@@ -40,14 +40,12 @@ pub const PeerInfo = struct {
     }
 };
 
-pub const eventLoopImpl = if (builtin.os.tag == .linux)
-    @import("eloop/linux.zig")
-else if (builtin.os.tag.isBSD())
-    @import("eloop/kqueue.zig")
-else if (builtin.os.tag == .windows)
-    @import("eloop/windows.zig")
-else
-    @compileError("unsupported OS");
+pub const eventLoopImpl = switch (builtin.target.os.tag) {
+    .linux => @import("eloop/linux.zig"),
+    .macos, .freebsd, .openbsd, .netbsd, .dragonfly => @import("eloop/kqueue.zig"),
+    .windows => @import("eloop/windows.zig"),
+    else => @compileError("unsupported OS"),
+};
 
 // --- Constants ---
 
@@ -261,26 +259,26 @@ pub const Conductor = struct {
         }
         if (w.launch == .sandboxed) {
             self.removeSandboxDir(w.id);
-            if (builtin.os.tag == .linux) worker.sandbox.removeCgroup(w.id);
+            if (builtin.target.os.tag == .linux) worker.sandbox.removeCgroup(w.id);
         }
         w.deinit();
         self.allocator.destroy(w);
     }
 
     fn removeSandboxDir(self: *Conductor, worker_id: u32) void {
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "sandbox-{d}", .{worker_id}) catch return;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const name = std.mem.print(&buf, "sandbox-{d}", .{worker_id}) catch return;
         var dir = Io.Dir.openDirAbsolute(self.io, self.cfg.socket_dir, .{}) catch return;
         defer dir.close(self.io);
         dir.deleteTree(self.io, name) catch {};
     }
 
     pub fn run(self: *Conductor) !void {
-        g_socket_path = try self.allocator.dupeZ(u8, self.cfg.socket_path);
+        g_socket_path = try self.allocator.dupeSentinel(u8, self.cfg.socket_path, 0);
         try eventLoopImpl.installSignalHandlers();
         defer eventLoopImpl.cleanupSignalHandlers();
         if (self.cfg.transport == .local) {
-            g_pid_path = try std.fmt.allocPrintSentinel(self.allocator, "{s}/conductor.pid", .{self.cfg.runtime_dir}, 0);
+            g_pid_path = try self.allocator.printSentinel("{s}/conductor.pid", .{self.cfg.runtime_dir}, 0);
         }
         const pid_file = if (self.cfg.transport == .local) self.writePidFile() else null;
         defer if (pid_file) |file| {
@@ -538,7 +536,7 @@ pub const Conductor = struct {
         const ours = protocol.client.version;
         std.debug.print("Client speaks protocol v{d}, this daemon v{d}; rejecting\n", .{ theirs, ours });
         var buf: [256]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "This juliaclient speaks protocol v{d} but the daemon speaks v{d}: {s}.\n", .{
+        const msg = try std.mem.print(&buf, "This juliaclient speaks protocol v{d} but the daemon speaks v{d}: {s}.\n", .{
             theirs, ours, if (theirs < ours) "rebuild or reinstall juliaclient to match the daemon" else "restart the daemon so it runs the newly installed version",
         });
         // Its streams come without a key: it knows of none. Id 0 is no
@@ -681,7 +679,7 @@ pub const Conductor = struct {
                 self.allocator.free(raw_args);
             }
             var parsed = try args.parse(self.allocator, raw_args);
-            errdefer parsed.deinit();
+            errdefer parsed.deinit(self.allocator);
             // A remote client's filesystem isn't ours: it names a project of ours
             // only by --project, and starts in its directory, else in our home.
             const home = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/";
@@ -693,7 +691,7 @@ pub const Conductor = struct {
                 return err;
             };
             errdefer if (proj) |p| self.allocator.free(p);
-            const project_dir = if (proj) |p| (if (p[0] == '@') home else if (std.mem.endsWith(u8, p, ".toml")) std.fs.path.dirname(p) orelse home else p) else home;
+            const project_dir = if (proj) |p| (if (p[0] == '@') home else if (std.mem.endsWith(u8, p, ".toml")) std.Io.Dir.path.dirname(p) orelse home else p) else home;
             const cwd = try self.allocator.dupe(u8, if (is_remote) project_dir else head.cwd);
             errdefer self.allocator.free(cwd);
             break :request .{
@@ -817,7 +815,7 @@ pub const Conductor = struct {
             break :blk .{ .local = local };
         } else .none;
         if (sandbox == .none) return sandbox;
-        if (comptime builtin.os.tag != .linux) {
+        if (comptime builtin.target.os.tag != .linux) {
             const msg = if (sandbox == .remote)
                 "Remote clients are refused: sandboxed workers are only available on Linux.\n" ++
                     "To run them unsandboxed, as the daemon's user, turn off \"Refuse remote clients\"\n" ++
@@ -839,12 +837,12 @@ pub const Conductor = struct {
         const ch = request.parsed.julia_channel orelse "";
         const tkey = args.packThreads(resolveThreads(request));
         return switch (sandbox) {
-            .none => std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
-            .remote => std.fmt.allocPrint(self.allocator, "__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
+            .none => self.allocator.print("{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
+            .remote => self.allocator.print("__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
             // Keyed by mount namespace: a worker never serves another sandbox or the host.
-            .client => |c| std.fmt.allocPrint(self.allocator, "__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
+            .client => |c| self.allocator.print("__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
             // Workers share only when their mounts match.
-            .local => |rw| std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw, trimTrailingSlashes(project_path), ch, tkey }),
+            .local => |rw| self.allocator.print("__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw, trimTrailingSlashes(project_path), ch, tkey }),
         };
     }
 
@@ -865,7 +863,7 @@ pub const Conductor = struct {
         std.debug.print("Restart: killed {d} worker(s) for {s}{s}{s}\n", .{
             nkilled, request.project orelse "", if (channel != null) " " else "", channel orelse "",
         });
-        const msg = try std.fmt.allocPrint(self.allocator, "Reset: killed {d} worker(s) for project\n", .{nkilled});
+        const msg = try self.allocator.print("Reset: killed {d} worker(s) for project\n", .{nkilled});
         defer self.allocator.free(msg);
         try self.serveString(socket, msg, 0);
     }
@@ -892,7 +890,7 @@ pub const Conductor = struct {
         };
         const w = found orelse {
             const msg = if (label) |l|
-                try std.fmt.allocPrint(self.allocator, "No session '{s}' is running.\n", .{l})
+                try self.allocator.print("No session '{s}' is running.\n", .{l})
             else
                 try self.allocator.dupe(u8, "No worker is running for this project to watch.\n");
             defer self.allocator.free(msg);
@@ -908,7 +906,7 @@ pub const Conductor = struct {
         std.debug.print("Client {d}: no worker: {}\n", .{ self.client_id, err });
         if (err == error.ClientGone) return;
         var msg_buf: [1024]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "Could not run a Julia worker for this session ({s}).\n{s}", .{
+        const msg = std.mem.print(&msg_buf, "Could not run a Julia worker for this session ({s}).\n{s}", .{
             @errorName(err), self.spawnFailureHint(err, sandbox),
         }) catch return;
         self.serveString(socket, msg, 1) catch |e| std.debug.print("Client {d}: could not report the failure: {}\n", .{ self.client_id, e });
@@ -948,7 +946,7 @@ pub const Conductor = struct {
             if (self.owned_env) |env| worker.freeEnv(allocator, env);
             allocator.free(self.cwd);
             if (self.project) |p| allocator.free(p);
-            self.parsed.deinit();
+            self.parsed.deinit(allocator);
             for (self.raw_args) |arg| allocator.free(arg);
             allocator.free(self.raw_args);
         }
@@ -987,7 +985,7 @@ pub const Conductor = struct {
             .ppid = request.ppid,
             .cwd = request.cwd,
             .env = request.env,
-            .switches = request.parsed.switches.items,
+            .switches = request.parsed.switches,
             .programfile = request.parsed.program_file,
             .args = request.parsed.program_args,
             .port_set = port_set,
@@ -1232,7 +1230,7 @@ pub const Conductor = struct {
     fn findWorkerByPpid(self: *Conductor, list: *WorkerList, ppid: u32, interactive: bool, now: i64) ?*worker.Worker {
         for (list.items) |w| {
             if (!self.isWorkerAvailable(w, interactive, now)) continue;
-            if (std.mem.indexOfScalar(u32, &w.recent_ppids, ppid) != null) {
+            if (std.mem.findScalar(u32, &w.recent_ppids, ppid) != null) {
                 if (self.isLabelExpired(w, now)) self.clearLabel(w);
                 return w;
             }
@@ -1431,7 +1429,7 @@ pub const Conductor = struct {
                 std.debug.print("Client {d}: left while worker {d} was starting\n", .{ hold.id, p.spawn.worker.id });
                 return self.failSpawn(p, error.ClientGone);
             }
-            const i = std.mem.indexOfScalar(*HeldClient, p.waiters.items, hold) orelse continue;
+            const i = std.mem.findScalar(*HeldClient, p.waiters.items, hold) orelse continue;
             std.debug.print("Client {d}: left while waiting for worker {d}\n", .{ hold.id, p.spawn.worker.id });
             _ = p.waiters.orderedRemove(i);
             self.event_loop.unwatchFd(@intFromPtr(hold) | tag_spawn_client, hold.socket);
@@ -1559,7 +1557,7 @@ pub const Conductor = struct {
                 .direct => false,
                 .client => blk: {
                     var buf: [32]u8 = undefined;
-                    const prefix = std.fmt.bufPrint(&buf, "__ns{d}__\x00", .{ns}) catch break :blk false;
+                    const prefix = std.mem.print(&buf, "__ns{d}__\x00", .{ns}) catch break :blk false;
                     break :blk std.mem.startsWith(u8, pool_key, prefix);
                 },
                 .sandboxed => platform.childMountNs(w.process) == ns,
@@ -1613,7 +1611,7 @@ pub const Conductor = struct {
         if (starting) |p| self.failSpawn(p, error.Restarted);
         const ended = running != null or starting != null;
         std.debug.print("Restart: session '{s}' {s}\n", .{ label, if (ended) "ended" else "not running" });
-        const msg = try std.fmt.allocPrint(self.allocator, "Reset: {s} session '{s}'\n", .{ if (ended) "ended" else "no running", label });
+        const msg = try self.allocator.print("Reset: {s} session '{s}'\n", .{ if (ended) "ended" else "no running", label });
         defer self.allocator.free(msg);
         try self.serveString(socket, msg, 0);
     }
@@ -2227,7 +2225,7 @@ pub const Conductor = struct {
         var it = self.active_clients.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.worker != w) continue;
-            if (std.mem.indexOfScalar(u32, running, entry.key_ptr.*) != null) continue;
+            if (std.mem.findScalar(u32, running, entry.key_ptr.*) != null) continue;
             if (n < stale.len) {
                 stale[n] = entry.key_ptr.*;
                 n += 1;
@@ -2378,7 +2376,7 @@ pub const Conductor = struct {
     /// Held locked while the conductor lives, so a client signals no stale pid.
     fn writePidFile(self: *Conductor) ?Io.File {
         var buf: [16]u8 = undefined;
-        const pid_str = std.fmt.bufPrint(&buf, "{d}", .{platform.getpid()}) catch unreachable;
+        const pid_str = std.mem.print(&buf, "{d}", .{platform.getpid()}) catch unreachable;
         const file = Io.Dir.createFileAbsolute(self.io, g_pid_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |err| {
             std.debug.print("Warning: failed to create PID file: {}\n", .{err});
             return null;
@@ -2546,7 +2544,7 @@ pub const Conductor = struct {
             const left_ms = @divTrunc(deadline - self.nowNs(), std.time.ns_per_ms);
             if (left_ms <= 0 or !platform.waitReadable(stdin, @intCast(left_ms))) break;
             len += platform.recvNonBlocking(stdin, buf[len..]) orelse break;
-            if (std.mem.indexOf(u8, buf[0..len], pal.sentinel) != null) break;
+            if (std.mem.find(u8, buf[0..len], pal.sentinel) != null) break;
         }
         var palette: pal.Palette = .{};
         pal.parse(buf[0..len], &palette);
@@ -2564,7 +2562,7 @@ pub const Conductor = struct {
         const all = [_][]const u8{ paths.stdin, paths.stdout, paths.stderr, paths.signals };
         for (all) |path| {
             if (self.cfg.transport == .tcp) {
-                const colon = std.mem.lastIndexOfScalar(u8, path, ':') orelse path.len;
+                const colon = std.mem.findScalarLast(u8, path, ':') orelse path.len;
                 w.writeLenPrefixed(u16, path[colon..]);
             } else {
                 w.writeLenPrefixed(u16, path);
@@ -2603,7 +2601,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(" - Sandbox memory limit: {s}\n", .{m});
     if (cfg.sandbox_max_cpu) |c|
         std.debug.print(" - Sandbox CPU limit: {d}%\n", .{c});
-    if (builtin.os.tag == .linux and (cfg.sandbox_max_memory != null or cfg.sandbox_max_cpu != null)) {
+    if (builtin.target.os.tag == .linux and (cfg.sandbox_max_memory != null or cfg.sandbox_max_cpu != null)) {
         worker.sandbox.delegateCgroups(cfg.sandbox_max_memory, cfg.sandbox_max_cpu) catch |err| {
             std.debug.print("Sandbox limits need a cgroup delegated to the conductor (systemd Delegate=yes); " ++
                 "unset JULIA_DAEMON_SANDBOX_MAX_MEMORY and _MAX_CPU to run without them.\n", .{});

@@ -10,7 +10,7 @@ const EnvVar = worker.EnvVar;
 pub const EnvCache = struct {
     const MAX_ENTRIES = 5;
 
-    entries: [MAX_ENTRIES]?Entry = .{null} ** MAX_ENTRIES,
+    entries: [MAX_ENTRIES]?Entry = @splat(null),
     access_counter: u64 = 0,
     allocator: Allocator,
 

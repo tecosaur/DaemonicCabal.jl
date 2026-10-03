@@ -72,7 +72,7 @@ const Viewer = struct {
     tab: usize = 0,
     focus: [tabs.len]usize = view.first_settings, // a setting's index, per tab
     staged: changes.Staged = .{},
-    applied: changes.Applied = .initEmpty(), // by this viewer, for its farewell
+    applied: changes.Applied = .empty, // by this viewer, for its farewell
     editor: ?Editor = null, // the focused setting's value, being typed
     message: Message = .{}, // until the next key
     asking: bool = false, // whether to save before quitting
@@ -107,7 +107,7 @@ const Message = struct {
 
     fn set(self: *Message, kind: @FieldType(Message, "kind"), comptime fmt: []const u8, fmt_args: anytype) void {
         self.kind = kind;
-        self.len = if (std.fmt.bufPrint(&self.bytes, fmt, fmt_args)) |t| t.len else |_| self.bytes.len;
+        self.len = if (std.mem.print(&self.bytes, fmt, fmt_args)) |t| t.len else |_| self.bytes.len;
     }
 };
 
@@ -464,12 +464,12 @@ fn save(c: *Conductor, v: *Viewer) bool {
         noServiceMessage(&v.message, to_save);
         return false;
     };
-    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const target = svc.target(&target_buf) catch {
         v.message.set(.problem, "Couldn't save: a drop-in beside {s} would have too long a path.", .{svc.path});
         return false;
     };
-    var shown_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var shown_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const shown = homeRelative(c, target, &shown_buf);
     service.save(c.allocator, c.io, svc, to_save) catch |err| {
         std.debug.print("Settings: saving to {s} failed: {}\n", .{ target, err });
@@ -526,7 +526,7 @@ fn reloadFailed(c: *Conductor, err: anyerror) void {
 // "~/…" for a path within the home directory.
 fn homeRelative(c: *const Conductor, path: []const u8, buf: []u8) []const u8 {
     const rest = status.withinHome(path, c.cfg.host_home) orelse return path;
-    return std.fmt.bufPrint(buf, "~{s}", .{rest}) catch path;
+    return std.mem.print(buf, "~{s}", .{rest}) catch path;
 }
 
 fn noServiceMessage(message: *Message, to_save: []const service.Change) void {
@@ -593,37 +593,37 @@ fn pathWarning(c: *const Conductor, kind: settings.Path, path: []const u8, whole
         const address = protocol.parseAddress(path) catch return null;
         if (address.mode == .tcp) return null;
     }
-    const bare = std.mem.indexOfAny(u8, path, "/\\") == null;
+    const bare = std.mem.findAny(u8, path, "/\\") == null;
     if (kind == .executable and bare) {
         if (!whole or onPath(c, path)) return null;
-        return std.fmt.bufPrint(buf, "{s} isn't on the daemon's PATH.", .{path}) catch null;
+        return std.mem.print(buf, "{s} isn't on the daemon's PATH.", .{path}) catch null;
     }
-    if (std.fs.path.dirname(path)) |dir| {
+    if (std.Io.Dir.path.dirname(path)) |dir| {
         const stat = cwd.statFile(c.io, dir, .{}) catch
-            return std.fmt.bufPrint(buf, "{s} doesn't exist.", .{dir}) catch null;
-        if (stat.kind != .directory) return std.fmt.bufPrint(buf, "{s} isn't a directory.", .{dir}) catch null;
+            return std.mem.print(buf, "{s} doesn't exist.", .{dir}) catch null;
+        if (stat.kind != .directory) return std.mem.print(buf, "{s} isn't a directory.", .{dir}) catch null;
     }
     if (!whole) return null;
     const stat = cwd.statFile(c.io, path, .{}) catch |err| return switch (err) {
-        error.FileNotFound => if (kind == .executable) std.fmt.bufPrint(buf, "{s} doesn't exist.", .{path}) catch null else null,
-        else => std.fmt.bufPrint(buf, "{s} can't be read: {s}.", .{ path, @errorName(err) }) catch null,
+        error.FileNotFound => if (kind == .executable) std.mem.print(buf, "{s} doesn't exist.", .{path}) catch null else null,
+        else => std.mem.print(buf, "{s} can't be read: {s}.", .{ path, @errorName(err) }) catch null,
     };
     return switch (kind) {
         .executable => if (stat.kind == .directory)
-            std.fmt.bufPrint(buf, "{s} is a directory.", .{path}) catch null
-        else if (cwd.access(c.io, path, .{ .execute = true })) |_| null else |_| std.fmt.bufPrint(buf, "{s} isn't executable.", .{path}) catch null,
-        .directory => if (stat.kind != .directory) std.fmt.bufPrint(buf, "{s} isn't a directory.", .{path}) catch null else null,
+            std.mem.print(buf, "{s} is a directory.", .{path}) catch null
+        else if (cwd.access(c.io, path, .{ .execute = true })) |_| null else |_| std.mem.print(buf, "{s} isn't executable.", .{path}) catch null,
+        .directory => if (stat.kind != .directory) std.mem.print(buf, "{s} isn't a directory.", .{path}) catch null else null,
         .socket => null,
     };
 }
 
 fn onPath(c: *const Conductor, name: []const u8) bool {
     const path_env = c.environ_map.get("PATH") orelse return false;
-    var dirs = std.mem.tokenizeScalar(u8, path_env, std.fs.path.delimiter);
+    var dirs = std.mem.tokenizeScalar(u8, path_env, std.Io.Dir.path.delimiter);
     while (dirs.next()) |dir| {
         for ([_][]const u8{ "", ".exe" }) |suffix| {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const candidate = std.fmt.bufPrint(&buf, "{s}{c}{s}{s}", .{ dir, std.fs.path.sep, name, suffix }) catch continue;
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const candidate = std.mem.print(&buf, "{s}{c}{s}{s}", .{ dir, std.Io.Dir.path.sep, name, suffix }) catch continue;
             if (std.Io.Dir.cwd().access(c.io, candidate, .{ .execute = true })) |_| return true else |_| {}
         }
     }
@@ -695,8 +695,8 @@ fn farewell(c: *const Conductor, v: *const Viewer, buf: []u8) []const u8 {
     w.print("Applied {d} change{s}", .{ n, if (n == 1) "" else "s" }) catch {};
     const svc = c.settings.service;
     if (unsaved == 0) {
-        var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var shown_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var shown_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         if (svc) |s| if (s.target(&target_buf)) |target| {
             w.print(", saved to {s}", .{homeRelative(c, target, &shown_buf)}) catch {};
         } else |_| {};

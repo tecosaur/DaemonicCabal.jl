@@ -118,7 +118,7 @@ fn resolveDepots(depot_env: ?[]const u8, host_home: []const u8) DepotTargets {
     const env = depot_env orelse "";
     if (depot_env != null and env.len == 0) return out;
     // ":" is equivalent to unset: both put the user depot first.
-    const explicit = std.mem.indexOfNone(u8, env, ":") != null;
+    const explicit = std.mem.findNone(u8, env, ":") != null;
     if (!explicit or env[0] == ':') out.push(homeDepotPath(host_home));
     var it = std.mem.splitScalar(u8, env, ':');
     while (it.next()) |entry| {
@@ -155,7 +155,7 @@ fn pathExists(path: [*:0]const u8) bool {
 /// used only for probing (the host sits under `/oldroot` after pivot_root).
 fn classifyInstallPrefixed(exe_path: []const u8, host_home: []const u8, prefix: []const u8) InstallRoot {
     if (exe_path.len == 0 or exe_path[0] != '/') return .unrecognised;
-    var dir = std.fs.path.dirname(exe_path) orelse return .unrecognised;
+    var dir = std.Io.Dir.path.dirname(exe_path) orelse return .unrecognised;
     var level: usize = 0;
     while (level < 2) : (level += 1) {
         if (isDangerousRoot(dir, host_home)) return .unrecognised;
@@ -164,7 +164,7 @@ fn classifyInstallPrefixed(exe_path: []const u8, host_home: []const u8, prefix: 
             if (pathExists(marker)) return .{ .install_root = dir };
         if (fmtPath(&buf, "{s}{s}/juliaup.json", .{ prefix, dir })) |marker|
             if (pathExists(marker)) return .{ .launcher_home = dir };
-        dir = std.fs.path.dirname(dir) orelse return .unrecognised;
+        dir = std.Io.Dir.path.dirname(dir) orelse return .unrecognised;
     }
     return .unrecognised;
 }
@@ -202,7 +202,7 @@ pub fn execInSandbox(
 ) SandboxError!posix.pid_t {
     const orig_uid = linux.getuid();
     const orig_gid = linux.getgid();
-    var cgroup_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var cgroup_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cgroup = try createCgroup(&cgroup_buf, config);
     const pid1 = callFork() orelse {
         removeCgroup(config.worker_id);
@@ -232,7 +232,7 @@ pub fn execInSandbox(
         posix.sigaction(.USR1, &relay, null);
         posix.sigprocmask(posix.SIG.UNBLOCK, &relayed, null);
         var status: u32 = 0;
-        while (errnoFromRc(linux.waitpid(@intCast(pid2), &status, 0))) |e| {
+        while (errnoFromRc(linux.waitpid(@intCast(pid2), @ptrCast(&status), 0))) |e| {
             if (e != .INTR) break;
         }
         linux.exit_group(@intCast(status >> 8));
@@ -280,11 +280,11 @@ fn setupNamespaces(flags: usize, orig_uid: linux.uid_t, orig_gid: linux.gid_t) S
     // setgroups must be denied before an unprivileged gid_map write.
     writeFile("/proc/self/setgroups", "deny") catch return SandboxError.SetgroupsFailed;
     var uid_buf: [64]u8 = undefined;
-    const uid_map = std.fmt.bufPrint(&uid_buf, "0 {d} 1\n", .{orig_uid}) catch
+    const uid_map = std.mem.print(&uid_buf, "0 {d} 1\n", .{orig_uid}) catch
         return SandboxError.UidMapFailed;
     writeFile("/proc/self/uid_map", uid_map) catch return SandboxError.UidMapFailed;
     var gid_buf: [64]u8 = undefined;
-    const gid_map = std.fmt.bufPrint(&gid_buf, "0 {d} 1\n", .{orig_gid}) catch
+    const gid_map = std.mem.print(&gid_buf, "0 {d} 1\n", .{orig_gid}) catch
         return SandboxError.GidMapFailed;
     writeFile("/proc/self/gid_map", gid_map) catch return SandboxError.GidMapFailed;
 }
@@ -354,8 +354,8 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
 /// pid file, other sockets, and host secrets), even where a depot or project
 /// mount contains it.
 fn mountWorkerSocketDir(setup_socket_path: []const u8, conductor_socket_path: []const u8) SandboxError!void {
-    const subdir = std.fs.path.dirname(setup_socket_path) orelse return SandboxError.MountFailed;
-    const runtime_dir = std.fs.path.dirname(subdir) orelse return SandboxError.MountFailed;
+    const subdir = std.Io.Dir.path.dirname(setup_socket_path) orelse return SandboxError.MountFailed;
+    const runtime_dir = std.Io.Dir.path.dirname(subdir) orelse return SandboxError.MountFailed;
     var cover_buf: [512]u8 = undefined;
     const cover = fmtPath(&cover_buf, "/newroot{s}", .{runtime_dir}) orelse return SandboxError.PathTooLong;
     mkdirp(cover);
@@ -435,7 +435,7 @@ fn mountSystemDirs() SandboxError!void {
 fn mirrorRootDir(comptime name: []const u8) SandboxError!void {
     const src = "/oldroot/" ++ name;
     const dst = "/newroot/" ++ name;
-    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const rc = linux.readlink(src, &target_buf, target_buf.len - 1);
     if (errnoFromRc(rc)) |e| switch (e) {
         .INVAL => return robind(src, dst),
@@ -483,7 +483,7 @@ fn mountJuliaInstall(exe_path: []const u8, home: []const u8, depot: []const u8) 
 var home_depot_buf: [384]u8 = undefined;
 fn homeDepotPath(home: []const u8) []const u8 {
     if (home.len == 0) return "";
-    return std.fmt.bufPrint(&home_depot_buf, "{s}/.julia", .{home}) catch "";
+    return std.mem.print(&home_depot_buf, "{s}/.julia", .{home}) catch "";
 }
 
 /// Returns the written depot, which `/home/sandbox/.julia` links to, or "".
@@ -554,7 +554,7 @@ fn mountDepotOverlay(depot_src: []const u8, depot_dst: [*:0]const u8) SandboxErr
 
 // --- Cgroup v2 resource limits ---
 
-var cgroup_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+var cgroup_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 /// The conductor's own cgroup, where each limited sandbox gets `sandbox-N`.
 var cgroup_root: ?[]const u8 = null;
 
@@ -566,9 +566,9 @@ pub fn delegateCgroups(max_memory: ?[]const u8, max_cpu: ?u32) SandboxError!void
     var self_buf: [1024]u8 = undefined;
     const self_len = readFile("/proc/self/cgroup", &self_buf) orelse return cgroupFailed("read /proc/self/cgroup");
     const own = cgroupV2Path(self_buf[0..self_len]) orelse return cgroupFailed("find a cgroup v2 hierarchy");
-    const root = std.fmt.bufPrint(&cgroup_root_buf, "/sys/fs/cgroup{s}", .{std.mem.trimEnd(u8, own, "/")}) catch
+    const root = std.mem.print(&cgroup_root_buf, "/sys/fs/cgroup{s}", .{std.mem.trimEnd(u8, own, "/")}) catch
         return SandboxError.PathTooLong;
-    var leaf_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var leaf_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const leaf = fmtPath(&leaf_buf, "{s}/conductor", .{root}) orelse return SandboxError.PathTooLong;
     try cgroupMkdir(leaf);
     try cgroupWrite(leaf, "cgroup.procs", "0");
@@ -579,7 +579,7 @@ pub fn delegateCgroups(max_memory: ?[]const u8, max_cpu: ?u32) SandboxError!void
 
 pub fn removeCgroup(worker_id: u32) void {
     const root = cgroup_root orelse return;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cg = fmtPath(&buf, "{s}/sandbox-{d}", .{ root, worker_id }) orelse return;
     _ = linux.unlinkat(linux.AT.FDCWD, cg, linux.AT.REMOVEDIR);
 }
@@ -593,7 +593,7 @@ fn createCgroup(buf: []u8, config: *const SandboxConfig) SandboxError!?[:0]const
     if (config.max_memory) |mem| try cgroupWrite(cg, "memory.max", mem);
     if (config.max_cpu) |cpu| {
         var val_buf: [32]u8 = undefined;
-        const quota = std.fmt.bufPrint(&val_buf, "{d} 100000", .{@as(u64, cpu) * 1000}) catch return SandboxError.CgroupSetupFailed;
+        const quota = std.mem.print(&val_buf, "{d} 100000", .{@as(u64, cpu) * 1000}) catch return SandboxError.CgroupSetupFailed;
         try cgroupWrite(cg, "cpu.max", quota);
     }
     return cg;
@@ -614,7 +614,7 @@ fn cgroupMkdir(path: [:0]const u8) SandboxError!void {
 }
 
 fn cgroupWrite(dir: []const u8, file: []const u8, data: []const u8) SandboxError!void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = fmtPath(&buf, "{s}/{s}", .{ dir, file }) orelse return SandboxError.PathTooLong;
     const fd_rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0);
     const e = errnoFromRc(fd_rc) orelse blk: {
@@ -633,22 +633,22 @@ fn cgroupFailed(step: []const u8) SandboxError {
 // --- Argv/envp construction ---
 
 fn buildArgv(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]const u8 {
-    var list = std.array_list.AlignedManaged([*:0]const u8, null).init(allocator);
-    defer list.deinit();
+    var list: std.ArrayList([*:0]const u8) = .empty;
+    defer list.deinit(allocator);
     errdefer for (list.items) |s| allocator.free(std.mem.span(s));
-    try list.append(try allocator.dupeZ(u8, config.julia_executable));
+    try list.append(allocator, try allocator.dupeSentinel(u8, config.julia_executable, 0));
     if (config.julia_channel) |ch|
-        try list.append(try allocator.dupeZ(u8, ch));
+        try list.append(allocator, try allocator.dupeSentinel(u8, ch, 0));
     if (config.worker_project.len > 0)
-        try list.append(try std.fmt.allocPrintSentinel(allocator, "--project={s}", .{config.worker_project}, 0));
+        try list.append(allocator, try allocator.printSentinel("--project={s}", .{config.worker_project}, 0));
     // Args containing spaces are not supported.
     var it = std.mem.tokenizeScalar(u8, config.worker_args, ' ');
     while (it.next()) |arg|
-        try list.append(try allocator.dupeZ(u8, arg));
+        try list.append(allocator, try allocator.dupeSentinel(u8, arg, 0));
     if (config.threads_arg) |t|
-        try list.append(try allocator.dupeZ(u8, t));
-    try list.append(try allocator.dupeZ(u8, "--eval"));
-    try list.append(try allocator.dupeZ(u8, config.eval_expr));
+        try list.append(allocator, try allocator.dupeSentinel(u8, t, 0));
+    try list.append(allocator, try allocator.dupeSentinel(u8, "--eval", 0));
+    try list.append(allocator, try allocator.dupeSentinel(u8, config.eval_expr, 0));
     const argv = try allocator.allocSentinel(?[*:0]const u8, list.items.len, null);
     for (list.items, 0..) |s, i| argv[i] = s;
     return argv;
@@ -675,8 +675,8 @@ const env_fixed = [_][]const u8{
 
 /// Public so `test_sandbox.zig` runs its command in the worker's environment.
 pub fn buildEnvp(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]const u8 {
-    var list = std.array_list.AlignedManaged([*:0]const u8, null).init(allocator);
-    defer list.deinit();
+    var list: std.ArrayList([*:0]const u8) = .empty;
+    defer list.deinit(allocator);
     errdefer for (list.items) |s| allocator.free(std.mem.span(s));
     const env = config.host_environ;
     for (env.array_hash_map.keys(), env.array_hash_map.values()) |key, value| {
@@ -684,14 +684,14 @@ pub fn buildEnvp(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*
             if (std.mem.startsWith(u8, kv, key) and kv[key.len] == '=') break true;
         } else false;
         if (!fixed and envAllowed(key))
-            try list.append(try std.fmt.allocPrintSentinel(allocator, "{s}={s}", .{ key, value }, 0));
+            try list.append(allocator, try allocator.printSentinel("{s}={s}", .{ key, value }, 0));
     }
-    for (env_fixed) |kv| try list.append(try allocator.dupeZ(u8, kv));
-    if (std.fs.path.dirname(config.julia_executable)) |bindir| {
-        try list.append(try std.fmt.allocPrintSentinel(allocator,
+    for (env_fixed) |kv| try list.append(allocator, try allocator.dupeSentinel(u8, kv, 0));
+    if (std.Io.Dir.path.dirname(config.julia_executable)) |bindir| {
+        try list.append(allocator, try allocator.printSentinel(
             "PATH={s}:/usr/local/bin:/usr/bin:/bin", .{bindir}, 0));
     } else {
-        try list.append(try allocator.dupeZ(u8, "PATH=/usr/local/bin:/usr/bin:/bin"));
+        try list.append(allocator, try allocator.dupeSentinel(u8, "PATH=/usr/local/bin:/usr/bin:/bin", 0));
     }
     const envp = try allocator.allocSentinel(?[*:0]const u8, list.items.len, null);
     for (list.items, 0..) |s, i| envp[i] = s;
@@ -768,7 +768,7 @@ fn remountTreeReadonly(target: [*:0]const u8) SandboxError!void {
     var it = std.mem.splitScalar(u8, info, '\n');
     while (it.next()) |line| {
         const entry = parseMountEntry(line) orelse continue;
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const path = unescapeMountPath(&path_buf, entry.point) orelse return SandboxError.PathTooLong;
         if (!isWithin(path, prefix)) continue;
         // Only the topmost mount at a point is reached through its path.
@@ -841,7 +841,7 @@ fn lockedFlags(options: []const u8) u32 {
 // --- Low-level helpers ---
 
 fn fmtPath(buf: []u8, comptime fmt: []const u8, args: anytype) ?[:0]const u8 {
-    const result = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args) catch return null;
+    const result = std.mem.print(buf[0 .. buf.len - 1], fmt, args) catch return null;
     buf[result.len] = 0;
     return buf[0..result.len :0];
 }

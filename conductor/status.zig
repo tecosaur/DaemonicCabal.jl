@@ -16,7 +16,7 @@ const tui = @import("tui.zig");
 const Conductor = main.Conductor;
 const Worker = worker.Worker;
 
-// Zig 0.16's ArrayList has no generic `.writer()`.
+// Zig 0.17's ArrayList has no generic `.writer()`.
 const Writer = struct {
     list: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
@@ -373,21 +373,21 @@ fn writeDurationPadded(w: Writer, total_seconds: i64, width: usize) !void {
 fn formatCountdown(buf: *[16]u8, total_seconds: i64) ![]const u8 {
     const s: u64 = @intCast(@max(0, total_seconds));
     if (s >= 600) return formatDuration(buf, total_seconds);
-    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s});
-    return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ s / 60, s % 60 });
+    if (s < 60) return std.mem.print(buf, "{d}s", .{s});
+    return std.mem.print(buf, "{d}m{d:0>2}s", .{ s / 60, s % 60 });
 }
 
 // The two largest units, the smaller left off when zero.
 fn formatDuration(buf: *[16]u8, total_seconds: i64) ![]const u8 {
     const s: u64 = @intCast(@max(0, total_seconds));
-    if (s < 60) return std.fmt.bufPrint(buf, "{d}s", .{s});
-    if (s < 3600) return std.fmt.bufPrint(buf, "{d}m", .{s / 60});
+    if (s < 60) return std.mem.print(buf, "{d}s", .{s});
+    if (s < 3600) return std.mem.print(buf, "{d}m", .{s / 60});
     const big, const small, const units: [2]u8 = if (s < 86400)
         .{ s / 3600, s % 3600 / 60, .{ 'h', 'm' } }
     else
         .{ s / 86400, s % 86400 / 3600, .{ 'd', 'h' } };
-    if (small == 0) return std.fmt.bufPrint(buf, "{d}{c}", .{ big, units[0] });
-    return std.fmt.bufPrint(buf, "{d}{c}{d}{c}", .{ big, units[0], small, units[1] });
+    if (small == 0) return std.mem.print(buf, "{d}{c}", .{ big, units[0] });
+    return std.mem.print(buf, "{d}{c}{d}{c}", .{ big, units[0], small, units[1] });
 }
 
 /// `path` past `home`, when within it: what follows `~`.
@@ -399,6 +399,7 @@ pub fn withinHome(path: []const u8, home: []const u8) ?[]const u8 {
 // --- Tree rendering ----------------------------------------------------------
 
 const indent = "  ";
+const footer_rule: [58][3]u8 = @splat("─".*);
 
 fn renderTree(c: *Conductor, w: Writer, s: Style, ctx: Ctx, view: View, now: i64) !void {
     var sandboxed: usize = 0;
@@ -452,7 +453,7 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const 
         const home_relative = withinHome(path, c.cfg.host_home);
         const shown = home_relative orelse path;
         const tilde = home_relative != null;
-        const slash = std.mem.lastIndexOfScalar(u8, shown, '/');
+        const slash = std.mem.findScalarLast(u8, shown, '/');
         const basename = if (slash) |i| shown[i + 1 ..] else shown;
         const parent = if (slash) |i| shown[0 .. i + 1] else "";
         if (all_inactive) try s.open(w, ansi.dim) else try s.open(w, ansi.bold ++ ansi.blue);
@@ -536,7 +537,7 @@ fn writeIdentity(c: *Conductor, w: Writer, s: Style, wk: *const Worker, health: 
     try writeHealthDot(s, w, health);
     try w.writeByte(' ');
     var id_buf: [10]u8 = undefined;
-    const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{wk.id}) catch unreachable;
+    const id_text = std.mem.print(&id_buf, "{d}", .{wk.id}) catch unreachable;
     var col: usize = 1 + id_text.len; // visible width written so far in this column
     if (health == .inactive) {
         try s.open(w, ansi.dim);
@@ -829,7 +830,7 @@ fn renderFooter(c: *Conductor, w: Writer, s: Style, view: View) !void {
     }
     try w.writeByte('\n');
     try s.open(w, ansi.dim);
-    try w.writeAll(indent ++ ("─" ** 58) ++ "\n");
+    try w.writeAll(indent ++ std.mem.asBytes(&footer_rule) ++ "\n");
     try w.writeAll(indent);
     try w.print("{d} workers", .{view.workers.len});
     if (view.reserve != null) try w.writeAll(" · 1 reserve");

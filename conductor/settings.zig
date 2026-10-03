@@ -31,7 +31,7 @@ pub const Tab = enum {
 };
 
 /// The sandbox is Linux's alone.
-const has_sandbox = builtin.os.tag == .linux;
+const has_sandbox = builtin.target.os.tag == .linux;
 pub const tabs: []const Tab = if (has_sandbox)
     std.enums.values(Tab)
 else
@@ -437,7 +437,7 @@ pub fn parseFlag(text: []const u8) ?bool {
 
 /// At least four ports, a worker's set, within the unprivileged ones.
 pub fn parsePorts(text: []const u8) ?[2]u16 {
-    const dash = std.mem.indexOfScalar(u8, text, '-') orelse return null;
+    const dash = std.mem.findScalar(u8, text, '-') orelse return null;
     const low = std.fmt.parseInt(u16, text[0..dash], 10) catch return null;
     const high = std.fmt.parseInt(u16, text[dash + 1 ..], 10) catch return null;
     if (low < 1024 or @as(u32, high) < @as(u32, low) + 3) return null;
@@ -521,7 +521,7 @@ fn isThreads(text: []const u8) bool {
 }
 
 fn printed(buf: []u8, comptime fmt: []const u8, fmt_args: anytype) Invalid![]const u8 {
-    return std.fmt.bufPrint(buf, fmt, fmt_args) catch error.Invalid;
+    return std.mem.print(buf, fmt, fmt_args) catch error.Invalid;
 }
 
 test "typed values normalise to their variable's form" {
@@ -607,7 +607,7 @@ test "display picks a duration's largest whole unit" {
 }
 
 test "timings stay positive, and the TTLs and free-memory levels ordered" {
-    var values = [_]?[]const u8{null} ** all.len;
+    var values: [all.len]?[]const u8 = @splat(null);
     try std.testing.expect(conflict(&values) == null);
     inline for (.{ "JULIA_DAEMON_PING_INTERVAL", "JULIA_DAEMON_PING_TIMEOUT", "JULIA_DAEMON_SPAWN_TIMEOUT" }) |key| {
         const i = Setting.index(key);
@@ -629,7 +629,7 @@ test "timings stay positive, and the TTLs and free-memory levels ordered" {
 }
 
 test "rows are used as the settings they hang on allow" {
-    var values = [_]?[]const u8{null} ** all.len;
+    var values: [all.len]?[]const u8 = @splat(null);
     const psi = all[Setting.index("JULIA_DAEMON_PSI_THRESHOLD")].used.?;
     const ports = all[Setting.index("JULIA_DAEMON_PORTS")].used.?;
     try std.testing.expect(psi.check(&values));
