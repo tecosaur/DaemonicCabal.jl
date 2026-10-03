@@ -8,7 +8,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const SwitchList = std.ArrayList(Switch);
 
 const Arity = enum { none, required, optional };
 
@@ -30,8 +29,6 @@ const Option = struct {
     needs_own_julia: bool = false,
     /// The client's, not Julia's: an abbreviation is of Julia's first.
     own: bool = false,
-    /// An optional value left bare, as Julia takes it.
-    bare: []const u8 = "",
 
     pub fn format(self: *const Option, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.short) |c| try w.print("-{c}/", .{c});
@@ -63,7 +60,7 @@ const options = [_]Option{
     .{ .long = "--threads", .short = 't', .arity = .required, .honoured = .always },
     .{ .long = "--gcthreads", .arity = .required },
     .{ .long = "--machine-file", .arity = .required },
-    .{ .long = "--project", .short = 'P', .arity = .optional, .honoured = .always, .bare = "@." },
+    .{ .long = "--project", .short = 'P', .arity = .optional, .honoured = .always },
     .{ .long = "--color", .arity = .required, .honoured = .always, .choices = "yes|no|auto" },
     .{ .long = "--history-file", .arity = .required, .honoured = .always, .choices = "yes|no" },
     .{ .long = "--startup-file", .arity = .required, .honoured = .only_as_no, .choices = "yes|no" },
@@ -155,7 +152,7 @@ pub const Problem = union(enum) {
 
     pub fn format(self: Problem, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
-            .unknown => |word| try w.print("unknown option `{s}`", .{word}),
+            .unknown => |arg| try w.print("unknown option `{s}`", .{arg}),
             .unknown_short => |c| try w.print("unknown option `-{c}`", .{c}),
             .missing_value => |option| try w.print("option `{f}` is missing an argument", .{option}),
             .unexpected_value => |option| try w.print("option `{f}` does not accept an argument", .{option}),
@@ -173,35 +170,46 @@ pub const Problem = union(enum) {
     }
 };
 
-pub const ParsedArgs = struct {
-    julia_channel: ?[]const u8, // JuliaUp's "+1.10"
-    /// In argv order, repeats included.
-    switches: []const Switch,
-    program_file: ?[]const u8,
-    program_args: []const []const u8,
+/// What `parse` found in an argv of `Word`s (slices, or C strings as a process
+/// is handed them). Its switches are read again from argv when asked for.
+pub fn Parsed(comptime Word: type) type {
+    return struct {
+        argv: []const Word,
+        /// Where the switches begin, after any channel.
+        first: usize,
+        julia_channel: ?[]const u8, // JuliaUp's "+1.10"
+        program_file: ?[]const u8,
+        program_args: []const Word,
 
-    pub fn deinit(self: *ParsedArgs, allocator: Allocator) void {
-        allocator.free(self.switches);
-    }
+        const Self = @This();
 
-    /// The last occurrence's value, as Julia takes.
-    pub fn getSwitch(self: *const ParsedArgs, name: []const u8) ?[]const u8 {
-        var result: ?[]const u8 = null;
-        for (self.switches) |sw| {
-            if (std.mem.eql(u8, sw.name, name)) result = sw.value;
+        /// In argv order, repeats included.
+        pub fn switches(self: *const Self) Scanner(Word) {
+            return .{ .argv = self.argv, .i = self.first };
         }
-        return result;
-    }
 
-    pub fn hasSwitch(self: *const ParsedArgs, name: []const u8) bool {
-        return self.getSwitch(name) != null;
-    }
+        /// The last occurrence's value, as Julia takes.
+        pub fn getSwitch(self: *const Self, name: []const u8) ?[]const u8 {
+            var result: ?[]const u8 = null;
+            var it = self.switches();
+            while (it.next()) |sw| {
+                if (std.mem.eql(u8, sw.name, name)) result = sw.value;
+            }
+            return result;
+        }
 
-    pub fn threadSwitch(self: *const ParsedArgs) Threads {
-        const value = self.getSwitch("--threads") orelse return threads_none;
-        return switchThreads(value).threads; // refused as parsed
-    }
-};
+        pub fn hasSwitch(self: *const Self, name: []const u8) bool {
+            return self.getSwitch(name) != null;
+        }
+
+        pub fn threadSwitch(self: *const Self) Threads {
+            const value = self.getSwitch("--threads") orelse return threads_none;
+            return switchThreads(value).threads; // refused as parsed
+        }
+    };
+}
+
+pub const ParsedArgs = Parsed([]const u8);
 
 /// (default pool, interactive pool) counts. Julia fixes these at startup, so
 /// they are part of a worker's identity. The default is unset only when
@@ -289,37 +297,38 @@ fn threadField(buf: []u8, val: u16) []const u8 {
     return std.mem.print(buf, "{d}", .{val}) catch unreachable;
 }
 
-pub const Error = Allocator.Error || error{InvalidArguments};
+pub const Error = error{InvalidArguments};
 
 /// As `parseReporting`, where why a command line is refused isn't wanted.
-pub fn parse(allocator: Allocator, argv: []const []const u8) Error!ParsedArgs {
+pub fn parse(argv: []const []const u8) Error!ParsedArgs {
     var problem: Problem = undefined;
-    return parseReporting(allocator, argv, &problem);
+    return parseReporting([]const u8, argv, &problem);
 }
 
 /// Split `argv` (the executable first) into switches, program file and ARGS.
 /// On `error.InvalidArguments`, `problem` holds why.
-pub fn parseReporting(allocator: Allocator, argv: []const []const u8, problem: *Problem) Error!ParsedArgs {
-    const julia_channel: ?[]const u8 = if (argv.len > 1 and argv[1].len > 0 and argv[1][0] == '+') argv[1] else null;
-    var switches: SwitchList = .empty;
-    defer switches.deinit(allocator);
-    const scan = try scanSwitches(allocator, &switches, argv, if (julia_channel == null) 1 else 2);
-    const rest = switch (scan) {
+pub fn parseReporting(comptime Word: type, argv: []const Word, problem: *Problem) Error!Parsed(Word) {
+    const channel: ?[]const u8 = if (argv.len > 1 and word(argv, 1).len > 0 and word(argv, 1)[0] == '+') word(argv, 1) else null;
+    var parsed: Parsed(Word) = .{
+        .argv = argv,
+        .first = if (channel == null) 1 else 2,
+        .julia_channel = channel,
+        .program_file = null,
+        .program_args = &.{},
+    };
+    var it = parsed.switches();
+    while (it.next()) |_| {}
+    const rest = switch (it.end.?) {
         .invalid => |why| {
             problem.* = why;
             return error.InvalidArguments;
         },
         .positionals, .stopped => |at| at,
     };
-    var parsed: ParsedArgs = .{
-        .julia_channel = julia_channel,
-        .switches = try switches.toOwnedSlice(allocator),
-        .program_file = null,
-        .program_args = argv[rest..],
-    };
+    parsed.program_args = argv[rest..];
     // After -e or -E, as in Julia, every positional is an ARG.
-    if (scan == .positionals and rest < argv.len and !parsed.hasSwitch("--eval") and !parsed.hasSwitch("--print")) {
-        parsed.program_file = argv[rest];
+    if (it.end.? == .positionals and rest < argv.len and !parsed.hasSwitch("--eval") and !parsed.hasSwitch("--print")) {
+        parsed.program_file = word(argv, rest);
         parsed.program_args = argv[rest + 1 ..];
     }
     return parsed;
@@ -333,42 +342,94 @@ const Scan = union(enum) {
     invalid: Problem,
 };
 
-fn scanSwitches(allocator: Allocator, switches: *SwitchList, argv: []const []const u8, first: usize) Allocator.Error!Scan {
-    var i = first;
-    while (i < argv.len) {
-        const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--")) return .{ .positionals = i + 1 };
-        if (arg.len < 2 or arg[0] != '-') return .{ .positionals = i };
-        const index = i;
-        i += 1;
-        if (arg[1] == '-') {
+/// Julia's switches in argv, one at a time, as getopt reads them; `end` says
+/// why they stopped.
+pub fn Scanner(comptime Word: type) type {
+    return struct {
+        argv: []const Word,
+        i: usize,
+        /// The bundle (`-qe code`) being read: its word, and where in it.
+        bundle: ?struct { index: usize, at: usize } = null,
+        end: ?Scan = null,
+
+        const Self = @This();
+
+        pub fn next(self: *Self) ?Switch {
+            if (self.end != null) return null;
+            if (self.bundle) |b| return self.short(b.index, b.at);
+            if (self.i == self.argv.len) return self.finish(.{ .positionals = self.i });
+            const arg = word(self.argv, self.i);
+            if (std.mem.eql(u8, arg, "--")) return self.finish(.{ .positionals = self.i + 1 });
+            if (arg.len < 2 or arg[0] != '-') return self.finish(.{ .positionals = self.i });
+            const index = self.i;
+            self.i += 1;
+            if (arg[1] != '-') return self.short(index, 1);
             const eq = std.mem.findScalar(u8, arg, '=');
-            const option = findLong(arg[0 .. eq orelse arg.len]) orelse return .{ .invalid = .{ .unknown = arg } };
+            const option = findLong(arg[0 .. eq orelse arg.len]) orelse return self.finish(.{ .invalid = .{ .unknown = arg } });
             const value = if (eq) |e| blk: {
-                if (option.arity == .none) return .{ .invalid = .{ .unexpected_value = option } };
+                if (option.arity == .none) return self.finish(.{ .invalid = .{ .unexpected_value = option } });
                 break :blk arg[e + 1 ..];
             } else if (option.arity != .required)
-                option.bare
+                bareValue(option)
             else
-                nextWord(argv, &i) orelse return .{ .invalid = .{ .missing_value = option } };
-            if (try accept(allocator, switches, option, value, index, i)) |end| return end;
-            continue;
+                self.nextWord() orelse return self.finish(.{ .invalid = .{ .missing_value = option } });
+            return self.accept(option, value, index);
         }
-        for (arg[1..], 2..) |c, after| {
+
+        fn short(self: *Self, index: usize, at: usize) ?Switch {
+            const arg = word(self.argv, index);
+            const c = arg[at];
             const option = for (&options) |*option| {
                 if (option.short == c) break option;
-            } else return .{ .invalid = .{ .unknown_short = c } };
+            } else return self.finish(.{ .invalid = .{ .unknown_short = c } });
             const value = if (option.arity == .none)
                 ""
-            else if (after < arg.len)
-                arg[after..]
+            else if (at + 1 < arg.len)
+                arg[at + 1 ..]
             else
-                nextWord(argv, &i) orelse if (option.arity == .optional) option.bare else return .{ .invalid = .{ .missing_value = option } };
-            if (try accept(allocator, switches, option, value, index, i)) |end| return end;
-            if (option.arity != .none) break;
+                self.nextWord() orelse if (option.arity == .optional) bareValue(option) else return self.finish(.{ .invalid = .{ .missing_value = option } });
+            self.bundle = if (option.arity == .none and at + 1 < arg.len) .{ .index = index, .at = at + 1 } else null;
+            return self.accept(option, value, index);
         }
-    }
-    return .{ .positionals = i };
+
+        fn nextWord(self: *Self) ?[]const u8 {
+            if (self.i == self.argv.len) return null;
+            defer self.i += 1;
+            return word(self.argv, self.i);
+        }
+
+        /// The switch, spanning argv from `index` to here, unless Julia would
+        /// refuse it; the scan ends after it if Julia would stop there.
+        fn accept(self: *Self, option: *const Option, value: []const u8, index: usize) ?Switch {
+            if (option.needs_own_julia) return self.finish(.{ .invalid = .{ .needs_own_julia = option } });
+            if (option.choices) |choices| if (value.len > 0 or option.arity != .optional) {
+                var allowed = std.mem.splitScalar(u8, choices, '|');
+                while (allowed.next()) |choice| {
+                    if (std.mem.eql(u8, choice, value)) break;
+                } else return self.finish(.{ .invalid = .{ .invalid_value = .{ .option = option, .value = value } } });
+            };
+            if (std.mem.eql(u8, option.long, "--threads")) switch (switchThreads(value)) {
+                .threads => {},
+                .refused => |refusal| return self.finish(.{ .invalid = .{ .invalid_threads = refusal } }),
+            };
+            if (option.stops) self.end = .{ .stopped = self.i };
+            return .{ .name = option.long, .value = value, .index = index, .words = self.i - index };
+        }
+
+        fn finish(self: *Self, end: Scan) ?Switch {
+            self.end = end;
+            return null;
+        }
+    };
+}
+
+fn word(argv: anytype, i: usize) []const u8 {
+    return if (@TypeOf(argv[i]) == [*:0]const u8) std.mem.span(argv[i]) else argv[i];
+}
+
+/// An optional value left bare, as Julia takes it: `--project` alone is `@.`.
+fn bareValue(option: *const Option) []const u8 {
+    return if (std.mem.eql(u8, option.long, "--project")) "@." else "";
 }
 
 /// An exact match, else the only one of Julia's options `name` abbreviates,
@@ -387,28 +448,4 @@ fn findLong(name: []const u8) ?*const Option {
         if (found) |option| return option;
     }
     return null;
-}
-
-fn nextWord(argv: []const []const u8, i: *usize) ?[]const u8 {
-    if (i.* == argv.len) return null;
-    defer i.* += 1;
-    return argv[i.*];
-}
-
-/// Records the switch, spanning `argv[index..end]`; the scan's end if Julia
-/// would refuse it or stop there.
-fn accept(allocator: Allocator, switches: *SwitchList, option: *const Option, value: []const u8, index: usize, end: usize) Allocator.Error!?Scan {
-    if (option.needs_own_julia) return .{ .invalid = .{ .needs_own_julia = option } };
-    if (option.choices) |choices| if (value.len > 0 or option.arity != .optional) {
-        var allowed = std.mem.splitScalar(u8, choices, '|');
-        while (allowed.next()) |choice| {
-            if (std.mem.eql(u8, choice, value)) break;
-        } else return .{ .invalid = .{ .invalid_value = .{ .option = option, .value = value } } };
-    };
-    if (std.mem.eql(u8, option.long, "--threads")) switch (switchThreads(value)) {
-        .threads => {},
-        .refused => |refusal| return .{ .invalid = .{ .invalid_threads = refusal } },
-    };
-    try switches.append(allocator, .{ .name = option.long, .value = value, .index = index, .words = end - index });
-    return if (option.stops) .{ .stopped = end } else null;
 }

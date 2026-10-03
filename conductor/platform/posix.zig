@@ -250,10 +250,9 @@ pub fn readAvailable(fd: posix.fd_t, buf: []u8) ?usize {
     }
 }
 pub fn dumpChildStderr(_: Io, _: std.mem.Allocator, _: *std.process.Child, _: u32) void {}
-pub fn collectEnviron(allocator: std.mem.Allocator, environ: std.process.Environ) ![]const []const u8 {
-    const entries = try allocator.alloc([]const u8, environ.block.slice.len);
-    for (environ.block.slice, entries) |entry, *kv| kv.* = std.mem.span(entry.?);
-    return entries;
+/// This process's argv and KEY=VALUE environment, UTF-8.
+pub fn processInputs(init: std.process.Init.Minimal) !struct { args: []const [*:0]const u8, env: []const [*:0]const u8 } {
+    return .{ .args = init.args.vector, .env = init.environ.block.view().slice };
 }
 /// Signal the conductor whose pid `pid_path` holds (its SIGUSR1 handler),
 /// if it lives: it holds the file locked.

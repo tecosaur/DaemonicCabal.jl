@@ -74,9 +74,6 @@ const EnvInfo = struct {
     home: ?[]const u8,
 };
 
-/// UTF-8, whatever the OS hands over.
-const Inputs = struct { args: []const []const u8, env: []const []const u8 };
-
 // <id:u8><len:u8><data>, possibly fragmented across reads.
 const SignalParser = struct {
     // Holds a whole frame beside a part: each pass takes some of a read.
@@ -250,17 +247,12 @@ pub fn main(init: std.process.Init.Minimal) void {
 
 fn run(init: std.process.Init.Minimal) !void {
     platform.openClosedStdio();
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const inputs = try collectInputs(arena.allocator(), init);
+    const inputs = try platform.processInputs(init);
     var env = scanEnv(inputs.env);
     var problem: args.Problem = undefined;
-    const parsed = args.parseReporting(arena.allocator(), inputs.args, &problem) catch |err| switch (err) {
-        error.InvalidArguments => {
-            platform.eprint("ERROR: {f}\n", .{problem});
-            exitClient(1);
-        },
-        else => return err,
+    const parsed = args.parseReporting([*:0]const u8, inputs.args, &problem) catch {
+        platform.eprint("ERROR: {f}\n", .{problem});
+        exitClient(1);
     };
     if (parsed.getSwitch("--address")) |addr| if (addr.len > 0) {
         env.server_path = addr;
@@ -277,7 +269,8 @@ fn run(init: std.process.Init.Minimal) !void {
         printVersion(env);
         return;
     }
-    for (parsed.switches) |sw| if (!sw.isHonoured()) {
+    var switches = parsed.switches();
+    while (switches.next()) |sw| if (!sw.isHonoured()) {
         const words = inputs.args[sw.index..][0..sw.words];
         platform.eprint("juliaclient: ignoring {s}{s}{s}, which only applies as Julia starts (set it for every worker in JULIA_DAEMON_WORKER_ARGS)\n", .{
             words[0], if (words.len > 1) " " else "", if (words.len > 1) words[1] else "",
@@ -309,24 +302,18 @@ fn run(init: std.process.Init.Minimal) !void {
     try runEventLoop(sync);
 }
 
-fn collectInputs(a: std.mem.Allocator, init: std.process.Init.Minimal) !Inputs {
-    var it = try std.process.Args.Iterator.initAllocator(init.args, a);
-    var argv: std.ArrayList([]const u8) = .empty;
-    while (it.next()) |arg| try argv.append(a, arg);
-    return .{ .args = argv.items, .env = try platform.collectEnviron(a, init.environ) };
-}
-
 /// As Julia's `FORCE_COLOR`, over `NO_COLOR`; null for neither.
-fn colorWanted(env: []const []const u8) ?bool {
+fn colorWanted(env: []const [*:0]const u8) ?bool {
     var wanted: ?bool = null;
-    for (env) |kv| {
+    for (env) |kv_z| {
+        const kv = std.mem.span(kv_z);
         if (std.mem.startsWith(u8, kv, "FORCE_COLOR=") and kv.len > "FORCE_COLOR=".len) return true;
         if (std.mem.startsWith(u8, kv, "NO_COLOR=") and kv.len > "NO_COLOR=".len) wanted = false;
     }
     return wanted;
 }
 
-fn scanEnv(kvs: []const []const u8) EnvInfo {
+fn scanEnv(kvs: []const [*:0]const u8) EnvInfo {
     var info = EnvInfo{ .fingerprint = 0, .count = 0, .server_path = null, .runtime_dir = null, .xdg_runtime_dir = null, .home = null };
     const env_vars = .{
         .{ "JULIA_DAEMON_SERVER=", "server_path" },
@@ -334,7 +321,8 @@ fn scanEnv(kvs: []const []const u8) EnvInfo {
         .{ "XDG_RUNTIME_DIR=", "xdg_runtime_dir" },
         .{ "HOME=", "home" },
     };
-    for (kvs) |kv| {
+    for (kvs) |kv_z| {
+        const kv = std.mem.span(kv_z);
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // varies per benchmark run
         // Only a variable is sent, so only one is counted.
         if (std.mem.findScalar(u8, kv, '=') == null) continue;
@@ -439,7 +427,7 @@ fn keepConductor(connection: protocol.Connection, runtime_dir: []const u8) posix
     return connection.socket;
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, forwarded: []const []const u8) !void {
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, forwarded: []const [*:0]const u8) !void {
     w.writeInt(u32, protocol.client.magic);
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color }));
     w.writeSlice(&.{ 0, 0, 0 });
@@ -457,11 +445,11 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, for
     w.pos += cwd.len;
     w.writeInt(u64, env.fingerprint);
     w.writeInt(u32, @intCast(forwarded.len));
-    for (forwarded) |arg| w.writeLenPrefixed(u32, arg);
+    for (forwarded) |arg| w.writeLenPrefixed(u32, std.mem.span(arg));
     w.flush();
 }
 
-fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) !SocketSet {
+fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kvs: []const [*:0]const u8) !SocketSet {
     const reader = protocol.BufReader{ .fd = conductor };
     while (true) switch (reader.readInt(u8) catch |err| replyFailure(err)) {
         protocol.client.env_request => sendFullEnv(w, env, kvs),
@@ -471,9 +459,9 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
     };
     client_id = try reader.readInt(u32);
     var paths_buf: [4 * (max_socket_path + 1)]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&paths_buf);
+    var used: usize = 0;
     var paths: [4][]const u8 = undefined;
-    for (&paths) |*path| path.* = try takeString(reader, fba.allocator());
+    for (&paths) |*path| path.* = try takeString(reader, &paths_buf, &used);
     client_key = try reader.readInt(u64);
     platform.close(conductor);
     const result = SocketSet{
@@ -500,22 +488,22 @@ fn replyFailure(err: anyerror) noreturn {
 }
 
 /// In this client's mount namespace, which the conductor cannot see into.
-fn spawnWorker(reader: protocol.BufReader, kvs: []const []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+fn spawnWorker(reader: protocol.BufReader, kvs: []const [*:0]const u8) !void {
+    var strings: [64 << 10]u8 = undefined;
+    var used: usize = 0;
+    var argv: [64:null]?[*:0]const u8 = undefined;
+    var envp: [4096:null]?[*:0]const u8 = undefined;
     const argc = try reader.readInt(u16);
-    if (argc == 0) return error.BadSpawnRequest;
-    const argv = try a.alloc(?[*:0]const u8, argc + 1);
-    for (argv[0..argc]) |*arg| arg.* = (try takeString(reader, a)).ptr;
+    if (argc == 0 or argc > argv.len) return error.BadSpawnRequest;
+    for (argv[0..argc]) |*arg| arg.* = (try takeString(reader, &strings, &used)).ptr;
     argv[argc] = null;
     // The daemon's own settings go first, so they shadow ours for the worker.
     const envc = try reader.readInt(u16);
-    const envp = try a.alloc(?[*:0]const u8, envc + kvs.len + 1);
-    for (envp[0..envc]) |*entry| entry.* = (try takeString(reader, a)).ptr;
-    for (kvs, envp[envc .. envc + kvs.len]) |kv, *entry| entry.* = (try a.dupeSentinel(u8, kv, 0)).ptr;
+    if (envc + kvs.len > envp.len) return error.BadSpawnRequest;
+    for (envp[0..envc]) |*entry| entry.* = (try takeString(reader, &strings, &used)).ptr;
+    for (kvs, envp[envc .. envc + kvs.len]) |kv, *entry| entry.* = kv;
     envp[envc + kvs.len] = null;
-    platform.spawnDetached(@ptrCast(argv.ptr), @ptrCast(envp.ptr)) catch |err| {
+    platform.spawnDetached(&argv, &envp) catch |err| {
         platform.eprint("Cannot start a Julia worker inside this sandbox: {s} ({s}).\n", .{
             std.mem.span(argv[0].?), @errorName(err),
         });
@@ -528,16 +516,21 @@ fn spawnWorker(reader: protocol.BufReader, kvs: []const []const u8) !void {
     };
 }
 
-fn takeString(reader: protocol.BufReader, a: std.mem.Allocator) ![:0]u8 {
+/// Into `buf` from `used.*` on, which it moves past.
+fn takeString(reader: protocol.BufReader, buf: []u8, used: *usize) ![:0]u8 {
     const len = try reader.readInt(u16);
-    const s = try a.allocSentinel(u8, len, 0);
-    try reader.readSlice(s);
-    return s;
+    if (len >= buf.len - used.*) return error.BadReply;
+    const start = used.*;
+    try reader.readSlice(buf[start..][0..len]);
+    buf[start + len] = 0;
+    used.* += len + 1;
+    return buf[start..][0..len :0];
 }
 
-fn sendFullEnv(w: *SocketWriter, env: EnvInfo, kvs: []const []const u8) void {
+fn sendFullEnv(w: *SocketWriter, env: EnvInfo, kvs: []const [*:0]const u8) void {
     w.writeInt(u32, env.count);
-    for (kvs) |kv| {
+    for (kvs) |kv_z| {
+        const kv = std.mem.span(kv_z);
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue;
         const eq = std.mem.findScalar(u8, kv, '=') orelse continue;
         w.writeLenPrefixed(u32, kv[0..eq]);

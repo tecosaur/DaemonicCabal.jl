@@ -743,7 +743,12 @@ pub const Worker = struct {
         // flags, id, key, cwd, the three counts, the program file's flag, port set
         var payload_size: usize = 1 + 4 + 8 + 4 + client_info.cwd.len + 3 * 4 + 1 + pf_len + 2;
         for (client_info.env) |e| payload_size += 8 + e.key.len + e.value.len;
-        for (client_info.switches) |sw| payload_size += 8 + sw.name.len + sw.value.len;
+        var sizing = client_info.switches;
+        var switch_count: u32 = 0;
+        while (sizing.next()) |sw| {
+            payload_size += 8 + sw.name.len + sw.value.len;
+            switch_count += 1;
+        }
         for (client_info.args) |arg| payload_size += 4 + arg.len;
         const send_buf = try allocator.alloc(u8, payload_size);
         defer allocator.free(send_buf);
@@ -757,8 +762,9 @@ pub const Worker = struct {
             w.writeLenPrefixed(u32, e.key);
             w.writeLenPrefixed(u32, e.value);
         }
-        w.writeInt(u32, @intCast(client_info.switches.len));
-        for (client_info.switches) |sw| {
+        w.writeInt(u32, switch_count);
+        var switches = client_info.switches;
+        while (switches.next()) |sw| {
             w.writeLenPrefixed(u32, sw.name);
             w.writeLenPrefixed(u32, sw.value);
         }
@@ -837,7 +843,7 @@ pub const ClientInfo = struct {
     ppid: u32,
     cwd: []const u8,
     env: []const EnvVar,
-    switches: []const args.Switch,
+    switches: args.Scanner([]const u8),
     programfile: ?[]const u8,
     args: []const []const u8,
     port_set: u16, // PortPool index, or PortPool.none when unmanaged

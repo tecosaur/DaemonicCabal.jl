@@ -20,6 +20,11 @@ const Location = enum(u64) {
 const buf_size = 1024;
 
 const StdinArgs = struct { src: posix.fd_t, fwd: cooked.StdinForwarder };
+// The stdin thread's, for the process's life.
+var stdin_args: StdinArgs = undefined;
+// The kernel's while a read is pending, which may outlast `run`.
+var bufs: [3][buf_size]u8 = undefined;
+var ctxs: [3]platform.RecvCtx = undefined;
 
 fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
     const args: *StdinArgs = @ptrCast(@alignCast(param orelse return 1));
@@ -51,23 +56,22 @@ pub fn run(
         return error.IocpCreateFailed;
     defer win32.CloseHandle(port);
 
-    const args = try std.heap.page_allocator.create(StdinArgs);
-    args.* = .{
+    stdin_args = .{
         .src = platform.getStdinHandle(),
         .fwd = .{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw },
     };
-    _ = platform.CreateThread(null, 0, &stdinProc, args, 0, null) orelse
+    _ = platform.CreateThread(null, 0, &stdinProc, &stdin_args, 0, null) orelse
         return error.StdinThreadFailed;
 
     const stream_fds = [3]posix.fd_t{ stdout_fd, stderr_fd, signals_fd };
-    var bufs: [3][buf_size]u8 = undefined;
-    var ctxs: [3]?*platform.RecvCtx = .{ null, null, null };
+    var pending = [3]bool{ false, false, false };
     for (stream_fds, 0..) |fd, i| {
         const loc: Location = @enumFromInt(i);
         if (platform.CreateIoCompletionPort(fd, port, @intFromEnum(loc), 0) == null)
             return error.IocpAssociateFailed;
         platform.markAssociated(fd);
-        ctxs[i] = platform.issueRecv(fd, &bufs[i]) orelse return error.StreamDead;
+        pending[i] = platform.issueRecv(fd, &bufs[i], &ctxs[i]);
+        if (!pending[i]) return error.StreamDead;
     }
 
     // Signals EOF without an exit code means the worker crashed.
@@ -91,10 +95,9 @@ pub fn run(
         const loc: Location = @enumFromInt(key);
         const idx: usize = @intFromEnum(loc);
 
-        const ctx = ctxs[idx] orelse continue;
-        ctxs[idx] = null;
-        const status = ctx.iosb.u.Status;
-        std.heap.page_allocator.destroy(ctx);
+        if (!pending[idx]) continue;
+        pending[idx] = false;
+        const status = ctxs[idx].iosb.u.Status;
 
         switch (loc) {
             .worker_stdout, .worker_stderr => {
@@ -108,8 +111,8 @@ pub fn run(
                         eof[idx] = true;
                         continue;
                     }
-                    ctxs[idx] = platform.issueRecv(stream_fds[idx], &bufs[idx]);
-                    if (ctxs[idx] == null) eof[idx] = true;
+                    pending[idx] = platform.issueRecv(stream_fds[idx], &bufs[idx], &ctxs[idx]);
+                    if (!pending[idx]) eof[idx] = true;
                 } else {
                     eof[idx] = true;
                 }
@@ -121,8 +124,8 @@ pub fn run(
                             exit_code = code;
                         },
                         .none => {
-                            ctxs[idx] = platform.issueRecv(signals_fd, &bufs[idx]);
-                            if (ctxs[idx] == null and exit_code == null) exit_code = 1;
+                            pending[idx] = platform.issueRecv(signals_fd, &bufs[idx], &ctxs[idx]);
+                            if (!pending[idx] and exit_code == null) exit_code = 1;
                         },
                     }
                 } else if (exit_code == null) {
