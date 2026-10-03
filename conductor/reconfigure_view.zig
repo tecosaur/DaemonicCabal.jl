@@ -67,7 +67,7 @@ pub const Check = struct {
 
     pub fn set(self: *Check, tone: @FieldType(Check, "tone"), comptime fmt: []const u8, fmt_args: anytype) void {
         self.tone = tone;
-        self.len = if (std.fmt.bufPrint(&self.bytes, fmt, fmt_args)) |t| t.len else |_| 0;
+        self.len = if (std.mem.print(&self.bytes, fmt, fmt_args)) |t| t.len else |_| 0;
     }
 
     fn text(self: *const Check) []const u8 {
@@ -398,7 +398,7 @@ const Frame = struct {
         try self.writeWrapped(s.about, text_width, indent.buffered(), self.muted());
         if (s.used) |use| if (!use.check(row.values)) {
             var reason_buf: [128]u8 = undefined;
-            const text = std.fmt.bufPrint(&reason_buf, "{c}{s}.", .{ std.ascii.toUpper(use.reason[0]), use.reason[1..] }) catch use.reason;
+            const text = std.mem.print(&reason_buf, "{c}{s}.", .{ std.ascii.toUpper(use.reason[0]), use.reason[1..] }) catch use.reason;
             try self.writeWrapped(text, text_width, indent.buffered(), self.muted());
         };
     }
@@ -580,11 +580,11 @@ test "a staged change shows what it was, and the footer counts it" {
     const scene = sceneOf(&state, &staged, &styles, 1, revise);
     const text = try drawnText(&scene);
     defer gpa.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "❯ Revise") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "yes") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "was default no") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "1 change staged") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Sessions*") != null);
+    try testing.expect(std.mem.find(u8, text, "❯ Revise") != null);
+    try testing.expect(std.mem.find(u8, text, "yes") != null);
+    try testing.expect(std.mem.find(u8, text, "was default no") != null);
+    try testing.expect(std.mem.find(u8, text, "1 change staged") != null);
+    try testing.expect(std.mem.find(u8, text, "Sessions*") != null);
 }
 
 test "keys that would do nothing are greyed" {
@@ -601,13 +601,13 @@ test "keys that would do nothing are greyed" {
     defer out.deinit(gpa);
     _ = try draw(gpa, &out, &scene, 0);
     // Nothing to apply or save: greyed, not bold.
-    try testing.expect(std.mem.indexOf(u8, out.items, bold ++ "a" ++ reset) == null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[90ma apply") != null);
+    try testing.expect(std.mem.find(u8, out.items, bold ++ "a" ++ reset) == null);
+    try testing.expect(std.mem.find(u8, out.items, "\x1b[90ma apply") != null);
     try staged.stage(gpa, &state, 0, "2");
     scene = sceneOf(&state, &staged, &styles, 0, 0);
     out.clearRetainingCapacity();
     _ = try draw(gpa, &out, &scene, 0);
-    try testing.expect(std.mem.indexOf(u8, out.items, bold ++ "a" ++ reset) != null);
+    try testing.expect(std.mem.find(u8, out.items, bold ++ "a" ++ reset) != null);
 }
 
 test "a change workers missed is marked on its row" {
@@ -627,8 +627,8 @@ test "a change workers missed is marked on its row" {
     scene.fleet = .{ .oldest_spawn_ns = 5, .idle_stale = true };
     const text = try drawnText(&scene);
     defer gpa.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "unsaved · new workers") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "1 change unsaved · 1 only for new workers: r retires the idle ones") != null);
+    try testing.expect(std.mem.find(u8, text, "unsaved · new workers") != null);
+    try testing.expect(std.mem.find(u8, text, "1 change unsaved · 1 only for new workers: r retires the idle ones") != null);
 }
 
 test "a frame taller than the terminal scrolls to keep its focus" {
@@ -651,11 +651,11 @@ test "a frame taller than the terminal scrolls to keep its focus" {
     const text = try drawnText(&scene);
     defer gpa.free(text);
     try testing.expectEqual(@as(usize, 7), std.mem.count(u8, text, "\n"));
-    try testing.expect(std.mem.indexOf(u8, text, "❯") != null and std.mem.indexOf(u8, text, "eased above") != null);
+    try testing.expect(std.mem.find(u8, text, "❯") != null and std.mem.find(u8, text, "eased above") != null);
     // The cursor's line is the focused row's, among those shown.
     var lines = std.mem.splitScalar(u8, text, '\n');
     for (0..cursor_line) |_| _ = lines.next();
-    try testing.expect(std.mem.indexOf(u8, lines.next().?, "eased above") != null);
+    try testing.expect(std.mem.find(u8, lines.next().?, "eased above") != null);
 }
 
 test "the editor's cursor is placed past wide characters' two columns" {
@@ -675,7 +675,7 @@ test "the editor's cursor is placed past wide characters' two columns" {
     defer out.deinit(gpa);
     _ = try draw(gpa, &out, &scene, 0);
     var expected: [16]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, out.items, try std.fmt.bufPrint(&expected, "\x1b[{d}G", .{value_col + 5})) != null);
+    try testing.expect(std.mem.find(u8, out.items, try std.mem.print(&expected, "\x1b[{d}G", .{value_col + 5})) != null);
 }
 
 test "a terminal a row high gets no cursor-up of 0, which moves one" {
@@ -695,5 +695,5 @@ test "a terminal a row high gets no cursor-up of 0, which moves one" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), try draw(gpa, &out, &scene, 0));
-    try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[0A") == null);
+    try testing.expect(std.mem.find(u8, out.items, "\x1b[0A") == null);
 }

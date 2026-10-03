@@ -8,7 +8,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const Io = std.Io;
 const protocol = @import("../protocol.zig");
-const impl = if (builtin.os.tag == .linux) @import("linux.zig") else @import("bsd.zig");
+const impl = if (builtin.target.os.tag == .linux) @import("linux.zig") else @import("bsd.zig");
 
 /// std.debug.print without its stderr locking and terminal handling, which
 /// cost the client ~110 KB. Truncates past 1 KiB.
@@ -22,9 +22,9 @@ pub fn eprint(comptime fmt: []const u8, args: anytype) void {
 /// Into an allocator (owned slice) or a `[]u8` buffer (sub-slice).
 pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
     if (@TypeOf(out) == std.mem.Allocator)
-        return std.fmt.allocPrint(out, fmt, args)
+        return out.print(fmt, args)
     else
-        return std.fmt.bufPrint(out, fmt, args) catch error.NameTooLong;
+        return std.mem.print(out, fmt, args) catch error.NameTooLong;
 }
 
 // I/O
@@ -86,8 +86,8 @@ pub const private_file_permissions: Io.File.Permissions = .fromMode(0o600);
 /// Refuses `path` unless it is a directory of ours, not a symlink, which is
 /// narrowed to owner-only. Absent is fine: there is nothing in it to trust.
 pub fn secureRuntimeDir(path: []const u8) error{UntrustedRuntimeDir}!void {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const pathz = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return refuseRuntimeDir(path, "is too long a path", .{});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const pathz = std.mem.printSentinel(&path_buf, "{s}", .{path}, 0) catch return refuseRuntimeDir(path, "is too long a path", .{});
     const fd = posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true }, 0) catch |err| switch (err) {
         error.FileNotFound => return,
         error.SymLinkLoop => return refuseRuntimeDir(path, "is a symlink", .{}),
@@ -108,8 +108,8 @@ fn refuseRuntimeDir(path: []const u8, comptime reason: []const u8, args: anytype
 }
 /// Up to `buf`'s length of a small file; null where it can't be read.
 pub fn readSmallFile(path: []const u8, buf: []u8) ?[]u8 {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const pathz = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return null;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const pathz = std.mem.printSentinel(&path_buf, "{s}", .{path}, 0) catch return null;
     const fd = posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return null;
     defer impl.rawClose(fd);
     return buf[0 .. posix.read(fd, buf) catch return null];
@@ -258,8 +258,8 @@ pub fn collectEnviron(allocator: std.mem.Allocator, environ: std.process.Environ
 /// Signal the conductor whose pid `pid_path` holds (its SIGUSR1 handler),
 /// if it lives: it holds the file locked.
 pub fn requestSocketRecreate(pid_path: []const u8) bool {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}", .{pid_path}) catch return false;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = std.mem.printSentinel(&path_buf, "{s}", .{pid_path}, 0) catch return false;
     const fd = posix.openatZ(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return false;
     defer impl.rawClose(fd);
     if (posix.errno(posix.system.flock(fd, posix.LOCK.SH | posix.LOCK.NB)) != .AGAIN) return false;

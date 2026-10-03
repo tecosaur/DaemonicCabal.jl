@@ -21,7 +21,7 @@ pub const StdinForwarder = struct {
     pub fn forward(self: *StdinForwarder, bytes: []const u8) void {
         var rest = bytes;
         if (platform.ctrlCIsInput() and !platform.ctrlCIsKey()) {
-            while (std.mem.indexOfScalar(u8, rest, 0x03)) |i| {
+            while (std.mem.findScalar(u8, rest, 0x03)) |i| {
                 self.pass(rest[0..i]);
                 if (self.isCooked()) self.cooked.discard();
                 platform.interrupt();

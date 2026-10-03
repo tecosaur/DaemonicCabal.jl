@@ -43,7 +43,7 @@ pub const LogRing = struct {
     /// Stderr in whatever pieces it came, each line added once ended.
     pub fn feed(self: *LogRing, gpa: std.mem.Allocator, when: i64, bytes: []const u8) void {
         var rest = bytes;
-        while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+        while (std.mem.findScalar(u8, rest, '\n')) |nl| {
             if (self.partial.items.len > 0) {
                 self.partial.appendSlice(gpa, rest[0..nl]) catch {};
                 self.add(gpa, when, .worker, self.partial.items);
@@ -82,8 +82,8 @@ test "the oldest go past the limit" {
     var ring = LogRing{};
     defer ring.deinit(gpa);
     var buf: [16]u8 = undefined;
-    for (0..max_entries + 5) |i| ring.add(gpa, @intCast(i), .worker, try std.fmt.bufPrint(&buf, "line {d}", .{i}));
+    for (0..max_entries + 5) |i| ring.add(gpa, @intCast(i), .worker, try std.mem.print(&buf, "line {d}", .{i}));
     try std.testing.expectEqual(@as(usize, max_entries), ring.count);
     try std.testing.expectEqualStrings("line 5", ring.at(0).text);
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "line {d}", .{max_entries + 4}), ring.at(max_entries - 1).text);
+    try std.testing.expectEqualStrings(try std.mem.print(&buf, "line {d}", .{max_entries + 4}), ring.at(max_entries - 1).text);
 }

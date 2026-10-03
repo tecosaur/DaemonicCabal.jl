@@ -22,9 +22,9 @@ pub fn resolve(
     if (std.mem.eql(u8, project, "@.")) return if (cwd.len == 0) null else findProjectToml(allocator, io, cwd, home_dir);
     if (std.mem.startsWith(u8, project, "@")) return try allocator.dupe(u8, project);
     if ((std.mem.eql(u8, project, "~") or std.mem.startsWith(u8, project, "~/")) and home_dir.len > 0)
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home_dir, project[1..] });
-    if (cwd.len == 0 and !std.fs.path.isAbsolute(project)) return error.CurrentDirUnavailable;
-    return try std.fs.path.resolve(allocator, &.{ cwd, project });
+        return try allocator.print("{s}{s}", .{ home_dir, project[1..] });
+    if (cwd.len == 0 and !std.Io.Dir.path.isAbsolute(project)) return error.CurrentDirUnavailable;
+    return try std.Io.Dir.path.resolveAlloc(allocator, &.{ cwd, project });
 }
 
 // As Base.project_names; the directory stands for whichever it holds.
@@ -33,16 +33,16 @@ const project_names = [_][]const u8{ "JuliaProject.toml", "Project.toml" };
 /// As Base.current_project: from `start_dir` up, giving up after `home_dir`.
 fn findProjectToml(allocator: std.mem.Allocator, io: Io, start_dir: []const u8, home_dir: []const u8) !?[]const u8 {
     var dir = start_dir;
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     while (true) {
         for (project_names) |name| {
-            const project_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name });
+            const project_path = try std.mem.print(&path_buf, "{s}/{s}", .{ dir, name });
             const file = Io.Dir.openFileAbsolute(io, project_path, .{}) catch continue;
             file.close(io);
             if (isNamedExactly(io, dir, name)) return try allocator.dupe(u8, dir);
         }
         if (std.mem.eql(u8, dir, home_dir)) return null;
-        const parent = std.fs.path.dirname(dir) orelse return null;
+        const parent = std.Io.Dir.path.dirname(dir) orelse return null;
         if (std.mem.eql(u8, parent, dir)) return null;
         dir = parent;
     }
@@ -78,7 +78,7 @@ test "a project names a path from the client's cwd, or an environment" {
     };
     for (cases) |case| {
         var parsed = try args.parse(gpa, case.argv);
-        defer parsed.deinit();
+        defer parsed.deinit(gpa);
         const got = try resolve(gpa, std.testing.io, &parsed, case.julia_project, "/home/me", "/work/app");
         defer if (got) |g| gpa.free(g);
         if (case.want) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);
@@ -95,7 +95,7 @@ test "a deleted cwd, sent empty, names no project" {
     };
     for (cases) |case| {
         var parsed = try args.parse(gpa, case.argv);
-        defer parsed.deinit();
+        defer parsed.deinit(gpa);
         const got = resolve(gpa, std.testing.io, &parsed, null, "/home/me", "");
         defer if (got) |g| if (g) |p| gpa.free(p) else {} else |_| {};
         const want = case.want catch |err| {
@@ -115,13 +115,13 @@ test "@. finds the project above the cwd" {
     try tmp.dir.writeFile(io, .{ .sub_path = "home/app/Project.toml", .data = "" });
     try tmp.dir.writeFile(io, .{ .sub_path = "home/app/src/project.toml", .data = "" });
     try tmp.dir.writeFile(io, .{ .sub_path = "Project.toml", .data = "" });
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(io, &buf)];
-    const home = try std.fs.path.join(gpa, &.{ root, "home" });
+    const home = try std.Io.Dir.path.join(gpa, &.{ root, "home" });
     defer gpa.free(home);
-    const app = try std.fs.path.join(gpa, &.{ home, "app" });
+    const app = try std.Io.Dir.path.join(gpa, &.{ home, "app" });
     defer gpa.free(app);
-    const src = try std.fs.path.join(gpa, &.{ app, "src" });
+    const src = try std.Io.Dir.path.join(gpa, &.{ app, "src" });
     defer gpa.free(src);
     const cases = [_]struct { argv: []const []const u8, home: []const u8 = "", cwd: []const u8, want: ?[]const u8 }{
         .{ .argv = &.{ "julia", "--project=@.", "-e", "1" }, .cwd = src, .want = app },
@@ -137,7 +137,7 @@ test "@. finds the project above the cwd" {
     };
     for (cases) |case| {
         var parsed = try args.parse(gpa, case.argv);
-        defer parsed.deinit();
+        defer parsed.deinit(gpa);
         const got = try resolve(gpa, io, &parsed, null, case.home, case.cwd);
         defer if (got) |g| gpa.free(g);
         if (case.want) |want| try std.testing.expectEqualStrings(want, got.?) else try std.testing.expect(got == null);

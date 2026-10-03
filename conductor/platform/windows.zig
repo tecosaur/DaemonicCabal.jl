@@ -554,7 +554,7 @@ fn connectAfd(fd: HANDLE, addr: *const posix.sockaddr, len: posix.socklen_t, tim
     var one: bool = true;
     try afdSockopt(fd, .set, win32.ws2_32.SOL.SOCKET, win32.ws2_32.SO.REUSE_UNICASTPORT, @as([]u8, @ptrCast(&one))[0..1]);
     // AFD wants an explicit bind of the unspecified address before a connect.
-    var bind_addr: [28]u8 = [_]u8{0} ** 28;
+    var bind_addr: [28]u8 = @splat(0);
     std.mem.writeInt(u16, bind_addr[0..2], addr.family, .little);
     const blen: usize = if (addr.family == posix.AF.INET) @sizeOf(posix.sockaddr.in) else @sizeOf(posix.sockaddr.in6);
     try afdBind(fd, .Active, bind_addr[0..blen]);
@@ -649,7 +649,7 @@ extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: DW
 
 /// Up to `buf`'s length of a small file; null where it can't be read.
 pub fn readSmallFile(path: []const u8, buf: []u8) ?[]u8 {
-    var wide: [std.fs.max_path_bytes:0]u16 = undefined;
+    var wide: [std.Io.Dir.max_path_bytes:0]u16 = undefined;
     const len = std.unicode.utf8ToUtf16Le(&wide, path) catch return null;
     wide[len] = 0;
     const GENERIC_READ: DWORD = 0x80000000;
@@ -1145,7 +1145,7 @@ pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
     if (!QueryFullProcessImageNameW(handle, 0, &wide, &size).toBool()) return null;
     var full_buf: [2048]u8 = undefined;
     const full_len = std.unicode.utf16LeToUtf8(&full_buf, wide[0..size]) catch return null;
-    const base = std.fs.path.basename(full_buf[0..full_len]);
+    const base = std.Io.Dir.path.basename(full_buf[0..full_len]);
     const n = @min(base.len, buf.len);
     @memcpy(buf[0..n], base[0..n]);
     return buf[0..n];
@@ -1250,9 +1250,9 @@ pub fn collectEnviron(allocator: Allocator, environ: std.process.Environ) ![]con
 /// Into an allocator (owned slice) or a `[]u8` buffer (sub-slice).
 pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 {
     if (@TypeOf(out) == std.mem.Allocator)
-        return std.fmt.allocPrint(out, fmt, args)
+        return out.print(fmt, args)
     else
-        return std.fmt.bufPrint(out, fmt, args) catch error.NameTooLong;
+        return std.mem.print(out, fmt, args) catch error.NameTooLong;
 }
 
 // =============================================================================

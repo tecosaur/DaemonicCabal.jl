@@ -12,7 +12,7 @@ const config = @import("config.zig");
 const args = @import("args.zig");
 const peek = @import("peek.zig");
 const logring = @import("logring.zig");
-pub const sandbox = if (builtin.os.tag == .linux) @import("sandbox.zig") else struct {
+pub const sandbox = if (builtin.target.os.tag == .linux) @import("sandbox.zig") else struct {
     pub fn envAllowed(_: []const u8) bool {
         return false;
     }
@@ -168,7 +168,7 @@ pub const Worker = struct {
     launch: LaunchKind = .direct,
     interactive: bool = false,
     pidfd: ?posix.fd_t = null, // for a client-spawned worker, which is not our child
-    recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,
+    recent_ppids: [max_recent_ppids]u32 = @splat(0),
     recent_ppids_next: usize = 0,
     stderr_scan: peek.Scanner = .{}, // for the stacks a snapshot writes there
     recent: logring.LogRing = .{}, // its stderr and our lines about it, for the live view
@@ -201,7 +201,7 @@ pub const Worker = struct {
         /// The conductor's own, which a direct worker inherits.
         environ_map: *const std.process.Environ.Map,
     ) !Spawn {
-        var subdir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var subdir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const socket_dir = try socketDir(&subdir_buf, cfg.socket_dir, launch, id);
         if (launch == .sandboxed) Io.Dir.createDirAbsolute(io, socket_dir, .default_dir) catch {};
         var setup = try protocol.createListener(io, .local, socket_dir, "wsetup.sock", "");
@@ -212,13 +212,12 @@ pub const Worker = struct {
         var address_buf: [protocol.max_socket_path + 16]u8 = undefined;
         const conductor_address = if (cfg.transport == .tcp) blk: {
             const target = try protocol.splitHostPort(cfg.socket_path);
-            const bracketed = std.mem.indexOfScalar(u8, target.host, ':') != null;
-            break :blk std.fmt.bufPrint(&address_buf, "tcp://{s}{s}{s}:{d}", .{
+            const bracketed = std.mem.findScalar(u8, target.host, ':') != null;
+            break :blk std.mem.print(&address_buf, "tcp://{s}{s}{s}:{d}", .{
                 if (bracketed) "[" else "", target.host, if (bracketed) "]" else "", target.port,
             }) catch return error.PathTooLong;
         } else cfg.socket_path;
-        const eval_expr = try std.fmt.allocPrint(
-            allocator,
+        const eval_expr = try allocator.print(
             "using DaemonWorker; DaemonWorker.runworker({f}, {f}, {d})",
             .{ juliaString(setup.addr()), juliaString(conductor_address), id },
         );
@@ -226,7 +225,7 @@ pub const Worker = struct {
         // Passed after worker_args so a client's request wins.
         const threads_arg: ?[]const u8 = if (try args.renderThreads(allocator, threads)) |v| blk: {
             defer allocator.free(v);
-            break :blk try std.fmt.allocPrint(allocator, "--threads={s}", .{v});
+            break :blk try allocator.print("--threads={s}", .{v});
         } else null;
         defer if (threads_arg) |a| allocator.free(a);
         const environ: ?*const std.process.Environ.Map = switch (launch) {
@@ -235,13 +234,13 @@ pub const Worker = struct {
             .client => |c| c.environ,
         };
         // Raw execve (sandbox, client spawn) needs an absolute path.
-        const bare = std.mem.indexOfScalar(u8, cfg.worker_executable, '/') == null;
+        const bare = std.mem.findScalar(u8, cfg.worker_executable, '/') == null;
         const resolved: ?[]const u8 = if (!bare) cfg.worker_executable else if (environ) |env|
             (if (env.get("PATH")) |p| resolveInPath(io, cfg.worker_executable, p) else null)
         else
             null;
         const child: std.process.Child = switch (launch) {
-            .sandboxed => |s| if (comptime builtin.os.tag != .linux) return error.SandboxUnsupported else blk: {
+            .sandboxed => |s| if (comptime builtin.target.os.tag != .linux) return error.SandboxUnsupported else blk: {
                 const exe_path = resolved orelse cfg.worker_executable;
                 var ro_binds: [8][]const u8 = undefined;
                 const n_ro = 1 + s.ro_binds.len;
@@ -275,28 +274,28 @@ pub const Worker = struct {
                 break :blk .{ .id = sandbox_pid, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
             },
             .direct, .client => blk: {
-                var argv = std.array_list.AlignedManaged([]const u8, null).init(allocator);
-                defer argv.deinit();
-                try argv.append(if (launch == .client) resolved orelse {
+                var argv: std.ArrayList([]const u8) = .empty;
+                defer argv.deinit(allocator);
+                try argv.append(allocator, if (launch == .client) resolved orelse {
                     std.debug.print("Worker {d}: cannot resolve '{s}' on the daemon's PATH to name it to the client's sandbox; set JULIA_DAEMON_WORKER_EXECUTABLE to an absolute path\n", .{ id, cfg.worker_executable });
                     return error.ExecutableNotFound;
                 } else cfg.worker_executable);
-                if (julia_channel) |ch| try argv.append(ch);
+                if (julia_channel) |ch| try argv.append(allocator, ch);
                 const project_arg: ?[]const u8 = if (cfg.worker_project.len > 0)
-                    try std.fmt.allocPrint(allocator, "--project={s}", .{cfg.worker_project})
+                    try allocator.print("--project={s}", .{cfg.worker_project})
                 else
                     null;
                 defer if (project_arg) |p| allocator.free(p);
-                if (project_arg) |p| try argv.append(p);
+                if (project_arg) |p| try argv.append(allocator, p);
                 {
                     // Args containing spaces are not supported.
                     var it = std.mem.tokenizeScalar(u8, cfg.worker_args, ' ');
-                    while (it.next()) |arg| try argv.append(arg);
+                    while (it.next()) |arg| try argv.append(allocator, arg);
                 }
-                if (threads_arg) |a| try argv.append(a);
-                if (interactive) try argv.append("-i");
-                try argv.append("--eval");
-                try argv.append(eval_expr);
+                if (threads_arg) |a| try argv.append(allocator, a);
+                if (interactive) try argv.append(allocator, "-i");
+                try argv.append(allocator, "--eval");
+                try argv.append(allocator, eval_expr);
                 break :blk switch (launch) {
                     .client => |c| handed: {
                         try sendSpawnRequest(c.socket, argv.items, c.environ);
@@ -801,7 +800,7 @@ pub const Worker = struct {
         try self.readAll(payload);
         var r = protocol.SliceReader{ .bytes = payload };
         self.active_clients = r.int(u32) catch return error.UnexpectedResponse;
-        var own_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var own_dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const own_dir = if (socket_dir) |d| std.mem.trimEnd(u8, try socketDir(&own_dir_buf, d, self.launch, self.id), "/") else null;
         var paths: [4][]const u8 = undefined;
         for (&paths, 0..) |*path, i| {
@@ -811,8 +810,8 @@ pub const Worker = struct {
             if (path.len > protocol.max_socket_path) return error.UnexpectedResponse;
             // A sandboxed worker could otherwise name any socket the client can reach.
             if (own_dir) |dir| {
-                const name = if (path.len > dir.len and std.mem.startsWith(u8, path.*, dir) and std.fs.path.isSep(path.*[dir.len])) path.*[dir.len + 1 ..] else "";
-                if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\") != null or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+                const name = if (path.len > dir.len and std.mem.startsWith(u8, path.*, dir) and std.Io.Dir.path.isSep(path.*[dir.len])) path.*[dir.len + 1 ..] else "";
+                if (name.len == 0 or std.mem.findAny(u8, name, "/\\") != null or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
                     self.log("runClient expected sockets in {s}, got {s}", .{ dir, path.* });
                     return error.UnexpectedResponse;
                 }
@@ -826,7 +825,7 @@ pub const Worker = struct {
 /// sandbox binds only a subdirectory of the conductor's `socket_dir`.
 pub fn socketDir(buf: []u8, socket_dir: []const u8, launch: Worker.LaunchKind, id: u32) ![]const u8 {
     if (launch != .sandboxed) return socket_dir;
-    return std.fmt.bufPrint(buf, "{s}/sandbox-{d}", .{ socket_dir, id }) catch error.PathTooLong;
+    return std.mem.print(buf, "{s}/sandbox-{d}", .{ socket_dir, id }) catch error.PathTooLong;
 }
 
 pub const ClientInfo = struct {
@@ -870,12 +869,12 @@ pub fn freeEnv(allocator: Allocator, env: []const EnvVar) void {
     allocator.free(env);
 }
 
-var resolve_buf: [std.fs.max_path_bytes]u8 = undefined;
+var resolve_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 fn resolveInPath(io: Io, name: []const u8, path_env: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        const candidate = std.fmt.bufPrint(&resolve_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        const candidate = std.mem.print(&resolve_buf, "{s}/{s}", .{ dir, name }) catch continue;
         Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
         return candidate;
     }

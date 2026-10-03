@@ -44,7 +44,7 @@ pub const Service = struct {
 
     /// `<kind>:<path>`, as JULIA_DAEMON_SERVICE holds it.
     pub fn parse(spec: []const u8) ?Service {
-        const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return null;
+        const colon = std.mem.findScalar(u8, spec, ':') orelse return null;
         const kind = std.meta.stringToEnum(Kind, spec[0..colon]) orelse return null;
         const path = spec[colon + 1 ..];
         if (path.len == 0) return null;
@@ -54,7 +54,7 @@ pub const Service = struct {
     /// Where saved changes are written.
     pub fn target(self: Service, buf: []u8) error{NameTooLong}![]const u8 {
         return switch (self.kind) {
-            .systemd => std.fmt.bufPrint(buf, "{s}.d/" ++ drop_in, .{self.path}) catch error.NameTooLong,
+            .systemd => std.mem.print(buf, "{s}.d/" ++ drop_in, .{self.path}) catch error.NameTooLong,
             .launchd, .powershell => self.path,
         };
     }
@@ -109,7 +109,7 @@ pub fn load(gpa: Allocator, io: Io, service: Service, out: *Declared) !void {
     defer gpa.free(text);
     try parse(gpa, service.kind, text, out);
     if (service.kind != .systemd) return;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const extra = try readIfThere(gpa, io, try service.target(&buf)) orelse return;
     defer gpa.free(extra);
     try parse(gpa, .systemd, extra, out);
@@ -118,8 +118,8 @@ pub fn load(gpa: Allocator, io: Io, service: Service, out: *Declared) !void {
 /// Writes `changes` to the service's environment, replacing the file whole
 /// (through a symbolic link, the file it names).
 pub fn save(gpa: Allocator, io: Io, service: Service, changes: []const Change) !void {
-    for (changes) |change| if (change.value) |v| if (std.mem.indexOfAny(u8, v, "\r\n") != null) return error.Unwritable;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (changes) |change| if (change.value) |v| if (std.mem.findAny(u8, v, "\r\n") != null) return error.Unwritable;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try service.target(&buf);
     const rewritten = switch (service.kind) {
         .systemd => blk: {
@@ -135,7 +135,7 @@ pub fn save(gpa: Allocator, io: Io, service: Service, changes: []const Change) !
                 try parse(gpa, .systemd, existing, &overrides);
             }
             for (changes) |change| try overrides.put(change.key, change.value);
-            try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+            try Io.Dir.cwd().createDirPath(io, std.Io.Dir.path.dirname(path).?);
             break :blk try dropIn(gpa, &unit.set, &overrides);
         },
         .launchd, .powershell => blk: {
@@ -161,7 +161,7 @@ pub fn parse(gpa: Allocator, kind: Kind, text: []const u8, out: *Declared) Error
 
 /// `text`, a plist or script, with `changes` made.
 pub fn rewrite(gpa: Allocator, kind: Kind, text: []const u8, changes: []const Change) Error![]u8 {
-    for (changes) |change| if (change.value) |v| if (std.mem.indexOfAny(u8, v, "\r\n") != null) return error.Unwritable;
+    for (changes) |change| if (change.value) |v| if (std.mem.findAny(u8, v, "\r\n") != null) return error.Unwritable;
     return switch (kind) {
         .systemd => unreachable, // a drop-in is written whole
         .launchd => rewritePlist(gpa, text, changes),
@@ -221,7 +221,7 @@ fn parseSystemd(gpa: Allocator, text: []const u8, out: *Declared) Error!void {
             var words = SystemdWords{ .text = line["Environment=".len..] };
             while (try words.next(gpa)) |word| {
                 defer gpa.free(word);
-                const eq = std.mem.indexOfScalar(u8, word, '=') orelse continue;
+                const eq = std.mem.findScalar(u8, word, '=') orelse continue;
                 if (eq == 0) continue;
                 try out.put(word[0..eq], word[eq + 1 ..]);
             }
@@ -283,23 +283,23 @@ const plist_indent = "        ";
 
 // The EnvironmentVariables dict's contents, between its tags.
 fn plistEnvSpan(text: []const u8) Error!struct { start: usize, end: usize } {
-    const key = std.mem.indexOf(u8, text, plist_env_key) orelse return error.Unrecognised;
+    const key = std.mem.find(u8, text, plist_env_key) orelse return error.Unrecognised;
     const after = key + plist_env_key.len;
-    const open = std.mem.indexOfPos(u8, text, after, "<dict>") orelse return error.Unrecognised;
+    const open = std.mem.findPos(u8, text, after, "<dict>") orelse return error.Unrecognised;
     if (std.mem.trim(u8, text[after..open], " \t\r\n").len != 0) return error.Unrecognised;
     const start = open + "<dict>".len;
-    const end = std.mem.indexOfPos(u8, text, start, "</dict>") orelse return error.Unrecognised;
-    if (std.mem.indexOf(u8, text[start..end], "<dict>") != null) return error.Unrecognised;
+    const end = std.mem.findPos(u8, text, start, "</dict>") orelse return error.Unrecognised;
+    if (std.mem.find(u8, text[start..end], "<dict>") != null) return error.Unrecognised;
     return .{ .start = start, .end = end };
 }
 
 fn parsePlist(gpa: Allocator, text: []const u8, out: *Environ.Map) Error!void {
     const span = try plistEnvSpan(text);
     var rest = text[span.start..span.end];
-    while (std.mem.indexOf(u8, rest, "<key>")) |k| {
-        const key_end = std.mem.indexOfPos(u8, rest, k, "</key>") orelse return error.Unrecognised;
-        const value_start = (std.mem.indexOfPos(u8, rest, key_end, "<string>") orelse return error.Unrecognised) + "<string>".len;
-        const value_end = std.mem.indexOfPos(u8, rest, value_start, "</string>") orelse return error.Unrecognised;
+    while (std.mem.find(u8, rest, "<key>")) |k| {
+        const key_end = std.mem.findPos(u8, rest, k, "</key>") orelse return error.Unrecognised;
+        const value_start = (std.mem.findPos(u8, rest, key_end, "<string>") orelse return error.Unrecognised) + "<string>".len;
+        const value_end = std.mem.findPos(u8, rest, value_start, "</string>") orelse return error.Unrecognised;
         const key = try xmlUnescaped(gpa, rest[k + "<key>".len .. key_end]);
         defer gpa.free(key);
         const value = try xmlUnescaped(gpa, rest[value_start..value_end]);
@@ -328,7 +328,7 @@ fn rewritePlist(gpa: Allocator, text: []const u8, changes: []const Change) Error
         try out.appendSlice(gpa, "</string>\n");
     }
     // The closing tag's own indent, as it was.
-    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..span.end], '\n')) |nl| nl + 1 else span.end;
+    const line_start = if (std.mem.findScalarLast(u8, text[0..span.end], '\n')) |nl| nl + 1 else span.end;
     const indent = if (std.mem.trim(u8, text[line_start..span.end], " \t").len == 0) text[line_start..span.end] else "";
     try out.appendSlice(gpa, indent);
     try out.appendSlice(gpa, text[span.end..]);
@@ -373,7 +373,7 @@ const utf8_bom = "\xEF\xBB\xBF";
 fn powershellLine(line: []const u8) ?struct { key: []const u8, quoted: []const u8 } {
     const trimmed = std.mem.trim(u8, std.mem.trimStart(u8, line, utf8_bom), " \t\r");
     if (!std.mem.startsWith(u8, trimmed, "$env:")) return null;
-    const eq = std.mem.indexOf(u8, trimmed, " = '") orelse return null;
+    const eq = std.mem.find(u8, trimmed, " = '") orelse return null;
     if (!std.mem.endsWith(u8, trimmed, "'") or trimmed.len < eq + 5) return null;
     return .{ .key = trimmed["$env:".len..eq], .quoted = trimmed[eq + 4 .. trimmed.len - 1] };
 }
@@ -408,7 +408,7 @@ fn rewritePowershell(gpa: Allocator, script: []const u8, changes: []const Change
         try out.appendSlice(gpa, utf8_bom);
         break :body body;
     } else script;
-    const launch = std.mem.indexOf(u8, text, "\n& \"") orelse return error.Unrecognised;
+    const launch = std.mem.find(u8, text, "\n& \"") orelse return error.Unrecognised;
     var done = try gpa.alloc(bool, changes.len);
     defer gpa.free(done);
     @memset(done, false);
@@ -479,13 +479,13 @@ fn readIfThere(gpa: Allocator, io: Io, path: []const u8) !?[]u8 {
 // old whole; through a symbolic link, the file it names, so the link stays.
 fn replaceFile(io: Io, link: []const u8, data: []const u8) !void {
     const cwd = Io.Dir.cwd();
-    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = if (cwd.realPathFile(io, link, &real_buf)) |n| real_buf[0..n] else |err| switch (err) {
         error.FileNotFound => link,
         else => return err,
     };
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const temporary = try std.fmt.bufPrint(&buf, "{s}.new", .{path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const temporary = try std.mem.print(&buf, "{s}.new", .{path});
     const file = try cwd.createFile(io, temporary, .{});
     errdefer cwd.deleteFile(io, temporary) catch {};
     {
@@ -578,16 +578,16 @@ test "saving over a symbolic link writes the file it names" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "real.plist", .data = plist_text });
     try tmp.dir.symLink(io, "real.plist", "agent.plist", .{});
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const link = try std.fmt.bufPrint(&path_buf, "{s}/agent.plist", .{dir});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link = try std.mem.print(&path_buf, "{s}/agent.plist", .{dir});
     try save(gpa, io, .{ .kind = .launchd, .path = link }, &.{.{ .key = "JULIA_DAEMON_MAX_TTL", .value = "60" }});
     var target_buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("real.plist", target_buf[0..try tmp.dir.readLink(io, "agent.plist", &target_buf)]);
     const written = try tmp.dir.readFileAlloc(io, "real.plist", gpa, .limited(1 << 16));
     defer gpa.free(written);
-    try std.testing.expect(std.mem.indexOf(u8, written, "<string>60</string>") != null);
+    try std.testing.expect(std.mem.find(u8, written, "<string>60</string>") != null);
 }
 
 const plist_text =
@@ -687,7 +687,7 @@ test "a script keeps its BOM, and its quotes are doubled" {
     const text = try rewrite(gpa, .powershell, bom_script, &.{.{ .key = "B", .value = "it's" }});
     defer gpa.free(text);
     try std.testing.expect(std.mem.startsWith(u8, text, utf8_bom ++ "$env:A"));
-    try std.testing.expect(std.mem.indexOf(u8, text, "$env:B = 'it''s'\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "$env:B = 'it''s'\n") != null);
 }
 
 test "a script doubles PowerShell's typographic single quotes too, and reads them back" {
@@ -695,7 +695,7 @@ test "a script doubles PowerShell's typographic single quotes too, and reads the
     const value = "C:\\Users\\O\u{2019}Brien \u{2018}a\u{201A}b\u{201B} it's";
     const text = try rewrite(gpa, .powershell, script_text, &.{.{ .key = "B", .value = value }});
     defer gpa.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "$env:B = 'C:\\Users\\O\u{2019}\u{2019}Brien \u{2018}\u{2018}a\u{201A}\u{201A}b\u{201B}\u{201B} it''s'\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "$env:B = 'C:\\Users\\O\u{2019}\u{2019}Brien \u{2018}\u{2018}a\u{201A}\u{201A}b\u{201B}\u{201B} it''s'\n") != null);
     var env = Declared.init(gpa);
     defer env.deinit();
     try parse(gpa, .powershell, text, &env);

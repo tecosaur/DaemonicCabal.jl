@@ -18,7 +18,7 @@ pub var signal_pipe: [2]posix.fd_t = .{ -1, -1 };
 
 /// Async-signal-safe, unlike platform.write's logging.
 fn rawWrite(fd: posix.fd_t, buf: [*]const u8, len: usize) void {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         _ = std.os.linux.write(fd, buf, len);
     } else {
         _ = std.c.write(fd, buf, len);

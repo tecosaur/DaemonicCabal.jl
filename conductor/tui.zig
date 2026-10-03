@@ -111,7 +111,7 @@ pub fn moveFocus(order: []const u32, focus: ?u32, key: Key) ?u32 {
         .down => if (order.len > 0) order[0] else null,
         else => null,
     };
-    const i = std.mem.indexOfScalar(u32, order, current) orelse return null;
+    const i = std.mem.findScalar(u32, order, current) orelse return null;
     return switch (key) {
         .down => order[@min(i + 1, order.len - 1)],
         .up => if (i == 0) null else order[i - 1],
@@ -124,7 +124,7 @@ pub fn moveFocus(order: []const u32, focus: ?u32, key: Key) ?u32 {
 /// the client now at its row, else none.
 pub fn keepFocus(order: []const u32, focus: ?u32, row: usize) ?u32 {
     const current = focus orelse return null;
-    if (std.mem.indexOfScalar(u32, order, current) != null) return current;
+    if (std.mem.findScalar(u32, order, current) != null) return current;
     return if (order.len > 0) order[@min(row, order.len - 1)] else null;
 }
 
@@ -135,7 +135,7 @@ pub fn lastLines(text: []const u8, out: [][]const u8) [][]const u8 {
     var rest = if (text[text.len - 1] == '\n') text[0 .. text.len - 1] else text;
     var n: usize = 0;
     while (n < out.len) {
-        const cut = std.mem.lastIndexOfScalar(u8, rest, '\n');
+        const cut = std.mem.findScalarLast(u8, rest, '\n');
         out[out.len - 1 - n] = if (cut) |i| rest[i + 1 ..] else rest;
         n += 1;
         rest = if (cut) |i| rest[0..i] else break;
@@ -155,9 +155,9 @@ pub fn scrollTop(total: usize, height: usize, keep_start: usize, keep_end: usize
 /// newline.
 pub fn lineRange(text: []const u8, first: usize, count: usize) []const u8 {
     var start: usize = 0;
-    for (0..first) |_| start = (std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return "") + 1;
+    for (0..first) |_| start = (std.mem.findScalarPos(u8, text, start, '\n') orelse return "") + 1;
     var end = start;
-    for (0..count) |_| end = (std.mem.indexOfScalarPos(u8, text, end, '\n') orelse return text[start..]) + 1;
+    for (0..count) |_| end = (std.mem.findScalarPos(u8, text, end, '\n') orelse return text[start..]) + 1;
     return text[start..end];
 }
 
@@ -281,7 +281,13 @@ pub fn textWidth(text: []const u8) usize {
 pub fn decode(text: []const u8) ?struct { cp: u21, len: u3 } {
     const len = std.unicode.utf8ByteSequenceLength(text[0]) catch return null;
     if (len > text.len) return null;
-    const cp = std.unicode.utf8Decode(text[0..len]) catch return null;
+    const cp: u21 = switch (len) {
+        1 => text[0],
+        2 => std.unicode.utf8Decode2(text[0..2].*) catch return null,
+        3 => std.unicode.utf8Decode3(text[0..3].*) catch return null,
+        4 => std.unicode.utf8Decode4(text[0..4].*) catch return null,
+        else => unreachable,
+    };
     return .{ .cp = cp, .len = len };
 }
 
@@ -342,7 +348,7 @@ const wide = [_][2]u21{
 const Row = struct {
     const max_cols = 512;
     const Cell = struct {
-        bytes: [16]u8 = .{' '} ++ .{0} ** 15, // room for combining marks
+        bytes: [16]u8 = .{' '} ++ @as([15]u8, @splat(0)), // room for combining marks
         n: u5 = 1, // 0: the second column of the wide character before
         wide: bool = false,
         style: u8 = 0,
@@ -497,7 +503,7 @@ const Sgr = struct {
     fn apply(self: *Sgr, params: []const u8) void {
         var groups = std.mem.splitScalar(u8, params, ';');
         while (groups.next()) |group| {
-            if (std.mem.indexOfScalar(u8, group, ':') != null) {
+            if (std.mem.findScalar(u8, group, ':') != null) {
                 self.applyColon(group);
                 continue;
             }
@@ -803,7 +809,7 @@ test "colour: however many changes a line makes, each cell keeps its own" {
     for (0..40) |i| try line.print(gpa, "\x1b[38;5;{d}m\x1b[1m#", .{i + 16});
     try line.appendSlice(gpa, "\x1b[22;38:2::1:2:3;48;2;4;5;6m$\x1b[4:3;7;49;39;27;24m%");
     _ = try appendColumns(&out, gpa, line.items, 80, true);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[0;1;38;5;55m#") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[0;1;38;5;55m#") != null);
     try std.testing.expect(std.mem.endsWith(u8, out.items, "\x1b[0;38;2;1;2;3;48;2;4;5;6m$\x1b[0m%"));
 }
 
