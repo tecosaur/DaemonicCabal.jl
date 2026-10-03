@@ -678,7 +678,13 @@ pub const Conductor = struct {
                 for (raw_args) |a| self.allocator.free(a);
                 self.allocator.free(raw_args);
             }
-            const parsed = try args.parse(raw_args);
+            var problem: args.Problem = undefined;
+            const parsed = args.parseReporting([]const u8, raw_args, &problem) catch |err| {
+                var buf: [512]u8 = undefined;
+                self.client_id = 0;
+                try self.serveString(pc.socket, std.mem.print(&buf, "ERROR: {f}\n", .{problem}) catch "ERROR: invalid command line\n", 1);
+                return err;
+            };
             // A remote client's filesystem isn't ours: it names a project of ours
             // only by --project, and starts in its directory, else in our home.
             const home = if (self.cfg.host_home.len > 0) self.cfg.host_home else "/";
