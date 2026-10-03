@@ -623,7 +623,7 @@ pub fn setTcpNodelay(fd: HANDLE) void {
 // users from joining or squatting the name.
 // =============================================================================
 
-const max_local_addr = 256;
+pub const max_local_addr = 256;
 const pipe_namespace = "\\\\.\\pipe\\julia-daemon";
 const PIPE_ACCESS_DUPLEX: DWORD = 0x00000003;
 const FILE_FLAG_OVERLAPPED: DWORD = 0x40000000;
