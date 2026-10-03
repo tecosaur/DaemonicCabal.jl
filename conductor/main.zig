@@ -911,9 +911,14 @@ pub const Conductor = struct {
         std.debug.print("Client {d}: no worker: {}\n", .{ self.client_id, err });
         if (err == error.ClientGone) return;
         var msg_buf: [1024]u8 = undefined;
-        const msg = std.mem.print(&msg_buf, "Could not run a Julia worker for this session ({s}).\n{s}", .{
-            @errorName(err), self.spawnFailureHint(err, sandbox),
-        }) catch return;
+        // Julia moved or upgraded since the service was set up, most likely.
+        const msg = (if (err == error.FileNotFound)
+            std.mem.print(&msg_buf, "Could not run a Julia worker: its executable, {s}, cannot be found.\n" ++
+                "Set JULIA_DAEMON_WORKER_EXECUTABLE in juliaclient --reconfigure, or run DaemonicCabal.install() again.\n", .{self.cfg.worker_executable})
+        else
+            std.mem.print(&msg_buf, "Could not run a Julia worker for this session ({s}).\n{s}", .{
+                @errorName(err), self.spawnFailureHint(err, sandbox),
+            })) catch return;
         self.serveString(socket, msg, 1) catch |e| std.debug.print("Client {d}: could not report the failure: {}\n", .{ self.client_id, e });
     }
 

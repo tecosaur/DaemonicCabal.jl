@@ -36,8 +36,10 @@ function daemon_env(settings::Dict{String,String};
                     ports::UnitRange{Int}, env)
     d = copy(settings)
     d["JULIA_DAEMON_WORKER_PROJECT"] = installed_worker_project()
-    get!(() -> something(Sys.which("julia"), joinpath(Sys.BINDIR, "julia")),
-         d, "JULIA_DAEMON_WORKER_EXECUTABLE")
+    # A saved executable is kept, unless it has since gone (Julia moved or upgraded).
+    if !isfile(get(d, "JULIA_DAEMON_WORKER_EXECUTABLE", ""))
+        d["JULIA_DAEMON_WORKER_EXECUTABLE"] = something(Sys.which("julia"), joinpath(Sys.BINDIR, "julia"))
+    end
     for (key, value) in ("JULIA_DAEMON_WORKER_MAXCLIENTS" => worker_maxclients,
                          "JULIA_DAEMON_MAX_TTL" => worker_ttl,
                          "JULIA_DAEMON_WORKER_ARGS" => worker_args)
