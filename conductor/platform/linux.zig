@@ -62,6 +62,9 @@ pub fn fileOwner(fd: posix.fd_t) ?struct { uid: posix.uid_t, mode: u32 } {
     return .{ .uid = stx.uid, .mode = stx.mode };
 }
 
+/// The service manager (journald) keeps the log.
+pub fn rotateLog(_: u64) void {}
+
 /// A pidfd turns readable once its process has exited.
 pub fn pidfdExited(fd: posix.fd_t) bool {
     var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};

@@ -27,6 +27,7 @@ pub const writeFile = if (os != .windows) impl.write else impl.writeFile;
 pub const writeOutput = if (os != .windows) impl.writeAll else impl.writeFileAll;
 pub const kill = impl.kill;
 pub const defaultRuntimeDir = impl.defaultRuntimeDir;
+pub const rotateLog = impl.rotateLog;
 pub fn getStdinHandle() std.posix.fd_t {
     if (os == .windows) return impl.getStdinHandle();
     return impl.STDIN_HANDLE;
