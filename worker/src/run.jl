@@ -26,7 +26,6 @@ function create_module()::Module
     end
     maininclude.head = :toplevel
     Core.eval(mod, maininclude)
-    Core.eval(mod, :(using InteractiveUtils))
     mod
 end
 
@@ -595,7 +594,7 @@ function runclient(mod::Module, client::ClientInfo; @nospecialize(stdout::IO=std
     if runrepl && !client.tty
         run_piped_repl(mod)
     elseif runrepl
-        Base.invokelatest(run_terminal_repl, client, stdout)
+        Base.invokelatest(run_terminal_repl, client, mod, stdout)
     end
 end
 
@@ -622,7 +621,7 @@ end
 
 # Called through `invokelatest`: loading packages calls `isinteractive`, whose
 # override would otherwise invalidate `runclient`, and so every run's code.
-function run_terminal_repl(client::ClientInfo, stdout::IO)
+function run_terminal_repl(client::ClientInfo, mod::Module, stdout::IO)
     interactiveinput = client.tty
     hascolor = get(stdout, :color, clienthascolor(client))
     quiet = any(((s, _),) -> s == "--quiet", client.switches)
@@ -634,6 +633,8 @@ function run_terminal_repl(client::ClientInfo, stdout::IO)
         requested
     end
     histfile = getval(client.switches, "--history-file", "yes") != "no"
+    # As julia's terminal REPL brings it into Main.
+    interactiveinput && Base.load_InteractiveUtils(mod)
     @static if VERSION < v"1.11"
         setglobal!(Base, :have_color, hascolor)
         Base.run_main_repl(interactiveinput, quiet, banner != :no, histfile, hascolor)
