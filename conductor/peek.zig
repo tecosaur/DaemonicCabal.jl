@@ -25,7 +25,7 @@ pub const Scanner = struct {
 
     pub fn feed(self: *Scanner, gpa: std.mem.Allocator, bytes: []const u8) void {
         var rest = bytes;
-        while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+        while (std.mem.findScalar(u8, rest, '\n')) |nl| {
             self.appendLine(gpa, rest[0..nl]);
             self.endLine(gpa);
             rest = rest[nl + 1 ..];
@@ -80,7 +80,7 @@ fn endsInFiller(text: []const u8) bool {
 
 fn lastLineStart(text: []const u8) usize {
     const body = if (text.len > 0 and text[text.len - 1] == '\n') text[0 .. text.len - 1] else text;
-    return if (std.mem.lastIndexOfScalar(u8, body, '\n')) |i| i + 1 else 0;
+    return if (std.mem.findScalarLast(u8, body, '\n')) |i| i + 1 else 0;
 }
 
 /// A readable digest of `stacks`: each busy thread's Julia frames, up to
@@ -96,7 +96,7 @@ pub fn digest(gpa: std.mem.Allocator, stacks: []const u8, max_frames: usize, out
             idle += 1;
             continue;
         }
-        if (std.mem.indexOf(u8, block, ".jl:") == null) continue; // no thread's stack
+        if (std.mem.find(u8, block, ".jl:") == null) continue; // no thread's stack
         if (busy > 0) try out.append(gpa, "");
         busy += 1;
         try out.append(gpa, "A running thread:");
@@ -104,7 +104,7 @@ pub fn digest(gpa: std.mem.Allocator, stacks: []const u8, max_frames: usize, out
         var frames: usize = 0;
         while (lines.next()) |line| {
             if (!isJuliaFrame(line)) continue;
-            if (std.mem.indexOf(u8, line, worker_source) != null or frames == max_frames) break;
+            if (std.mem.find(u8, line, worker_source) != null or frames == max_frames) break;
             try out.append(gpa, line);
             frames += 1;
         }
@@ -122,16 +122,16 @@ const worker_source = "/worker/src/";
 // Waiting in the scheduler, collecting garbage, or the profile's listener.
 fn isIdle(block: []const u8) bool {
     for ([_][]const u8{ "jl_task_get_next", "jl_parallel_gc_threadfun", "jl_concurrent_gc_threadfun", "profile_printing_listener", "jl_gc_mark_threadfun" }) |mark| {
-        if (std.mem.indexOf(u8, block, mark) != null) return true;
+        if (std.mem.find(u8, block, mark) != null) return true;
     }
     return false;
 }
 
 // "sin at ./math.jl:1332 [inlined]", not a C frame of the runtime.
 fn isJuliaFrame(line: []const u8) bool {
-    const at = std.mem.indexOf(u8, line, " at ") orelse return false;
+    const at = std.mem.find(u8, line, " at ") orelse return false;
     const where = line[at + 4 ..];
-    return std.mem.indexOf(u8, where, ".jl:") != null;
+    return std.mem.find(u8, where, ".jl:") != null;
 }
 
 test "the scanner keeps the stacks between the banners" {

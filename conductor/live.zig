@@ -132,7 +132,7 @@ const Note = struct {
     until: i64 = 0,
 
     fn set(self: *Note, now: i64, comptime fmt: []const u8, fmt_args: anytype) void {
-        self.len = if (std.fmt.bufPrint(&self.bytes, fmt, fmt_args)) |t| t.len else |_| 0;
+        self.len = if (std.mem.print(&self.bytes, fmt, fmt_args)) |t| t.len else |_| 0;
         self.until = now + note_s;
     }
 
@@ -332,7 +332,7 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     defer frame.deinit(c.allocator);
     var lines = report.lines;
     const placed = if (sub.focus) |focus| placed: {
-        sub.focus_row = std.mem.indexOfScalar(u32, report.clients, focus) orelse 0;
+        sub.focus_row = std.mem.findScalar(u32, report.clients, focus) orelse 0;
         break :placed report.placement;
     } else null;
     // The pane encloses the focused row, its top border; the frame stays a
@@ -433,7 +433,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
 fn paneFooter(c: *Conductor, sub: *const Subscriber, info: main.ActiveClientInfo, snap: ?*const Snapshot, buf: *[160]u8) []const u8 {
     if (sub.confirming) |id| {
         const whole = info.session and (info.sync or info.worker.session_label != null);
-        return std.fmt.bufPrint(buf, "terminate client {d}{s}? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } }), .{
+        return std.mem.print(buf, "terminate client {d}{s}? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } }), .{
             if (c.active_clients.get(id)) |target| target.pid else id,
             if (whole) " and its session" else "",
         }) catch "terminate? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } });
@@ -596,9 +596,9 @@ fn appendLines(gpa: std.mem.Allocator, out: *std.ArrayList([]const u8), text: []
 // when this client has none.
 fn clientSection(report: []const u8, client: u32) []const u8 {
     var buf: [48]u8 = undefined;
-    const head = std.fmt.bufPrint(&buf, "── client {d} ──", .{client}) catch return report;
-    const start = std.mem.indexOf(u8, report, head) orelse return report;
-    const end = std.mem.indexOfPos(u8, report, start + head.len, "\n── ") orelse report.len;
+    const head = std.mem.print(&buf, "── client {d} ──", .{client}) catch return report;
+    const start = std.mem.find(u8, report, head) orelse return report;
+    const end = std.mem.findPos(u8, report, start + head.len, "\n── ") orelse report.len;
     return report[start..end];
 }
 
@@ -727,17 +727,17 @@ fn latestEntry(c: *Conductor, w: *const worker.Worker, buf: []u8) []const u8 {
     if (w.recent.count == 0) return "";
     const entry = w.recent.at(w.recent.count - 1);
     var age_buf: [16]u8 = undefined;
-    return std.fmt.bufPrint(buf, "Latest in its log (l), {s}: {s}", .{ ageText(&age_buf, c.currentTime() - entry.at), entry.text }) catch "";
+    return std.mem.print(buf, "Latest in its log (l), {s}: {s}", .{ ageText(&age_buf, c.currentTime() - entry.at), entry.text }) catch "";
 }
 
 fn ageText(buf: []u8, seconds: i64) []const u8 {
     const s: u64 = @intCast(@max(0, seconds));
     return (if (s < 60)
-        std.fmt.bufPrint(buf, "{d}s ago", .{s})
+        std.mem.print(buf, "{d}s ago", .{s})
     else if (s < 3600)
-        std.fmt.bufPrint(buf, "{d}m ago", .{s / 60})
+        std.mem.print(buf, "{d}m ago", .{s / 60})
     else
-        std.fmt.bufPrint(buf, "{d}h ago", .{s / 3600})) catch "";
+        std.mem.print(buf, "{d}h ago", .{s / 3600})) catch "";
 }
 
 fn pagerLines(gpa: std.mem.Allocator, snap: *const Snapshot, out: *std.ArrayList([]const u8)) !void {
@@ -928,9 +928,9 @@ fn dialWorker(c: *Conductor, address: []const u8) !posix.socket_t {
         "[::1]"
     else
         bind;
-    const bracketed = host.len > 0 and host[0] != '[' and std.mem.indexOfScalar(u8, host, ':') != null;
+    const bracketed = host.len > 0 and host[0] != '[' and std.mem.findScalar(u8, host, ':') != null;
     var buf: [300]u8 = undefined;
-    const target = try std.fmt.bufPrint(&buf, "{s}{s}{s}{s}", .{ if (bracketed) "[" else "", host, if (bracketed) "]" else "", address });
+    const target = try std.mem.print(&buf, "{s}{s}{s}{s}", .{ if (bracketed) "[" else "", host, if (bracketed) "]" else "", address });
     return (try protocol.connectAddress(.tcp, target, protocol.connect_timeout_ms)).socket;
 }
 
@@ -950,7 +950,7 @@ fn onWatchOutput(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     sub.tail.appendSlice(c.allocator, bytes) catch return;
     if (sub.tail.items.len > max_tail_bytes) {
         const over = sub.tail.items.len - max_tail_bytes;
-        const cut = if (std.mem.indexOfScalarPos(u8, sub.tail.items, over, '\n')) |i| i + 1 else over;
+        const cut = if (std.mem.findScalarPos(u8, sub.tail.items, over, '\n')) |i| i + 1 else over;
         sub.tail.replaceRangeAssumeCapacity(0, cut, &.{});
     }
     noteChange(c);

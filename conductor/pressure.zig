@@ -33,7 +33,7 @@ pub const Monitor = struct {
         }
         switch (self.source) {
             .psi => std.debug.print(" - Memory pressure: PSI /proc/pressure/memory, some avg10 >= {d}%\n", .{cfg.psi_threshold}),
-            .memfree => if (builtin.os.tag == .linux)
+            .memfree => if (builtin.target.os.tag == .linux)
                 std.debug.print(" - Memory pressure: free-memory level (PSI unavailable, normal on stock Linux)\n", .{})
             else
                 std.debug.print(" - Memory pressure: free-memory level\n", .{}),

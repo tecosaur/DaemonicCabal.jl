@@ -19,7 +19,7 @@ pub const Rgb = struct {
 pub const Palette = struct {
     foreground: ?Rgb = null, // OSC 10
     background: ?Rgb = null, // OSC 11
-    ansi: [16]?Rgb = [_]?Rgb{null} ** 16, // OSC 4
+    ansi: [16]?Rgb = @splat(null), // OSC 4
 
     pub fn isPopulated(self: Palette) bool {
         if (self.foreground != null or self.background != null) return true;
@@ -186,7 +186,7 @@ pub const Sgr = struct {
         var sgr: Sgr = .{};
         if (from != null and to != null) {
             const c = blend(from.?, to.?, t);
-            if (std.fmt.bufPrint(&sgr.bytes, "\x1b[" ++ code ++ ";2;{d};{d};{d}m", .{ c.r, c.g, c.b })) |text| {
+            if (std.mem.print(&sgr.bytes, "\x1b[" ++ code ++ ";2;{d};{d};{d}m", .{ c.r, c.g, c.b })) |text| {
                 sgr.len = text.len;
                 return sgr;
             } else |_| {}

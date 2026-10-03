@@ -88,7 +88,7 @@ pub const State = struct {
     pub fn apply(self: *State, gpa: Allocator, staged: *Staged) Allocator.Error!Outcome {
         var values = staged.values(self);
         if (settings.conflict(&values)) |conflict| return .{ .conflict = conflict };
-        var applied: Applied = .initEmpty();
+        var applied: Applied = .empty;
         for (&staged.edits, 0..) |*edit, i| {
             const change = edit.* orelse continue;
             try setOwned(gpa, &self.applied[i], change.text());
@@ -103,7 +103,7 @@ pub const State = struct {
     }
 };
 
-pub const Applied = std.StaticBitSet(all.len);
+pub const Applied = std.bit_set.Static(all.len);
 
 pub const Outcome = union(enum) {
     conflict: settings.Conflict,

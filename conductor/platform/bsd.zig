@@ -10,7 +10,7 @@ const posix = std.posix;
 const shared = @import("posix.zig");
 
 /// OpenBSD sets these only system-wide.
-pub const tcp_keepalive_options: ?[3]u32 = switch (builtin.os.tag) {
+pub const tcp_keepalive_options: ?[3]u32 = switch (builtin.target.os.tag) {
     .macos => .{ c.TCP.KEEPALIVE, c.TCP.KEEPINTVL, c.TCP.KEEPCNT },
     .freebsd => .{ 256, 512, 1024 }, // netinet/tcp.h
     else => null,
@@ -98,13 +98,13 @@ fn sysctlUint(comptime name: [:0]const u8) ?u64 {
 }
 
 // macOS phys_footprint is already the reclaimable figure.
-pub const mem_is_reclaimable = builtin.os.tag == .macos;
+pub const mem_is_reclaimable = builtin.target.os.tag == .macos;
 
 // proc_pid_rusage, as task_for_pid is denied to unprivileged callers.
 // phys_footprint excludes the shared sysimage pages every worker maps.
 // FreeBSD/OpenBSD: null, their kinfo_proc ABI being unverifiable.
 pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
-    if (builtin.os.tag != .macos) return null;
+    if (builtin.target.os.tag != .macos) return null;
     const ru = darwinRusage(pid) orelse return null;
     const cpu_ns: f64 = @floatFromInt(machToNanos(ru.ri_user_time + ru.ri_system_time));
     return .{ .mem_bytes = ru.ri_phys_footprint, .cpu_seconds = cpu_ns / 1_000_000_000.0 };
@@ -124,7 +124,7 @@ fn machToNanos(ticks: u64) u64 {
 }
 
 pub fn processReclaimable(pid: posix.pid_t) ?u64 {
-    if (builtin.os.tag != .macos) return null;
+    if (builtin.target.os.tag != .macos) return null;
     const ru = darwinRusage(pid) orelse return null;
     return ru.ri_phys_footprint;
 }
@@ -147,7 +147,7 @@ const rusage_info_v0 = extern struct {
 extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *anyopaque) c_int;
 
 fn darwinRusage(pid: posix.pid_t) ?rusage_info_v0 {
-    if (builtin.os.tag != .macos) return null;
+    if (builtin.target.os.tag != .macos) return null;
     var info: rusage_info_v0 = undefined;
     if (proc_pid_rusage(@intCast(pid), RUSAGE_INFO_V0, @ptrCast(&info)) != 0) return null;
     return info;
@@ -160,7 +160,7 @@ pub fn readPsiSomeAvg10() ?f64 {
 }
 
 pub fn readMemInfo() ?MemInfo {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         // The kernel's own free-memory percentage, as `memory_pressure` reports it:
         // page counts double-count file-backed pages sitting inactive.
         .macos => blk: {
@@ -181,7 +181,7 @@ pub fn readMemInfo() ?MemInfo {
 }
 
 pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
-    if (builtin.os.tag != .macos) return null;
+    if (builtin.target.os.tag != .macos) return null;
     const ppid = (darwinBsdInfo(pid) orelse return null).pbi_ppid;
     if (ppid == 0) return null;
     const parent = darwinBsdInfo(@intCast(ppid)) orelse return null;
@@ -259,7 +259,7 @@ pub fn fileOwner(fd: posix.fd_t) ?struct { uid: posix.uid_t, mode: u32 } {
 
 // Paths
 pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, home: ?[]const u8) ![]const u8 {
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         // A macOS XDG_RUNTIME_DIR is often a sandbox-private path other
         // processes can't reach.
         const home_dir = home orelse blk: {
@@ -286,7 +286,7 @@ const IpAddress = std.Io.net.IpAddress;
 
 pub fn lookupHost(name: []const u8, port: u16, buf: []IpAddress) ![]IpAddress {
     var name_buf: [256]u8 = undefined;
-    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch return error.InvalidAddress;
+    const name_z = std.mem.printSentinel(&name_buf, "{s}", .{name}, 0) catch return error.InvalidAddress;
     const hints = std.mem.zeroInit(c.addrinfo, .{ .socktype = posix.SOCK.STREAM });
     var res: ?*c.addrinfo = null;
     const rc = c.getaddrinfo(name_z, null, &hints, &res);
