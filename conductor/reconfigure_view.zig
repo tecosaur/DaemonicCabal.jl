@@ -397,15 +397,21 @@ const Frame = struct {
         const children = row.k + 1 < row.items.len and row.items[row.k + 1].depth > item.depth;
         indent.writeAll(if (children) "│ " else "  ") catch {};
         indent.writeAll(reset) catch {};
-        const text_width = width -| (4 + 2 * @as(usize, item.depth));
+        const indent_cols = 4 + 2 * @as(usize, item.depth);
+        const text_width = width -| indent_cols;
+        // Kept while editing, empty too, so the rows don't shift as it comes and goes.
         if (self.scene.editor) |e| if (e.check.len > 0) {
             const colour = switch (e.check.tone) {
                 .fine => self.muted(),
                 .warning => warning_colour,
                 .problem => problem_colour,
             };
-            try self.writeWrapped(e.check.text(), text_width, indent.buffered(), colour);
-        };
+            if (indent_cols <= value_col and value_col + tui.textWidth(e.check.text()) <= width) {
+                try self.write(indent.buffered());
+                try self.pad(value_col - indent_cols);
+                try self.print("{s}{s}" ++ reset ++ "\n", .{ colour, e.check.text() });
+            } else try self.writeWrapped(e.check.text(), text_width, indent.buffered(), colour);
+        } else try self.print("{s}" ++ reset ++ "\n", .{indent.buffered()});
         try self.writeWrapped(s.about, text_width, indent.buffered(), self.muted());
         if (s.used) |use| if (!use.check(row.values)) {
             var reason_buf: [128]u8 = undefined;
@@ -782,4 +788,58 @@ test "an empty field shows, greyed, what it leaves" {
     out.clearRetainingCapacity();
     _ = try draw(gpa, &out, &scene, 0);
     try testing.expect(std.mem.find(u8, out.items, "62G") == null);
+}
+
+test "an editor's check line stays, empty or not" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const limit = Setting.index("JULIA_DAEMON_SANDBOX_MAX_MEMORY");
+    const styles = Styles.of(null);
+    var scene = sceneOf(&state, &staged, &styles, @intFromEnum(all[limit].tab), limit);
+    var said: Check = .{};
+    said.set(.fine, "Unset: no limit.", .{});
+    const silent: Check = .{};
+    scene.editor = .{ .text = "", .cursor = 0, .check = &said };
+    const with_check = try drawnText(&scene);
+    defer gpa.free(with_check);
+    scene.editor = .{ .text = "4G", .cursor = 2, .check = &silent };
+    const without = try drawnText(&scene);
+    defer gpa.free(without);
+    try testing.expectEqual(std.mem.count(u8, with_check, "\n"), std.mem.count(u8, without, "\n"));
+}
+
+test "an editor's check sits under its field when it fits, else wraps from the tree" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const server = Setting.index("JULIA_DAEMON_SERVER");
+    const styles = Styles.of(null);
+    var scene = sceneOf(&state, &staged, &styles, @intFromEnum(all[server].tab), server);
+    // The column `needle` starts at, on the line holding it.
+    const columnOf = struct {
+        fn of(text: []const u8, needle: []const u8) usize {
+            const at = std.mem.find(u8, text, needle).?;
+            const line_start = if (std.mem.findScalarLast(u8, text[0..at], '\n')) |nl| nl + 1 else 0;
+            return tui.textWidth(text[line_start..at]);
+        }
+    }.of;
+    var check: Check = .{};
+    check.set(.warning, "Port 9591 is in use.", .{});
+    scene.editor = .{ .text = "tcp://0.0.0.0:9591", .cursor = 0, .check = &check };
+    const fits = try drawnText(&scene);
+    defer gpa.free(fits);
+    try testing.expectEqual(value_col, columnOf(fits, "Port 9591"));
+    check.set(.warning, "This says rather more than the space beside the field could hold, so it wraps.", .{});
+    const wraps = try drawnText(&scene);
+    defer gpa.free(wraps);
+    try testing.expectEqual(4, columnOf(wraps, "This says"));
 }
