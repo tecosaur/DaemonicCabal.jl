@@ -5,12 +5,14 @@ const OUTPUT_BUFFER_THRESHOLD = 8192
 const OUTPUT_FLUSH_DELAY_S = 0.01  # the longest output waits for more to join it
 
 const OutputBuffer = @static if VERSION >= v"1.11-" Memory{UInt8} else Vector{UInt8} end
+# Buffers whose writes were interrupted, which libuv may still be reading.
+const IN_FLIGHT = (lock = ReentrantLock(), buffers = OutputBuffer[])
 
 # Locked as stock stdout is, whole operations at a time: a `print` holds it
 # across its parts, and a flush while the sink writes.
 mutable struct BufferedOutput{S <: IO} <: IO
     const sink::S
-    const buf::OutputBuffer
+    buf::OutputBuffer
     pos::Int
     armed::Bool  # a deadline flush is pending
     const lock::ReentrantLock
@@ -26,7 +28,18 @@ function Base.flush(o::BufferedOutput)
         n = o.pos
         # Emptied first, so a failed write isn't retried by every later flush.
         o.pos = 0
-        n > 0 && GC.@preserve o unsafe_write(o.sink, pointer(o.buf), UInt(n))
+        if n > 0
+            try
+                GC.@preserve o unsafe_write(o.sink, pointer(o.buf), UInt(n))
+            catch err
+                # Interrupted, the write may go on in libuv, from this buffer.
+                if !(err isa Base.IOError)
+                    @lock IN_FLIGHT.lock push!(IN_FLIGHT.buffers, o.buf)
+                    o.buf = OutputBuffer(undef, OUTPUT_BUFFER_THRESHOLD)
+                end
+                rethrow()
+            end
+        end
         flush(o.sink)
     end
 end
