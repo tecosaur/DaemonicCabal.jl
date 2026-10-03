@@ -580,7 +580,7 @@ pub const Conductor = struct {
             .client_exit, .client_interrupt => return note.key == self.keyFor(.client, note.subject),
             // Of a client gone already, it can do nothing.
             .client_done => (self.active_clients.get(note.subject) orelse return true).worker.id,
-            .peek_report => note.subject,
+            .peek_report, .interrupted => note.subject,
         };
         return note.key == self.keyFor(.worker, worker_id);
     }
@@ -598,12 +598,9 @@ pub const Conductor = struct {
                     if (!w.ping_pending) self.event_loop.scheduleHealthCheck(w);
                 }
             },
-            .client_interrupt => if (self.active_clients.get(subject)) |info| {
-                // From Julia 1.14 the message cancels exactly the client's code,
-                // and the SIGINT finds nothing to cancel; before, the SIGINT
-                // interrupts whichever client's code thread 0 runs.
-                info.worker.cancelClient(subject, note.evaluation);
-                info.worker.signal(platform.SIG.INT);
+            .client_interrupt => if (self.active_clients.get(subject)) |info| info.worker.interrupt(subject, note.evaluation),
+            .interrupted => if (self.findWorkerById(subject)) |w| {
+                w.interrupt_unread = false;
             },
             .peek_report => {
                 const w = self.findWorkerById(subject) orelse return;

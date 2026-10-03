@@ -155,6 +155,8 @@ pub const Worker = struct {
     last_active: i64,
     last_pinged: i64,
     ping_pending: bool = false,
+    /// A client's interrupt sent, its reading not yet acknowledged.
+    interrupt_unread: bool = false,
     /// Set once an unanswered ping has been met with `forceInterrupt`.
     unresponsive_interrupted: bool = false,
     /// Echoed in the pong, which tells a late pong for an earlier ping from this one's.
@@ -671,14 +673,20 @@ pub const Worker = struct {
         self.writeString(.drop_session, label);
     }
 
-    /// A client's Ctrl-C during `evaluation`, which from Julia 1.14 cancels
-    /// exactly that client's code.
-    pub fn cancelClient(self: *Worker, id: u32, evaluation: u32) void {
-        self.writeHeader(.cancel_client, 8);
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], id, .little);
-        std.mem.writeInt(u32, buf[4..8], evaluation, .little);
+    /// A client's Ctrl-C during `evaluation` (0 for whichever runs), which the
+    /// worker throws into that evaluation itself, saying so. A SIGINT, which
+    /// lands on whatever thread 0 runs, follows only while an earlier one goes
+    /// unacknowledged: thread 0 too busy to read it, in a tight loop.
+    pub fn interrupt(self: *Worker, id: u32, evaluation: u32) void {
+        var buf: [protocol.worker.header_size + 8]u8 = undefined;
+        buf[0] = @intFromEnum(protocol.worker.MessageType.cancel_client);
+        std.mem.writeInt(u32, buf[1..5], 8, .little);
+        std.mem.writeInt(u32, buf[5..9], id, .little);
+        std.mem.writeInt(u32, buf[9..13], evaluation, .little);
+        // One write, so a SIGINT can't come between the header and its payload.
         platform.write(self.socket, &buf);
+        if (self.interrupt_unread) self.signal(.INT);
+        self.interrupt_unread = true;
     }
 
     /// The worker drops clients not in `ids`; returns its count of clients

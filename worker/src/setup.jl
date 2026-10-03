@@ -225,24 +225,40 @@ end
 @static if isdefined(Base, :sigint_new_episode!)
     include("cancellation.jl")
 else
-    with_client_scope(f, ::ClientInfo) = f()
-    # The conductor's SIGINT does it, but Windows has none, so it is passed on.
-    interrupt_client(::Integer, ::Integer) = @static if Sys.iswindows() pass_interrupt() end
-    const EXECUTING = Task[]  # running a client's code, under `STATE.lock`
+    # Whose run a task's code is (0 before 1.11, which runs one at a time).
+    @static if VERSION >= v"1.11"
+        const RUN_CLIENT = ScopedValue(0)
+        with_client_scope(f, client::ClientInfo) = @with RUN_CLIENT => client.id f()
+    else
+        with_client_scope(f, ::ClientInfo) = f()
+    end
+    # The tasks running clients' code, numbered as signalled to their
+    # clients, under `STATE.lock`.
+    const EXECUTING = @NamedTuple{number::UInt32, client::Int, task::Task}[]
+    const EVALUATIONS = Threads.Atomic{UInt32}(0)
     function as_client_code(f)
-        task = current_task()
-        @lock STATE.lock push!(EXECUTING, task)
-        signal_executing(true)
+        number = Threads.atomic_add!(EVALUATIONS, UInt32(1)) + UInt32(1)
+        client = @static if VERSION >= v"1.11" RUN_CLIENT[] else 0 end
+        @lock STATE.lock push!(EXECUTING, (; number, client, task = current_task()))
+        signal_executing(true, number)
         try
             f()
         finally
             signal_executing(false)
-            @lock STATE.lock filter!(!=(task), EXECUTING)
+            @lock STATE.lock filter!(e -> e.number != number, EXECUTING)
+        end
+    end
+    # Thrown into the evaluation it names, or unnumbered, the client's: read
+    # only while thread 0 is free, so one meant for an earlier, read late, is let go.
+    function interrupt_client(id::Integer, evaluation::Integer)
+        for e in @lock STATE.lock copy(EXECUTING)
+            aimed = if evaluation == 0 e.client in (0, id) else e.number == evaluation end
+            aimed && e.task.sticky && e.task !== current_task() && inject_interrupt(e.task)
         end
     end
     shielded(f) = Base.disable_sigint(f)
     function pass_interrupt()
-        for task in @lock STATE.lock copy(EXECUTING)
+        for (; task) in @lock STATE.lock copy(EXECUTING)
             # A task not held to thread 0 (the REPL pre-warm's) is none a Ctrl-C was for.
             task.sticky && task !== current_task() && inject_interrupt(task)
         end
@@ -947,7 +963,8 @@ function serve_client_run(conn::IO)
     end
 end
 
-# A client's Ctrl-C arrives as `cancel_client` (before 1.14, with the conductor's SIGINT).
+# A client's Ctrl-C arrives as `cancel_client`, and a SIGINT only while thread 0
+# is too busy for one to be read (a tight loop).
 function serve_message(conn::IO, header::MessageHeader)
     if header.msg_type == MSG_TYPE.ping
         seq = read(conn, UInt8)
@@ -992,6 +1009,8 @@ function serve_message(conn::IO, header::MessageHeader)
         teardown_session!(read_string(conn))
     elseif header.msg_type == MSG_TYPE.cancel_client
         interrupt_client(read(conn, UInt32), read(conn, UInt32))
+        # Read, so thread 0 was free: no SIGINT need follow.
+        send_notification(STATE.conductor_socket[], NOTIF_TYPE.interrupted, UInt32(CONDUCTOR_WORKER_ID[]))
     elseif header.msg_type == MSG_TYPE.start_peek
         start_peek()
     else

@@ -8,6 +8,7 @@ const NOTIFICATION_MAGIC = 0x4A444E02  # "JDN\x02" little-endian
 const NOTIF_TYPE = (
     client_done = 0x01,
     peek_report = 0x06,
+    interrupted = 0x07,  # a `cancel_client` read: the worker's id
 )
 
 const MSG_TYPE = (

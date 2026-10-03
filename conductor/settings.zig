@@ -106,7 +106,7 @@ pub const Use = struct {
 pub const Values = []const ?[]const u8;
 
 pub const all = [_]Setting{
-    .{ .key = "JULIA_DAEMON_WORKER_MAXCLIENTS", .label = "Clients per worker", .tab = .workers, .kind = .count, .default = "1", .effect = .restart, .field = "worker_maxclients", .about = "How many clients a worker serves at once, 0 for no limit. Above 1, before Julia 1.14, Ctrl-C can't be aimed at one client." },
+    .{ .key = "JULIA_DAEMON_WORKER_MAXCLIENTS", .label = "Clients per worker", .tab = .workers, .kind = .count, .default = "1", .effect = .restart, .field = "worker_maxclients", .about = "How many clients a worker serves at once, 0 for no limit. Above 1, before Julia 1.14, a Ctrl-C to a tight loop can't be aimed at one client." },
     .{ .key = "JULIA_DAEMON_RESERVE_WORKER", .label = "Reserve worker", .tab = .workers, .kind = .flag, .default = "1", .effect = .now, .field = "reserve_worker", .about = "Keep a spare worker started, ready for the next new project." },
     .{ .key = "JULIA_DAEMON_WORKER_EXECUTABLE", .label = "executable", .tab = .workers, .depth = 1, .heading = "Julia", .kind = .{ .path = .executable }, .default = "julia", .effect = .new_workers, .field = "worker_executable", .about = "The Julia binary workers run, found on the daemon's PATH unless absolute." },
     .{ .key = "JULIA_DAEMON_WORKER_ARGS", .label = "arguments", .tab = .workers, .depth = 1, .kind = .text, .default = "--startup-file=no", .effect = .new_workers, .field = "worker_args", .about = "Julia's arguments for each worker, split at spaces." },
