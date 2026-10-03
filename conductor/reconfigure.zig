@@ -690,6 +690,7 @@ fn pendingOf(c: *const Conductor, v: *const Viewer) changes.Pending {
 
 fn repaint(c: *Conductor, v: *Viewer) void {
     if (v.term.queued.items.len > 0 and !v.term.flushQueued()) return;
+    var placeholder_buf: [64]u8 = undefined;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(c.allocator);
     const scene: view.Scene = .{
@@ -699,7 +700,7 @@ fn repaint(c: *Conductor, v: *Viewer) void {
         .saving = c.settings.service != null,
         .tab = v.tab,
         .focus = v.focus[v.tab],
-        .editor = if (v.editor) |*e| .{ .text = e.text.items, .cursor = e.cursor, .check = &e.check } else null,
+        .editor = if (v.editor) |*e| .{ .text = e.text.items, .cursor = e.cursor, .check = &e.check, .placeholder = placeholder(&all[v.focus[v.tab]], &placeholder_buf) } else null,
         .message = if (v.message.kind == .none) null else .{ .problem = v.message.kind == .problem, .text = v.message.bytes[0..v.message.len] },
         .asking = v.asking,
         .flagged = flaggedPaths(c, v),
@@ -712,6 +713,21 @@ fn repaint(c: *Conductor, v: *Viewer) void {
         return;
     };
     v.term.sendFrame(c.allocator, out.items);
+}
+
+// What an empty field leaves, in the setting's own form: its default, or
+// for a limit, all there is.
+fn placeholder(s: *const settings.Setting, buf: []u8) []const u8 {
+    if (s.default != null) return settings.display(s, null, buf);
+    if (std.mem.eql(u8, s.key, "JULIA_DAEMON_SANDBOX_MAX_MEMORY")) {
+        const memory = platform.readMemInfo() orelse return s.unset;
+        return std.mem.print(buf, "{d}G", .{memory.total >> 30}) catch s.unset;
+    }
+    if (std.mem.eql(u8, s.key, "JULIA_DAEMON_SANDBOX_MAX_CPU")) {
+        const cores = std.Thread.getCpuCount() catch return s.unset;
+        return std.mem.print(buf, "{d}", .{100 * cores}) catch s.unset;
+    }
+    return s.unset;
 }
 
 // The path settings whose values, as they would be, may not do.
