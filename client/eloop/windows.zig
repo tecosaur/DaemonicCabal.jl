@@ -28,16 +28,20 @@ var ctxs: [3]platform.RecvCtx = undefined;
 
 fn stdinProc(param: ?*anyopaque) callconv(.winapi) win32.DWORD {
     const args: *StdinArgs = @ptrCast(@alignCast(param orelse return 1));
-    var buf: [buf_size]u8 = undefined;
+    var buf: [cooked.StdinForwarder.max_read]u8 = undefined;
     while (true) {
         var got: win32.DWORD = 0;
         platform.awaitConsoleKey(args.src);
         if (!platform.ReadFile(args.src, &buf, buf.len, &got, null).toBool()) break;
+        // Its own thread, so sends here may wait.
         if (got == 0) {
-            if (args.fwd.end()) continue;
+            const goes_on = args.fwd.end();
+            _ = args.fwd.flush();
+            if (goes_on) continue;
             return 0;
         }
         args.fwd.forward(buf[0..got]);
+        _ = args.fwd.flush();
     }
     platform.sendEof(args.fwd.dst);
     return 0;

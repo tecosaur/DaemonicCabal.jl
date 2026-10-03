@@ -15,6 +15,8 @@ const Location = enum(u64) {
     worker_stdout,
     worker_stderr,
     signals,
+    /// The worker's stdin, which has room again for what waits to be sent.
+    worker_stdin,
 };
 
 // A regular-file stdin must read on from its position, not from offset 0 forever.
@@ -32,7 +34,7 @@ pub fn run(
 ) !u8 {
     // Each indexed by its Location.
     const srcs = [4]posix.fd_t{ posix.STDIN_FILENO, stdout_fd, stderr_fd, signals_fd };
-    var bufs: [4][1024]u8 = undefined;
+    var bufs: [4][cooked.StdinForwarder.max_read]u8 = undefined;
     var ended = [4]bool{ false, false, false, false };
     var stdin_fwd = cooked.StdinForwarder{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw };
     for (0..srcs.len) |i| try queueRead(ring, @enumFromInt(i), srcs[i], &bufs[i]);
@@ -47,7 +49,8 @@ pub fn run(
             const cqe = try ring.copy_cqe();
             const loc = std.enums.fromInt(Location, cqe.user_data) orelse continue;
             const i = @intFromEnum(loc);
-            const data = bufs[i][0..@intCast(@max(0, cqe.res))];
+            // A poll's result is its events, not data.
+            const data: []u8 = if (loc == .worker_stdin) &.{} else bufs[i][0..@intCast(@max(0, cqe.res))];
             switch (loc) {
                 .worker_stdout, .worker_stderr => {
                     if (cqe.res <= 0) {
@@ -60,11 +63,17 @@ pub fn run(
                         continue;
                     }
                 },
-                .local_stdin => {
+                .local_stdin, .worker_stdin => {
                     if (exit_code != null) continue;
-                    if (cqe.res <= 0) {
-                        if (!stdin_fwd.end()) continue;
-                    } else stdin_fwd.forward(data);
+                    if (loc == .local_stdin) {
+                        if (cqe.res <= 0) _ = stdin_fwd.end() else stdin_fwd.forward(data);
+                    }
+                    if (!stdin_fwd.flush()) {
+                        _ = try ring.poll_add(@intFromEnum(Location.worker_stdin), stdin_fd, posix.POLL.OUT);
+                    } else if (!stdin_fwd.ended) {
+                        try queueRead(ring, .local_stdin, srcs[0], &bufs[0]);
+                    }
+                    continue;
                 },
                 .signals => {
                     if (cqe.res <= 0) {

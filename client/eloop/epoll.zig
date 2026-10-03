@@ -15,6 +15,8 @@ const Location = enum(u64) {
     worker_stdout,
     worker_stderr,
     signals,
+    /// The worker's stdin, watched for room while what waits to be sent can't go.
+    worker_stdin,
 };
 
 /// Returns the worker's exit code.
@@ -35,16 +37,18 @@ pub fn run(
     try watch(epfd, signals_fd, .signals);
     // Regular files and /dev/null can't be polled, but never block: they're read each round.
     const stdin_polled = if (watch(epfd, posix.STDIN_FILENO, .local_stdin)) true else |_| false;
-    var buf: [1024]u8 = undefined;
+    var stdin_watched = stdin_polled;
+    var buf: [cooked.StdinForwarder.max_read]u8 = undefined;
     var stdin_fwd = cooked.StdinForwarder{ .dst = stdin_fd, .sync_mode = sync_mode, .wants_raw = &signal_parser.worker_wants_raw };
+    // What was forwarded can't all go yet: local stdin waits, the worker's stdin is watched.
+    var blocked = false;
     // Signals EOF without an exit code means the worker crashed.
     var exit_code: ?u8 = null;
     var stdout_eof = false;
     var stderr_eof = false;
-    var stdin_eof = false;
     var events: [5]linux.epoll_event = undefined;
     while (exit_code == null or !stdout_eof or !stderr_eof) {
-        const draining_stdin = !stdin_polled and !stdin_eof and exit_code == null;
+        const draining_stdin = !stdin_polled and !stdin_fwd.ended and !blocked and exit_code == null;
         const wait_rc = linux.epoll_wait(epfd, &events, 4, if (draining_stdin) 0 else -1);
         switch (linux.errno(wait_rc)) {
             .SUCCESS => {},
@@ -59,14 +63,30 @@ pub fn run(
         for (events[0..count]) |ev| switch (@as(Location, @enumFromInt(ev.data.u64))) {
             .worker_stdout => stdout_eof = !relay(epfd, stdout_fd, posix.STDOUT_FILENO, &buf),
             .worker_stderr => stderr_eof = !relay(epfd, stderr_fd, posix.STDERR_FILENO, &buf),
-            .local_stdin => {
+            .local_stdin, .worker_stdin => |loc| {
                 if (exit_code != null) continue;
-                if (readSome(epfd, posix.STDIN_FILENO, &buf)) |data| {
-                    stdin_fwd.forward(data);
-                } else if (stdin_fwd.end()) {
-                    try watch(epfd, posix.STDIN_FILENO, .local_stdin);
-                } else {
-                    stdin_eof = true;
+                if (loc == .local_stdin) {
+                    if (blocked) continue;
+                    if (readSome(epfd, posix.STDIN_FILENO, &buf)) |data| {
+                        stdin_fwd.forward(data);
+                    } else {
+                        stdin_watched = false;
+                        _ = stdin_fwd.end();
+                    }
+                }
+                const sent = stdin_fwd.flush();
+                if (!sent and !blocked) {
+                    if (stdin_watched) unwatch(epfd, posix.STDIN_FILENO);
+                    stdin_watched = false;
+                    try watchFor(epfd, stdin_fd, .worker_stdin, linux.EPOLL.OUT);
+                    blocked = true;
+                } else if (sent) {
+                    if (blocked) unwatch(epfd, stdin_fd);
+                    blocked = false;
+                    if (stdin_polled and !stdin_watched and !stdin_fwd.ended) {
+                        try watch(epfd, posix.STDIN_FILENO, .local_stdin);
+                        stdin_watched = true;
+                    }
                 }
             },
             .signals => {
@@ -77,7 +97,8 @@ pub fn run(
                 } else 1;
                 // No longer read, so unwatched: they would stay ready.
                 unwatch(epfd, signals_fd);
-                unwatch(epfd, posix.STDIN_FILENO);
+                if (stdin_watched) unwatch(epfd, posix.STDIN_FILENO);
+                if (blocked) unwatch(epfd, stdin_fd);
             },
         };
     }
@@ -94,7 +115,11 @@ fn relay(epfd: i32, src: posix.fd_t, dst: posix.fd_t, buf: []u8) bool {
 }
 
 fn watch(epfd: i32, fd: posix.fd_t, location: Location) !void {
-    var ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .u64 = @intFromEnum(location) } };
+    return watchFor(epfd, fd, location, linux.EPOLL.IN);
+}
+
+fn watchFor(epfd: i32, fd: posix.fd_t, location: Location, events: u32) !void {
+    var ev = linux.epoll_event{ .events = events, .data = .{ .u64 = @intFromEnum(location) } };
     if (linux.errno(linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS) return error.EpollCtlFailed;
 }
 
