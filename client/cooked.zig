@@ -8,13 +8,25 @@ const posix = std.posix;
 const platform = @import("platform/main.zig");
 
 /// Local stdin on its way to the worker: line-edited here while a `--sync`
-/// worker wants cooked input, passed straight through otherwise.
+/// worker wants cooked input, passed straight through otherwise. What it
+/// forwards waits for `flush`, so a worker not reading its stdin holds up
+/// only the next read of ours, never its output.
 pub const StdinForwarder = struct {
     dst: posix.socket_t,
     sync_mode: bool,
     /// The signal parser's; on Windows another thread writes it.
     wants_raw: *const bool,
     cooked: CookedState = .{},
+    /// What one `forward` or `end` made of its input, a line held back included.
+    unsent: [@sizeOf(@FieldType(CookedState, "line_buf")) + 2 * max_read]u8 = undefined,
+    unsent_start: usize = 0,
+    unsent_end: usize = 0,
+    /// Local input is over: the worker's stdin ends once `unsent` has gone.
+    ended: bool = false,
+    eof_sent: bool = false,
+
+    /// The most `forward` is given at once, and only once all before has gone.
+    pub const max_read = 1024;
 
     /// A Ctrl-C typed in raw mode comes as a byte, as in Julia's: unless the
     /// REPL takes it as a key, it interrupts, as the terminal's signal would.
@@ -36,17 +48,50 @@ pub const StdinForwarder = struct {
     /// the end of input so far.
     pub fn end(self: *StdinForwarder) bool {
         if (platform.isatty(platform.getStdinHandle()) and !platform.inRawMode()) {
-            platform.write(self.dst, "\x04");
+            self.put("\x04");
             return true;
         }
-        platform.sendEof(self.dst);
+        self.ended = true;
         return false;
+    }
+
+    /// Sends what is unsent without waiting, and then any end of input;
+    /// whether all has gone. Until it has, local stdin is left unread.
+    pub fn flush(self: *StdinForwarder) bool {
+        while (self.unsent_start < self.unsent_end) {
+            const sent = platform.sendNonBlocking(self.dst, self.unsent[self.unsent_start..self.unsent_end]) orelse {
+                // The worker's stdin has closed, so nothing will read it.
+                self.unsent_start = self.unsent_end;
+                break;
+            };
+            if (sent == 0) return false;
+            self.unsent_start += sent;
+        }
+        self.unsent_start = 0;
+        self.unsent_end = 0;
+        if (self.ended and !self.eof_sent) {
+            platform.sendEof(self.dst);
+            self.eof_sent = true;
+        }
+        return true;
+    }
+
+    fn put(self: *StdinForwarder, bytes: []const u8) void {
+        if (bytes.len > self.unsent.len - self.unsent_end) {
+            // Never while `forward` keeps within `max_read`; written out, rather than lost.
+            platform.write(self.dst, self.unsent[self.unsent_start..self.unsent_end]);
+            self.unsent_start = 0;
+            self.unsent_end = 0;
+            return platform.write(self.dst, bytes);
+        }
+        @memcpy(self.unsent[self.unsent_end..][0..bytes.len], bytes);
+        self.unsent_end += bytes.len;
     }
 
     fn pass(self: *StdinForwarder, bytes: []const u8) void {
         if (self.isCooked()) {
-            for (bytes) |byte| self.cooked.process(byte, self.dst);
-        } else platform.write(self.dst, bytes);
+            for (bytes) |byte| self.cooked.process(byte, self);
+        } else self.put(bytes);
     }
 
     fn isCooked(self: *const StdinForwarder) bool {
@@ -63,19 +108,19 @@ pub const CookedState = struct {
     keys: ?platform.LineEditingKeys = null,
 
     /// Echo goes to local stdout.
-    pub fn process(self: *CookedState, byte: u8, stdin_fd: posix.socket_t) void {
+    pub fn process(self: *CookedState, byte: u8, out: *StdinForwarder) void {
         const keys = self.keys orelse keys: {
             self.keys = platform.lineEditingKeys();
             break :keys self.keys.?;
         };
         if (byte == '\r' or byte == '\n') {
             writeLocal("\r\n");
-            self.send(stdin_fd);
-            platform.socketWrite(stdin_fd, "\n");
+            self.send(out);
+            out.put("\n");
         } else if (byte == keys.eof) {
             // Ends input on an empty line, as the worker takes a lone 0x04
             // while cooked, else sends the line so far.
-            if (self.line_len == 0) platform.socketWrite(stdin_fd, "\x04") else self.send(stdin_fd);
+            if (self.line_len == 0) out.put("\x04") else self.send(out);
         } else if (byte == keys.erase) {
             if (self.line_len > 0) self.eraseChar();
         } else if (byte == keys.kill) {
@@ -102,8 +147,8 @@ pub const CookedState = struct {
         writeLocal("^C");
     }
 
-    fn send(self: *CookedState, stdin_fd: posix.socket_t) void {
-        if (self.line_len > 0) platform.socketWrite(stdin_fd, self.line_buf[0..self.line_len]);
+    fn send(self: *CookedState, out: *StdinForwarder) void {
+        if (self.line_len > 0) out.put(self.line_buf[0..self.line_len]);
         self.line_len = 0;
     }
 

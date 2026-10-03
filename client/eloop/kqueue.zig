@@ -20,6 +20,8 @@ const UDATA_STDIN: usize = 0;
 const UDATA_STDOUT: usize = 1;
 const UDATA_STDERR: usize = 2;
 const UDATA_SIGNALS: usize = 3;
+/// The worker's stdin, watched for room while what waits to be sent can't go.
+const UDATA_WORKER_STDIN: usize = 4;
 
 /// Returns the worker's exit code.
 pub fn run(
@@ -49,7 +51,7 @@ pub fn run(
         var stdin_change = [1]c.Kevent{makeKevent(@intCast(posix.STDIN_FILENO), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDIN)};
         break :blk keventCall(kq, &stdin_change, &no_events, null) >= 0;
     };
-    const buf_size = 1024;
+    const buf_size = cooked.StdinForwarder.max_read;
     var out_buf: [buf_size]u8 = undefined;
     var stdin_buf: [buf_size]u8 = undefined;
     var signals_buf: [buf_size]u8 = undefined;
@@ -58,11 +60,13 @@ pub fn run(
     var stdout_eof = false;
     var stderr_eof = false;
     var stdin_closed = false;
+    // What was forwarded can't all go yet: local stdin waits, the worker's stdin is watched.
+    var blocked = false;
     var events: [8]c.Kevent = undefined;
     var no_changes: [0]c.Kevent = undefined;
     const zero_ts = c.timespec{ .sec = 0, .nsec = 0 };
     while (true) {
-        const draining_stdin = !stdin_polled and !stdin_closed and exit_code == null;
+        const draining_stdin = !stdin_polled and !stdin_closed and !blocked and exit_code == null;
         const nevents = keventCall(kq, &no_changes, &events, if (draining_stdin) &zero_ts else null);
         if (nevents < 0) {
             const err: posix.E = @enumFromInt(c._errno().*);
@@ -76,14 +80,14 @@ pub fn run(
             switch (ev.udata) {
                 UDATA_STDOUT => if (relay(stdout_fd, posix.STDOUT_FILENO, &out_buf, ev)) {
                     stdout_eof = true;
-                    unwatch(kq, stdout_fd);
+                    unwatch(kq, stdout_fd, c.EVFILT.READ);
                 },
                 UDATA_STDERR => if (relay(stderr_fd, posix.STDERR_FILENO, &out_buf, ev)) {
                     stderr_eof = true;
-                    unwatch(kq, stderr_fd);
+                    unwatch(kq, stderr_fd, c.EVFILT.READ);
                 },
                 UDATA_STDIN => {
-                    if (exit_code != null or stdin_closed) continue;
+                    if (exit_code != null or stdin_closed or blocked) continue;
                     var remaining: usize = @intCast(ev.data);
                     var ended = (ev.flags & EV_EOF) != 0;
                     while (remaining > 0) {
@@ -95,11 +99,27 @@ pub fn run(
                         }
                         stdin_fwd.forward(stdin_buf[0..n]);
                         remaining -= n;
+                        // The rest is read once this has gone.
+                        if (!stdin_fwd.flush()) {
+                            ended = false;
+                            break;
+                        }
                     }
                     if (ended and !stdin_fwd.end()) {
                         stdin_closed = true;
-                        unwatch(kq, posix.STDIN_FILENO);
+                        unwatch(kq, posix.STDIN_FILENO, c.EVFILT.READ);
                     }
+                    if (!stdin_fwd.flush()) {
+                        if (!stdin_closed) unwatch(kq, posix.STDIN_FILENO, c.EVFILT.READ);
+                        watch(kq, stdin_fd, c.EVFILT.WRITE, UDATA_WORKER_STDIN);
+                        blocked = true;
+                    }
+                },
+                UDATA_WORKER_STDIN => {
+                    if (exit_code != null or !stdin_fwd.flush()) continue;
+                    unwatch(kq, stdin_fd, c.EVFILT.WRITE);
+                    blocked = false;
+                    if (stdin_polled and !stdin_closed) watch(kq, posix.STDIN_FILENO, c.EVFILT.READ, UDATA_STDIN);
                 },
                 UDATA_SIGNALS => {
                     var remaining: usize = @intCast(ev.data);
@@ -121,21 +141,26 @@ pub fn run(
                     }
                     // No longer read, so unwatched: they would stay ready.
                     if (exit_code != null) {
-                        unwatch(kq, signals_fd);
-                        if (stdin_polled) unwatch(kq, posix.STDIN_FILENO);
+                        unwatch(kq, signals_fd, c.EVFILT.READ);
+                        if (stdin_polled and !stdin_closed and !blocked) unwatch(kq, posix.STDIN_FILENO, c.EVFILT.READ);
+                        if (blocked) unwatch(kq, stdin_fd, c.EVFILT.WRITE);
                     }
                 },
                 else => {},
             }
         }
         // Drain non-pollable stdin directly; read()==0 is EOF.
-        if (!stdin_polled and !stdin_closed and exit_code == null) {
+        if (!stdin_polled and !stdin_closed and !blocked and exit_code == null) {
             const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch 0;
             if (n == 0) {
-                platform.sendEof(stdin_fd);
+                _ = stdin_fwd.end();
                 stdin_closed = true;
             } else {
                 stdin_fwd.forward(stdin_buf[0..n]);
+            }
+            if (!stdin_fwd.flush()) {
+                watch(kq, stdin_fd, c.EVFILT.WRITE, UDATA_WORKER_STDIN);
+                blocked = true;
             }
         }
         if (exit_code != null and stdout_eof and stderr_eof) {
@@ -144,9 +169,15 @@ pub fn run(
     }
 }
 
+fn watch(kq: posix.fd_t, fd: posix.fd_t, filter: i16, udata: usize) void {
+    var change = [1]c.Kevent{makeKevent(@intCast(fd), filter, c.EV.ADD, 0, 0, udata)};
+    var no_events: [0]c.Kevent = undefined;
+    _ = keventCall(kq, &change, &no_events, null);
+}
+
 /// Level-triggered, a registration left at an end reports it forever.
-fn unwatch(kq: posix.fd_t, fd: posix.fd_t) void {
-    var change = [1]c.Kevent{makeKevent(@intCast(fd), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
+fn unwatch(kq: posix.fd_t, fd: posix.fd_t, filter: i16) void {
+    var change = [1]c.Kevent{makeKevent(@intCast(fd), filter, c.EV.DELETE, 0, 0, 0)};
     var no_events: [0]c.Kevent = undefined;
     _ = keventCall(kq, &change, &no_events, null);
 }
