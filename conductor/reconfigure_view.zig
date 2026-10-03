@@ -34,6 +34,9 @@ const focus_mark = "\x1b[1;34m❯" ++ reset;
 const staged_colour = "\x1b[33m";
 const unsaved_colour = "\x1b[36m";
 const problem_colour = "\x1b[31m";
+// After a path's value, when it may not do.
+const flag = " " ++ bold ++ problem_colour ++ "!\x1b[39m\x1b[22m";
+const flag_cols: usize = 2;
 const warning_colour = "\x1b[33m";
 const number_colour = "\x1b[35m";
 const choice_colour = "\x1b[34m";
@@ -86,6 +89,8 @@ pub const Scene = struct {
     editor: ?struct { text: []const u8, cursor: usize, check: *const Check } = null,
     message: ?struct { problem: bool, text: []const u8 } = null,
     asking: bool = false, // whether to save before quitting
+    /// Paths that may not do (missing, say), marked by their values.
+    flagged: std.StaticBitSet(all.len) = .empty,
     styles: *const Styles,
     cols: u16,
     rows: u16,
@@ -218,7 +223,7 @@ const Frame = struct {
         var buf: [max_items]Item = undefined;
         const items = itemsOf(tabs[scene.tab], &buf);
         for (items, 0..) |item, k| {
-            const row: Row = .{ .items = items, .k = k, .values = &values, .value_cols = valueCols(items, &values) };
+            const row: Row = .{ .items = items, .k = k, .values = &values, .value_cols = valueCols(items, &values, scene.flagged) };
             const focused = item.setting == scene.focus;
             if (focused) self.focus_lines[0] = self.line();
             try self.writeRow(row);
@@ -310,7 +315,10 @@ const Frame = struct {
         else
             kindColour(s, value orelse s.default.?);
         try self.print("{s}{s}\x1b[39m", .{ colour, shown });
-        const note_at = @max(tui.textWidth(shown), row.value_cols);
+        const flagged = scene.flagged.isSet(i);
+        if (flagged) try self.write(flag);
+        const shown_cols = tui.textWidth(shown) + if (flagged) flag_cols else 0;
+        const note_at = @max(shown_cols, row.value_cols);
         var note_buf: [192]u8 = undefined;
         var note = std.Io.Writer.fixed(&note_buf);
         const at_default = changes.alike(i, value, null);
@@ -328,8 +336,8 @@ const Frame = struct {
         } else if (value != null) note.print("unset: {s}", .{s.unset}) catch {};
         const text = note.buffered();
         const cols = tui.textWidth(text) + if (marked) "default".len else 0;
-        if (cols == 0) return tui.textWidth(shown);
-        try self.pad(note_at - tui.textWidth(shown));
+        if (cols == 0) return shown_cols;
+        try self.pad(note_at - shown_cols);
         try self.print("  {s}{s}{s}\x1b[39m", .{ if (used) self.muted() else "", text, if (marked) dim ++ "default\x1b[22m" else "" });
         if (!used) try self.write(dim);
         return note_at + 2 + cols;
@@ -500,12 +508,12 @@ fn tabMark(scene: *const Scene, tab: settings.Tab) enum { none, staged, unsaved 
 }
 
 // The widest value shown among `items`, those past `max_value_cols` aside.
-fn valueCols(items: []const Item, values: *const changes.Values) usize {
+fn valueCols(items: []const Item, values: *const changes.Values, flagged: std.StaticBitSet(all.len)) usize {
     var widest: usize = 0;
     for (items) |item| {
         const i = item.setting orelse continue;
         var buf: [128]u8 = undefined;
-        const cols = tui.textWidth(settings.display(&all[i], values[i], &buf));
+        const cols = tui.textWidth(settings.display(&all[i], values[i], &buf)) + if (flagged.isSet(i)) flag_cols else 0;
         if (cols <= max_value_cols) widest = @max(widest, cols);
     }
     return widest;
@@ -696,4 +704,31 @@ test "a terminal a row high gets no cursor-up of 0, which moves one" {
     defer out.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), try draw(gpa, &out, &scene, 0));
     try testing.expect(std.mem.find(u8, out.items, "\x1b[0A") == null);
+}
+
+test "a flagged path is marked after its value" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const executable = Setting.index("JULIA_DAEMON_WORKER_EXECUTABLE");
+    try staged.stage(gpa, &state, executable, "/gone/julia");
+    const styles = Styles.of(null);
+    var scene = sceneOf(&state, &staged, &styles, @intFromEnum(all[executable].tab), executable);
+    const unflagged = try drawnText(&scene);
+    defer gpa.free(unflagged);
+    try testing.expect(std.mem.find(u8, unflagged, "/gone/julia !") == null);
+    scene.flagged.set(executable);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    _ = try draw(gpa, &out, &scene, 0);
+    try testing.expect(std.mem.find(u8, out.items, "/gone/julia" ++ "\x1b[39m" ++ flag) != null);
+    const flagged = try drawnText(&scene);
+    defer gpa.free(flagged);
+    const at = std.mem.find(u8, flagged, "/gone/julia !").?;
+    const line_end = std.mem.findScalarPos(u8, flagged, at, '\n').?;
+    try testing.expect(std.mem.find(u8, flagged[at..line_end], "was default julia") != null);
 }
