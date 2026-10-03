@@ -249,11 +249,8 @@ fn run(init: std.process.Init.Minimal) !void {
     platform.openClosedStdio();
     const inputs = try platform.processInputs(init);
     var env = scanEnv(inputs.env);
-    var problem: args.Problem = undefined;
-    const parsed = args.parseReporting([*:0]const u8, inputs.args, &problem) catch {
-        platform.eprint("ERROR: {f}\n", .{problem});
-        exitClient(1);
-    };
+    // What Julia would refuse, the conductor refuses.
+    const parsed = args.read([*:0]const u8, inputs.args);
     if (parsed.getSwitch("--address")) |addr| if (addr.len > 0) {
         env.server_path = addr;
     };

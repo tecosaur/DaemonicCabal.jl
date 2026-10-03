@@ -128,9 +128,9 @@ pub const Switch = struct {
     words: usize,
 
     pub fn isHonoured(self: Switch) bool {
-        const option = for (&options) |*option| {
-            if (std.mem.eql(u8, option.long, self.name)) break option;
-        } else return false;
+        const option = findExact(self.name) orelse return false;
+        // Refused, not ignored.
+        if (option.needs_own_julia) return true;
         return switch (option.honoured) {
             .never => false,
             .always => true,
@@ -160,7 +160,7 @@ pub const Problem = union(enum) {
                 try w.print("julia: invalid argument to -{c} ({s})", .{ c, invalid.value })
             else
                 try w.print("julia: invalid argument to {s}={{{s}}} ({s})", .{ invalid.option.long, invalid.option.choices.?, invalid.value }),
-            .invalid_threads => |refusal| try w.writeAll(switch (refusal) {
+            .invalid_threads => |why| try w.writeAll(switch (why) {
                 .default => "julia: -t,--threads=<n>[,auto|<m>]; n must be an integer >= 1",
                 .interactive => "julia: -t,--threads=<n>,<m>; m must be an integer >= 0",
                 .auto_interactive => "julia: -t,--threads=auto,<m>; m must be an integer >= 0",
@@ -305,19 +305,28 @@ pub fn parse(argv: []const []const u8) Error!ParsedArgs {
     return parseReporting([]const u8, argv, &problem);
 }
 
-/// Split `argv` (the executable first) into switches, program file and ARGS.
-/// On `error.InvalidArguments`, `problem` holds why.
-pub fn parseReporting(comptime Word: type, argv: []const Word, problem: *Problem) Error!Parsed(Word) {
+/// `argv`'s switches as far as they can be read, unchecked: what the client
+/// needs of them, the conductor refusing what Julia would. No program file.
+pub fn read(comptime Word: type, argv: []const Word) Parsed(Word) {
     const channel: ?[]const u8 = if (argv.len > 1 and word(argv, 1).len > 0 and word(argv, 1)[0] == '+') word(argv, 1) else null;
-    var parsed: Parsed(Word) = .{
+    return .{
         .argv = argv,
         .first = if (channel == null) 1 else 2,
         .julia_channel = channel,
         .program_file = null,
         .program_args = &.{},
     };
+}
+
+/// Split `argv` (the executable first) into switches, program file and ARGS.
+/// On `error.InvalidArguments`, `problem` holds why.
+pub fn parseReporting(comptime Word: type, argv: []const Word, problem: *Problem) Error!Parsed(Word) {
+    var parsed = read(Word, argv);
     var it = parsed.switches();
-    while (it.next()) |_| {}
+    while (it.next()) |sw| if (refusal(sw)) |why| {
+        problem.* = why;
+        return error.InvalidArguments;
+    };
     const rest = switch (it.end.?) {
         .invalid => |why| {
             problem.* = why;
@@ -398,20 +407,9 @@ pub fn Scanner(comptime Word: type) type {
             return word(self.argv, self.i);
         }
 
-        /// The switch, spanning argv from `index` to here, unless Julia would
-        /// refuse it; the scan ends after it if Julia would stop there.
+        /// The switch, spanning argv from `index` to here; the scan ends after
+        /// it if Julia would stop there.
         fn accept(self: *Self, option: *const Option, value: []const u8, index: usize) ?Switch {
-            if (option.needs_own_julia) return self.finish(.{ .invalid = .{ .needs_own_julia = option } });
-            if (option.choices) |choices| if (value.len > 0 or option.arity != .optional) {
-                var allowed = std.mem.splitScalar(u8, choices, '|');
-                while (allowed.next()) |choice| {
-                    if (std.mem.eql(u8, choice, value)) break;
-                } else return self.finish(.{ .invalid = .{ .invalid_value = .{ .option = option, .value = value } } });
-            };
-            if (std.mem.eql(u8, option.long, "--threads")) switch (switchThreads(value)) {
-                .threads => {},
-                .refused => |refusal| return self.finish(.{ .invalid = .{ .invalid_threads = refusal } }),
-            };
             if (option.stops) self.end = .{ .stopped = self.i };
             return .{ .name = option.long, .value = value, .index = index, .words = self.i - index };
         }
@@ -432,12 +430,34 @@ fn bareValue(option: *const Option) []const u8 {
     return if (std.mem.eql(u8, option.long, "--project")) "@." else "";
 }
 
-/// An exact match, else the only one of Julia's options `name` abbreviates,
-/// else, abbreviating none of them, the only one of the client's.
-fn findLong(name: []const u8) ?*const Option {
+/// Why Julia would refuse a switch it read.
+fn refusal(sw: Switch) ?Problem {
+    const option = findExact(sw.name).?;
+    if (option.needs_own_julia) return .{ .needs_own_julia = option };
+    if (option.choices) |choices| if (sw.value.len > 0 or option.arity != .optional) {
+        var allowed = std.mem.splitScalar(u8, choices, '|');
+        while (allowed.next()) |choice| {
+            if (std.mem.eql(u8, choice, sw.value)) break;
+        } else return .{ .invalid_value = .{ .option = option, .value = sw.value } };
+    };
+    if (std.mem.eql(u8, option.long, "--threads")) switch (switchThreads(sw.value)) {
+        .threads => {},
+        .refused => |why| return .{ .invalid_threads = why },
+    };
+    return null;
+}
+
+fn findExact(name: []const u8) ?*const Option {
     for (&options) |*option| {
         if (std.mem.eql(u8, option.long, name)) return option;
     }
+    return null;
+}
+
+/// An exact match, else the only one of Julia's options `name` abbreviates,
+/// else, abbreviating none of them, the only one of the client's.
+fn findLong(name: []const u8) ?*const Option {
+    if (findExact(name)) |option| return option;
     for ([_]bool{ false, true }) |own| {
         var found: ?*const Option = null;
         for (&options) |*option| {
