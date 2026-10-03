@@ -1152,6 +1152,9 @@ pub fn sleepMs(ms: u32) void {
     Sleep(ms);
 }
 
+/// Only macOS rotates its own log.
+pub fn rotateLog(_: u64) void {}
+
 pub fn currentDir(buf: []u8) ![]const u8 {
     var wide: [4096]u16 = undefined;
     const len = GetCurrentDirectoryW(wide.len, &wide);

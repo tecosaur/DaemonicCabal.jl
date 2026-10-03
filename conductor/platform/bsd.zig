@@ -257,6 +257,27 @@ pub fn fileOwner(fd: posix.fd_t) ?struct { uid: posix.uid_t, mode: u32 } {
 }
 
 
+/// Past `max_bytes`, the log a launchd agent's stderr names (macOS gives an
+/// fd's path) moves to `<path>.1`, and stdout and stderr go on in a new one.
+pub fn rotateLog(max_bytes: u64) void {
+    if (builtin.target.os.tag != .macos) return;
+    var err_st: c.Stat = undefined;
+    if (c.fstat(posix.STDERR_FILENO, &err_st) != 0 or !posix.S.ISREG(err_st.mode) or err_st.size <= max_bytes) return;
+    var path_buf: [std.Io.Dir.max_path_bytes:0]u8 = @splat(0);
+    if (c.fcntl(posix.STDERR_FILENO, c.F.GETPATH, &path_buf) == -1) return;
+    var old_buf: [std.Io.Dir.max_path_bytes + 2:0]u8 = undefined;
+    const old = std.mem.printSentinel(&old_buf, "{s}.1", .{std.mem.sliceTo(&path_buf, 0)}, 0) catch return;
+    var out_st: c.Stat = undefined;
+    const shares_stdout = c.fstat(posix.STDOUT_FILENO, &out_st) == 0 and out_st.dev == err_st.dev and out_st.ino == err_st.ino;
+    if (c.rename(&path_buf, old) != 0) return;
+    const fd = c.open(&path_buf, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, @intCast(err_st.mode & 0o777)));
+    if (fd < 0) return;
+    if (shares_stdout) _ = c.dup2(fd, posix.STDOUT_FILENO);
+    _ = c.dup2(fd, posix.STDERR_FILENO);
+    _ = c.close(fd);
+}
+
+
 // Paths
 pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, home: ?[]const u8) ![]const u8 {
     if (builtin.target.os.tag == .macos) {

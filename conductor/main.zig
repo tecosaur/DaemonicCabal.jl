@@ -2297,6 +2297,7 @@ pub const Conductor = struct {
     }
 
     pub fn onPingTimer(self: *Conductor) void {
+        platform.rotateLog(10 << 20);
         if (!self.pressure_monitor.active()) self.sweepPendingKills();
         self.enforceMaxTtl();
         const now = self.currentTime();
