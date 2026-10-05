@@ -778,7 +778,7 @@ pub const Conductor = struct {
             return .done;
         }
         const outcome = self.assignClientToWorker(socket, &request, worker_key, sandbox, null, null) catch |err| {
-            self.reportNoWorker(socket, err, sandbox);
+            self.reportNoWorker(socket, err, sandbox, "");
             return .done;
         };
         request_held = outcome == .held;
@@ -904,14 +904,17 @@ pub const Conductor = struct {
         return .done;
     }
 
-    fn reportNoWorker(self: *Conductor, socket: posix.socket_t, err: anyerror, sandbox: SandboxKind) void {
+    /// `output` is what a failed spawn wrote last, shown in place of a hint.
+    fn reportNoWorker(self: *Conductor, socket: posix.socket_t, err: anyerror, sandbox: SandboxKind, output: []const u8) void {
         std.debug.print("Client {d}: no worker: {}\n", .{ self.client_id, err });
         if (err == error.ClientGone) return;
-        var msg_buf: [1024]u8 = undefined;
+        var msg_buf: [2048]u8 = undefined;
         // Julia moved or upgraded since the service was set up, most likely.
         const msg = (if (err == error.FileNotFound)
             std.mem.print(&msg_buf, "Could not run a Julia worker: its executable, {s}, cannot be found.\n" ++
                 "Run juliaclient --reconfigure to set another (Workers, Julia executable), or DaemonicCabal.install() again.\n", .{self.cfg.worker_executable})
+        else if (output.len > 0)
+            std.mem.print(&msg_buf, "Could not run a Julia worker for this session ({s}). It wrote:\n{s}\n", .{ @errorName(err), output })
         else
             std.mem.print(&msg_buf, "Could not run a Julia worker for this session ({s}).\n{s}", .{
                 @errorName(err), self.spawnFailureHint(err, sandbox),
@@ -1131,20 +1134,23 @@ pub const Conductor = struct {
         self.unholdClient(hold);
     }
 
-    const Resumption = union(enum) { select, on: *worker.Worker, refuse: anyerror };
+    const Resumption = union(enum) { select, on: *worker.Worker, refuse: Refusal };
+    /// Why no worker serves a client: an error, and what a failed spawn wrote.
+    const Refusal = struct { err: anyerror, output: []const u8 = "" };
 
     // A client served meanwhile (`--restart` fails spawns) stays the current one.
     fn resumeHeld(self: *Conductor, hold: *HeldClient, how: Resumption) void {
         const serving = self.client_id;
         defer self.client_id = serving;
         self.client_id = hold.id;
+        const output = if (how == .refuse) how.refuse.output else "";
         const attempt: anyerror!Outcome = switch (how) {
-            .refuse => |err| err,
+            .refuse => |refusal| refusal.err,
             .select => self.assignClientToWorker(hold.socket, &hold.request, hold.worker_key, hold.sandbox, hold, null),
             .on => |w| self.assignClientToWorker(hold.socket, &hold.request, hold.worker_key, hold.sandbox, hold, w),
         };
         const outcome = attempt catch |err| blk: {
-            self.reportNoWorker(hold.socket, err, hold.sandbox);
+            self.reportNoWorker(hold.socket, err, hold.sandbox, output);
             break :blk Outcome.done;
         };
         if (outcome == .done) self.discardHold(hold);
@@ -1467,8 +1473,10 @@ pub const Conductor = struct {
         p.spawn.abandon(self.io);
         // A child it left, precompiling, may hold the pipe open.
         if (self.drainStderr(&p.spawn.worker, false)) p.spawn.worker.process.stderr.?.close(self.io);
+        var output_buf: [1024]u8 = undefined;
+        const output = p.spawn.worker.recent.tail(.worker, 8, &output_buf);
         p.spawn.worker.recent.deinit(self.allocator);
-        self.settleSpawn(p, .{ .refuse = err });
+        self.settleSpawn(p, .{ .refuse = .{ .err = err, .output = output } });
     }
 
     fn completeSpawn(self: *Conductor, p: *PendingSpawn, connected: worker.Worker) void {
@@ -1478,7 +1486,7 @@ pub const Conductor = struct {
             var lost = connected;
             lost.killAndReap();
             lost.deinit();
-            return self.settleSpawn(p, .{ .refuse = err });
+            return self.settleSpawn(p, .{ .refuse = .{ .err = err } });
         };
         w.* = connected;
         if (w.stderrFd()) |fd| self.event_loop.watchFd(@intFromPtr(w) | tag_worker_stderr, fd);
@@ -1491,8 +1499,8 @@ pub const Conductor = struct {
                 self.enqueueKill(w);
             },
             .client => |hold| {
-                const list = self.getWorkerList(hold.worker_key) catch |err| return self.settleSpawn(p, .{ .refuse = err });
-                self.seatWorker(list, w, hold.request.project orelse "", labelOf(&hold.request)) catch |err| return self.settleSpawn(p, .{ .refuse = err });
+                const list = self.getWorkerList(hold.worker_key) catch |err| return self.settleSpawn(p, .{ .refuse = .{ .err = err } });
+                self.seatWorker(list, w, hold.request.project orelse "", labelOf(&hold.request)) catch |err| return self.settleSpawn(p, .{ .refuse = .{ .err = err } });
                 return self.settleSpawn(p, .{ .on = w });
             },
         }
@@ -1511,9 +1519,9 @@ pub const Conductor = struct {
             self.detachSpawn(p);
             p.spawn.abandon(self.io);
             p.spawn.worker.recent.deinit(self.allocator);
-            for (p.waiters.items) |hold| self.resumeHeld(hold, .{ .refuse = error.DaemonShuttingDown });
+            for (p.waiters.items) |hold| self.resumeHeld(hold, .{ .refuse = .{ .err = error.DaemonShuttingDown } });
             p.waiters.clearRetainingCapacity();
-            self.settleSpawn(p, .{ .refuse = error.DaemonShuttingDown });
+            self.settleSpawn(p, .{ .refuse = .{ .err = error.DaemonShuttingDown } });
         }
     }
 
