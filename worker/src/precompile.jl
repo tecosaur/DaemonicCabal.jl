@@ -155,7 +155,7 @@ let frames = Vector{Base.StackTraces.StackFrame}
         end
     end
 end
-@static VERSION >= v"1.11" && precompile(display_client_error, (IO, Base.ExceptionStack))
+precompile(display_client_error, (IO, Base.ExceptionStack))
 precompile(replay_history, (Base.PipeEndpoint, Recording, Tuple{Int, Int}, Int))
 @static if isdefined(Base, :sigint_new_episode!)
     precompile(with_client_scope, (Function, ClientInfo))
