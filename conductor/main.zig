@@ -1118,6 +1118,7 @@ pub const Conductor = struct {
         const key = try self.allocator.dupe(u8, worker_key);
         hold.* = .{ .socket = socket, .request = request.*, .worker_key = key, .sandbox = sandbox, .id = self.client_id };
         hold.request.env = env;
+        platform.write(socket, &.{protocol.client.starting_worker});
         return hold;
     }
 
