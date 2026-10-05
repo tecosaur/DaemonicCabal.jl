@@ -107,27 +107,28 @@ function Base.display(d::REPL.REPLDisplay, ::MIME"text/plain", exit::DaemonClien
     REPL.LineEdit.transition(d.repl.mistate, :abort)
 end
 
-@static if VERSION >= v"1.11"
-    # `Base.display_error`, as the worker overrides it.
-    function display_client_error(@nospecialize(io::IO), stack::Base.ExceptionStack)
-        if !isempty(stack) && first(stack).exception isa DaemonClientExit
-            # `exit_client` has let the client go, so the REPL just stops.
-            Base.invokelatest(display, first(stack).exception)
-        else
-            # Relayed Ctrl-Cs keep landing after the loop breaks: held off while
-            # the interrupt they asked for renders, then dropped, being answered.
-            try
-                shielded() do
-                    printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
-                    Base.show_exception_stack(IOContext(io, :limit => true), stack)
-                    println(io)
-                end
-            catch err
-                err isa InterruptException || rethrow()
+# `Base.display_error`, as the worker overrides it.
+function display_client_error(@nospecialize(io::IO), stack::Base.ExceptionStack)
+    if !isempty(stack) && first(stack).exception isa DaemonClientExit
+        # `exit_client` has let the client go (before 1.11, its run's end
+        # will), so the REPL just stops.
+        Base.invokelatest(display, first(stack).exception)
+    else
+        # Relayed Ctrl-Cs keep landing after the loop breaks: held off while
+        # the interrupt they asked for renders, then dropped, being answered.
+        try
+            shielded() do
+                printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
+                Base.show_exception_stack(IOContext(io, :limit => true), stack)
+                println(io)
             end
+        catch err
+            err isa InterruptException || rethrow()
         end
     end
+end
 
+@static if VERSION >= v"1.11"
     # As its process would end, whatever the run's code goes on to do, its
     # output going nowhere.
     function let_client_go(code::Int)

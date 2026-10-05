@@ -11,8 +11,9 @@
     @eval Base.get_have_truecolor() = $client_have_truecolor()
 end
 
+@eval Base.display_error(io::IO, stack::Base.ExceptionStack) = $display_client_error(io, stack)
+
 @static if VERSION >= v"1.11"
-    @eval Base.display_error(io::IO, stack::Base.ExceptionStack) = $display_client_error(io, stack)
     # The display stack is process-wide, but a REPL's display belongs to its
     # own session: not to a concurrent run, nor to the REPL pre-warm.
     @eval Base.Multimedia.xdisplayable(d::REPL.REPLDisplay, @nospecialize args...) =
