@@ -450,10 +450,12 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
     const reader = protocol.BufReader{ .fd = conductor };
     while (true) switch (reader.readInt(u8) catch |err| replyFailure(err)) {
         protocol.client.env_request => sendFullEnv(w, env, kvs),
+        protocol.client.starting_worker => showLaunching(true),
         protocol.client.spawn_request => try spawnWorker(reader, kvs),
         protocol.client.socket_paths => break,
         else => replyFailure(error.BadReply),
     };
+    showLaunching(false);
     client_id = try reader.readInt(u32);
     var paths_buf: [4 * (max_socket_path + 1)]u8 = undefined;
     var used: usize = 0;
@@ -472,7 +474,17 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
 }
 
 // A daemon that recognises a protocol mismatch says so; an older one just closes.
+var launching_shown = false;
+
+/// While a worker starts, a terminal's stderr says so, dimmed, until the reply.
+fn showLaunching(shown: bool) void {
+    if (shown == launching_shown or !platform.isatty(platform.getStderrHandle())) return;
+    platform.writeFile(platform.getStderrHandle(), if (shown) "\x1b[2mLaunching new worker...\x1b[22m" else "\r\x1b[2K");
+    launching_shown = shown;
+}
+
 fn replyFailure(err: anyerror) noreturn {
+    showLaunching(false);
     platform.eprint(
         \\The daemon did not reply as expected ({s}).
         \\It is probably running a different protocol version than this juliaclient:

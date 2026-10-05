@@ -125,7 +125,7 @@ const client_switches_help =
 // under a secret of the conductor's, so none can be forged from an id.
 pub const client = struct {
     pub const magic_prefix: u32 = 0x4A4443; // "JDC", then the version byte
-    pub const version: u8 = 3;
+    pub const version: u8 = 4;
     pub const magic: u32 = magic_prefix << 8 | version;
     pub const env_request: u8 = 0x3F; // fingerprint cache miss: send the full env
     pub const host_key_file = "conductor.key";
@@ -137,6 +137,8 @@ pub const client = struct {
     // paths, then the client's key (u64). A client of another version reads
     // as far as the paths, so a mismatch can be reported to it.
     pub const socket_paths: u8 = 0x01;
+    // A worker is starting for it, which it may say it waits on: no payload.
+    pub const starting_worker: u8 = 0x02;
 
     pub const Flags = packed struct(u8) {
         tty: bool,
