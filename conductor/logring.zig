@@ -29,6 +29,31 @@ pub const LogRing = struct {
         self.partial.deinit(gpa);
     }
 
+    /// The last `lines` from `source`, oldest first, each indented, into
+    /// `buf`, as many as fit whole.
+    pub fn tail(self: *const LogRing, source: Source, lines: usize, buf: []u8) []const u8 {
+        var first = self.count;
+        var taken: usize = 0;
+        var len: usize = 0;
+        while (first > 0 and taken < lines) {
+            const entry = self.at(first - 1);
+            if (entry.source == source) {
+                if (len + 3 + entry.text.len > buf.len) break;
+                len += 3 + entry.text.len;
+                taken += 1;
+            }
+            first -= 1;
+        }
+        var out = std.Io.Writer.fixed(buf);
+        for (first..self.count) |i| {
+            const entry = self.at(i);
+            if (entry.source != source) continue;
+            if (out.end > 0) out.writeByte('\n') catch {};
+            out.print("  {s}", .{entry.text}) catch {};
+        }
+        return out.buffered();
+    }
+
     /// A line, cut to `max_line_bytes`; a blank one is left out.
     pub fn add(self: *LogRing, gpa: std.mem.Allocator, when: i64, source: Source, line: []const u8) void {
         const text = std.mem.trimEnd(u8, line, "\r\n ");
@@ -86,4 +111,19 @@ test "the oldest go past the limit" {
     try std.testing.expectEqual(@as(usize, max_entries), ring.count);
     try std.testing.expectEqualStrings("line 5", ring.at(0).text);
     try std.testing.expectEqualStrings(try std.mem.print(&buf, "line {d}", .{max_entries + 4}), ring.at(max_entries - 1).text);
+}
+
+test "a tail is the last of one source's lines that fit, oldest first" {
+    const gpa = std.testing.allocator;
+    var ring = LogRing{};
+    defer ring.deinit(gpa);
+    ring.add(gpa, 1, .worker, "one");
+    ring.add(gpa, 2, .conductor, "spawned");
+    ring.add(gpa, 3, .worker, "two");
+    ring.add(gpa, 4, .worker, "three");
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("  two\n  three", ring.tail(.worker, 2, &buf));
+    try std.testing.expectEqualStrings("  one\n  two\n  three", ring.tail(.worker, 8, &buf));
+    try std.testing.expectEqualStrings("  three", ring.tail(.worker, 8, buf[0..10]));
+    try std.testing.expectEqualStrings("", ring.tail(.worker, 8, buf[0..3]));
 }
