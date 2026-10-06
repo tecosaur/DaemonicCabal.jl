@@ -58,6 +58,18 @@ pub const Service = struct {
             .launchd, .powershell => self.path,
         };
     }
+
+    /// The shell command restarting the conductor with what's saved: launchd
+    /// rereads a plist only as it loads it, so it's unloaded and loaded again.
+    pub fn restartCommand(self: Service, buf: []u8) error{NameTooLong}![]const u8 {
+        const quote = if (std.mem.findScalar(u8, self.path, ' ') != null) "'" else "";
+        const unit = std.Io.Dir.path.basename(self.path);
+        return switch (self.kind) {
+            .systemd => std.mem.print(buf, "systemctl --user restart {s}", .{std.mem.cutSuffix(u8, unit, ".service") orelse unit}),
+            .launchd => std.mem.print(buf, "launchctl unload {0s}{1s}{0s} && launchctl load {0s}{1s}{0s}", .{ quote, self.path }),
+            .powershell => std.mem.print(buf, "taskkill /F /IM julia-conductor.exe & schtasks /run /tn \"Julia\\JuliaDaemon\"", .{}),
+        } catch error.NameTooLong;
+    }
 };
 
 /// A variable set, or unset (null).
@@ -506,6 +518,22 @@ test "a service is named by kind and path" {
     try std.testing.expect(Service.parse("upstart:/x") == null);
     try std.testing.expect(Service.parse("launchd:") == null);
     try std.testing.expect(Service.parse("nothing") == null);
+}
+
+test "a service restarts as its manager has it reread what was saved" {
+    var buf: [256]u8 = undefined;
+    const unit = Service.parse("systemd:/home/u/.config/systemd/user/julia-daemon.service").?;
+    try std.testing.expectEqualStrings("systemctl --user restart julia-daemon", try unit.restartCommand(&buf));
+    const plist = Service.parse("launchd:/Users/u/Library/LaunchAgents/org.julialang.julia-daemon.plist").?;
+    try std.testing.expectEqualStrings(
+        "launchctl unload /Users/u/Library/LaunchAgents/org.julialang.julia-daemon.plist && launchctl load /Users/u/Library/LaunchAgents/org.julialang.julia-daemon.plist",
+        try plist.restartCommand(&buf),
+    );
+    const spaced = Service.parse("launchd:/Users/a b/agent.plist").?;
+    try std.testing.expectEqualStrings("launchctl unload '/Users/a b/agent.plist' && launchctl load '/Users/a b/agent.plist'", try spaced.restartCommand(&buf));
+    const script = Service.parse("powershell:C:\\Users\\u\\julia-daemon.ps1").?;
+    try std.testing.expectEqualStrings("taskkill /F /IM julia-conductor.exe & schtasks /run /tn \"Julia\\JuliaDaemon\"", try script.restartCommand(&buf));
+    try std.testing.expectError(error.NameTooLong, plist.restartCommand(buf[0..32]));
 }
 
 const unit_text =

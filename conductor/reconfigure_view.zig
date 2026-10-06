@@ -109,6 +109,34 @@ pub fn clear(gpa: Allocator, out: *std.ArrayList(u8), from: usize, last: ?[]cons
     while (lines.next()) |line| try out.print(gpa, "{s}\r\n", .{line});
 }
 
+/// What a viewer's changes came to, as it leaves.
+pub const Farewell = struct {
+    problem: ?[]const u8 = null, // with its last action
+    changed: usize,
+    live: usize = 0, // in effect without a restart
+    saved: usize = 0,
+    saved_to: ?[]const u8 = null, // the service's file; none, nothing saves them
+    note: ?[]const u8 = null, // on when the service rereads what's saved
+    restart: usize = 0, // read only as the conductor starts
+    restart_command: ?[]const u8 = null, // given only when restarting loses nothing
+};
+
+/// `f` as lines, its counts standing out in the colours the frame gives them.
+pub fn writeFarewell(w: *std.Io.Writer, f: Farewell) !void {
+    if (f.problem) |problem| try w.print("{s}\n", .{problem});
+    if (f.changed == 0) return w.writeAll("No settings changed.");
+    try w.print("Changed " ++ bold ++ "{d}" ++ reset ++ " setting{s}", .{ f.changed, if (f.changed == 1) "" else "s" });
+    if (f.live > 0) try w.print("\n• \x1b[1;32m{d}" ++ reset ++ " applied live", .{f.live});
+    if (f.saved > 0) {
+        try w.print("\n• \x1b[1;34m{d}" ++ reset ++ " saved to {s}", .{ f.saved, f.saved_to orelse "the service" });
+        if (f.note) |note| try w.print(": {s}", .{note});
+    }
+    const unsaved = f.changed - f.saved;
+    if (unsaved > 0) try w.print("\n• " ++ bold ++ unsaved_colour ++ "{d}" ++ reset ++ " unsaved{s}", .{ unsaved, if (f.saved_to == null) ", with no service to save to" else "" });
+    if (f.restart > 0) try w.print("\n• " ++ bold ++ staged_colour ++ "{d}" ++ reset ++ " require{s} a restart", .{ f.restart, if (f.restart == 1) "s" else "" });
+    if (f.restart_command) |command| try w.print("\n\nTo restart the daemon, run:\n    {s}", .{command});
+}
+
 /// `scene` drawn over the last frame, the cursor `from` lines below its top;
 /// returns how far below its own top it leaves the cursor.
 pub fn draw(gpa: Allocator, out: *std.ArrayList(u8), scene: *const Scene, from: usize) !usize {
@@ -587,17 +615,21 @@ fn drawnText(scene: *const Scene) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     _ = try draw(testing.allocator, &out, scene, 0);
+    return withoutEscapes(out.items);
+}
+
+fn withoutEscapes(bytes: []const u8) ![]u8 {
     var plain: std.ArrayList(u8) = .empty;
     errdefer plain.deinit(testing.allocator);
     var i: usize = 0;
-    while (i < out.items.len) {
-        if (out.items[i] == 0x1b) {
+    while (i < bytes.len) {
+        if (bytes[i] == 0x1b) {
             i += 1;
-            while (i < out.items.len and !std.ascii.isAlphabetic(out.items[i])) i += 1;
+            while (i < bytes.len and !std.ascii.isAlphabetic(bytes[i])) i += 1;
             i += 1;
             continue;
         }
-        try plain.append(testing.allocator, out.items[i]);
+        try plain.append(testing.allocator, bytes[i]);
         i += 1;
     }
     return plain.toOwnedSlice(testing.allocator);
@@ -899,6 +931,68 @@ test "an editor's check sits under its field when it fits, else wraps from the t
     const wraps = try drawnText(&scene);
     defer gpa.free(wraps);
     try testing.expectEqual(4, columnOf(wraps, "This says"));
+}
+
+fn farewellText(f: Farewell) ![]u8 {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeFarewell(&w, f);
+    return withoutEscapes(w.buffered());
+}
+
+test "a farewell counts what was changed, and how far each went" {
+    const gpa = testing.allocator;
+    const live = try farewellText(.{ .changed = 2, .live = 2, .saved = 2, .saved_to = "~/u/reconfigure.conf" });
+    defer gpa.free(live);
+    try testing.expectEqualStrings(
+        \\Changed 2 settings
+        \\• 2 applied live
+        \\• 2 saved to ~/u/reconfigure.conf
+    , live);
+    const restart = try farewellText(.{ .changed = 3, .live = 2, .saved = 3, .saved_to = "~/u/reconfigure.conf", .restart = 1, .restart_command = "systemctl --user restart julia-daemon" });
+    defer gpa.free(restart);
+    try testing.expectEqualStrings(
+        \\Changed 3 settings
+        \\• 2 applied live
+        \\• 3 saved to ~/u/reconfigure.conf
+        \\• 1 requires a restart
+        \\
+        \\To restart the daemon, run:
+        \\    systemctl --user restart julia-daemon
+    , restart);
+}
+
+test "a farewell says what wasn't saved, and offers no restart that would lose it" {
+    const gpa = testing.allocator;
+    const unserviced = try farewellText(.{ .changed = 1, .restart = 1 });
+    defer gpa.free(unserviced);
+    try testing.expectEqualStrings(
+        \\Changed 1 setting
+        \\• 1 unsaved, with no service to save to
+        \\• 1 requires a restart
+    , unserviced);
+    const partly = try farewellText(.{ .changed = 3, .live = 3, .saved = 1, .saved_to = "/s/agent.plist", .note = "launchd reads it as it loads the agent" });
+    defer gpa.free(partly);
+    try testing.expectEqualStrings(
+        \\Changed 3 settings
+        \\• 3 applied live
+        \\• 1 saved to /s/agent.plist: launchd reads it as it loads the agent
+        \\• 2 unsaved
+    , partly);
+}
+
+test "a farewell after nothing changed says so, after any problem" {
+    const gpa = testing.allocator;
+    const none = try farewellText(.{ .problem = "Couldn't save: permission denied.", .changed = 0 });
+    defer gpa.free(none);
+    try testing.expectEqualStrings("Couldn't save: permission denied.\nNo settings changed.", none);
+}
+
+test "a farewell's counts stand out" {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeFarewell(&w, .{ .changed = 2, .live = 2, .saved = 2, .saved_to = "~/x" });
+    try testing.expect(std.mem.find(u8, w.buffered(), bold ++ "2" ++ reset ++ " settings") != null);
 }
 
 test "an unset setting shows what the platform makes of it, where it says" {
