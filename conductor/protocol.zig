@@ -147,7 +147,9 @@ pub const client = struct {
     pub const Flags = packed struct(u8) {
         tty: bool,
         color: bool = false,
-        _reserved: u6 = 0,
+        /// The full environment follows the args, as `env_request` would ask.
+        env_follows: bool = false,
+        _reserved: u5 = 0,
     };
 };
 
@@ -546,4 +548,21 @@ pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16) !Listener {
     };
     var buf: [8]u8 = undefined;
     return Listener.fromServer(server, .tcp, try std.mem.print(&buf, ":{d}", .{actual_port}));
+}
+
+test "addresses dialled together each get their own socket, or why not" {
+    const io = std.testing.io;
+    const loopback: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var first = try loopback.listen(io, .{});
+    defer first.deinit(io);
+    var second = try loopback.listen(io, .{});
+    defer second.deinit(io);
+    var closed = try loopback.listen(io, .{});
+    const refusing = closed.socket.address;
+    closed.deinit(io);
+    var results: [3]anyerror!std.posix.socket_t = undefined;
+    platform.connectTcpEach(&.{ first.socket.address, refusing, second.socket.address }, 1000, &results);
+    platform.close(try results[0]);
+    try std.testing.expectError(error.ConnectionRefused, results[1]);
+    platform.close(try results[2]);
 }

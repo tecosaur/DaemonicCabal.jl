@@ -66,6 +66,7 @@ pub const listenLocal = shared.listenLocal;
 pub const connectLocal = shared.connectLocal;
 pub const connectLocalOnce = shared.connectLocalOnce;
 pub const connectTcp = shared.connectTcp;
+pub const connectTcpEach = shared.connectTcpEach;
 pub const local_transport_name = shared.local_transport_name;
 pub const spawnWorker = shared.spawnWorker;
 pub const no_child = shared.no_child;

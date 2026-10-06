@@ -598,6 +598,13 @@ pub fn rawSocket(family: u32, sock_type: u32) ?HANDLE {
 }
 
 /// std's connect collapses the failure reason into error.Unexpected.
+/// Each of `ips` dialled in turn, each within `timeout_ms`: into its slot
+/// of `results`, a socket connected to it, or why not.
+pub fn connectTcpEach(ips: []const Io.net.IpAddress, timeout_ms: u32, results: []anyerror!HANDLE) void {
+    std.debug.assert(ips.len == results.len);
+    for (ips, results) |ip, *result| result.* = connectTcp(ip, timeout_ms);
+}
+
 pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !HANDLE {
     var storage: Io.Threaded.PosixAddress = undefined;
     const len = Io.Threaded.addressToPosix(&ip, &storage);
