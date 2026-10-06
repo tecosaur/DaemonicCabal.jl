@@ -64,7 +64,7 @@ pub const Styles = struct {
 /// How the editor's text stands: its form, why it can't be staged, or a
 /// warning it may not do.
 pub const Check = struct {
-    tone: enum { fine, warning, problem } = .fine,
+    tone: enum { fine, good, warning, problem } = .fine,
     bytes: [256]u8 = undefined,
     len: usize = 0,
 
@@ -420,6 +420,7 @@ const Frame = struct {
         if (self.scene.editor) |e| if (e.check.len > 0) {
             const colour = switch (e.check.tone) {
                 .fine => self.muted(),
+                .good => on_colour,
                 .warning => warning_colour,
                 .problem => problem_colour,
             };

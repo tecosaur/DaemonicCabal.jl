@@ -611,11 +611,15 @@ fn checkEditor(c: *const Conductor, v: *Viewer) void {
         var why_buf: [256]u8 = undefined;
         if (pathWarning(c, s.kind.path, path, e.settled, &why_buf)) |why| return check.set(.warning, "{s}", .{why});
     };
+    var why_buf: [160]u8 = undefined;
+    const ports = if (e.settled) checkListen(c, i, &values, &why_buf) else null;
+    if (ports) |found| if (found == .unfit) return check.set(.warning, "{s}", .{found.unfit});
     if (e.implied) return check.set(.fine, "The platform's: confirmed as it is, it stays unset.", .{});
     var shown_buf: [128]u8 = undefined;
     const shown = settings.display(s, form, &shown_buf);
     if (form == null) return check.set(.fine, "{s}: {s}.", .{ if (s.default != null) "Default" else "Unset", shown });
-    if (std.mem.eql(u8, std.mem.trim(u8, e.text.items, " \t"), shown)) return check.set(.fine, "", .{});
+    if (std.mem.eql(u8, std.mem.trim(u8, e.text.items, " \t"), shown))
+        return if (ports != null) check.set(.good, "✓ available", .{}) else check.set(.fine, "", .{});
     check.set(.fine, "As {s}.", .{shown});
 }
 
@@ -651,6 +655,88 @@ fn pathWarning(c: *const Conductor, kind: settings.Path, path: []const u8, whole
         .directory => if (stat.kind != .directory) std.mem.print(buf, "{s} isn't a directory.", .{path}) catch null else null,
         .socket => null,
     };
+}
+
+/// The ports the conductor listens on now, which its restart frees.
+const Held = struct {
+    server_port: ?u16 = null,
+    pool: ?protocol.PortPool = null, // its sets taken by clients
+
+    fn of(c: *const Conductor) Held {
+        const server = if (c.cfg.transport == .tcp) protocol.splitHostPort(c.cfg.socket_path) catch null else null;
+        return .{ .server_port = if (server) |at| at.port else null, .pool = c.port_pool };
+    }
+
+    fn has(self: Held, port: u16) bool {
+        if (self.server_port == port) return true;
+        const pool = self.pool orelse return false;
+        if (port < pool.base) return false;
+        const set = (port - pool.base) / 4;
+        return set < pool.count and !pool.free.isSet(set);
+    }
+};
+
+/// What trying ports found: each free, or why not.
+const Ports = union(enum) { free, unfit: []const u8 };
+
+// Whether the conductor could listen where setting `i` would have it, as
+// `values` stand: a TCP server's port, or its workers'. Null if unchecked.
+fn checkListen(c: *const Conductor, i: usize, values: settings.Values, buf: []u8) ?Ports {
+    const server_i = settings.Setting.index("JULIA_DAEMON_SERVER");
+    const server = protocol.parseAddress(values[server_i] orelse return null) catch return null;
+    if (server.mode != .tcp) return null;
+    const at = protocol.splitHostPort(server.addr) catch return null;
+    const ports: [2]u16 = if (i == server_i)
+        .{ at.port, at.port }
+    else if (i == settings.Setting.index("JULIA_DAEMON_PORTS")) blk: {
+        const range = settings.parsePorts(values[i] orelse return null) orelse return null;
+        // Those the pool would use, and no more.
+        break :blk .{ range[0], range[0] + settings.portSets(range) * 4 - 1 };
+    } else return null;
+    return checkPorts(c.io, at.host, ports[0], ports[1], .of(c), buf);
+}
+
+// Whether ports `low` to `high` at `host` can all be listened on, each tried
+// in turn but those `held`. Only an address is tried, as looking a name up
+// could hold the conductor up: a name is left unchecked, null.
+fn checkPorts(io: std.Io, host: []const u8, low: u16, high: u16, held: Held, buf: []u8) ?Ports {
+    const unfit = struct {
+        fn because(into: []u8, comptime fmt: []const u8, fmt_args: anytype) Ports {
+            var w = std.Io.Writer.fixed(into);
+            w.print(fmt, fmt_args) catch {}; // cut short, not lost
+            return .{ .unfit = w.buffered() };
+        }
+    }.because;
+    var address = std.Io.net.IpAddress.parse(if (std.mem.eql(u8, host, "localhost")) "127.0.0.1" else host, 0) catch return null;
+    var in_use: usize = 0;
+    var first: u16 = 0;
+    var port = low;
+    while (true) : (port += 1) {
+        if (!held.has(port)) {
+            address.setPort(port);
+            // Without reuse, so the probe can't share a port, and its connections, with a listener allowing it.
+            if (address.listen(io, .{ .kernel_backlog = 1 })) |listener| {
+                var probe = listener;
+                probe.deinit(io);
+            } else |err| switch (err) {
+                error.AddressInUse => {
+                    if (in_use == 0) first = port;
+                    in_use += 1;
+                },
+                error.AddressUnavailable => return unfit(buf, "{s} isn't an address of this machine.", .{host}),
+                error.AccessDenied => return unfit(buf, "Port {d} needs privileges to listen on.", .{port}),
+                else => return unfit(buf, "Couldn't try port {d}: {s}.", .{ port, @errorName(err) }),
+            }
+        }
+        if (port == high) break;
+    }
+    if (in_use == 0) return .free;
+    const count = @as(u32, high) - low + 1;
+    if (in_use == 1) return if (count == 1)
+        unfit(buf, "Port {d} is in use.", .{first})
+    else
+        unfit(buf, "Port {d} of these {d} is in use.", .{ first, count });
+    return unfit(buf, "{d} of these {d} ports are in use, the first {d}.", .{ in_use, count, first });
 }
 
 /// Where `name` is found on the daemon's PATH, into `buf`.
@@ -798,4 +884,55 @@ fn sweep(c: *Conductor) void {
         v.deinit(c.allocator);
         c.allocator.destroy(v);
     }
+}
+
+test "a port another holds is in use; one the conductor holds is its own" {
+    const io = std.testing.io;
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var other = try loopback.listen(io, .{});
+    defer other.deinit(io);
+    const port = other.socket.address.getPort();
+    var buf: [160]u8 = undefined;
+    var expected_buf: [64]u8 = undefined;
+    const in_use = try std.fmt.bufPrint(&expected_buf, "Port {d} is in use.", .{port});
+    try std.testing.expectEqualStrings(in_use, checkPorts(io, "127.0.0.1", port, port, .{}, &buf).?.unfit);
+    try std.testing.expectEqualStrings(in_use, checkPorts(io, "localhost", port, port, .{}, &buf).?.unfit);
+    try std.testing.expect(checkPorts(io, "127.0.0.1", port, port, .{ .server_port = port }, &buf).? == .free);
+    var pool = protocol.PortPool.init(port, 1);
+    try std.testing.expect(checkPorts(io, "127.0.0.1", port, port + 3, .{ .pool = pool }, &buf).? == .unfit);
+    _ = pool.allocate();
+    try std.testing.expect(checkPorts(io, "127.0.0.1", port, port + 3, .{ .pool = pool }, &buf).? == .free);
+}
+
+test "a free port is found free; an address not this machine's, and a name, aren't" {
+    const io = std.testing.io;
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var released = try loopback.listen(io, .{});
+    const port = released.socket.address.getPort();
+    released.deinit(io);
+    var buf: [160]u8 = undefined;
+    try std.testing.expect(checkPorts(io, "127.0.0.1", port, port, .{}, &buf).? == .free);
+    // TEST-NET-1, reserved for documentation, so never this machine's.
+    try std.testing.expectEqualStrings("192.0.2.1 isn't an address of this machine.", checkPorts(io, "192.0.2.1", port, port, .{}, &buf).?.unfit);
+    // Looking a name up could hold the conductor up, so it's left unchecked.
+    try std.testing.expect(checkPorts(io, "example.invalid", port, port, .{}, &buf) == null);
+}
+
+test "a range names the first port in use" {
+    const io = std.testing.io;
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var other = try loopback.listen(io, .{});
+    defer other.deinit(io);
+    const port = other.socket.address.getPort();
+    var buf: [160]u8 = undefined;
+    const why = checkPorts(io, "127.0.0.1", port, port +| 3, .{}, &buf).?.unfit;
+    var port_buf: [8]u8 = undefined;
+    try std.testing.expect(std.mem.find(u8, why, try std.fmt.bufPrint(&port_buf, "{d}", .{port})) != null);
+    try std.testing.expect(std.mem.find(u8, why, "of these 4") != null);
+}
+
+test "a message too long for its buffer is cut short, not lost" {
+    var buf: [24]u8 = undefined;
+    const why = checkPorts(std.testing.io, "192.0.2.1", 50000, 50000, .{}, &buf).?.unfit;
+    try std.testing.expectEqualStrings("192.0.2.1 isn't an addre", why);
 }

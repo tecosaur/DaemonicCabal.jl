@@ -445,6 +445,11 @@ pub fn parsePorts(text: []const u8) ?[2]u16 {
     return .{ low, high };
 }
 
+/// The sets of four ports a range gives clients, as many as the pool holds.
+pub fn portSets(range: [2]u16) u16 {
+    return @intCast(@min((@as(u32, range[1]) - range[0] + 1) / 4, protocol.PortPool.max_port_sets));
+}
+
 const Bytes = struct {
     count: u64,
     suffix: []const u8,
@@ -706,4 +711,10 @@ test "stepping back past where it began stops there" {
     try std.testing.expectEqualStrings("1500K", step(low, "2M", false, "1500K", &buf).?);
     try std.testing.expectEqualStrings("12.5%", step(low, "12%", true, "12.5%", &buf).?);
     try std.testing.expectEqualStrings("1M", step(low, "2M", false, "12.5%", &buf).?); // not comparable
+}
+
+test "a port range gives clients its whole sets of four, as many as the pool holds" {
+    try std.testing.expectEqual(25, portSets(.{ 9592, 9691 }));
+    try std.testing.expectEqual(1, portSets(.{ 10000, 10006 }));
+    try std.testing.expectEqual(protocol.PortPool.max_port_sets, portSets(.{ 1024, 65535 }));
 }
