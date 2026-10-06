@@ -14,6 +14,7 @@ let
     write(cr, UInt8(0x00))                        # flags: tty=false, force=false
     write(cr, UInt32(7))                          # client id
     write(cr, UInt64(12345))                      # key
+    write(cr, UInt16(24), UInt16(80))             # terminal size
     write_string(cr, "/tmp")                               # cwd
     write(cr, UInt32(2))                          # env_count
     foreach(s -> write_string(cr, s), ("TERM", "xterm-256color", "HOME", "/home/test"))
@@ -52,7 +53,6 @@ let
     write(out, UInt16(0))
     send_signal(out, SIGNAL_EXIT, UInt8[0])
     send_signal(out, SIGNAL_RAW_MODE, UInt8[true])
-    send_signal(out, SIGNAL_QUERY_SIZE, UInt8[])
     # -- Helpers ---------------------------------------------------------------
     getval(client.switches, "--eval", "")
     getval(client.switches, "--missing", "default")

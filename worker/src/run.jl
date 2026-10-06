@@ -40,18 +40,18 @@ function warm_repl_path()
         get(ENV, "JULIA_DAEMON_PREWARM", "1") ∈ ("no", "false", "0") && return nothing
         try
             cin, cout, cerr, sig = linked_pipe(), linked_pipe(), linked_pipe(), linked_pipe()
-            # Closed, so raw!/displaysize skip the client round-trip.
+            # Closed, so raw! sends nothing.
             foreach(close, (sig.in, sig.out))
             drains = [errormonitor(@async try read(p.out) catch end) for p in (cout, cerr)]
             feeder = errormonitor(@async try
                 write(cin.in, "1+1\n")
                 close(cin.in)
             catch end)
-            client = ClientInfo(true, true, false, 0, 0, pwd(),
+            client = ClientInfo(true, true, false, nothing, 0, 0, pwd(),
                                 ["TERM" => "xterm-256color", "JULIA_DAEMON_REVISE" => "no"],
                                 [("--history-file", "no")],
                                 nothing, String[], PORT_SET_NONE)
-            runclient(client, cin.out, cout.in, cerr.in, sig.out; owned_streams=())
+            runclient(client, cin.out, cout.in, cerr.in, ClientSignals(sig.out, nothing); owned_streams=())
             foreach(close, (cout.in, cerr.in))
             foreach(wait, [drains; feeder])
         catch e
@@ -137,7 +137,7 @@ end
         term.redirect_err = devnull
         session = term.sync_session
         if isnothing(session)
-            release_client(term.stdout, term.stderr, term.signals, code)
+            release_client(term.stdout, term.stderr, term.signals.io, code)
         else
             end_sync_session!(session, code)
         end
@@ -179,7 +179,7 @@ end
 
 function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInput},
                    client_stdout::IO, client_stderr::IO,
-                   signals::StreamIO;
+                   signals::ClientSignals;
                    owned_streams::Tuple=(client_stdout, client_stderr),
                    sync_session::Union{Nothing, SyncSession}=nothing,
                    repl_ref::Base.RefValue{REPL.LineEditREPL}=Ref{REPL.LineEditREPL}(),
@@ -302,7 +302,7 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
         # corrupt the task fiber.
         shielded() do
             teardown_client(client, client_stdin, run_stdout, client_stderr,
-                            signals, owned_streams, exit_code)
+                            signals.io, owned_streams, exit_code)
         end
     end
     exit_code
@@ -310,11 +310,11 @@ end
 
 # Following a session's transcript, in place of running code.
 function watch_client(client::ClientInfo, watch::String, client_stdin, client_stdout::IO,
-                      client_stderr::IO, signals::StreamIO, owned_streams::Tuple)
+                      client_stderr::IO, signals::ClientSignals, owned_streams::Tuple)
     exit_code = try
         @static if VERSION >= v"1.11"
             watch_session(getval(client.switches, "--session", ""), watch, client_stdout;
-                          color=color_choice(client), terminal=client.color, until=signals)
+                          color=color_choice(client), terminal=client.color, until=signals.gone)
         else
             println(client_stderr, "--watch needs the session's worker to run Julia 1.11 or later.")
             1
@@ -324,7 +324,7 @@ function watch_client(client::ClientInfo, watch::String, client_stdin, client_st
         1
     end
     shielded() do
-        teardown_client(client, client_stdin, client_stdout, client_stderr, signals, owned_streams, exit_code)
+        teardown_client(client, client_stdin, client_stdout, client_stderr, signals.io, owned_streams, exit_code)
     end
     exit_code
 end

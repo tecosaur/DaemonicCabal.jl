@@ -9,7 +9,7 @@ mutable struct VirtualTerm
     const stdin::Union{StreamIO, TerminalInput}
     const stdout::OutputIO
     const stderr::OutputIO
-    const signals::StreamIO
+    const signals::ClientSignals
     const term::String
     const sync_session::Union{Nothing, SyncSession}
     const stdout_is_terminal::Bool
@@ -43,7 +43,7 @@ const WORKER_TERM = VirtualTerm(
     Base.PipeEndpoint(),
     Base.PipeEndpoint(),
     Base.PipeEndpoint(),
-    Base.PipeEndpoint(),
+    ClientSignals(Base.PipeEndpoint(), Threads.Condition(), Base.Event(), 0, nothing),  # never read
     "Unknown",
     nothing, nothing, nothing, nothing
 )
@@ -183,16 +183,6 @@ Base.get(::Base.GenericIOBuffer, key::Symbol, default::Module) = client_module_d
 client_module_default(key::Symbol, default) =
     if key === :module && default === Main CLIENT_MODULE[] else default end
 
-function query_displaysize(signals::StreamIO)
-    # Response: id(1) + len(1) + height(2) + width(2)
-    resp = @lock signals begin
-        send_signal(signals, SIGNAL_QUERY_SIZE, UInt8[])
-        read(signals, 6)
-    end
-    length(resp) == 6 || return DEFAULT_DISPLAYSIZE
-    answered_size(resp[3:6])
-end
-
 # As stock julia's, which asks only a terminal, and otherwise takes LINES and COLUMNS.
 function Base.displaysize(io::Union{ScopedStdout, ScopedStderr, TerminalStdout})
     term = ACTIVE_TERM[]
@@ -202,8 +192,8 @@ function Base.displaysize(io::Union{ScopedStdout, ScopedStderr, TerminalStdout})
     elseif !(term.stdout_is_terminal || io isa ScopedStderr)
         displaysize()
     else
-        term === WORKER_TERM && return DEFAULT_DISPLAYSIZE # no client to ask
-        isopen(term.signals) || return DEFAULT_DISPLAYSIZE
-        query_displaysize(term.signals)
+        term === WORKER_TERM && return DEFAULT_DISPLAYSIZE # no client
+        # As its client last said: Julia's own size without a terminal.
+        something(term.signals.size, displaysize())
     end
 end

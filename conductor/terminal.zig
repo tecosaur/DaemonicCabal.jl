@@ -45,7 +45,20 @@ pub fn unwatch(c: *Conductor, w: *Watch) void {
     c.event_loop.unwatchFd(@intFromPtr(w) | tag, w.fd);
 }
 
-pub const Size = struct { rows: u16 = 24, cols: u16 = 80 };
+pub const Size = struct {
+    rows: u16 = 24,
+    cols: u16 = 80,
+
+    /// The client's, where it has a terminal.
+    pub fn of(size: protocol.TerminalSize) Size {
+        if (size.rows == 0 or size.cols == 0) return .{};
+        return .{ .rows = size.rows, .cols = size.cols };
+    }
+
+    pub fn told(self: Size) protocol.TerminalSize {
+        return .{ .rows = self.rows, .cols = self.cols };
+    }
+};
 
 pub const Terminal = struct {
     streams: ClientStreams, // held open across repaints
@@ -61,11 +74,10 @@ pub const Terminal = struct {
     gone: bool = false,
 
     /// Keys as they're pressed (its client is raw from the start), and the
-    /// terminal's size, from here on; the cursor hidden and autowrap off until
-    /// it's closed.
+    /// terminal's size as the client says it changes, from here on; the
+    /// cursor hidden and autowrap off until it's closed.
     pub fn open(self: *Terminal, c: *Conductor) void {
         const signals = self.streams.fd(.signals);
-        self.querySize();
         self.input = .{ .kind = .input, .fd = self.streams.fd(.stdin) };
         self.signals = .{ .kind = .signals, .fd = signals };
         watch(c, &self.input);
@@ -97,10 +109,6 @@ pub const Terminal = struct {
 
     pub fn stdout(self: *const Terminal) posix.socket_t {
         return self.streams.fd(.stdout);
-    }
-
-    pub fn querySize(self: *const Terminal) void {
-        platform.write(self.streams.fd(.signals), &[_]u8{ protocol.signals.query_size, 0x00 });
     }
 
     pub fn send(self: *Terminal, gpa: std.mem.Allocator, bytes: []const u8) void {
@@ -138,14 +146,12 @@ pub const Terminal = struct {
         self.send(gpa, frame);
     }
 
-    /// The client's replies: a raw-mode ack, or the terminal's size.
+    /// The client's signals: a raw-mode ack, or its terminal's new size.
     pub fn onSignals(self: *Terminal, bytes: []const u8) void {
         for (bytes) |byte| {
             const msg = self.frames.feed(byte) orelse continue;
-            if (msg[0] == protocol.signals.query_size and msg[1] == 4) self.size = .{
-                .rows = std.mem.readInt(u16, msg[2..4], .little),
-                .cols = std.mem.readInt(u16, msg[4..6], .little),
-            };
+            if (msg[0] == protocol.signals.size and msg[1] == protocol.TerminalSize.encoded_len)
+                self.size = .of(.decode(msg[2..6]));
         }
     }
 };

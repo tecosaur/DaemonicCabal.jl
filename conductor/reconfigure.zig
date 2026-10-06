@@ -116,10 +116,10 @@ const Message = struct {
 
 /// Takes `streams`, the terminal of a client allowed to reconfigure, and
 /// its `palette` when it answered for one.
-pub fn subscribe(c: *Conductor, streams: Conductor.ClientStreams, palette: ?pal.Palette) !void {
+pub fn subscribe(c: *Conductor, streams: Conductor.ClientStreams, palette: ?pal.Palette, size: protocol.TerminalSize) !void {
     const v = try c.allocator.create(Viewer);
     errdefer c.allocator.destroy(v);
-    v.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_id }, .styles = .of(palette) };
+    v.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_id, .size = .of(size) }, .styles = .of(palette) };
     try c.settings.viewers.append(c.allocator, v);
     if (c.settings.viewers.items.len == 1) rereadService(c, v);
     v.term.open(c);
@@ -246,7 +246,6 @@ fn onKeys(c: *Conductor, v: *Viewer, bytes: []const u8) void {
         }
         if (v.term.gone) return;
     }
-    v.term.querySize(); // a resize redraws as it's answered
     repaint(c, v);
 }
 
