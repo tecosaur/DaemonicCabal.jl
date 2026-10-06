@@ -97,14 +97,11 @@ end
         term = ACTIVE_TERM[]
         if !isnothing(term.sync_session)
             switch_raw_mode!(term.sync_session, raw)
-        elseif isopen(term.signals)
+        elseif isopen(term.signals.io)
             if term.stdin isa TerminalInput
                 @lock term.stdin.lock term.stdin.raw = raw
             end
-            @lock term.signals begin
-                send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
-                read(term.signals, 2) # ack
-            end
+            switch_raw_mode!(term.signals, raw)
         end
         true
     end
@@ -115,14 +112,7 @@ else
         if input isa TerminalInput
             @lock input.lock input.raw = raw
         end
-        if sig !== nothing && isopen(sig)
-            try
-                @lock sig begin
-                    send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
-                    read(sig, 2) # ack
-                end
-            catch end
-        end
+        sig === nothing || switch_raw_mode!(sig, raw)
         true
     end
 end
@@ -203,13 +193,9 @@ function suspend_client()
     else
         CLIENT_SIGNALS[]
     end
-    if isnothing(sig) || !isopen(sig)
-        return
-    end
-    @lock sig begin
-        send_signal(sig, SIGNAL_SUSPEND, UInt8[])
-        read(sig, 2) # ack
-    end
+    isnothing(sig) && return
+    # However long it stays stopped.
+    send_acked!(sig, SIGNAL_SUSPEND, UInt8[]) > 0 && await_acks((sig,); timeout_s=nothing)
     nothing
 end
 

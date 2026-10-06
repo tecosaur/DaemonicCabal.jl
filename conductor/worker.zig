@@ -748,8 +748,8 @@ pub const Worker = struct {
         socket_dir: ?[]const u8,
     ) !SocketPaths {
         const pf_len: usize = if (client_info.programfile) |pf| 4 + pf.len else 0;
-        // flags, id, key, cwd, the three counts, the program file's flag, port set
-        var payload_size: usize = 1 + 4 + 8 + 4 + client_info.cwd.len + 3 * 4 + 1 + pf_len + 2;
+        // flags, id, key, size, cwd, the three counts, the program file's flag, port set
+        var payload_size: usize = 1 + 4 + 8 + protocol.TerminalSize.encoded_len + 4 + client_info.cwd.len + 3 * 4 + 1 + pf_len + 2;
         for (client_info.env) |e| payload_size += 8 + e.key.len + e.value.len;
         var sizing = client_info.switches;
         var switch_count: u32 = 0;
@@ -764,6 +764,7 @@ pub const Worker = struct {
         w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .color = client_info.color, .force = client_info.force }));
         w.writeInt(u32, client_info.id);
         w.writeInt(u64, client_info.key);
+        w.writeSlice(&client_info.size.encode());
         w.writeLenPrefixed(u32, client_info.cwd);
         w.writeInt(u32, @intCast(client_info.env.len));
         for (client_info.env) |e| {
@@ -846,6 +847,7 @@ pub const ClientInfo = struct {
     tty: bool,
     color: bool,
     force: bool, // bypass the worker's capacity check
+    size: protocol.TerminalSize = .{}, // the client's terminal's, as it started
     id: u32, // conductor-assigned
     key: u64, // which the client gives the worker on each stdio connection
     ppid: u32,

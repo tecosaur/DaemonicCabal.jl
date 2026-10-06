@@ -114,8 +114,9 @@ const client_switches_help =
 ++ DAEMON_MANAGEMENT_HELP;
 
 
-// Client ↔ Conductor: magic + flags + pid + ppid + host key + cwd +
-// env_fingerprint + args, answered by kind-byte frames ending in socket_paths.
+// Client ↔ Conductor: magic + flags + pid + ppid + host key + terminal size
+// (`TerminalSize`) + cwd + env_fingerprint + args, answered by kind-byte
+// frames ending in socket_paths.
 // Over TCP, the host key (`host_key_file` in the runtime dir) shows a
 // loopback client to be the host's, not a sandbox's; zeros elsewhere.
 //
@@ -125,7 +126,7 @@ const client_switches_help =
 // under a secret of the conductor's, so none can be forged from an id.
 pub const client = struct {
     pub const magic_prefix: u32 = 0x4A4443; // "JDC", then the version byte
-    pub const version: u8 = 4;
+    pub const version: u8 = 5;
     pub const magic: u32 = magic_prefix << 8 | version;
     pub const env_request: u8 = 0x3F; // fingerprint cache miss: send the full env
     pub const host_key_file = "conductor.key";
@@ -150,9 +151,34 @@ pub const client = struct {
     };
 };
 
+/// Rows then columns (u16 each), zeros where there's no terminal: in a
+/// request, in `client_run`, and as a `signals.size` frame's data.
+pub const TerminalSize = struct {
+    rows: u16 = 0,
+    cols: u16 = 0,
+
+    pub const encoded_len = 4;
+
+    pub fn decode(bytes: *const [encoded_len]u8) TerminalSize {
+        return .{ .rows = std.mem.readInt(u16, bytes[0..2], .little), .cols = std.mem.readInt(u16, bytes[2..4], .little) };
+    }
+
+    pub fn encode(self: TerminalSize) [encoded_len]u8 {
+        var bytes: [encoded_len]u8 = undefined;
+        std.mem.writeInt(u16, bytes[0..2], self.rows, .little);
+        std.mem.writeInt(u16, bytes[2..4], self.cols, .little);
+        return bytes;
+    }
+
+    /// The frame telling a worker, or a view's conductor, the size changed.
+    pub fn frame(self: TerminalSize) [2 + encoded_len]u8 {
+        return [_]u8{ signals.size, encoded_len } ++ self.encode();
+    }
+};
+
 // Conductor ↔ Worker Protocol
 pub const worker = struct {
-    pub const magic: u32 = 0x4A445704; // "JDW\x04"
+    pub const magic: u32 = 0x4A445705; // "JDW\x05"
     /// type(u8) + payload length(u32).
     pub const header_size = 5;
     /// Header, then the ping's sequence byte echoed and the worker's client count (u16).
@@ -220,11 +246,13 @@ pub fn keyFor(secret: *const [16]u8, kind: KeyKind, id: u32) u64 {
     return std.crypto.auth.siphash.SipHash64(2, 4).toInt(&msg, secret);
 }
 
-// Signals (Worker → Client): id:u8 + len:u8 + data
+// Signals: id:u8 + len:u8 + data, from the worker (or a view's conductor)
+// to the client, which acks some with the id and no data; and `size`, the
+// one the client sends unasked.
 pub const signals = struct {
     pub const exit: u8 = 0x01;
-    pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw
-    pub const query_size: u8 = 0x03; // response: height(u16) + width(u16)
+    pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw; acked
+    pub const size: u8 = 0x03;       // client's: its terminal's `TerminalSize`, on each change
     pub const nodelay: u8 = 0x04;
     pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating (+ its number, u32)
     pub const suspend_client: u8 = 0x06; // acked once the client runs again

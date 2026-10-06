@@ -314,28 +314,102 @@ end
 # Pre-1.11 stand-ins for the scoped values scopedio.jl defines; that path is
 # single-client.
 @static if VERSION < v"1.11"
-    const CLIENT_SIGNALS = Ref{Union{Nothing, StreamIO}}(nothing)
+    const CLIENT_SIGNALS = Ref{Union{Nothing, ClientSignals}}(nothing)
     const CLIENT_INPUT = Ref{Union{Nothing, StreamIO, TerminalInput}}(nothing)
     const CLIENT_INTERACTIVE = Ref(false)
     const CLIENT_END = Ref{Union{Nothing, RunEnd}}(nothing)
 end
 
-# Signal protocol (Worker → Client)
-# A lone client's replies are read inline, the stream locked from request to reply.
+# Signal protocol: each to the client, but `SIGNAL_SIZE`, the client's own.
 const SIGNAL_EXIT = 0x01
-const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
-const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
+const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw; acked
+const SIGNAL_SIZE = 0x03       # the client's terminal's rows and columns (u16 each), as they change
 const SIGNAL_NODELAY = 0x04    # disable Nagle on stdin + signals
 const SIGNAL_EXECUTING = 0x05  # data: 0x00 = at prompt, 0x01 = evaluating; evaluation number (u32 LE)
 const SIGNAL_SUSPEND = 0x06    # acked once the client runs again
 
 const DEFAULT_DISPLAYSIZE = (24, 80)
+const REPLY_TIMEOUT_S = 1.0  # the longest a raw-mode switch's ack is waited for
 
-# A size query's answer: height and width, each a u16 (LE), 0 when unknown.
-function answered_size(data::Vector{UInt8})
-    height, width = ltoh.(reinterpret(UInt16, data))
-    (if iszero(height) first(DEFAULT_DISPLAYSIZE) else Int(height) end,
-     if iszero(width) last(DEFAULT_DISPLAYSIZE) else Int(width) end)
+# Read from here on; `size` is the client's terminal's as it started.
+function ClientSignals(io::StreamIO, size::Union{Nothing, Tuple{Int, Int}})
+    signals = ClientSignals(io, Threads.Condition(), Base.Event(), 0, size)
+    errormonitor(Threads.@spawn read_signals(signals))
+    signals
+end
+
+# Each ack, and each change of size, until the client stops sending.
+function read_signals(signals::ClientSignals)
+    io = signals.io
+    try
+        while true
+            uninterrupted(() -> Base.wait_readnb(io, 2))
+            bytesavailable(io) >= 2 || break
+            id, len = read(io, UInt8), Int(read(io, UInt8))
+            uninterrupted(() -> Base.wait_readnb(io, len))
+            bytesavailable(io) >= len || break
+            data = read(io, len)
+            @lock signals.replied begin
+                if id == SIGNAL_SIZE
+                    signals.size = told_size(data)
+                elseif id == SIGNAL_RAW_MODE || id == SIGNAL_SUSPEND
+                    signals.acks_due = max(signals.acks_due - 1, 0)
+                end
+                notify(signals.replied)
+            end
+        end
+    catch err
+        err isa Base.IOError || err isa EOFError || rethrow()
+    finally
+        # No more acks are coming, so none is waited for.
+        @lock signals.replied begin
+            signals.acks_due = 0
+            notify(signals.replied)
+        end
+        notify(signals.gone)
+    end
+end
+
+# The acks now due from its client, this one included; 0 if it couldn't be sent.
+function send_acked!(signals::ClientSignals, id::UInt8, data::Vector{UInt8})
+    isopen(signals.io) || return 0
+    due = @lock signals.replied signals.acks_due += 1
+    try
+        send_signal(signals.io, id, data)
+        due
+    catch err
+        err isa Base.IOError || rethrow()
+        @lock signals.replied signals.acks_due -= 1
+        0
+    end
+end
+
+# Until each client has acked all it was sent, or `timeout_s` passes (nothing, never).
+function await_acks(clients; timeout_s::Union{Nothing, Real}=REPLY_TIMEOUT_S)
+    deadline = isnothing(timeout_s) ? nothing : time() + timeout_s
+    for signals in clients
+        expired = Ref(false)
+        timer = isnothing(deadline) ? nothing : Timer(max(deadline - time(), 0.0)) do _
+            @lock signals.replied begin
+                expired[] = true
+                notify(signals.replied)
+            end
+        end
+        try
+            uninterrupted() do
+                @lock signals.replied while signals.acks_due > 0 && !expired[]
+                    wait(signals.replied)
+                end
+            end
+        finally
+            isnothing(timer) || close(timer)
+        end
+    end
+end
+
+# Its client's terminal switched, as far as it acknowledges in time.
+function switch_raw_mode!(signals::ClientSignals, raw::Bool)
+    send_acked!(signals, SIGNAL_RAW_MODE, UInt8[raw]) > 0 && await_acks((signals,))
 end
 
 # One write per frame: a multi-argument `write` yields between arguments, so
@@ -380,16 +454,16 @@ stand in: LineEdit holds the terminal raw across evaluation.
         # Outside a client session there's no client, and the pipe was never opened.
         term === WORKER_TERM && return
         session = term.sync_session
-        isnothing(session) && return send_executing(term.signals, executing, evaluation)
+        isnothing(session) && return send_executing(term.signals.io, executing, evaluation)
         @lock session.executing_lock begin
             session.executing[] = (executing, evaluation)
-            foreach(p -> send_executing(p.signals, executing, evaluation), @atomic session.participants)
+            foreach(p -> send_executing(p.signals.io, executing, evaluation), @atomic session.participants)
         end
     end
 else
     function signal_executing(executing::Bool, evaluation::UInt32=UInt32(0))
         sig = CLIENT_SIGNALS[]
-        isnothing(sig) || send_executing(sig, executing, evaluation)
+        isnothing(sig) || send_executing(sig.io, executing, evaluation)
     end
 end
 
@@ -476,7 +550,7 @@ function sync_client_disconnect!(client::ClientInfo, client_stdin::StreamIO,
     detach!(session, participant)
     # The terminal is raw, so end the line ourselves.
     try write(participant.stdout, "\r\n") catch end
-    release_client(participant.stdout, participant.stderr, participant.signals, 0)
+    release_client(participant.stdout, participant.stderr, participant.signals.io, 0)
     try close(client_stdin) catch end
     unregister_client!(client)
 end
@@ -503,7 +577,7 @@ function end_sync_session!(session::SyncSession, code::Int)
         taken
     end
     for p in participants
-        release_client(p.stdout, p.stderr, p.signals, code)
+        release_client(p.stdout, p.stderr, p.signals.io, code)
     end
 end
 
@@ -536,73 +610,6 @@ end
 
 # Participants
 
-const SYNC_REPLY_TIMEOUT_S = 1.0  # the longest a participant's answer is waited for
-
-function Participant(stdout::StreamIO, stderr::StreamIO, signals::StreamIO)
-    participant = Participant(stdout, stderr, signals, Threads.Condition(), 0, 0, nothing)
-    errormonitor(Threads.@spawn read_replies(participant))
-    participant
-end
-
-# Its client answers each raw-mode switch with an ack and each size query
-# with its size, framed as the signals it answers.
-function read_replies(p::Participant)
-    sig = p.signals
-    try
-        while true
-            uninterrupted(() -> Base.wait_readnb(sig, 2))
-            bytesavailable(sig) >= 2 || break
-            id, len = read(sig, UInt8), Int(read(sig, UInt8))
-            uninterrupted(() -> Base.wait_readnb(sig, len))
-            bytesavailable(sig) >= len || break
-            data = read(sig, len)
-            @lock p.replied begin
-                if id == SIGNAL_RAW_MODE
-                    p.acks_due = max(p.acks_due - 1, 0)
-                elseif id == SIGNAL_QUERY_SIZE
-                    p.sizes_due = max(p.sizes_due - 1, 0)
-                    if length(data) == 4
-                        p.size = answered_size(data)
-                    end
-                end
-                notify(p.replied)
-            end
-        end
-    catch err
-        err isa Base.IOError || err isa EOFError || rethrow()
-    finally
-        # No more answers are coming, so none is waited for.
-        @lock p.replied begin
-            p.acks_due = 0
-            p.sizes_due = 0
-            notify(p.replied)
-        end
-    end
-end
-
-# Until each of `participants` has none `due`, or the timeout passes.
-function await_replies(due::Function, participants)
-    deadline = time() + SYNC_REPLY_TIMEOUT_S
-    for p in participants
-        expired = Ref(false)
-        timer = Timer(max(deadline - time(), 0.0)) do _
-            @lock p.replied begin
-                expired[] = true
-                notify(p.replied)
-            end
-        end
-        try
-            uninterrupted() do
-                @lock p.replied while due(p) > 0 && !expired[]
-                    wait(p.replied)
-                end
-            end
-        finally
-            close(timer)
-        end
-    end
-end
-
 # The broadcast writers follow the participants.
 function set_participants!(session::SyncSession, participants::Vector{Participant})
     @lock STATE.lock begin
@@ -613,7 +620,7 @@ function set_participants!(session::SyncSession, participants::Vector{Participan
 end
 
 attach!(session::SyncSession, p::Participant) =
-    set_participants!(session, push!(filter(q -> isopen(q.signals), @atomic session.participants), p))
+    set_participants!(session, push!(filter(q -> isopen(q.signals.io), @atomic session.participants), p))
 
 detach!(session::SyncSession, p::Participant) =
     set_participants!(session, filter(q -> q !== p, @atomic session.participants))
@@ -622,54 +629,19 @@ detach!(session::SyncSession, p::Participant) =
 # is not waited on.
 function switch_raw_mode!(session::SyncSession, raw::Bool)
     @lock session.input.lock session.input.raw = raw
-    waited = Participant[]
+    waited = ClientSignals[]
     for p in @atomic session.participants
-        isopen(p.signals) || continue
-        due = @lock p.replied p.acks_due += 1
-        try
-            send_signal(p.signals, SIGNAL_RAW_MODE, UInt8[raw])
-        catch err
-            err isa Base.IOError || rethrow()
-            @lock p.replied p.acks_due -= 1
-            continue
-        end
-        due == 1 && push!(waited, p)
+        send_acked!(p.signals, SIGNAL_RAW_MODE, UInt8[raw]) == 1 && push!(waited, p.signals)
     end
-    await_replies(p -> p.acks_due, waited)
+    await_acks(waited)
 end
 
-# Unless it has yet to answer an earlier query.
-function ask_size!(p::Participant)
-    isopen(p.signals) || return false
-    asking = @lock p.replied begin
-        idle = p.sizes_due == 0
-        if idle
-            p.sizes_due = 1
-        end
-        idle
-    end
-    asking || return false
-    try
-        send_signal(p.signals, SIGNAL_QUERY_SIZE, UInt8[])
-        true
-    catch err
-        err isa Base.IOError || rethrow()
-        @lock p.replied p.sizes_due = 0
-        false
-    end
-end
+participant_size(p::Participant) = something(p.signals.size, DEFAULT_DISPLAYSIZE)
 
-function participant_size(p::Participant)
-    ask_size!(p) && await_replies(q -> q.sizes_due, (p,))
-    something(p.size, DEFAULT_DISPLAYSIZE)
-end
-
-# The smallest of its participants', like tmux; one slow to answer counts at
-# its last answer.
+# The smallest of its participants', like tmux.
 function session_displaysize(session::SyncSession)
     participants = @atomic session.participants
-    await_replies(p -> p.sizes_due, filter(ask_size!, participants))
-    sizes = [p.size for p in participants if !isnothing(p.size)]
+    sizes = [p.signals.size for p in participants if !isnothing(p.signals.size)]
     if isempty(sizes) DEFAULT_DISPLAYSIZE else (minimum(first, sizes), minimum(last, sizes)) end
 end
 
@@ -681,7 +653,7 @@ end
 
 function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
                             client_stdout::StreamIO, client_stderr::StreamIO,
-                            signals::StreamIO, label::String)
+                            signals::ClientSignals, label::String)
     is_interactive = client.tty &&
         isnothing(client.programfile) &&
         !any(p -> first(p) ∈ ("--eval", "--print"), client.switches)
@@ -699,7 +671,7 @@ end
 # replays inline. Off the message loop, which must not wait on a client.
 function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::StreamIO,
                                         client_stdout::StreamIO, client_stderr::StreamIO,
-                                        signals::StreamIO, session::SyncSession)
+                                        signals::ClientSignals, session::SyncSession)
     participant = Participant(client_stdout, client_stderr, signals)
     # Its `--sync=N`, or the daemon's setting.
     pages = something(tryparse(Int, getval(client.switches, "--sync", "")), SYNC_REPLAY_PAGES)
@@ -723,7 +695,7 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
         copy_input(client_stdin, session.input; leaves = () -> is_line_empty(session))
         sync_client_disconnect!(client, client_stdin, participant, session)
     end
-    register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals)
+    register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals.io)
 end
 
 # Attached once replayed, so the live output can't come before it.
@@ -733,11 +705,9 @@ function join_sync_repl(session::SyncSession, p::Participant, pages::Int)
         replay_history(p.stdout, session.screen, participant_size(p), pages)
         attach!(session, p)
         @lock(session.input.lock, isopen(session.input.writer)) || return end_sync_session!(session, 0)
-        @lock p.replied p.acks_due += 1
-        send_signal(p.signals, SIGNAL_RAW_MODE, UInt8[@lock session.input.lock session.input.raw])
-        await_replies(q -> q.acks_due, (p,))
+        switch_raw_mode!(p.signals, @lock session.input.lock session.input.raw)
         # Joining mid-evaluation, its Ctrl-C is to interrupt it.
-        @lock session.executing_lock send_executing(p.signals, session.executing[]...)
+        @lock session.executing_lock send_executing(p.signals.io, session.executing[]...)
     catch err
         # It left while joining, and its disconnect tidies up.
         err isa Base.IOError || rethrow()
@@ -772,7 +742,7 @@ end
 # The result goes plainly to this client and REPL-style to the shared scrollback.
 function spawn_eval_sync_client!(client::ClientInfo, client_stdin::StreamIO,
                                  client_stdout::StreamIO, client_stderr::StreamIO,
-                                 signals::StreamIO, session::SyncSession)
+                                 signals::ClientSignals, session::SyncSession)
     mi = repl_mistate(session)
     task = errormonitor(@async begin # thread 0 for Ctrl-C; see `spawn_client!`
         # Only the shared screen's tidiness rides on these; the run goes ahead.
@@ -791,7 +761,7 @@ function spawn_eval_sync_client!(client::ClientInfo, client_stdin::StreamIO,
         write(session.out, "\n")
         restore_repl_prompt(session, mi)
     end)
-    register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals)
+    register_client!(client.id, task, client_stdin, client_stdout, client_stderr, signals.io)
 end
 
 function clear_repl_input(session::SyncSession, mi::Union{Nothing, REPL.LineEdit.MIState})
@@ -897,7 +867,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         foreach(close, servers)
         foreach(remove_socket_file, paths)
     end
-    client_stdin, client_stdout, client_stderr, signals = streams
+    client_stdin, client_stdout, client_stderr, signals_io = streams
     if first(servers) isa Sockets.TCPServer
         # A client gone without closing would otherwise hold its session forever.
         for sock in streams
@@ -905,9 +875,10 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         end
         # Interactive: an editor's redraw is several small writes, each held
         # back for the last one's delayed ACK while Nagle is on.
-        foreach(sock -> Sockets.nagle(sock, false), (signals, client_stdout, client_stderr))
-        send_signal(signals, SIGNAL_NODELAY, UInt8[])
+        foreach(sock -> Sockets.nagle(sock, false), (signals_io, client_stdout, client_stderr))
+        send_signal(signals_io, SIGNAL_NODELAY, UInt8[])
     end
+    signals = ClientSignals(signals_io, client.size)
     label = sync_session_label(client)
     if isnothing(label)
         # @async, not Threads.@spawn: jl_try_deliver_sigint only ever targets
@@ -919,7 +890,7 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         end)
         register_client!(client.id, task, streams...)
     else
-        spawn_sync_client!(client, streams..., label)
+        spawn_sync_client!(client, client_stdin, client_stdout, client_stderr, signals, label)
     end
 end
 

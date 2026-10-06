@@ -620,14 +620,15 @@ pub const Conductor = struct {
         pid: u32, // self-reported
         ppid: u32,
         host_key: *const protocol.client.HostKey,
+        size: protocol.TerminalSize,
         cwd: []const u8,
         fingerprint: u64,
         args_at: usize, // their count
     };
 
     fn parseRequestHead(r: *protocol.SliceReader) !RequestHead {
-        // flags(1) + reserved(3) + pid(4) + ppid(4) + host key(16)
-        const fixed = try r.take(28);
+        // flags(1) + reserved(3) + pid(4) + ppid(4) + host key(16) + size(4)
+        const fixed = try r.take(32);
         const cwd = try r.lenPrefixed(u32);
         const fingerprint = try r.int(u64);
         return .{
@@ -635,6 +636,7 @@ pub const Conductor = struct {
             .pid = std.mem.readInt(u32, fixed[4..8], .little),
             .ppid = std.mem.readInt(u32, fixed[8..12], .little),
             .host_key = fixed[12..28],
+            .size = .decode(fixed[28..32]),
             .cwd = cwd,
             .fingerprint = fingerprint,
             .args_at = r.pos,
@@ -703,6 +705,7 @@ pub const Conductor = struct {
             errdefer self.allocator.free(cwd);
             break :request .{
                 .flags = head.flags,
+                .size = head.size,
                 .pid = head.pid,
                 .host_pid = if (platform.peerPid(pc.socket)) |p| platform.pidNumber(p) else null,
                 .ppid = head.ppid,
@@ -751,7 +754,7 @@ pub const Conductor = struct {
             request.project = null;
         };
         if (request.parsed.hasSwitch("--reconfigure")) {
-            try self.serveReconfigure(socket, request.flags.tty, !is_remote and sandbox == .none);
+            try self.serveReconfigure(socket, request.flags.tty, request.size, !is_remote and sandbox == .none);
             return .done;
         }
         if (request.parsed.hasSwitch("--status")) {
@@ -760,7 +763,7 @@ pub const Conductor = struct {
                 .remote => .remote_sandbox,
                 .client => |c| .{ .mount_ns = c.ns },
             };
-            try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty, scope);
+            try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty, request.size, scope);
             return .done;
         }
         if (sandbox == .remote and self.cfg.sandbox_session_bypass) if (labelOf(&request)) |label| {
@@ -947,6 +950,7 @@ pub const Conductor = struct {
 
     const ClientRequest = struct {
         flags: protocol.client.Flags,
+        size: protocol.TerminalSize, // zeros without a terminal
         pid: u32, // self-reported, meaningful only in the client's pid namespace
         host_pid: ?u32, // from peer credentials; null on TCP
         ppid: u32,
@@ -994,6 +998,7 @@ pub const Conductor = struct {
             .tty = request.flags.tty,
             .color = request.flags.color,
             .force = labelOf(request) != null,
+            .size = request.size,
             .id = self.client_id,
             .key = self.keyFor(.client, self.client_id),
             .ppid = request.ppid,
@@ -2521,7 +2526,7 @@ pub const Conductor = struct {
     }
 
     // Only the conductor's own user, at a local socket, may change it.
-    fn serveReconfigure(self: *Conductor, client_socket: posix.socket_t, tty: bool, allowed: bool) !void {
+    fn serveReconfigure(self: *Conductor, client_socket: posix.socket_t, tty: bool, size: protocol.TerminalSize, allowed: bool) !void {
         if (!allowed) {
             std.debug.print("Client {d}: --reconfigure refused (not a local, unsandboxed client)\n", .{self.client_id});
             return self.serveString(client_socket, "--reconfigure needs a local, unsandboxed client of the conductor's own user.\n", 1);
@@ -2533,12 +2538,12 @@ pub const Conductor = struct {
         }
         var streams = try self.openClientStreams(client_socket, true);
         std.debug.print("Client {d}: --reconfigure\n", .{self.client_id});
-        try reconfigure.subscribe(self, streams, self.probePalette(&streams));
+        try reconfigure.subscribe(self, streams, self.probePalette(&streams), size);
     }
 
     // A TTY client is colour-probed first; a non-answering terminal gets the flat report.
     // A styled TTY one-shot waits a beat so its CPU meter resolves.
-    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, switch_value: ?[]const u8, tty: bool, scope: status.Scope) !void {
+    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, switch_value: ?[]const u8, tty: bool, size: protocol.TerminalSize, scope: status.Scope) !void {
         // A bare `--status` has an empty value.
         const format = if (switch_value) |v| (if (v.len > 0) v else null) else null;
         var streams = try self.openClientStreams(client_socket, true);
@@ -2547,7 +2552,7 @@ pub const Conductor = struct {
         const is_live = tty and format != null and std.mem.eql(u8, format.?, "live");
         const palette: ?pal.Palette = if (tty and (format == null or is_live)) self.probePalette(&streams) else null;
         if (is_live or (tty and format == null)) {
-            try live.subscribe(self, streams, palette, scope, !is_live);
+            try live.subscribe(self, streams, palette, size, scope, !is_live);
             held = true;
             return;
         }

@@ -426,6 +426,7 @@ pub const SignalHandler = struct {
     write_fn: *const fn (*anyopaque, []const u8) void,
     notify_exit_fn: *const fn () void,
     notify_interrupt_fn: *const fn () void,
+    notify_resize_fn: ?*const fn () void = null, // once there's a worker to tell
     pub fn writeStdio(self: SignalHandler, data: []const u8) void {
         self.write_fn(self.sockets_ptr, data);
     }
@@ -434,6 +435,9 @@ pub const SignalHandler = struct {
     }
     pub fn notifyInterrupt(self: SignalHandler) void {
         self.notify_interrupt_fn();
+    }
+    pub fn notifyResize(self: SignalHandler) void {
+        if (self.notify_resize_fn) |f| f();
     }
 };
 var g_signal_handler: ?SignalHandler = null;
@@ -445,6 +449,7 @@ fn signalAction(sig: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callc
             handler.notifyExit();
             std.process.exit(128 +% @as(u8, @intCast(@intFromEnum(sig))));
         },
+        .WINCH => handler.notifyResize(),
         else => {},
     }
 }
@@ -464,6 +469,9 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     posix.sigaction(posix.SIG.TERM, &sigact, null);
     posix.sigaction(posix.SIG.HUP, &sigact, null);
     posix.sigaction(posix.SIG.QUIT, &sigact, null);
+    // Restarting what it interrupts: a resize being dragged sends many.
+    const resize_act = posix.Sigaction{ .handler = .{ .sigaction = signalAction }, .mask = mask, .flags = posix.SA.RESTART };
+    posix.sigaction(posix.SIG.WINCH, &resize_act, null);
     const pipe_act = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = std.mem.zeroes(posix.sigset_t),

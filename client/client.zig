@@ -129,7 +129,7 @@ const SignalParser = struct {
         debuglog.event("signal: {s} {f}", .{ switch (id) {
             protocol.signals.exit => "exit",
             protocol.signals.raw_mode => "raw_mode",
-            protocol.signals.query_size => "query_size",
+            protocol.signals.size => "size",
             protocol.signals.nodelay => "nodelay",
             protocol.signals.executing => "executing",
             protocol.signals.suspend_client => "suspend",
@@ -138,6 +138,9 @@ const SignalParser = struct {
         return switch (id) {
             protocol.signals.exit => .{ .exit = if (data.len >= 1) data[0] else 1 },
             protocol.signals.raw_mode => blk: {
+                // Ahead of the ack, so the worker has it as the switch is done:
+                // a console reports a resize only while raw.
+                reportResize();
                 if (data.len == 1) {
                     platform.setWorkerRawMode(data[0] != 0);
                     if (self.sync_mode) {
@@ -154,17 +157,6 @@ const SignalParser = struct {
                 // No ack: a stray one would be taken for the next raw_mode ack.
                 if (data.len >= 1) platform.setWorkerExecuting(data[0] != 0);
                 if (data.len == 5) evaluation = std.mem.readInt(u32, data[1..5], .little);
-                break :blk .none;
-            },
-            protocol.signals.query_size => blk: {
-                const size = getTerminalSize();
-                var resp: [6]u8 = undefined;
-                resp[0] = id;
-                resp[1] = 4;
-                std.mem.writeInt(u16, resp[2..4], size.height, .little);
-                std.mem.writeInt(u16, resp[4..6], size.width, .little);
-                platform.socketWrite(fd, &resp);
-                debuglog.event("signal: answered {d}x{d}", .{ size.height, size.width });
                 break :blk .none;
             },
             protocol.signals.suspend_client => blk: {
@@ -196,6 +188,7 @@ var viewing = false;
 var conductor_peer: ?Io.net.IpAddress = null;
 var signal_parser = SignalParser{};
 var client_id: u32 = 0; // conductor-assigned
+var terminal_size: protocol.TerminalSize = .{}; // as the worker was last told
 var client_key: u64 = 0; // with it, which proves it ours
 
 // --- Signal handler wiring ---
@@ -203,6 +196,15 @@ var client_key: u64 = 0; // with it, which proves it ours
 fn signalWriteStdin(ptr: *anyopaque, data: []const u8) void {
     const sock_set: *SocketSet = @ptrCast(@alignCast(ptr));
     platform.socketWrite(sock_set.stdin, data);
+}
+
+/// The terminal's size, if it has changed since the worker was last told it.
+fn reportResize() void {
+    const size = terminalSize();
+    if (std.meta.eql(size, terminal_size)) return;
+    terminal_size = size;
+    platform.socketWrite(sockets.signals, &size.frame());
+    debuglog.event("signal: sent size {d}x{d}", .{ size.rows, size.cols });
 }
 
 fn signalNotifyExit() void {
@@ -224,12 +226,14 @@ fn signalStopWatching() void {
     exitClient(130);
 }
 
-fn registerSignalHandlers(on_interrupt: *const fn () void) void {
+/// `on_resize` once the worker's sockets are open.
+fn registerSignalHandlers(on_interrupt: *const fn () void, on_resize: ?*const fn () void) void {
     platform.registerSignalHandlers(.{
         .sockets_ptr = @ptrCast(&sockets),
         .write_fn = &signalWriteStdin,
         .notify_exit_fn = &signalNotifyExit,
         .notify_interrupt_fn = on_interrupt,
+        .notify_resize_fn = on_resize,
     });
 }
 
@@ -293,7 +297,7 @@ fn run(init: std.process.Init.Minimal) !void {
     defer platform.restoreConsoleIo(console);
     defer platform.setRawMode(false);
     // Until a worker is reached, a Ctrl-C gives up, as Julia's does starting.
-    registerSignalHandlers(&signalGiveUp);
+    registerSignalHandlers(&signalGiveUp, null);
     const conductor = try connectToConductor(env);
     debuglog.event("conductor: connected over {s} to {s}", .{ @tagName(transport_mode), conductor_path });
     if (transport_mode == .tcp) platform.setTcpNodelay(conductor);
@@ -302,10 +306,12 @@ fn run(init: std.process.Init.Minimal) !void {
     // The worker's own terminal knows nothing of ours. Colour follows where
     // output goes, as Julia's does.
     const color = colorWanted(inputs.env) orelse platform.isatty(platform.getStdoutHandle());
+    terminal_size = terminalSize();
     try sendClientInfo(&w, env, is_tty, color, inputs.args);
     debuglog.event("conductor: request sent", .{});
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
-    registerSignalHandlers(if (watching) &signalStopWatching else &signalNotifyInterrupt);
+    registerSignalHandlers(if (watching) &signalStopWatching else &signalNotifyInterrupt, &reportResize);
+    reportResize(); // since the request
     signal_parser.sync_mode = sync;
     // Cooked, as Julia's terminal is, until a REPL asks for raw; a --sync
     // client's and a view's are raw throughout.
@@ -466,6 +472,7 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, for
     w.writeInt(u32, @intCast(platform.getpid()));
     w.writeInt(u32, @intCast(platform.getppid()));
     w.writeSlice(&host_key);
+    w.writeSlice(&terminal_size.encode());
     // CWD, read straight into the buffer behind its length
     if (w.pos + 4 >= w.buf.len) w.flush();
     const len_pos = w.pos;
@@ -661,12 +668,12 @@ fn notifyConductor(kind: protocol.notification.Type) void {
     platform.socketWrite(fd, buf[0..len]);
 }
 
-fn getTerminalSize() struct { height: u16, width: u16 } {
-    // The worker's REPL divides by the column count, so never send a 0.
+/// Zeros without a terminal, which the worker takes as Julia does without one.
+fn terminalSize() protocol.TerminalSize {
     // Only an output handle answers on Windows.
-    const size = platform.getTerminalSize(platform.getStdinHandle()) orelse platform.getTerminalSize(platform.getStdoutHandle());
-    if (size) |sz| if (sz.rows != 0 and sz.cols != 0)
-        return .{ .height = sz.rows, .width = sz.cols };
-    return .{ .height = 24, .width = 80 };
+    const size = platform.getTerminalSize(platform.getStdinHandle()) orelse
+        platform.getTerminalSize(platform.getStdoutHandle()) orelse return .{};
+    if (size.rows == 0 or size.cols == 0) return .{};
+    return .{ .rows = size.rows, .cols = size.cols };
 }
 

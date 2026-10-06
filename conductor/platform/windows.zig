@@ -1304,17 +1304,19 @@ pub fn getStderrHandle() HANDLE {
 
 const ENABLE_LINE_INPUT: DWORD = 0x0002;
 const ENABLE_ECHO_INPUT: DWORD = 0x0004;
+const ENABLE_WINDOW_INPUT: DWORD = 0x0008;
 const ENABLE_VIRTUAL_TERMINAL_INPUT: DWORD = 0x0200;
 var saved_mode: ?DWORD = null;
 
-// Processed input stays on so Ctrl-C still reaches the ctrl handler.
+// Processed input stays on so Ctrl-C still reaches the ctrl handler. Window
+// input reports a resize to `awaitConsoleKey`.
 pub fn setRawMode(raw: bool) void {
     const stdin = getStdinHandle();
     if (raw) {
         var mode: DWORD = undefined;
         if (!GetConsoleMode(stdin, &mode).toBool()) return;
         if (saved_mode == null) saved_mode = mode;
-        _ = SetConsoleMode(stdin, (mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_VIRTUAL_TERMINAL_INPUT);
+        _ = SetConsoleMode(stdin, (mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT);
     } else if (saved_mode) |mode| {
         _ = SetConsoleMode(stdin, mode);
         saved_mode = null;
@@ -1322,6 +1324,7 @@ pub fn setRawMode(raw: bool) void {
 }
 
 const KEY_EVENT: u16 = 0x0001;
+const WINDOW_BUFFER_SIZE_EVENT: u16 = 0x0004;
 const INPUT_RECORD = extern struct {
     EventType: u16,
     Event: extern union {
@@ -1333,8 +1336,9 @@ extern "kernel32" fn PeekConsoleInputW(hConsoleInput: HANDLE, lpBuffer: *INPUT_R
 extern "kernel32" fn ReadConsoleInputW(hConsoleInput: HANDLE, lpBuffer: *INPUT_RECORD, nLength: DWORD, lpNumberOfEventsRead: *DWORD) BOOL;
 
 /// Returns once a key is pressed at `console`, dropping the events a read
-/// would skip: a console read keeps the mode it began in, so one waiting
-/// already would miss the REPL's switch to raw. At once for other handles.
+/// would skip, a resize reported as it goes: a console read keeps the mode
+/// it began in, so one waiting already would miss the REPL's switch to raw.
+/// At once for other handles.
 pub fn awaitConsoleKey(console: HANDLE) void {
     var mode: DWORD = undefined;
     if (!GetConsoleMode(console, &mode).toBool()) return;
@@ -1344,6 +1348,7 @@ pub fn awaitConsoleKey(console: HANDLE) void {
         if (!PeekConsoleInputW(console, &record, 1, &n).toBool() or n == 0) return;
         if (record.EventType == KEY_EVENT and record.Event.key.bKeyDown.toBool()) return;
         if (!ReadConsoleInputW(console, &record, 1, &n).toBool()) return;
+        if (record.EventType == WINDOW_BUFFER_SIZE_EVENT) if (g_signal_handler) |handler| handler.notifyResize();
     }
 }
 
@@ -1392,6 +1397,7 @@ const SignalHandler = struct {
     write_fn: *const fn (*anyopaque, []const u8) void,
     notify_exit_fn: *const fn () void,
     notify_interrupt_fn: *const fn () void,
+    notify_resize_fn: ?*const fn () void = null, // once there's a worker to tell
     pub fn writeStdio(self: SignalHandler, data: []const u8) void {
         self.write_fn(self.sockets_ptr, data);
     }
@@ -1400,6 +1406,9 @@ const SignalHandler = struct {
     }
     pub fn notifyInterrupt(self: SignalHandler) void {
         self.notify_interrupt_fn();
+    }
+    pub fn notifyResize(self: SignalHandler) void {
+        if (self.notify_resize_fn) |f| f();
     }
 };
 

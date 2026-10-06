@@ -30,16 +30,22 @@ mutable struct RunEnd
     ended::Bool  # its hooks have run
 end
 
-# A --sync client. One task reads its answers (`read_replies`), so waiting on
-# them can be bounded: one slow to answer holds up only itself.
-mutable struct Participant
-    const stdout::StreamIO
-    const stderr::StreamIO
-    const signals::StreamIO
+# A client's signals stream, which it sends on unasked. One task reads it
+# (`read_signals`), so waiting on an ack can be bounded, and one slow to
+# answer holds up only itself; and its terminal's size is known as it changes.
+mutable struct ClientSignals
+    const io::StreamIO
     const replied::Threads.Condition
-    acks_due::Int  # raw-mode switches sent it, yet to be acknowledged
-    sizes_due::Int  # display size queries, yet to be answered
-    size::Union{Nothing, Tuple{Int, Int}}  # its latest answer
+    const gone::Base.Event  # the client has stopped sending
+    acks_due::Int  # raw-mode switches and suspensions sent it, yet to be acknowledged
+    size::Union{Nothing, Tuple{Int, Int}}  # its terminal's rows and columns; nothing without one
+end
+
+# A --sync client.
+struct Participant
+    stdout::StreamIO
+    stderr::StreamIO
+    signals::ClientSignals
 end
 
 mutable struct SyncSession

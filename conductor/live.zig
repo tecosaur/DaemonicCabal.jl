@@ -142,10 +142,10 @@ const Note = struct {
 };
 
 /// Takes `streams`. A live subscriber's first frame is drawn at once.
-pub fn subscribe(c: *Conductor, streams: ClientStreams, palette: ?pal.Palette, scope: status.Scope, oneshot: bool) !void {
+pub fn subscribe(c: *Conductor, streams: ClientStreams, palette: ?pal.Palette, size: protocol.TerminalSize, scope: status.Scope, oneshot: bool) !void {
     const sub = try c.allocator.create(Subscriber);
     errdefer c.allocator.destroy(sub);
-    sub.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_id }, .scope = scope, .oneshot = oneshot };
+    sub.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_id, .size = .of(size) }, .scope = scope, .oneshot = oneshot };
     try c.live.list.append(c.allocator, sub);
     if (oneshot) {
         c.refreshStats(null); // first reading; the deferred fire takes the second
@@ -252,7 +252,15 @@ pub fn onReadable(c: *Conductor, w: *Watch) void {
     const bytes = buf[0..n];
     switch (w.kind) {
         .input => onKeys(c, sub, bytes),
-        .signals => sub.term.onSignals(bytes),
+        .signals => {
+            const was = sub.term.size;
+            sub.term.onSignals(bytes);
+            if (!std.meta.eql(was, sub.term.size)) {
+                // A session watched is drawn at the viewer's size.
+                if (sub.attachment) |a| platform.write(a.signals.fd, &sub.term.size.told().frame());
+                noteChange(c);
+            }
+        },
         .watch_output => onWatchOutput(c, sub, bytes),
         .watch_signals => onWatchSignals(c, sub, bytes),
     }
@@ -275,10 +283,7 @@ fn fire(c: *Conductor) void {
     var behind = false;
     var blinking = false;
     for (c.live.list.items) |sub| {
-        if (!sub.oneshot) {
-            platform.write(sub.term.streams.fd(.signals), &[_]u8{ protocol.signals.query_size, 0x00 });
-            retarget(c, sub);
-        }
+        if (!sub.oneshot) retarget(c, sub);
         repaint(c, sub);
         if (sub.oneshot) sub.term.gone = true;
         behind = behind or sub.term.queued.items.len > 0;
@@ -846,7 +851,7 @@ fn leaveFollow(c: *Conductor, sub: *Subscriber) void {
 /// `.transcript` once attached.
 fn attach(c: *Conductor, sub: *Subscriber, w: *worker.Worker, follow: bool) Preview {
     if (w.ping_pending or !w.answersWithin(probe_timeout_ms)) return .{ .busy = c.currentTime() };
-    const a = openAttachment(c, w, follow) catch |err| {
+    const a = openAttachment(c, w, follow, sub.term.size) catch |err| {
         std.debug.print("Status: watching worker {d}'s session failed: {}\n", .{ w.id, err });
         return .{ .failed = c.currentTime() };
     };
@@ -856,7 +861,7 @@ fn attach(c: *Conductor, sub: *Subscriber, w: *worker.Worker, follow: bool) Prev
     return .transcript;
 }
 
-fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
+fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool, size: terminal.Size) !*Attachment {
     const port_set = if (c.port_pool) |*pool| pool.allocate() orelse protocol.PortPool.none else protocol.PortPool.none;
     var tracked = false;
     errdefer if (!tracked) c.releasePortSet(port_set);
@@ -871,6 +876,7 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool) !*Attachment {
         .tty = true,
         .color = true,
         .force = true,
+        .size = size.told(),
         .id = id,
         .key = c.keyFor(.client, id),
         .ppid = 0,
@@ -948,7 +954,7 @@ fn onWatchOutput(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     noteChange(c);
 }
 
-// The worker asks what it would ask a client, and says when the watch ends.
+// The worker's signals, as a client's: a raw-mode switch to ack, and the watch's end.
 fn onWatchSignals(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     const a = sub.attachment orelse return;
     for (bytes) |byte| {
@@ -956,12 +962,6 @@ fn onWatchSignals(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
         switch (msg[0]) {
             protocol.signals.exit => return endAttachment(c, sub, if (msg[1] >= 1) msg[2] else 1),
             protocol.signals.raw_mode => platform.write(a.signals.fd, &[_]u8{ msg[0], 0 }),
-            protocol.signals.query_size => {
-                var reply = [_]u8{ msg[0], 4, 0, 0, 0, 0 };
-                std.mem.writeInt(u16, reply[2..4], sub.term.size.rows, .little);
-                std.mem.writeInt(u16, reply[4..6], sub.term.size.cols, .little);
-                platform.write(a.signals.fd, &reply);
-            },
             else => {},
         }
     }

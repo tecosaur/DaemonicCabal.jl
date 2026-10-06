@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-const PROTOCOL_MAGIC = 0x4A445704  # "JDW\x04" little-endian
+const PROTOCOL_MAGIC = 0x4A445705  # "JDW\x05" little-endian
 const NOTIFICATION_MAGIC = 0x4A444E02  # "JDN\x02" little-endian
 
 # Notifications, over the conductor's main socket
@@ -138,6 +138,7 @@ struct ClientInfo
     tty::Bool
     color::Bool
     force::Bool  # bypass capacity (labelled sessions, watchers)
+    size::Union{Nothing, Tuple{Int, Int}}  # its terminal's, as it started; nothing without one
     id::Int      # conductor-assigned
     key::UInt64  # which it gives on each of its stdio connections
     cwd::String
@@ -148,10 +149,19 @@ struct ClientInfo
     port_set::Int  # 0xFFFF when unmanaged
 end
 
+# A terminal's rows and columns, each a u16 (LE), as a client tells them:
+# nothing for zeros, from a client without one.
+function told_size(data::AbstractVector{UInt8})
+    length(data) == 4 || return nothing
+    rows, cols = ltoh.(reinterpret(UInt16, data))
+    if iszero(rows) || iszero(cols) nothing else (Int(rows), Int(cols)) end
+end
+
 function read_client_run(conn::IO)
     flags = read(conn, UInt8)
     id = Int(read(conn, UInt32))
     key = read(conn, UInt64)
+    size = told_size(read(conn, 4))
     cwd = read_string(conn)
     env = Pair{String, String}[read_string(conn) => read_string(conn) for _ in 1:read(conn, UInt32)]
     switches = Tuple{String, String}[(read_string(conn), read_string(conn)) for _ in 1:read(conn, UInt32)]
@@ -159,6 +169,6 @@ function read_client_run(conn::IO)
     args = String[read_string(conn) for _ in 1:read(conn, UInt32)]
     port_set = Int(read(conn, UInt16))
     ClientInfo((flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0,
-               id, key, cwd, env, switches, programfile, args, port_set)
+               size, id, key, cwd, env, switches, programfile, args, port_set)
 end
 

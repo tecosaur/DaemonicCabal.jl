@@ -263,8 +263,8 @@ Base.buffer_writes(io::RecordedOutput, args...) = Base.buffer_writes(io.sink, ar
     watch_session(label, format, out; color, terminal, until) -> exit code
 
 Write the transcript of session `label` to `out`, then follow it until
-`until` ends: the watcher's signals socket, which it holds until it exits
-(its stdin may end at once). The comma-separated `format` may hold `once`,
+`until` is notified: the watcher's signals have ended, which it holds open
+until it exits (its stdin may end at once). The comma-separated `format` may hold `once`,
 to stop after the transcript so far, `json`, for one JSON object per
 line, and `recorded`, to watch only a session already recorded. An
 unrecorded session is otherwise recorded from the first watch on; with
@@ -275,7 +275,7 @@ when `out` is a colour `terminal`, but JSON is not, as its escaped codes
 show literally there.
 """
 function watch_session(label::String, format::String, out::IO;
-                       color::Union{Nothing, Bool}=nothing, terminal::Bool=false, until::IO)
+                       color::Union{Nothing, Bool}=nothing, terminal::Bool=false, until::Base.Event)
     options = split(format, ',', keepempty=false)
     unknown = setdiff(options, ("json", "once", "recorded"))
     if !isempty(unknown)
@@ -319,7 +319,7 @@ end
 
 # Under `transcript.lock`, until `until` ends; a plain destination's rows
 # are let go as they fall quiet.
-function subscribe!(transcript::Transcript, watcher::Watcher, until::IO)
+function subscribe!(transcript::Transcript, watcher::Watcher, until::Base.Event)
     push!(transcript.watchers, watcher)
     isnothing(watcher.plain) || Timer(QUIET_ROWS_S; interval = QUIET_ROWS_S) do timer
         uninterrupted() do
@@ -335,7 +335,7 @@ function subscribe!(transcript::Transcript, watcher::Watcher, until::IO)
     end
     Threads.@spawn begin
         try
-            uninterrupted(() -> while !eof(until) readavailable(until) end)
+            uninterrupted(() -> wait(until))
         catch
         end
         @lock transcript.lock filter!(w -> w !== watcher, transcript.watchers)
