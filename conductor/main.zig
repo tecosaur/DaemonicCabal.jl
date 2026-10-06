@@ -655,6 +655,7 @@ pub const Conductor = struct {
     fn receiveRequest(self: *Conductor, pc: *PendingConnection, r: *protocol.SliceReader) !?Outcome {
         const head = parseRequestHead(r) catch |err| return if (err == error.Truncated) null else err;
         const args_end = pc.env_at orelse pc.listEnd(head.args_at, 1) catch |err| return if (err == error.Truncated) null else err;
+        if (head.flags.env_follows) pc.env_at = args_end;
         const is_remote = self.isRemote(&pc.peer, head.host_key);
         // The cache is this machine's: a remote client's environment would
         // only evict local ones.

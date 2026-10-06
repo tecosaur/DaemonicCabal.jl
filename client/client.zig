@@ -304,7 +304,11 @@ fn run(init: std.process.Init.Minimal) !void {
     // output goes, as Julia's does.
     const color = colorWanted(inputs.env) orelse platform.isatty(platform.getStdoutHandle());
     terminal_size = terminalSize();
-    try sendClientInfo(&w, env, is_tty, color, inputs.args);
+    // A remote client's environment is never cached, so is asked for a round
+    // trip later; over TCP it goes at once.
+    const env_follows = transport_mode == .tcp;
+    try sendClientInfo(&w, env, is_tty, color, env_follows, inputs.args);
+    if (env_follows) sendFullEnv(&w, env, inputs.env);
     debuglog.event("conductor: request sent", .{});
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers(if (watching) &signalStopWatching else &signalNotifyInterrupt, &reportResize);
@@ -462,9 +466,9 @@ fn keepConductor(connection: protocol.Connection, runtime_dir: []const u8) posix
     return connection.socket;
 }
 
-fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, forwarded: []const [*:0]const u8) !void {
+fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, env_follows: bool, forwarded: []const [*:0]const u8) !void {
     w.writeInt(u32, protocol.client.magic);
-    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color }));
+    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color, .env_follows = env_follows }));
     w.writeSlice(&.{ 0, 0, 0 });
     w.writeInt(u32, @intCast(platform.getpid()));
     w.writeInt(u32, @intCast(platform.getppid()));
@@ -512,12 +516,8 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
     for (&paths) |*path| path.* = try takeString(reader, &paths_buf, &used);
     client_key = try reader.readInt(u64);
     platform.close(conductor);
-    const result = SocketSet{
-        .stdin = connectToWorkerSocket(paths[0], "stdin"),
-        .stdout = connectToWorkerSocket(paths[1], "stdout"),
-        .stderr = connectToWorkerSocket(paths[2], "stderr"),
-        .signals = connectToWorkerSocket(paths[3], "signals"),
-    };
+    const connected = connectToWorkerSockets(&paths);
+    const result = SocketSet{ .stdin = connected[0], .stdout = connected[1], .stderr = connected[2], .signals = connected[3] };
     if (transport_mode == .tcp) platform.setTcpNodelay(result.signals);
     return result;
 }
@@ -613,34 +613,51 @@ fn exitClient(code: u8) noreturn {
     std.process.exit(code);
 }
 
-/// `raw` is relayed from the worker, which may be sandboxed: only an address
-/// of the conductor's own transport is dialled.
-fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.socket_t {
-    const connected = switch (transport_mode) {
-        // Just `:port`, a port on the conductor's host.
-        .tcp => blk: {
-            if (raw.len == 0 or raw[0] != ':') break :blk error.InvalidAddress;
-            var ip = conductor_peer orelse break :blk error.NoConductorAddress;
-            ip.setPort(std.fmt.parseInt(u16, raw[1..], 10) catch break :blk error.InvalidAddress);
-            break :blk platform.connectTcp(ip, protocol.connect_timeout_ms);
+/// The worker's stdin, stdout, stderr and signals sockets, at `paths`, which
+/// are relayed from the worker, which may be sandboxed: only addresses of the
+/// conductor's own transport are dialled, over TCP all at once.
+fn connectToWorkerSockets(paths: *const [4][]const u8) [4]posix.socket_t {
+    const labels = [_][]const u8{ "stdin", "stdout", "stderr", "signals" };
+    var results: [4]anyerror!posix.socket_t = undefined;
+    switch (transport_mode) {
+        // Just `:port`s, ports on the conductor's host.
+        .tcp => {
+            var ips: [4]Io.net.IpAddress = undefined;
+            for (paths, &ips, labels) |raw, *ip, label| ip.* = workerAddress(raw) catch |e| failedToConnect(label, raw, e);
+            platform.connectTcpEach(&ips, protocol.connect_timeout_ms, &results);
         },
-        .local => blk: {
-            const address = protocol.parseAddress(raw) catch break :blk error.InvalidAddress;
-            if (address.mode != .local) break :blk error.InvalidAddress;
-            break :blk platform.connectLocalOnce(raw);
+        .local => for (paths, &results) |raw, *result| {
+            const address = protocol.parseAddress(raw) catch {
+                result.* = error.InvalidAddress;
+                continue;
+            };
+            result.* = if (address.mode == .local) platform.connectLocalOnce(raw) else error.InvalidAddress;
         },
-    };
-    const socket = connected catch |e| {
-        platform.eprint("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ raw, e });
-        exitClient(127);
-    };
-    debuglog.event("worker: " ++ label ++ " connected at {s}", .{raw});
-    if (transport_mode == .tcp) platform.setTcpKeepalive(socket, protocol.tcp_keepalive_idle_s);
-    // Whoever else reached the socket first is refused for want of the key.
+    }
+    var connected: [4]posix.socket_t = undefined;
+    // Whoever else reached a socket first is refused for want of the key.
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, client_key, .little);
-    platform.socketWrite(socket, &key);
-    return socket;
+    for (results, paths, labels, &connected) |result, raw, label, *socket| {
+        socket.* = result catch |e| failedToConnect(label, raw, e);
+        debuglog.event("worker: {s} connected at {s}", .{ label, raw });
+        if (transport_mode == .tcp) platform.setTcpKeepalive(socket.*, protocol.tcp_keepalive_idle_s);
+        platform.socketWrite(socket.*, &key);
+    }
+    return connected;
+}
+
+/// `:port`, a port on the conductor's host.
+fn workerAddress(raw: []const u8) !Io.net.IpAddress {
+    if (raw.len == 0 or raw[0] != ':') return error.InvalidAddress;
+    var ip = conductor_peer orelse return error.NoConductorAddress;
+    ip.setPort(std.fmt.parseInt(u16, raw[1..], 10) catch return error.InvalidAddress);
+    return ip;
+}
+
+fn failedToConnect(label: []const u8, raw: []const u8, err: anyerror) noreturn {
+    platform.eprint("Client: failed to connect to {s}: {s}: {}\n", .{ label, raw, err });
+    exitClient(127);
 }
 
 /// The evaluation the worker last said was executing (0 if unnumbered), which

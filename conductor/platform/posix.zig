@@ -155,26 +155,84 @@ pub fn connectLocalOnce(path: []const u8) !posix.socket_t {
 pub const local_transport_name = "unix socket";
 /// Bounded, unlike the kernel's minutes of SYN retries.
 pub fn connectTcp(ip: Io.net.IpAddress, timeout_ms: u32) !posix.socket_t {
+    var result: [1]anyerror!posix.socket_t = undefined;
+    connectTcpEach(&.{ip}, timeout_ms, &result);
+    return result[0];
+}
+
+/// Each of `ips` dialled at once, all within `timeout_ms`: into its slot of
+/// `results`, a blocking socket connected to it, or why not.
+pub fn connectTcpEach(ips: []const Io.net.IpAddress, timeout_ms: u32, results: []anyerror!posix.socket_t) void {
+    std.debug.assert(ips.len == results.len and ips.len <= max_dialled);
+    // Those under way, polled together.
+    var pending: [max_dialled]posix.pollfd = undefined;
+    var slots: [max_dialled]usize = undefined;
+    var flags: [max_dialled]usize = undefined;
+    var n: usize = 0;
+    for (ips, results, 0..) |ip, *result, i| {
+        const started = startConnect(ip, &flags[i]) catch |err| {
+            result.* = err;
+            continue;
+        };
+        result.* = started.fd;
+        if (!started.in_progress) {
+            result.* = finishConnect(started.fd, flags[i]);
+            continue;
+        }
+        pending[n] = .{ .fd = started.fd, .events = posix.POLL.OUT, .revents = 0 };
+        slots[n] = i;
+        n += 1;
+    }
+    var left_ms: i64 = timeout_ms;
+    const deadline_ns = monotonicNs() + @as(u64, timeout_ms) * std.time.ns_per_ms;
+    while (n > 0 and left_ms > 0) : (left_ms = @divTrunc(@as(i64, @intCast(deadline_ns)) - @as(i64, @intCast(monotonicNs())), std.time.ns_per_ms)) {
+        _ = posix.poll(pending[0..n], @intCast(left_ms)) catch break;
+        var k: usize = 0;
+        while (k < n) {
+            if (pending[k].revents == 0) {
+                k += 1;
+                continue;
+            }
+            const i = slots[k];
+            results[i] = finishConnect(pending[k].fd, flags[i]);
+            n -= 1;
+            pending[k] = pending[n];
+            slots[k] = slots[n];
+        }
+    }
+    for (pending[0..n], slots[0..n]) |pfd, i| {
+        impl.rawClose(pfd.fd);
+        results[i] = error.ConnectionTimedOut;
+    }
+}
+const max_dialled = 8;
+
+const Started = struct { fd: posix.socket_t, in_progress: bool };
+
+// Non-blocking until `finishConnect`, which restores `flags`.
+fn startConnect(ip: Io.net.IpAddress, flags: *usize) !Started {
     var storage: Io.Threaded.PosixAddress = undefined;
     const len = Io.Threaded.addressToPosix(&ip, &storage);
     const fd = impl.rawSocket(storage.any.family, posix.SOCK.STREAM) orelse return error.SocketCreateFailed;
     errdefer impl.rawClose(fd);
-    const flags = try fcntl(fd, posix.F.GETFL, 0);
+    flags.* = try fcntl(fd, posix.F.GETFL, 0);
     const nonblock: u32 = @bitCast(posix.O{ .NONBLOCK = true });
-    _ = try fcntl(fd, posix.F.SETFL, flags | nonblock);
-    switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
-        .SUCCESS => {},
-        .INPROGRESS => {
-            var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-            if (try posix.poll(&pfd, @intCast(timeout_ms)) == 0) return error.ConnectionTimedOut;
-            var err: c_int = 0;
-            var err_len: posix.socklen_t = @sizeOf(c_int);
-            if (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err), &err_len)) != .SUCCESS)
-                return error.Unexpected;
-            if (err != 0) return connectError(@enumFromInt(err));
-        },
-        else => |e| return connectError(e),
-    }
+    _ = try fcntl(fd, posix.F.SETFL, flags.* | nonblock);
+    return switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
+        .SUCCESS => .{ .fd = fd, .in_progress = false },
+        .INPROGRESS => .{ .fd = fd, .in_progress = true },
+        else => |e| connectError(e),
+    };
+}
+
+// Closed unless connected.
+fn finishConnect(fd: posix.socket_t, flags: usize) !posix.socket_t {
+    errdefer impl.rawClose(fd);
+    var err: c_int = 0;
+    var err_len: posix.socklen_t = @sizeOf(c_int);
+    if (posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err), &err_len)) != .SUCCESS)
+        return error.Unexpected;
+    if (err != 0) return connectError(@enumFromInt(err));
     _ = try fcntl(fd, posix.F.SETFL, flags);
     return fd;
 }
