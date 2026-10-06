@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("platform/main.zig");
 const protocol = @import("protocol.zig");
 const settings = @import("settings.zig");
@@ -77,9 +78,20 @@ pub const Config = struct {
             parsed.addr;
         errdefer allocator.free(socket_path);
         const transport = parsed.mode;
-        if (transport == .local) {
-            // The longest socket the conductor makes there: a client's reply sockets', `/<16 hex>-signals.sock`.
-            const name_len = "/0123456789abcdef-signals.sock".len;
+        {
+            // The longest socket made there: locally a client's reply socket or a
+            // worker's own, over TCP only a worker's setup socket. A sandboxed
+            // worker's (Linux only) sit a subdirectory deeper.
+            const sandbox_dir = if (builtin.os.tag == .linux)
+                std.fmt.comptimePrint("/sandbox-{d}", .{std.math.maxInt(u32)})
+            else
+                "";
+            // A worker names its own with its random id, then a random suffix.
+            const worker_socket = if (builtin.os.tag.isDarwin()) "/w-abcdef-abcdefgh.sock" else "/worker-abcdef-abcdefgh.sock";
+            const name_len = switch (transport) {
+                .local => @max("/0123456789abcdef-signals.sock".len, sandbox_dir.len + worker_socket.len),
+                .tcp => sandbox_dir.len + "/0123456789abcdef-wsetup.sock".len,
+            };
             const most = platform.max_local_addr - 1;
             if (socket_dir.len + name_len > most) {
                 std.debug.print(
