@@ -954,14 +954,13 @@ fn onWatchOutput(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     noteChange(c);
 }
 
-// The worker's signals, as a client's: a raw-mode switch to ack, and the watch's end.
+// The worker's signals, as a client's: of them, only the watch's end matters.
 fn onWatchSignals(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     const a = sub.attachment orelse return;
     for (bytes) |byte| {
         const msg = a.frames.feed(byte) orelse continue;
         switch (msg[0]) {
             protocol.signals.exit => return endAttachment(c, sub, if (msg[1] >= 1) msg[2] else 1),
-            protocol.signals.raw_mode => platform.write(a.signals.fd, &[_]u8{ msg[0], 0 }),
             else => {},
         }
     }

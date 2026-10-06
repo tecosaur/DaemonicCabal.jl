@@ -43,7 +43,7 @@ const WORKER_TERM = VirtualTerm(
     Base.PipeEndpoint(),
     Base.PipeEndpoint(),
     Base.PipeEndpoint(),
-    ClientSignals(Base.PipeEndpoint(), Threads.Condition(), Base.Event(), 0, nothing),  # never read
+    ClientSignals(Base.PipeEndpoint(), Threads.Condition(), Base.Event(), false, nothing),  # never read
     "Unknown",
     nothing, nothing, nothing, nothing
 )

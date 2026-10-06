@@ -138,8 +138,7 @@ const SignalParser = struct {
         return switch (id) {
             protocol.signals.exit => .{ .exit = if (data.len >= 1) data[0] else 1 },
             protocol.signals.raw_mode => blk: {
-                // Ahead of the ack, so the worker has it as the switch is done:
-                // a console reports a resize only while raw.
+                // A console reports a resize only while raw.
                 reportResize();
                 if (data.len == 1) {
                     platform.setWorkerRawMode(data[0] != 0);
@@ -150,11 +149,9 @@ const SignalParser = struct {
                         platform.setRawMode(data[0] != 0);
                     }
                 }
-                platform.socketWrite(fd, &[_]u8{ id, 0 }); // ack
                 break :blk .none;
             },
             protocol.signals.executing => blk: {
-                // No ack: a stray one would be taken for the next raw_mode ack.
                 if (data.len >= 1) platform.setWorkerExecuting(data[0] != 0);
                 if (data.len == 5) evaluation = std.mem.readInt(u32, data[1..5], .little);
                 break :blk .none;
