@@ -142,6 +142,24 @@ pub const first_settings: [tabs.len]usize = blk: {
     break :blk first;
 };
 
+/// The next setting of `i`'s tab down (or up) that `values` leave in use,
+/// else `i`.
+pub fn moveFocus(i: usize, down: bool, values: settings.Values) usize {
+    var j = i;
+    while (if (down) j + 1 < all.len else j > 0) {
+        j = if (down) j + 1 else j - 1;
+        if (all[j].tab == all[i].tab and settings.isUsed(j, values)) return j;
+    }
+    return i;
+}
+
+/// `i`, if `values` leave it in use, else the setting it hangs on.
+pub fn usableFocus(i: usize, values: settings.Values) usize {
+    if (settings.isUsed(i, values)) return i;
+    const up = moveFocus(i, false, values);
+    return if (up != i) up else moveFocus(i, true, values);
+}
+
 // Where values start: past the widest row's label, in every tab alike.
 const value_col = blk: {
     var widest = 0;
@@ -182,8 +200,7 @@ const Row = struct {
 
     // A heading is unused with the first row under it.
     fn used(self: Row) bool {
-        const i = self.item().setting orelse self.items[self.k + 1].setting.?;
-        return if (all[i].used) |use| use.check(self.values) else true;
+        return settings.isUsed(self.item().setting orelse self.items[self.k + 1].setting.?, self.values);
     }
 };
 
@@ -413,11 +430,6 @@ const Frame = struct {
             } else try self.writeWrapped(e.check.text(), text_width, indent.buffered(), colour);
         } else try self.print("{s}" ++ reset ++ "\n", .{indent.buffered()});
         try self.writeWrapped(s.about, text_width, indent.buffered(), self.muted());
-        if (s.used) |use| if (!use.check(row.values)) {
-            var reason_buf: [128]u8 = undefined;
-            const text = std.mem.print(&reason_buf, "{c}{s}.", .{ std.ascii.toUpper(use.reason[0]), use.reason[1..] }) catch use.reason;
-            try self.writeWrapped(text, text_width, indent.buffered(), self.muted());
-        };
     }
 
     // Each line after `indent`, in `style`.
@@ -811,6 +823,39 @@ test "an editor's check line stays, empty or not" {
     const without = try drawnText(&scene);
     defer gpa.free(without);
     try testing.expectEqual(std.mem.count(u8, with_check, "\n"), std.mem.count(u8, without, "\n"));
+}
+
+test "focus passes over the settings the others leave unused" {
+    var values: [all.len]?[]const u8 = @splat(null);
+    const server = Setting.index("JULIA_DAEMON_SERVER");
+    const ports = Setting.index("JULIA_DAEMON_PORTS");
+    const runtime = Setting.index("JULIA_DAEMON_RUNTIME");
+    try testing.expectEqual(runtime, moveFocus(server, true, &values));
+    try testing.expectEqual(server, moveFocus(runtime, false, &values));
+    values[server] = "tcp://localhost:9345";
+    try testing.expectEqual(ports, moveFocus(server, true, &values));
+    try testing.expectEqual(ports, moveFocus(runtime, false, &values));
+    // Pressure off, nothing below it in its tab is reachable.
+    const pressure = Setting.index("JULIA_DAEMON_MEMORY_PRESSURE");
+    values[pressure] = "0";
+    try testing.expectEqual(pressure, moveFocus(pressure, true, &values));
+}
+
+test "focus on a setting left unused moves to the one it hangs on" {
+    var values: [all.len]?[]const u8 = @splat(null);
+    const server = Setting.index("JULIA_DAEMON_SERVER");
+    const ports = Setting.index("JULIA_DAEMON_PORTS");
+    try testing.expectEqual(server, usableFocus(ports, &values));
+    try testing.expectEqual(server, usableFocus(server, &values));
+    values[server] = "tcp://localhost:9345";
+    try testing.expectEqual(ports, usableFocus(ports, &values));
+    const pressure = Setting.index("JULIA_DAEMON_MEMORY_PRESSURE");
+    values[pressure] = "0";
+    try testing.expectEqual(pressure, usableFocus(Setting.index("JULIA_DAEMON_MEMFREE_HIGH"), &values));
+}
+
+test "every tab's first setting is used whatever the others hold" {
+    for (first_settings) |i| try testing.expect(all[i].used == null);
 }
 
 test "an editor's check sits under its field when it fits, else wraps from the tree" {
