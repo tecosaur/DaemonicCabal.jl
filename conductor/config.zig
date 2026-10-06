@@ -36,6 +36,7 @@ pub const Config = struct {
     sandbox_max_memory: ?[]const u8, // e.g. "4G"
     sandbox_max_cpu: ?u32, // percent, 200 = 2 cores
     sandbox_session_bypass: bool,
+    sandbox_reuse: bool, // per remote host
 
     pub const PortRange = struct { base: u16, count: u16 };
 
