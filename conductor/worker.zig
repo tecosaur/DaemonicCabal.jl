@@ -169,6 +169,7 @@ pub const Worker = struct {
     mem_at: i64 = 0, // seconds
     launch: LaunchKind = .direct,
     interactive: bool = false,
+    origin: ?Io.net.IpAddress = null, // the remote host it was started for, port zeroed
     pidfd: ?posix.fd_t = null, // for a client-spawned worker, which is not our child
     recent_ppids: [max_recent_ppids]u32 = @splat(0),
     recent_ppids_next: usize = 0,

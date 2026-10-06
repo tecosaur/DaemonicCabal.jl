@@ -643,6 +643,13 @@ pub const Conductor = struct {
         };
     }
 
+    /// The host `peer` connects from, which its port doesn't change.
+    fn hostOf(peer: ?Io.net.IpAddress) ?Io.net.IpAddress {
+        var host = peer orelse return null;
+        host.setPort(0);
+        return host;
+    }
+
     /// Over TCP, a loopback peer is the host's only with the host key: a
     /// sandbox shares the host's network, but not its runtime dir.
     fn isRemote(self: *const Conductor, peer: *const PeerInfo, host_key: *const protocol.client.HostKey) bool {
@@ -718,7 +725,7 @@ pub const Conductor = struct {
                 .owned_env = owned_env,
             };
         };
-        return try self.handleClient(pc.socket, is_remote, request);
+        return try self.handleClient(pc.socket, is_remote, pc.peer.address, request);
     }
 
     // `r`'s lengths are already checked.
@@ -742,13 +749,13 @@ pub const Conductor = struct {
         return worker.dupeEnv(self.allocator, env);
     }
 
-    fn handleClient(self: *Conductor, socket: posix.socket_t, is_remote: bool, received: ClientRequest) !Outcome {
+    fn handleClient(self: *Conductor, socket: posix.socket_t, is_remote: bool, peer: ?Io.net.IpAddress, received: ClientRequest) !Outcome {
         var request = received;
         var request_held = false; // moved into a HeldClient while its worker starts
         defer if (!request_held) request.deinit(self.allocator);
         self.client_counter += 1;
         self.client_id = self.client_counter;
-        const sandbox = try self.sandboxFor(socket, is_remote, &request) orelse return .done;
+        const sandbox = try self.sandboxFor(socket, is_remote, peer, &request) orelse return .done;
         // A sandbox binds its project, which a remote client could name as any path of ours.
         if (sandbox == .remote) if (request.project) |p| {
             self.allocator.free(p);
@@ -796,13 +803,13 @@ pub const Conductor = struct {
 
     /// How the client's worker is sandboxed; null once the client has been
     /// refused one.
-    fn sandboxFor(self: *Conductor, socket: posix.socket_t, is_remote: bool, request: *const ClientRequest) !?SandboxKind {
+    fn sandboxFor(self: *Conductor, socket: posix.socket_t, is_remote: bool, peer: ?Io.net.IpAddress, request: *const ClientRequest) !?SandboxKind {
         const wants_sandbox = request.parsed.hasSwitch("--sandbox");
         // A client in another mount namespace is sandboxed by something we cannot
         // see into, so it spawns its own worker there.
         const foreign_ns = if (is_remote) null else platform.peerForeignMountNs(socket);
         const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or wants_sandbox))
-            .remote
+            .{ .remote = hostOf(peer) }
         else if (foreign_ns) |ns| blk: {
             // Refused, not downgraded: we can neither see into nor nest in the client's sandbox.
             if (wants_sandbox) {
@@ -973,7 +980,7 @@ pub const Conductor = struct {
 
     pub const SandboxKind = union(enum) {
         none,
-        remote,
+        remote: ?Io.net.IpAddress, // the client's host, port zeroed; null if unknown
         local: []const u8, // the one rw bind mount: the project, or just cwd
         client: struct { socket: posix.socket_t, ns: u64 }, // the client spawns the worker inside its own sandbox
     };
@@ -1206,15 +1213,21 @@ pub const Conductor = struct {
                 if (self.tryAssignWorker(f.w, &info, .session_label)) |a| return a;
             }
         }
-        // Skip ppid/recency reuse for remote clients (isolation) and labeled
-        // sessions (their identity is the label, handled above and below).
-        if (sandbox != .remote and label == null) {
+        // Skip ppid/recency reuse for labeled sessions (their identity is the
+        // label, handled above and below), and for a remote client but of a
+        // worker started for its own host, as its setting allows (isolation).
+        const reusable = switch (sandbox) {
+            .remote => |host| self.cfg.sandbox_reuse and host != null,
+            else => true,
+        };
+        if (reusable and label == null) {
+            const host = if (sandbox == .remote) sandbox.remote else null;
             // 2. PPID-affinity (interactive flag must match)
-            if (self.findWorkerByPpid(list, client_info.ppid, want_interactive, now)) |w| {
+            if (self.findWorkerByPpid(list, client_info.ppid, want_interactive, now, host)) |w| {
                 if (self.tryAssignWorker(w, client_info, .ppid_affinity)) |a| return a;
             }
             // 3. Lightest available worker, sparing the most-recent for ppid reuse
-            if (self.tryExistingWorkers(list, client_info, want_interactive, now)) |a| return a;
+            if (self.tryExistingWorkers(list, client_info, want_interactive, now, host)) |a| return a;
         }
         // 3b. New labeled session: claim an idle worker and tag it, else spawn.
         if (label != null and sandbox == .none) {
@@ -1251,9 +1264,9 @@ pub const Conductor = struct {
         return .{ .paths = paths, .w = w, .reason = reason };
     }
 
-    fn findWorkerByPpid(self: *Conductor, list: *WorkerList, ppid: u32, interactive: bool, now: i64) ?*worker.Worker {
+    fn findWorkerByPpid(self: *Conductor, list: *WorkerList, ppid: u32, interactive: bool, now: i64, host: ?Io.net.IpAddress) ?*worker.Worker {
         for (list.items) |w| {
-            if (!self.isWorkerAvailable(w, interactive, now)) continue;
+            if (!self.isWorkerAvailable(w, interactive, now) or !std.meta.eql(w.origin, host)) continue;
             if (std.mem.findScalar(u32, &w.recent_ppids, ppid) != null) {
                 if (self.isLabelExpired(w, now)) self.clearLabel(w);
                 return w;
@@ -1284,10 +1297,10 @@ pub const Conductor = struct {
     }
 
     // Spare the most recent for its ppid owner; the lightest goes, so heavy workers age out.
-    fn tryExistingWorkers(self: *Conductor, list: *WorkerList, client_info: *const worker.ClientInfo, interactive: bool, now: i64) ?WorkerAssignment {
+    fn tryExistingWorkers(self: *Conductor, list: *WorkerList, client_info: *const worker.ClientInfo, interactive: bool, now: i64, host: ?Io.net.IpAddress) ?WorkerAssignment {
         var newest: ?*worker.Worker = null;
         for (list.items) |w| {
-            if (!self.isWorkerAvailable(w, interactive, now)) continue;
+            if (!self.isWorkerAvailable(w, interactive, now) or !std.meta.eql(w.origin, host)) continue;
             if (newest == null or w.last_active > newest.?.last_active) newest = w;
         }
         if (newest == null) return null;
@@ -1295,7 +1308,7 @@ pub const Conductor = struct {
         var pick: ?*worker.Worker = null;
         var pick_mem: u64 = 0;
         for (list.items) |w| {
-            if (w == newest.? or !self.isWorkerAvailable(w, interactive, now)) continue;
+            if (w == newest.? or !self.isWorkerAvailable(w, interactive, now) or !std.meta.eql(w.origin, host)) continue;
             // Unmeasured ranks heaviest; an idle candidate's mem is current.
             const mem = if (w.mem > 0) w.mem else std.math.maxInt(u64);
             if (pick == null or mem < pick_mem or (mem == pick_mem and w.last_active > pick.?.last_active)) {
@@ -1390,6 +1403,7 @@ pub const Conductor = struct {
             },
         };
         const p = try self.beginSpawn(.{ .client = hold }, hold.request.parsed.julia_channel, resolveThreads(&hold.request), interactive, launch);
+        if (hold.sandbox == .remote) p.spawn.worker.origin = hold.sandbox.remote;
         std.debug.print("Spawning {s}worker {d} (pid {d}) for project {s}{s}{s}\n", .{
             switch (hold.sandbox) {
                 .client => "client-spawned ",
@@ -2669,6 +2683,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(" - Sandbox remote clients: disabled\n", .{});
     if (cfg.sandbox_session_bypass)
         std.debug.print(" - Sandbox session bypass: enabled\n", .{});
+    if (!cfg.sandbox_reuse)
+        std.debug.print(" - Sandbox reuse per host: disabled\n", .{});
     // Needed even in TCP mode: the worker setup socket is always local.
     _ = try Io.Dir.cwd().createDirPathStatus(io, cfg.runtime_dir, platform.runtime_dir_permissions);
     try platform.secureRuntimeDir(cfg.runtime_dir);
