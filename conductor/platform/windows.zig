@@ -647,17 +647,30 @@ pub const private_file_permissions: Io.File.Permissions = .default_file;
 
 extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE;
 
-/// Up to `buf`'s length of a small file; null where it can't be read.
-pub fn readSmallFile(path: []const u8, buf: []u8) ?[]u8 {
+extern "kernel32" fn LockFileEx(hFile: HANDLE, dwFlags: DWORD, dwReserved: DWORD, nNumberOfBytesToLockLow: DWORD, nNumberOfBytesToLockHigh: DWORD, lpOverlapped: *OVERLAPPED) BOOL;
+
+/// Up to `buf`'s length of a small file; null where it can't be read, or if
+/// `held`, where no other process holds it locked (std's locks cover its first
+/// byte), as a live conductor does.
+pub fn readSmallFile(path: []const u8, buf: []u8, held: bool) ?[]u8 {
     var wide: [std.Io.Dir.max_path_bytes:0]u16 = undefined;
     const len = std.unicode.utf8ToUtf16Le(&wide, path) catch return null;
     wide[len] = 0;
     const GENERIC_READ: DWORD = 0x80000000;
-    const FILE_SHARE_READ: DWORD = 1;
+    // Sharing writes too, as a holder of the file has them.
+    const FILE_SHARE_READ_WRITE_DELETE: DWORD = 7;
     const OPEN_EXISTING: DWORD = 3;
-    const handle = CreateFileW(wide[0..len :0], GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
+    const handle = CreateFileW(wide[0..len :0], GENERIC_READ, FILE_SHARE_READ_WRITE_DELETE, null, OPEN_EXISTING, 0, null);
     if (handle == win32.INVALID_HANDLE_VALUE) return null;
     defer close(handle);
+    if (held) {
+        const LOCKFILE_FAIL_IMMEDIATELY: DWORD = 1;
+        const LOCKFILE_EXCLUSIVE_LOCK: DWORD = 2;
+        var overlapped: OVERLAPPED = undefined;
+        @memset(std.mem.asBytes(&overlapped), 0);
+        // Taken, the lock goes with the handle.
+        if (LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlapped).toBool()) return null;
+    }
     var n: DWORD = 0;
     if (!ReadFile(handle, buf.ptr, @intCast(buf.len), &n, null).toBool()) return null;
     return buf[0..n];
@@ -857,6 +870,10 @@ pub const Listener = struct {
     }
     pub fn addr(self: *const Listener) []const u8 {
         return self.addr_buf[0..self.addr_len];
+    }
+    /// Where a TCP listener is bound.
+    pub fn bound(self: *const Listener) ?Io.net.IpAddress {
+        return if (self.backing == .socket) self.backing.socket.socket.address else null;
     }
     pub fn fd(self: *const Listener) HANDLE {
         return switch (self.backing) {

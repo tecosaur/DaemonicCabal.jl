@@ -288,6 +288,11 @@ pub const Conductor = struct {
         if (self.cfg.transport == .tcp) try self.writeHostKey();
         var listener = try self.createServer();
         defer if (listener.fd() != platform.no_socket) listener.close(self.io); // a failed recreate closed it
+        const port_file = self.writePortFile(&listener) catch |err| blk: {
+            std.debug.print("Warning: failed to write the port file: {}\n", .{err});
+            break :blk null;
+        };
+        defer if (port_file) |file| file.close(self.io);
         std.debug.print("Conductor listening on {s}\n", .{self.cfg.socket_path});
         if (self.cfg.reserve_worker) self.beginReserveSpawn() catch |err| {
             std.debug.print("Failed to start a reserve worker: {}\n", .{err});
@@ -310,7 +315,7 @@ pub const Conductor = struct {
                 _ = std.fmt.parseInt(u32, id, 10) catch continue;
                 dir.deleteTree(self.io, entry.name) catch {};
             } else if (std.mem.endsWith(u8, entry.name, ".sock") or std.mem.eql(u8, entry.name, "conductor.pid") or
-                std.mem.eql(u8, entry.name, protocol.client.host_key_file))
+                std.mem.eql(u8, entry.name, protocol.client.host_key_file) or std.mem.startsWith(u8, entry.name, protocol.client.port_file))
             {
                 dir.deleteFile(self.io, entry.name) catch {};
             }
@@ -2397,6 +2402,26 @@ pub const Conductor = struct {
         var file = try dir.createFile(self.io, protocol.client.host_key_file, .{ .permissions = platform.private_file_permissions });
         defer file.close(self.io);
         try file.writeStreamingAll(self.io, &self.host_key);
+    }
+
+    /// Only where a client here reaches the listener at 127.0.0.1. Renamed into
+    /// place, so none reads it half written, and held under a shared lock, as
+    /// on Windows an exclusive one would bar reading it.
+    fn writePortFile(self: *Conductor, listener: *const protocol.Listener) !?Io.File {
+        const ip = switch (listener.bound() orelse return null) {
+            .ip4 => |a| a,
+            .ip6 => return null,
+        };
+        if (!std.mem.eql(u8, &ip.bytes, &.{ 127, 0, 0, 1 }) and !std.mem.allEqual(u8, &ip.bytes, 0)) return null;
+        const staging = protocol.client.port_file ++ ".new";
+        var dir = try Io.Dir.openDirAbsolute(self.io, self.cfg.runtime_dir, .{});
+        defer dir.close(self.io);
+        const file = try dir.createFile(self.io, staging, .{ .permissions = platform.private_file_permissions, .lock = .shared, .lock_nonblocking = true });
+        errdefer file.close(self.io);
+        var buf: [5]u8 = undefined;
+        try file.writeStreamingAll(self.io, std.mem.print(&buf, "{d}", .{ip.port}) catch unreachable);
+        try dir.rename(staging, dir, protocol.client.port_file, self.io);
+        return file;
     }
 
     /// Held locked while the conductor lives, so a client signals no stale pid.

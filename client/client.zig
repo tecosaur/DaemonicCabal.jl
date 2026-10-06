@@ -337,7 +337,9 @@ fn scanEnv(kvs: []const [*:0]const u8) EnvInfo {
     return info;
 }
 
-fn locateConductor(env: EnvInfo, runtime_dir_buf: *[max_socket_path]u8) !struct { runtime_dir: []const u8, address: protocol.Address } {
+const Located = struct { runtime_dir: []const u8, address: protocol.Address };
+
+fn locateConductor(env: EnvInfo, runtime_dir_buf: *[max_socket_path]u8) !Located {
     const runtime_dir = env.runtime_dir orelse
         try platform.defaultRuntimeDir(runtime_dir_buf, env.xdg_runtime_dir, env.home);
     var socket_dir_buf: [max_socket_path]u8 = undefined;
@@ -345,6 +347,26 @@ fn locateConductor(env: EnvInfo, runtime_dir_buf: *[max_socket_path]u8) !struct 
     const raw_path = env.server_path orelse
         try platform.localSocketPath(&conductor_path_buf, socket_dir, "conductor.sock", .{});
     return .{ .runtime_dir = runtime_dir, .address = try protocol.parseAddress(raw_path) };
+}
+
+var held_port_addr_buf: [16]u8 = undefined;
+
+/// Dials the conductor once: at its address, or given none, once the socket
+/// fails, at the port a live conductor over TCP holds in the runtime dir;
+/// `transport_mode` and `conductor_path` then say which.
+fn dialConductor(env: EnvInfo, located: Located, timeout_ms: u32) !protocol.Connection {
+    transport_mode = located.address.mode;
+    conductor_path = located.address.addr;
+    const err = if (protocol.connectAddress(transport_mode, conductor_path, timeout_ms)) |c| return c else |e| e;
+    if (env.server_path != null) return err;
+    platform.secureRuntimeDir(located.runtime_dir) catch return err;
+    var path_buf: [max_socket_path + 16]u8 = undefined;
+    const path = std.mem.print(&path_buf, "{s}/" ++ protocol.client.port_file, .{located.runtime_dir}) catch return err;
+    var port_buf: [5]u8 = undefined;
+    const port = platform.readSmallFile(path, &port_buf, true) orelse return err;
+    transport_mode = .tcp;
+    conductor_path = std.mem.print(&held_port_addr_buf, "127.0.0.1:{s}", .{port}) catch unreachable;
+    return protocol.connectAddress(.tcp, conductor_path, timeout_ms);
 }
 
 /// Over TCP, what shows this client the host's rather than a sandbox's.
@@ -360,12 +382,9 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
         else => return err,
     };
     const runtime_dir = located.runtime_dir;
-    transport_mode = located.address.mode;
-    if (transport_mode == .local) platform.secureRuntimeDir(runtime_dir) catch exitClient(1);
-    conductor_path = located.address.addr;
-    const addr = conductor_path;
+    if (located.address.mode == .local) platform.secureRuntimeDir(runtime_dir) catch exitClient(1);
     const timeout = protocol.connect_timeout_ms;
-    const first_err = if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c, runtime_dir) else |err| err;
+    const first_err = if (dialConductor(env, located, timeout)) |c| return keepConductor(c, runtime_dir) else |err| err;
     // A refusal may be a conductor restarting, and a live conductor can be asked
     // to recreate a missing socket; a timeout is not worth repeating.
     const worth_retrying = switch (transport_mode) {
@@ -378,11 +397,11 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
     if (worth_retrying) {
         for (0..20) |_| {
             platform.sleepMs(100);
-            if (protocol.connectAddress(transport_mode, addr, timeout)) |c| return keepConductor(c, runtime_dir) else |_| {}
+            if (dialConductor(env, located, timeout)) |c| return keepConductor(c, runtime_dir) else |_| {}
         }
     }
     if (first_err == error.UnknownHostName) {
-        platform.eprint("Cannot resolve the host in {s}.\n", .{addr});
+        platform.eprint("Cannot resolve the host in {s}.\n", .{conductor_path});
         exitClient(127);
     }
     platform.eprint(
@@ -394,19 +413,21 @@ fn connectToConductor(env: EnvInfo) !posix.socket_t {
         \\
         \\Or specify a different address with -a <addr>
         \\
-    , .{ addr, restart_hint });
+    , .{ conductor_path, restart_hint });
     exitClient(127);
 }
 
 fn printVersion(env: EnvInfo) void {
     const plain = "juliaclient " ++ protocol.VERSION;
     var runtime_dir_buf: [max_socket_path]u8 = undefined;
-    const address: ?protocol.Address = if (locateConductor(env, &runtime_dir_buf)) |located|
-        (if (protocol.probeAddress(located.address.mode, located.address.addr, 1000)) located.address else null)
-    else |_| null;
+    const reached = if (locateConductor(env, &runtime_dir_buf)) |located| blk: {
+        const connection = dialConductor(env, located, 1000) catch break :blk false;
+        platform.close(connection.socket);
+        break :blk true;
+    } else |_| false;
     var line_buf: [2 * max_socket_path]u8 = undefined;
-    const line = if (address) |a| std.mem.print(&line_buf, plain ++ ", connected to conductor over {s} {s}\n", .{
-        if (a.mode == .tcp) "TCP" else platform.local_transport_name, a.addr,
+    const line = if (reached) std.mem.print(&line_buf, plain ++ ", connected to conductor over {s} {s}\n", .{
+        if (transport_mode == .tcp) "TCP" else platform.local_transport_name, conductor_path,
     }) catch plain ++ "\n" else plain ++ ", no conductor detected\n";
     platform.writeFile(platform.getStdoutHandle(), line);
 }
@@ -417,7 +438,7 @@ fn keepConductor(connection: protocol.Connection, runtime_dir: []const u8) posix
     if (connection.peer) |ip| if (protocol.isLoopback(ip)) {
         var path_buf: [max_socket_path + 16]u8 = undefined;
         const path = std.mem.print(&path_buf, "{s}/" ++ protocol.client.host_key_file, .{runtime_dir}) catch "";
-        if (platform.readSmallFile(path, &host_key)) |read| {
+        if (platform.readSmallFile(path, &host_key, false)) |read| {
             if (read.len != host_key.len) host_key = std.mem.zeroes(protocol.client.HostKey);
         }
     };
