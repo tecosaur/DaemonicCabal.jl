@@ -331,6 +331,12 @@ pub fn requestSocketRecreate(pid_path: []const u8) bool {
 pub fn sleepMs(ms: u32) void {
     _ = posix.poll(&.{}, @intCast(ms)) catch {};
 }
+/// A client has one thread: nothing to take turns with.
+pub const Lock = struct {
+    pub fn acquire(_: *Lock) void {}
+    pub fn release(_: *Lock) void {}
+};
+
 pub fn monotonicNs() u64 {
     var ts: posix.timespec = undefined;
     _ = posix.system.clock_gettime(posix.CLOCK.MONOTONIC, &ts);

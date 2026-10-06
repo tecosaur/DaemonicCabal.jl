@@ -1183,6 +1183,18 @@ pub fn sleepMs(ms: u32) void {
     Sleep(ms);
 }
 
+pub const Lock = struct {
+    srw: win32.SRWLOCK = .{},
+
+    pub fn acquire(self: *Lock) void {
+        ntdll.RtlAcquireSRWLockExclusive(&self.srw);
+    }
+
+    pub fn release(self: *Lock) void {
+        ntdll.RtlReleaseSRWLockExclusive(&self.srw);
+    }
+};
+
 pub fn monotonicNs() u64 {
     var count: i64 = 0;
     var frequency: i64 = 1;
