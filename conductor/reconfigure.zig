@@ -840,38 +840,32 @@ fn flaggedPaths(c: *const Conductor, v: *const Viewer) std.StaticBitSet(all.len)
 // with its last action, what that was.
 fn farewell(c: *const Conductor, v: *const Viewer, buf: []u8) []const u8 {
     const model = &c.settings.model;
-    var w = std.Io.Writer.fixed(buf);
-    if (v.message.kind == .problem) w.print("{s}\n", .{v.message.bytes[0..v.message.len]}) catch {};
-    const n = v.applied.count();
-    if (n == 0) {
-        w.writeAll("No settings changed.") catch {};
-        return w.buffered();
-    }
-    var unsaved: usize = 0;
-    var restart: usize = 0;
+    var f: view.Farewell = .{
+        .problem = if (v.message.kind == .problem) v.message.bytes[0..v.message.len] else null,
+        .changed = v.applied.count(),
+    };
+    var restart_unsaved = false;
     var it = v.applied.iterator(.{});
     while (it.next()) |i| {
-        if (model.isUnsaved(i)) unsaved += 1;
-        if (model.awaitsRestart(i)) restart += 1;
+        const unsaved = model.isUnsaved(i);
+        if (!unsaved) f.saved += 1;
+        if (model.awaitsRestart(i)) {
+            f.restart += 1;
+            restart_unsaved = restart_unsaved or unsaved;
+        } else f.live += 1;
     }
-    w.print("Applied {d} change{s}", .{ n, if (n == 1) "" else "s" }) catch {};
-    const svc = c.settings.service;
-    if (unsaved == 0) {
-        var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        var shown_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        if (svc) |s| if (s.target(&target_buf)) |target| {
-            w.print(", saved to {s}", .{homeRelative(c, target, &shown_buf)}) catch {};
-        } else |_| {};
-    } else if (svc == null) {
-        w.writeAll(" (no service to save them to)") catch {};
-    } else if (unsaved == n) {
-        w.writeAll(" (unsaved)") catch {};
-    } else {
-        w.print(" ({d} unsaved)", .{unsaved}) catch {};
+    var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var shown_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var command_buf: [2 * std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (c.settings.service) |svc| {
+        if (svc.target(&target_buf)) |target| f.saved_to = homeRelative(c, target, &shown_buf) else |_| {}
+        // Restarting would lose what's unsaved.
+        if (f.restart > 0 and !restart_unsaved) f.restart_command = svc.restartCommand(&command_buf) catch null;
+        // A restart has the service manager reread what's saved, as the note would say.
+        if (f.restart_command == null) f.note = svc.kind.rereadNote();
     }
-    if (unsaved < n) if (svc) |s| if (s.kind.rereadNote()) |note| w.print("; {s}", .{note}) catch {};
-    if (restart > 0) w.print("; {d} take{s} effect on restart", .{ restart, if (restart == 1) "s" else "" }) catch {};
-    w.writeAll(".") catch {};
+    var w = std.Io.Writer.fixed(buf);
+    view.writeFarewell(&w, f) catch {};
     return w.buffered();
 }
 
@@ -888,7 +882,7 @@ fn sweep(c: *Conductor) void {
         _ = viewers.swapRemove(i);
         var leaving: std.ArrayList(u8) = .empty;
         defer leaving.deinit(c.allocator);
-        var buf: [1536]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         view.clear(c.allocator, &leaving, v.cursor_line, farewell(c, v, &buf)) catch {};
         v.term.close(c, leaving.items);
         v.deinit(c.allocator);
