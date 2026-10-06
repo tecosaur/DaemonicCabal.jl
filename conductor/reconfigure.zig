@@ -258,7 +258,7 @@ fn browseKey(c: *Conductor, v: *Viewer, key: tui.Key) void {
     switch (key) {
         .left, .back_tab => v.tab = (v.tab + tabs.len - 1) % tabs.len,
         .right, .tab => v.tab = (v.tab + 1) % tabs.len,
-        .up, .down => v.focus[v.tab] = moveFocus(tabs[v.tab], i, key == .down),
+        .up, .down => v.focus[v.tab] = view.moveFocus(i, key == .down, &v.staged.values(model)),
         .escape => quit(c, v),
         .enter => edit(c, v, i),
         .char => |ch| switch (ch) {
@@ -400,16 +400,6 @@ fn charAfter(text: []const u8, at: usize) usize {
 fn closeEditor(c: *Conductor, v: *Viewer) void {
     v.editor.?.deinit(c.allocator);
     v.editor = null;
-}
-
-// The next setting of `tab` down (or up) from `i`, else `i`.
-fn moveFocus(tab: settings.Tab, i: usize, down: bool) usize {
-    var j = i;
-    while (if (down) j + 1 < all.len else j > 0) {
-        j = if (down) j + 1 else j - 1;
-        if (all[j].tab == tab) return j;
-    }
-    return i;
 }
 
 // --- Applying and saving ---
@@ -697,6 +687,8 @@ fn pendingOf(c: *const Conductor, v: *const Viewer) changes.Pending {
 
 fn repaint(c: *Conductor, v: *Viewer) void {
     if (v.term.queued.items.len > 0 and !v.term.flushQueued()) return;
+    // Another's change can leave the focused setting unused; one being edited stays.
+    if (v.editor == null) v.focus[v.tab] = view.usableFocus(v.focus[v.tab], &v.staged.values(&c.settings.model));
     var placeholder_buf: [64]u8 = undefined;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(c.allocator);

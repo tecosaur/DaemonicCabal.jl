@@ -80,7 +80,7 @@ pub const Setting = struct {
     unset: []const u8 = "", // shown for an unset value without a default
     effect: Effect,
     about: []const u8,
-    /// Whether the other settings leave it in use, and why not.
+    /// Whether the other settings leave it in use.
     used: ?Use = null,
     field: ?[]const u8 = null, // its `Config` field
     alias: ?[]const u8 = null, // a deprecated variable, read in its absence
@@ -97,10 +97,7 @@ pub fn hasField(comptime name: []const u8) bool {
     return false;
 }
 
-pub const Use = struct {
-    check: *const fn (values: Values) bool,
-    reason: []const u8,
-};
+pub const Use = *const fn (values: Values) bool;
 
 /// Each setting's value, as `all` orders them; null is unset.
 pub const Values = []const ?[]const u8;
@@ -136,25 +133,30 @@ pub const all = [_]Setting{
     .{ .key = "JULIA_DAEMON_SANDBOX_SESSION_BYPASS", .label = "session bypass", .tab = .sandbox, .depth = 1, .kind = .flag, .default = "0", .effect = .now, .field = "sandbox_session_bypass", .used = sandboxing, .about = "Let a remote client's --session=<label> join a local, unsandboxed worker." },
 };
 
-const pressure_on: Use = .{ .check = struct {
+const pressure_on: Use = struct {
     fn check(values: Values) bool {
         return isOn(resolved(values, Setting.index("JULIA_DAEMON_MEMORY_PRESSURE")));
     }
-}.check, .reason = "unused while memory pressure is off" };
+}.check;
 
-const tcp: Use = .{ .check = struct {
+const tcp: Use = struct {
     fn check(values: Values) bool {
         const server = values[Setting.index("JULIA_DAEMON_SERVER")] orelse return false;
         const address = protocol.parseAddress(server) catch return false;
         return address.mode == .tcp;
     }
-}.check, .reason = "only used by a TCP server" };
+}.check;
 
-const sandboxing: Use = .{ .check = struct {
+const sandboxing: Use = struct {
     fn check(values: Values) bool {
         return isOn(resolved(values, Setting.index("JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS")));
     }
-}.check, .reason = "unused while remote clients aren't sandboxed" };
+}.check;
+
+/// Whether `values` leave setting `i` in use.
+pub fn isUsed(i: usize, values: Values) bool {
+    return if (all[i].used) |use| use(values) else true;
+}
 
 /// A setting's value, else its default, else empty.
 pub fn resolved(values: Values, i: usize) []const u8 {
@@ -629,14 +631,15 @@ test "timings stay positive, and the TTLs and free-memory levels ordered" {
 
 test "rows are used as the settings they hang on allow" {
     var values: [all.len]?[]const u8 = @splat(null);
-    const psi = all[Setting.index("JULIA_DAEMON_PSI_THRESHOLD")].used.?;
-    const ports = all[Setting.index("JULIA_DAEMON_PORTS")].used.?;
-    try std.testing.expect(psi.check(&values));
-    try std.testing.expect(!ports.check(&values));
+    const psi = Setting.index("JULIA_DAEMON_PSI_THRESHOLD");
+    const ports = Setting.index("JULIA_DAEMON_PORTS");
+    const server = Setting.index("JULIA_DAEMON_SERVER");
+    try std.testing.expect(isUsed(psi, &values) and isUsed(server, &values));
+    try std.testing.expect(!isUsed(ports, &values));
     values[Setting.index("JULIA_DAEMON_MEMORY_PRESSURE")] = "0";
-    values[Setting.index("JULIA_DAEMON_SERVER")] = "tcp://localhost:9345";
-    try std.testing.expect(!psi.check(&values));
-    try std.testing.expect(ports.check(&values));
+    values[server] = "tcp://localhost:9345";
+    try std.testing.expect(!isUsed(psi, &values));
+    try std.testing.expect(isUsed(ports, &values));
 }
 
 test "numeric values step: durations and sizes by round values, the rest by one" {
