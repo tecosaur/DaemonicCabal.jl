@@ -1146,6 +1146,11 @@ pub fn readMemInfo() ?MemInfo {
     return .{ .available = ms.ullAvailPhys, .total = ms.ullTotalPhys };
 }
 
+/// Unknown: Windows answers only through `netsh`.
+pub fn ephemeralPorts() ?[2]u16 {
+    return null;
+}
+
 pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
     const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
     const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, .FALSE, pid) orelse return null;

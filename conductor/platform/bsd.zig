@@ -180,6 +180,16 @@ pub fn readMemInfo() ?MemInfo {
     };
 }
 
+pub fn ephemeralPorts() ?[2]u16 {
+    return switch (builtin.target.os.tag) {
+        .macos, .freebsd => .{
+            std.math.cast(u16, sysctlUint("net.inet.ip.portrange.first") orelse return null) orelse return null,
+            std.math.cast(u16, sysctlUint("net.inet.ip.portrange.last") orelse return null) orelse return null,
+        },
+        else => null, // OpenBSD's are under a MIB with no name to look it up by
+    };
+}
+
 pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
     if (builtin.target.os.tag != .macos) return null;
     const ppid = (darwinBsdInfo(pid) orelse return null).pbi_ppid;

@@ -562,6 +562,10 @@ fn platformValue(c: *const Conductor, v: *const Viewer, i: usize, buf: []u8) ?[]
     const xdg = c.environ_map.get("XDG_RUNTIME_DIR");
     const home = c.environ_map.get("HOME");
     if (std.mem.eql(u8, key, "JULIA_DAEMON_RUNTIME")) return platform.defaultRuntimeDir(buf, xdg, home) catch null;
+    if (std.mem.eql(u8, key, "JULIA_DAEMON_PORTS")) {
+        const range = platform.ephemeralPorts() orelse return null;
+        return std.mem.print(buf, "{d}-{d}", .{ range[0], range[1] }) catch null;
+    }
     if (!std.mem.eql(u8, key, "JULIA_DAEMON_SERVER")) return null;
     var runtime_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const runtime = v.staged.effective(&c.settings.model, settings.Setting.index("JULIA_DAEMON_RUNTIME")) orelse
@@ -612,7 +616,8 @@ fn checkEditor(c: *const Conductor, v: *Viewer) void {
         if (pathWarning(c, s.kind.path, path, e.settled, &why_buf)) |why| return check.set(.warning, "{s}", .{why});
     };
     var why_buf: [160]u8 = undefined;
-    const ports = if (e.settled) checkListen(c, i, &values, &why_buf) else null;
+    // The platform's ports are shared with every outgoing connection: no use trying them.
+    const ports = if (e.settled and !e.implied) checkListen(c, i, &values, &why_buf) else null;
     if (ports) |found| if (found == .unfit) return check.set(.warning, "{s}", .{found.unfit});
     if (e.implied) return check.set(.fine, "The platform's: confirmed as it is, it stays unset.", .{});
     var shown_buf: [128]u8 = undefined;
@@ -776,6 +781,10 @@ fn repaint(c: *Conductor, v: *Viewer) void {
     // Another's change can leave the focused setting unused; one being edited stays.
     if (v.editor == null) v.focus[v.tab] = view.usableFocus(v.focus[v.tab], &v.staged.values(&c.settings.model));
     var placeholder_buf: [64]u8 = undefined;
+    var implied: [all.len]?[]const u8 = @splat(null);
+    var ports_buf: [16]u8 = undefined;
+    const ports = settings.Setting.index("JULIA_DAEMON_PORTS");
+    implied[ports] = platformValue(c, v, ports, &ports_buf);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(c.allocator);
     const scene: view.Scene = .{
@@ -789,6 +798,7 @@ fn repaint(c: *Conductor, v: *Viewer) void {
         .message = if (v.message.kind == .none) null else .{ .problem = v.message.kind == .problem, .text = v.message.bytes[0..v.message.len] },
         .asking = v.asking,
         .flagged = flaggedPaths(c, v),
+        .implied = implied,
         .styles = &v.styles,
         .cols = v.term.size.cols,
         .rows = v.term.size.rows,
@@ -935,4 +945,10 @@ test "a message too long for its buffer is cut short, not lost" {
     var buf: [24]u8 = undefined;
     const why = checkPorts(std.testing.io, "192.0.2.1", 50000, 50000, .{}, &buf).?.unfit;
     try std.testing.expectEqualStrings("192.0.2.1 isn't an addre", why);
+}
+
+test "the system's ephemeral ports read as a range, where it has them" {
+    if (@import("builtin").target.os.tag != .linux) return error.SkipZigTest;
+    const range = platform.ephemeralPorts().?;
+    try std.testing.expect(range[0] >= 1024 and range[0] < range[1]);
 }

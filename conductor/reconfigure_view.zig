@@ -92,6 +92,8 @@ pub const Scene = struct {
     asking: bool = false, // whether to save before quitting
     /// Paths that may not do (missing, say), marked by their values.
     flagged: std.StaticBitSet(all.len) = .empty,
+    /// What an unset setting without a default comes to, where the platform says.
+    implied: [all.len]?[]const u8 = @splat(null),
     styles: *const Styles,
     cols: u16,
     rows: u16,
@@ -241,7 +243,7 @@ const Frame = struct {
         var buf: [max_items]Item = undefined;
         const items = itemsOf(tabs[scene.tab], &buf);
         for (items, 0..) |item, k| {
-            const row: Row = .{ .items = items, .k = k, .values = &values, .value_cols = valueCols(items, &values, scene.flagged) };
+            const row: Row = .{ .items = items, .k = k, .values = &values, .value_cols = valueCols(scene, items, &values) };
             const focused = item.setting == scene.focus;
             if (focused) self.focus_lines[0] = self.line();
             try self.writeRow(row);
@@ -321,7 +323,7 @@ const Frame = struct {
         const applied = scene.state.applied[i];
         const used = row.used();
         var buf: [128]u8 = undefined;
-        const shown = settings.display(s, value, &buf);
+        const shown = shownValue(scene, i, value, &buf);
         const colour = if (!used)
             ""
         else if (staged)
@@ -529,13 +531,22 @@ fn tabMark(scene: *const Scene, tab: settings.Tab) enum { none, staged, unsaved 
     return if (unsaved) .unsaved else .none;
 }
 
+// Setting `i`'s `value` as its row shows it: unset, with no default, what
+// the platform makes of it beside what it is.
+fn shownValue(scene: *const Scene, i: usize, value: ?[]const u8, buf: []u8) []const u8 {
+    const s = &all[i];
+    if (value != null or s.default != null) return settings.display(s, value, buf);
+    const implied = scene.implied[i] orelse return s.unset;
+    return std.mem.print(buf, "{s} ({s})", .{ s.unset, implied }) catch s.unset;
+}
+
 // The widest value shown among `items`, those past `max_value_cols` aside.
-fn valueCols(items: []const Item, values: *const changes.Values, flagged: std.StaticBitSet(all.len)) usize {
+fn valueCols(scene: *const Scene, items: []const Item, values: *const changes.Values) usize {
     var widest: usize = 0;
     for (items) |item| {
         const i = item.setting orelse continue;
         var buf: [128]u8 = undefined;
-        const cols = tui.textWidth(settings.display(&all[i], values[i], &buf)) + if (flagged.isSet(i)) flag_cols else 0;
+        const cols = tui.textWidth(shownValue(scene, i, values[i], &buf)) + if (scene.flagged.isSet(i)) flag_cols else 0;
         if (cols <= max_value_cols) widest = @max(widest, cols);
     }
     return widest;
@@ -888,4 +899,26 @@ test "an editor's check sits under its field when it fits, else wraps from the t
     const wraps = try drawnText(&scene);
     defer gpa.free(wraps);
     try testing.expectEqual(4, columnOf(wraps, "This says"));
+}
+
+test "an unset setting shows what the platform makes of it, where it says" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var state = try changes.State.init(gpa, &env, null);
+    defer state.deinit(gpa);
+    var staged: changes.Staged = .{};
+    defer staged.deinit(gpa);
+    const server = Setting.index("JULIA_DAEMON_SERVER");
+    const ports = Setting.index("JULIA_DAEMON_PORTS");
+    try staged.stage(gpa, &state, server, "tcp://0.0.0.0:9591");
+    const styles = Styles.of(null);
+    var scene = sceneOf(&state, &staged, &styles, @intFromEnum(all[ports].tab), server);
+    const unsaid = try drawnText(&scene);
+    defer gpa.free(unsaid);
+    try testing.expect(std.mem.find(u8, unsaid, "any free ") != null and std.mem.find(u8, unsaid, "(") == null);
+    scene.implied[ports] = "32768-60999";
+    const said = try drawnText(&scene);
+    defer gpa.free(said);
+    try testing.expect(std.mem.find(u8, said, "any free (32768-60999)") != null);
 }

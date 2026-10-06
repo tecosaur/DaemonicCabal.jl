@@ -116,6 +116,8 @@ pub const mem_is_reclaimable = shared.mem_is_reclaimable;
 pub const processReclaimable = shared.processReclaimable;
 pub const readPsiSomeAvg10 = shared.readPsiSomeAvg10;
 pub const readMemInfo = shared.readMemInfo;
+/// The ports the system picks a listener's from, given port 0.
+pub const ephemeralPorts = impl.ephemeralPorts;
 pub const getParentName = shared.getParentName;
 pub const setTcpNodelay = shared.setTcpNodelay;
 pub const setTcpKeepalive = shared.setTcpKeepalive;

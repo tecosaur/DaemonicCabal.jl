@@ -276,6 +276,14 @@ pub fn readMemInfo() ?MemInfo {
     return .{ .available = avail * 1024, .total = total * 1024 };
 }
 
+pub fn ephemeralPorts() ?[2]u16 {
+    var buf: [64]u8 = undefined;
+    var fields = std.mem.tokenizeAny(u8, readFile("/proc/sys/net/ipv4/ip_local_port_range", &buf) orelse return null, " \t\n");
+    const low = std.fmt.parseInt(u16, fields.next() orelse return null, 10) catch return null;
+    const high = std.fmt.parseInt(u16, fields.next() orelse return null, 10) catch return null;
+    return .{ low, high };
+}
+
 // Paths
 pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, _: ?[]const u8) ![]const u8 {
     if (xdg_runtime_dir) |xdg|
