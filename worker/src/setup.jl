@@ -886,7 +886,6 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
     end
     send_sockets(conn, paths..., active_count)
     replied[] = true
-    t0 = time_ns()
     streams = try
         accept_client_sockets(servers, client.key)
     catch
@@ -904,12 +903,10 @@ function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
         for sock in streams
             ccall(:uv_tcp_keepalive, Cint, (Ptr{Cvoid}, Cint, Cuint), sock.handle, 1, TCP_KEEPALIVE_IDLE_S)
         end
-        Sockets.nagle(signals, false)
-        if time_ns() - t0 < 40_000_000
-            Sockets.nagle(client_stdout, false)
-            Sockets.nagle(client_stderr, false)
-            send_signal(signals, SIGNAL_NODELAY, UInt8[])
-        end
+        # Interactive: an editor's redraw is several small writes, each held
+        # back for the last one's delayed ACK while Nagle is on.
+        foreach(sock -> Sockets.nagle(sock, false), (signals, client_stdout, client_stderr))
+        send_signal(signals, SIGNAL_NODELAY, UInt8[])
     end
     label = sync_session_label(client)
     if isnothing(label)
