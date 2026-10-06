@@ -52,9 +52,13 @@ const BINARIES = [
     ("juliaclient",     "client/client.zig"),
 ]
 const SERVICE_NAME = "julia-daemon"
-const SERVICE_FILE = joinpath(get(ENV, "XDG_CONFIG_HOME",
-    joinpath(homedir(), ".config")),
-    "systemd", "user", "$SERVICE_NAME.service")
+const SERVICE_FILE, STOP_SERVICE, START_SERVICE = if Sys.isapple()
+    plist = joinpath(homedir(), "Library", "LaunchAgents", "org.julialang.$SERVICE_NAME.plist")
+    plist, `launchctl unload $plist`, [`launchctl load $plist`]
+else
+    joinpath(get(ENV, "XDG_CONFIG_HOME", joinpath(homedir(), ".config")), "systemd", "user", "$SERVICE_NAME.service"),
+    `systemctl --user stop $SERVICE_NAME`, [`systemctl --user daemon-reload`, `systemctl --user start $SERVICE_NAME`]
+end
 
 function with_srcdir(f)
     staged || !isnothing(rev) || return f(@__DIR__)
@@ -80,33 +84,45 @@ function build_binaries(srcdir; outdir, flags, exe=Sys.iswindows() ? ".exe" : ""
     end
 end
 
-# Only a service pointed at this checkout's conductor runs a debug build.
-const manage_service = Sys.islinux() && !release && isfile(SERVICE_FILE) &&
-    occursin(joinpath(@__DIR__, "julia-conductor"), read(SERVICE_FILE, String))
+# A debug build is run by the service, with this checkout's conductor and worker.
+const manage_service = !release && (Sys.isapple() || Sys.islinux() && !isnothing(Sys.which("systemctl")))
 
-function stop_service()
-    manage_service || return
-    run(ignorestatus(`systemctl --user stop $SERVICE_NAME`))
-end
+stop_service() = manage_service && isfile(SERVICE_FILE) && run(ignorestatus(STOP_SERVICE))
 
-function start_service_with_worker(srcdir)
+function run_checkout(srcdir)
+    if !isfile(SERVICE_FILE)
+        run(`$(Base.julia_cmd()) --project=$(@__DIR__) -e 'using Pkg; Pkg.instantiate(); using DaemonicCabal; DaemonicCabal.install()'`)
+        stop_service()
+    end
     # A build worktree is removed once with_srcdir returns.
     worker_project = joinpath(srcdir, "worker")
     if srcdir != @__DIR__
-        id = bytes2hex(rand(UInt8, 4))
-        dest = "/tmp/julia-worker-$id"
+        dest = joinpath(tempdir(), "julia-worker-" * bytes2hex(rand(UInt8, 4)))
         cp(worker_project, dest)
         worker_project = dest
         @info "Copied worker to $dest"
     end
+    conductor, client = joinpath(@__DIR__, "julia-conductor"), joinpath(@__DIR__, "juliaclient")
+    edits = if Sys.isapple()
+        [r"(<key>ProgramArguments</key>\s*<array>\s*<string>).*?<"s => SubstitutionString("\\1$conductor<"),
+         r"(<key>JULIA_DAEMON_WORKER_PROJECT</key>\s*<string>).*?<"s => SubstitutionString("\\1$worker_project<")]
+    else
+        [r"^ExecStart=.*$"m => "ExecStart=\"$conductor\"",
+         r"^Environment=\"JULIA_DAEMON_WORKER_PROJECT=.*\"$"m => "Environment=\"JULIA_DAEMON_WORKER_PROJECT=$worker_project\""]
+    end
     content = read(SERVICE_FILE, String)
-    content = replace(content,
-        r"Environment=\"JULIA_DAEMON_WORKER_PROJECT=.*\"" =>
-        "Environment=\"JULIA_DAEMON_WORKER_PROJECT=$worker_project\"")
-    write(SERVICE_FILE, content)
-    run(`systemctl --user daemon-reload`)
-    run(`systemctl --user start $SERVICE_NAME`)
-    @info "Restarted $SERVICE_NAME with worker at $worker_project"
+    all(e -> occursin(first(e), content), edits) || error("$SERVICE_FILE can't be pointed at this checkout; rerun DaemonicCabal.install()")
+    write(SERVICE_FILE, replace(content, edits...))
+    link = joinpath(get(ENV, "XDG_BIN_HOME", joinpath(homedir(), ".local", "bin")), "juliaclient")
+    rm(link; force=true)
+    symlink(client, link)
+    foreach(run, START_SERVICE)
+    # So a client run straight after the build finds the conductor listening.
+    timedwait(10; pollint=0.1) do
+        occursin("connected to conductor", read(ignorestatus(`$client --version`), String))
+    end === :ok || @warn "$SERVICE_NAME isn't answering after 10s; see its log"
+    @info "Restarted $SERVICE_NAME with worker at $worker_project, and $link runs this checkout's client; \
+           DaemonicCabal.install() restores a release"
 end
 
 function build()
@@ -118,10 +134,9 @@ function build()
             results = build_binaries(srcdir; outdir=@__DIR__, flags,
                 runner=cmd -> success(pipeline(cmd; stdout, stderr)))
             if manage_service
-                start_service_with_worker(srcdir)
+                run_checkout(srcdir)
             else
-                @info "To run this build, point a service's ExecStart at $(joinpath(@__DIR__, "julia-conductor")), \
-                       or install a release with DaemonicCabal.install()"
+                @info "To run this build, point a service at $(joinpath(@__DIR__, "julia-conductor"))"
             end
             return Int(any(!, results))
         end
