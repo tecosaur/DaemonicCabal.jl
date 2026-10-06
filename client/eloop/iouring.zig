@@ -9,6 +9,7 @@ const posix = std.posix;
 
 const platform = @import("../platform/main.zig");
 const cooked = @import("../cooked.zig");
+const debuglog = @import("../debuglog.zig");
 
 const Location = enum(u64) {
     local_stdin,
@@ -57,6 +58,7 @@ pub fn run(
                         ended[i] = true;
                         continue;
                     }
+                    debuglog.event("{s}: {d} B {f}", .{ if (loc == .worker_stdout) "stdout" else "stderr", data.len, debuglog.preview(data) });
                     if (!platform.writeOutput(if (loc == .worker_stdout) posix.STDOUT_FILENO else posix.STDERR_FILENO, data)) {
                         platform.close(srcs[i]);
                         ended[i] = true;

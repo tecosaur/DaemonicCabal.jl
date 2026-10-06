@@ -273,6 +273,11 @@ pub fn requestSocketRecreate(pid_path: []const u8) bool {
 pub fn sleepMs(ms: u32) void {
     _ = posix.poll(&.{}, @intCast(ms)) catch {};
 }
+pub fn monotonicNs() u64 {
+    var ts: posix.timespec = undefined;
+    _ = posix.system.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
 pub const currentDir = impl.currentDir;
 pub const lookupHost = impl.lookupHost;
 pub fn pidNumber(pid: posix.pid_t) u32 {

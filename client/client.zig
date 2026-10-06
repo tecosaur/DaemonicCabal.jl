@@ -8,6 +8,7 @@ const posix = std.posix;
 const protocol = @import("protocol.zig");
 const args = @import("args.zig");
 const platform = @import("platform/main.zig");
+const debuglog = @import("debuglog.zig");
 
 const eloop = switch (builtin.target.os.tag) {
     .linux => @import("eloop/linux.zig"),
@@ -125,6 +126,15 @@ const SignalParser = struct {
     }
 
     fn dispatch(self: *@This(), id: u8, data: []const u8, fd: posix.socket_t) Result {
+        debuglog.event("signal: {s} {f}", .{ switch (id) {
+            protocol.signals.exit => "exit",
+            protocol.signals.raw_mode => "raw_mode",
+            protocol.signals.query_size => "query_size",
+            protocol.signals.nodelay => "nodelay",
+            protocol.signals.executing => "executing",
+            protocol.signals.suspend_client => "suspend",
+            else => "unknown",
+        }, debuglog.preview(data) });
         return switch (id) {
             protocol.signals.exit => .{ .exit = if (data.len >= 1) data[0] else 1 },
             protocol.signals.raw_mode => blk: {
@@ -154,6 +164,7 @@ const SignalParser = struct {
                 std.mem.writeInt(u16, resp[2..4], size.height, .little);
                 std.mem.writeInt(u16, resp[4..6], size.width, .little);
                 platform.socketWrite(fd, &resp);
+                debuglog.event("signal: answered {d}x{d}", .{ size.height, size.width });
                 break :blk .none;
             },
             protocol.signals.suspend_client => blk: {
@@ -248,6 +259,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 fn run(init: std.process.Init.Minimal) !void {
     platform.openClosedStdio();
     const inputs = try platform.processInputs(init);
+    debuglog.init(inputs.env);
     var env = scanEnv(inputs.env);
     // What Julia would refuse, the conductor refuses.
     const parsed = args.read([*:0]const u8, inputs.args);
@@ -283,6 +295,7 @@ fn run(init: std.process.Init.Minimal) !void {
     // Until a worker is reached, a Ctrl-C gives up, as Julia's does starting.
     registerSignalHandlers(&signalGiveUp);
     const conductor = try connectToConductor(env);
+    debuglog.event("conductor: connected over {s} to {s}", .{ @tagName(transport_mode), conductor_path });
     if (transport_mode == .tcp) platform.setTcpNodelay(conductor);
     defer notifyConductor(.client_exit);
     var w = SocketWriter{ .handle = conductor };
@@ -290,6 +303,7 @@ fn run(init: std.process.Init.Minimal) !void {
     // output goes, as Julia's does.
     const color = colorWanted(inputs.env) orelse platform.isatty(platform.getStdoutHandle());
     try sendClientInfo(&w, env, is_tty, color, inputs.args);
+    debuglog.event("conductor: request sent", .{});
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers(if (watching) &signalStopWatching else &signalNotifyInterrupt);
     signal_parser.sync_mode = sync;
@@ -469,13 +483,23 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, for
 
 fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kvs: []const [*:0]const u8) !SocketSet {
     const reader = protocol.BufReader{ .fd = conductor };
-    while (true) switch (reader.readInt(u8) catch |err| replyFailure(err)) {
-        protocol.client.env_request => sendFullEnv(w, env, kvs),
-        protocol.client.starting_worker => showLaunching(true),
-        protocol.client.spawn_request => try spawnWorker(reader, kvs),
-        protocol.client.socket_paths => break,
-        else => replyFailure(error.BadReply),
-    };
+    while (true) {
+        const reply = reader.readInt(u8) catch |err| replyFailure(err);
+        debuglog.event("conductor: {s}", .{switch (reply) {
+            protocol.client.env_request => "wants the full environment",
+            protocol.client.starting_worker => "starting a worker",
+            protocol.client.spawn_request => "wants the worker spawned here",
+            protocol.client.socket_paths => "assigned a worker",
+            else => "unexpected reply",
+        }});
+        switch (reply) {
+            protocol.client.env_request => sendFullEnv(w, env, kvs),
+            protocol.client.starting_worker => showLaunching(true),
+            protocol.client.spawn_request => try spawnWorker(reader, kvs),
+            protocol.client.socket_paths => break,
+            else => replyFailure(error.BadReply),
+        }
+    }
     showLaunching(false);
     client_id = try reader.readInt(u32);
     var paths_buf: [4 * (max_socket_path + 1)]u8 = undefined;
@@ -606,6 +630,7 @@ fn connectToWorkerSocket(raw: []const u8, comptime label: []const u8) posix.sock
         platform.eprint("Client: failed to connect to " ++ label ++ ": {s}: {}\n", .{ raw, e });
         exitClient(127);
     };
+    debuglog.event("worker: " ++ label ++ " connected at {s}", .{raw});
     if (transport_mode == .tcp) platform.setTcpKeepalive(socket, protocol.tcp_keepalive_idle_s);
     // Whoever else reached the socket first is refused for want of the key.
     var key: [8]u8 = undefined;

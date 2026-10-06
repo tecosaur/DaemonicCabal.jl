@@ -92,6 +92,8 @@ extern "kernel32" fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *DWORD) BOOL
 extern "kernel32" fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) BOOL;
 extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: HANDLE, lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO) BOOL;
 extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) BOOL;
+extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) BOOL;
+extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) BOOL;
 pub extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) BOOL;
 extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) DWORD;
 extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) BOOL;
@@ -1172,6 +1174,14 @@ pub fn requestSocketRecreate(_: []const u8) bool {
 
 pub fn sleepMs(ms: u32) void {
     Sleep(ms);
+}
+
+pub fn monotonicNs() u64 {
+    var count: i64 = 0;
+    var frequency: i64 = 1;
+    _ = QueryPerformanceCounter(&count);
+    _ = QueryPerformanceFrequency(&frequency);
+    return @intCast(@divTrunc(@as(i128, count) * std.time.ns_per_s, frequency));
 }
 
 /// Only macOS rotates its own log.
