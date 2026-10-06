@@ -184,8 +184,7 @@ fn parsePortRange(s: ?[]const u8) !?Config.PortRange {
         std.debug.print("Error: JULIA_DAEMON_PORTS={s} isn't {s}.\n", .{ str, settings.expected(.ports) });
         return error.InvalidConfig;
     };
-    const count = @min((range[1] - range[0] + 1) / 4, protocol.PortPool.max_port_sets);
-    return .{ .base = range[0], .count = count };
+    return .{ .base = range[0], .count = settings.portSets(range) };
 }
 
 fn testEnv(setting: [2][]const u8) !std.process.Environ.Map {
