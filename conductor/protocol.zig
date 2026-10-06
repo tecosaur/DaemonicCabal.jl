@@ -129,6 +129,9 @@ pub const client = struct {
     pub const magic: u32 = magic_prefix << 8 | version;
     pub const env_request: u8 = 0x3F; // fingerprint cache miss: send the full env
     pub const host_key_file = "conductor.key";
+    // Over TCP on 127.0.0.1, the conductor's port, held locked while it lives:
+    // a client given no address dials it once the socket fails.
+    pub const port_file = "conductor.port";
     pub const HostKey = [16]u8;
     // The client spawns its own worker: u16 argc, argc × (u16 len + bytes), then
     // u16 n, n × (u16 len + "KEY=VALUE") placed ahead of the client's env.
@@ -459,12 +462,6 @@ pub fn isLoopback(address: Io.net.IpAddress) bool {
         .ip6 => |a| std.mem.eql(u8, &a.bytes, &Io.net.Ip6Address.loopback(0).bytes) or
             (std.mem.eql(u8, a.bytes[0..12], &v4_mapped) and a.bytes[12] == 127),
     };
-}
-
-pub fn probeAddress(mode: TransportMode, addr: []const u8, timeout_ms: u32) bool {
-    const connection = connectAddress(mode, addr, timeout_ms) catch return false;
-    platform.close(connection.socket);
-    return true;
 }
 
 /// For listening, which only the conductor does, so through std. Prefers IPv4,

@@ -106,12 +106,15 @@ fn refuseRuntimeDir(path: []const u8, comptime reason: []const u8, args: anytype
         "Remove it, or set JULIA_DAEMON_RUNTIME to a directory of your own.\n", .{path} ++ args);
     return error.UntrustedRuntimeDir;
 }
-/// Up to `buf`'s length of a small file; null where it can't be read.
-pub fn readSmallFile(path: []const u8, buf: []u8) ?[]u8 {
+/// Up to `buf`'s length of a small file; null where it can't be read, or if
+/// `held`, where no other process holds it locked, as a live conductor does.
+pub fn readSmallFile(path: []const u8, buf: []u8, held: bool) ?[]u8 {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const pathz = std.mem.printSentinel(&path_buf, "{s}", .{path}, 0) catch return null;
     const fd = posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return null;
     defer impl.rawClose(fd);
+    // Taken, the lock goes with the descriptor.
+    if (held and posix.errno(posix.system.flock(fd, posix.LOCK.EX | posix.LOCK.NB)) != .AGAIN) return null;
     return buf[0 .. posix.read(fd, buf) catch return null];
 }
 // Local transport: AF_UNIX sockets in the runtime dir.
@@ -206,6 +209,10 @@ pub const Listener = struct {
     pub fn addr(self: *const Listener) []const u8 {
         return self.addr_buf[0..self.addr_len];
     }
+    /// Where a TCP listener is bound.
+    pub fn bound(self: *const Listener) ?Io.net.IpAddress {
+        return if (self.mode == .tcp) self.server.socket.address else null;
+    }
     pub fn fd(self: *const Listener) posix.socket_t {
         return self.server.socket.handle;
     }
@@ -255,16 +262,11 @@ pub fn processInputs(init: std.process.Init.Minimal) !struct { args: []const [*:
     return .{ .args = init.args.vector, .env = init.environ.block.view().slice };
 }
 /// Signal the conductor whose pid `pid_path` holds (its SIGUSR1 handler),
-/// if it lives: it holds the file locked.
+/// if it lives.
 pub fn requestSocketRecreate(pid_path: []const u8) bool {
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = std.mem.printSentinel(&path_buf, "{s}", .{pid_path}, 0) catch return false;
-    const fd = posix.openatZ(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return false;
-    defer impl.rawClose(fd);
-    if (posix.errno(posix.system.flock(fd, posix.LOCK.SH | posix.LOCK.NB)) != .AGAIN) return false;
     var buf: [16]u8 = undefined;
-    const n = posix.read(fd, &buf) catch return false;
-    const pid = std.fmt.parseInt(posix.pid_t, std.mem.trimEnd(u8, buf[0..n], "\n\r "), 10) catch return false;
+    const text = readSmallFile(pid_path, &buf, true) orelse return false;
+    const pid = std.fmt.parseInt(posix.pid_t, std.mem.trimEnd(u8, text, "\n\r "), 10) catch return false;
     // 0 and negatives name process groups, down to everything we may signal.
     return pid > 0 and impl.kill(pid, posix.SIG.USR1) == 0;
 }
