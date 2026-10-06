@@ -9,6 +9,7 @@ const protocol = @import("protocol.zig");
 const args = @import("args.zig");
 const platform = @import("platform/main.zig");
 const debuglog = @import("debuglog.zig");
+const typeahead = @import("typeahead.zig");
 
 const eloop = switch (builtin.target.os.tag) {
     .linux => @import("eloop/linux.zig"),
@@ -135,6 +136,11 @@ const SignalParser = struct {
             protocol.signals.suspend_client => "suspend",
             else => "unknown",
         }, debuglog.preview(data) });
+        // Off the prompt, or leaving it: keys typed ahead may mean something else now.
+        switch (id) {
+            protocol.signals.exit, protocol.signals.raw_mode, protocol.signals.executing => typeahead.drop(),
+            else => {},
+        }
         return switch (id) {
             protocol.signals.exit => .{ .exit = if (data.len >= 1) data[0] else 1 },
             protocol.signals.raw_mode => blk: {
@@ -195,11 +201,17 @@ fn signalWriteStdin(ptr: *anyopaque, data: []const u8) void {
     platform.socketWrite(sock_set.stdin, data);
 }
 
+fn isRemote() bool {
+    if (transport_mode != .tcp) return false;
+    return !protocol.isLoopback(conductor_peer orelse return false);
+}
+
 /// The terminal's size, if it has changed since the worker was last told it.
 fn reportResize() void {
     const size = terminalSize();
     if (std.meta.eql(size, terminal_size)) return;
     terminal_size = size;
+    typeahead.resize(size.cols);
     platform.socketWrite(sockets.signals, &size.frame());
     debuglog.event("signal: sent size {d}x{d}", .{ size.rows, size.cols });
 }
@@ -313,6 +325,8 @@ fn run(init: std.process.Init.Minimal) !void {
     sockets = try connectToWorker(conductor, &w, env, inputs.env);
     registerSignalHandlers(if (watching) &signalStopWatching else &signalNotifyInterrupt, &reportResize);
     reportResize(); // since the request
+    // A worker a round trip away echoes each key that much later.
+    if (isRemote() and is_tty and !viewing and !watching) typeahead.enable(terminal_size.cols);
     signal_parser.sync_mode = sync;
     // Cooked, as Julia's terminal is, until a REPL asks for raw; a --sync
     // client's and a view's are raw throughout.

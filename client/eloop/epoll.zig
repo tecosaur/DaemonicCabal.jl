@@ -10,6 +10,7 @@ const posix = std.posix;
 const platform = @import("../platform/main.zig");
 const cooked = @import("../cooked.zig");
 const debuglog = @import("../debuglog.zig");
+const typeahead = @import("../typeahead.zig");
 
 const Location = enum(u64) {
     local_stdin,
@@ -110,7 +111,7 @@ pub fn run(
 fn relay(epfd: i32, src: posix.fd_t, dst: posix.fd_t, buf: []u8) bool {
     const data = readSome(epfd, src, buf) orelse return false;
     debuglog.event("{s}: {d} B {f}", .{ if (dst == posix.STDOUT_FILENO) "stdout" else "stderr", data.len, debuglog.preview(data) });
-    if (platform.writeOutput(dst, data)) return true;
+    if (typeahead.relay(dst, data)) return true;
     unwatch(epfd, src);
     platform.close(src);
     return false;

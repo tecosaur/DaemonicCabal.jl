@@ -76,6 +76,9 @@ pub const dumpChildStderr = shared.dumpChildStderr;
 pub const processInputs = shared.processInputs;
 pub const requestSocketRecreate = shared.requestSocketRecreate;
 pub const sleepMs = shared.sleepMs;
+/// Taken in turns by a client's threads: Windows reads local input on one
+/// of its own, apart from the output it writes.
+pub const Lock = shared.Lock;
 /// Nanoseconds on a clock that never steps back, for timing alone.
 pub const monotonicNs = shared.monotonicNs;
 pub const currentDir = shared.currentDir;

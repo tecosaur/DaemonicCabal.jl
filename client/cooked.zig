@@ -7,6 +7,7 @@ const std = @import("std");
 const posix = std.posix;
 const platform = @import("platform/main.zig");
 const debuglog = @import("debuglog.zig");
+const typeahead = @import("typeahead.zig");
 
 /// Local stdin on its way to the worker: line-edited here while a `--sync`
 /// worker wants cooked input, passed straight through otherwise. What it
@@ -33,6 +34,7 @@ pub const StdinForwarder = struct {
     /// REPL takes it as a key, it interrupts, as the terminal's signal would.
     pub fn forward(self: *StdinForwarder, bytes: []const u8) void {
         debuglog.event("stdin: {d} B {f}", .{ bytes.len, debuglog.preview(bytes) });
+        typeahead.typed(bytes);
         var rest = bytes;
         if (platform.ctrlCIsInput() and !platform.ctrlCIsKey()) {
             while (std.mem.findScalar(u8, rest, 0x03)) |i| {
