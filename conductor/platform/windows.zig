@@ -1155,6 +1155,54 @@ pub fn readMemInfo() ?MemInfo {
     return .{ .available = ms.ullAvailPhys, .total = ms.ullTotalPhys };
 }
 
+var ephemeral_cache: ?[2]u16 = null;
+var ephemeral_asked = false;
+
+/// Windows exposes no API for the dynamic port range, which it only answers
+/// for through `netsh`. As a viewer's repaint reads it each time, it is asked
+/// for once and kept.
+pub fn ephemeralPorts(allocator: Allocator, io: Io) ?[2]u16 {
+    if (ephemeral_asked) return ephemeral_cache;
+    ephemeral_asked = true;
+    const asked = std.process.run(allocator, io, .{
+        .argv = &.{ "netsh", "int", "ipv4", "show", "dynamicport", "tcp" },
+    }) catch return null;
+    defer allocator.free(asked.stdout);
+    defer allocator.free(asked.stderr);
+    ephemeral_cache = if (asked.term.success()) parseDynamicPorts(asked.stdout) else null;
+    return ephemeral_cache;
+}
+
+// netsh's output is localized, so the range is taken from its two numbers,
+// wherever they stand: the start port, then how many ports there are.
+fn parseDynamicPorts(out: []const u8) ?[2]u16 {
+    var words = std.mem.tokenizeAny(u8, out, " \t\r\n");
+    while (words.next()) |word| {
+        const start = std.fmt.parseInt(u16, word, 10) catch continue;
+        const count = while (words.next()) |next| {
+            break std.fmt.parseInt(u16, next, 10) catch continue;
+        } else return null;
+        const last = @as(u32, start) + count -| 1;
+        return if (start >= 1024 and count > 0 and last <= std.math.maxInt(u16)) .{ start, @intCast(last) } else null;
+    }
+    return null;
+}
+
+test "the dynamic port range parsed from netsh's output, in English and German" {
+    const english =
+        "Protocol tcp Dynamic Port Range\n" ++
+        "---------------------------------\n" ++
+        "Start Port      : 49152\n" ++
+        "Number of Ports : 16384\n\n\n";
+    try std.testing.expectEqual(@as(?[2]u16, .{ 49152, 65535 }), parseDynamicPorts(english));
+    const german = "Teilbereich der dynamischen Anmeldung für Protokoll TCP\n" ++
+        "-------------------\n" ++
+        "Anfangsport      : 11313\n" ++
+        "Anzahl der Ports: 00020\n";
+    try std.testing.expectEqual(@as(?[2]u16, .{ 11313, 11332 }), parseDynamicPorts(german));
+    try std.testing.expectEqual(@as(?[2]u16, null), parseDynamicPorts("keine Zahl\n-----\n"));
+}
+
 pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
     const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
     const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, .FALSE, pid) orelse return null;
