@@ -31,13 +31,13 @@ mutable struct RunEnd
 end
 
 # A client's signals stream, which it sends on unasked. One task reads it
-# (`read_signals`), so waiting on an ack can be bounded, and one slow to
-# answer holds up only itself; and its terminal's size is known as it changes.
+# (`read_signals`): its terminal's size is known as it changes, and its
+# resuming after a suspension can be waited on.
 mutable struct ClientSignals
     const io::StreamIO
     const replied::Threads.Condition
     const gone::Base.Event  # the client has stopped sending
-    acks_due::Int  # raw-mode switches and suspensions sent it, yet to be acknowledged
+    suspended::Bool  # it was sent a suspension, and has yet to ack it
     size::Union{Nothing, Tuple{Int, Int}}  # its terminal's rows and columns; nothing without one
 end
 

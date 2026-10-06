@@ -194,8 +194,7 @@ function suspend_client()
         CLIENT_SIGNALS[]
     end
     isnothing(sig) && return
-    # However long it stays stopped.
-    send_acked!(sig, SIGNAL_SUSPEND, UInt8[]) > 0 && await_acks((sig,); timeout_s=nothing)
+    suspend!(sig)
     nothing
 end
 

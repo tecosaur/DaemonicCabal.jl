@@ -322,23 +322,22 @@ end
 
 # Signal protocol: each to the client, but `SIGNAL_SIZE`, the client's own.
 const SIGNAL_EXIT = 0x01
-const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw; acked
+const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
 const SIGNAL_SIZE = 0x03       # the client's terminal's rows and columns (u16 each), as they change
 const SIGNAL_NODELAY = 0x04    # disable Nagle on stdin + signals
 const SIGNAL_EXECUTING = 0x05  # data: 0x00 = at prompt, 0x01 = evaluating; evaluation number (u32 LE)
 const SIGNAL_SUSPEND = 0x06    # acked once the client runs again
 
 const DEFAULT_DISPLAYSIZE = (24, 80)
-const REPLY_TIMEOUT_S = 1.0  # the longest a raw-mode switch's ack is waited for
 
 # Read from here on; `size` is the client's terminal's as it started.
 function ClientSignals(io::StreamIO, size::Union{Nothing, Tuple{Int, Int}})
-    signals = ClientSignals(io, Threads.Condition(), Base.Event(), 0, size)
+    signals = ClientSignals(io, Threads.Condition(), Base.Event(), false, size)
     errormonitor(Threads.@spawn read_signals(signals))
     signals
 end
 
-# Each ack, and each change of size, until the client stops sending.
+# Each change of size, and a suspension's ack, until the client stops sending.
 function read_signals(signals::ClientSignals)
     io = signals.io
     try
@@ -352,8 +351,8 @@ function read_signals(signals::ClientSignals)
             @lock signals.replied begin
                 if id == SIGNAL_SIZE
                     signals.size = told_size(data)
-                elseif id == SIGNAL_RAW_MODE || id == SIGNAL_SUSPEND
-                    signals.acks_due = max(signals.acks_due - 1, 0)
+                elseif id == SIGNAL_SUSPEND
+                    signals.suspended = false
                 end
                 notify(signals.replied)
             end
@@ -363,54 +362,31 @@ function read_signals(signals::ClientSignals)
     finally
         # No more acks are coming, so none is waited for.
         @lock signals.replied begin
-            signals.acks_due = 0
+            signals.suspended = false
             notify(signals.replied)
         end
         notify(signals.gone)
     end
 end
 
-# The acks now due from its client, this one included; 0 if it couldn't be sent.
-function send_acked!(signals::ClientSignals, id::UInt8, data::Vector{UInt8})
-    isopen(signals.io) || return 0
-    due = @lock signals.replied signals.acks_due += 1
-    try
-        send_signal(signals.io, id, data)
-        due
-    catch err
-        err isa Base.IOError || rethrow()
-        @lock signals.replied signals.acks_due -= 1
-        0
+# Its client stopped, as a terminal's job is, until it acks that it runs
+# again, or goes, however long that takes.
+function suspend!(signals::ClientSignals)
+    @lock signals.replied signals.suspended = true
+    if !send_to_client(signals.io, SIGNAL_SUSPEND, UInt8[])
+        @lock signals.replied signals.suspended = false
+        return
     end
-end
-
-# Until each client has acked all it was sent, or `timeout_s` passes (nothing, never).
-function await_acks(clients; timeout_s::Union{Nothing, Real}=REPLY_TIMEOUT_S)
-    deadline = isnothing(timeout_s) ? nothing : time() + timeout_s
-    for signals in clients
-        expired = Ref(false)
-        timer = isnothing(deadline) ? nothing : Timer(max(deadline - time(), 0.0)) do _
-            @lock signals.replied begin
-                expired[] = true
-                notify(signals.replied)
-            end
-        end
-        try
-            uninterrupted() do
-                @lock signals.replied while signals.acks_due > 0 && !expired[]
-                    wait(signals.replied)
-                end
-            end
-        finally
-            isnothing(timer) || close(timer)
+    uninterrupted() do
+        @lock signals.replied while signals.suspended
+            wait(signals.replied)
         end
     end
 end
 
-# Its client's terminal switched, as far as it acknowledges in time.
-function switch_raw_mode!(signals::ClientSignals, raw::Bool)
-    send_acked!(signals, SIGNAL_RAW_MODE, UInt8[raw]) > 0 && await_acks((signals,))
-end
+# Not waited on: the client switches as it reads it, and newlines are
+# translated alike either way, so only keys typed meanwhile see the old mode.
+switch_raw_mode!(signals::ClientSignals, raw::Bool) = send_to_client(signals.io, SIGNAL_RAW_MODE, UInt8[raw])
 
 # One write per frame: a multi-argument `write` yields between arguments, so
 # concurrent senders could interleave mid-frame.
@@ -432,14 +408,21 @@ function release_client(stdout::IO, stderr::IO, signals::IO, code::Integer)
     catch end
 end
 
-function send_executing(signals::StreamIO, executing::Bool, evaluation::UInt32)
-    isopen(signals) || return
-    # `isopen` lags a peer close, so a client leaving mid-evaluation throws here.
-    try send_signal(signals, SIGNAL_EXECUTING, [UInt8(executing); reinterpret(UInt8, [htol(evaluation)])])
+# Unless its client has gone: whether it went.
+function send_to_client(io::StreamIO, id::UInt8, data::Vector{UInt8})
+    isopen(io) || return false
+    # `isopen` lags a peer close, so a client leaving meanwhile throws here.
+    try
+        send_signal(io, id, data)
+        true
     catch err
         err isa Base.IOError || rethrow()
+        false
     end
 end
+
+send_executing(signals::StreamIO, executing::Bool, evaluation::UInt32) =
+    send_to_client(signals, SIGNAL_EXECUTING, [UInt8(executing); reinterpret(UInt8, [htol(evaluation)])])
 
 """
     signal_executing(executing::Bool, evaluation::UInt32=0)
@@ -625,15 +608,9 @@ attach!(session::SyncSession, p::Participant) =
 detach!(session::SyncSession, p::Participant) =
     set_participants!(session, filter(q -> q !== p, @atomic session.participants))
 
-# Every participant is switched, but one yet to acknowledge an earlier switch
-# is not waited on.
 function switch_raw_mode!(session::SyncSession, raw::Bool)
     @lock session.input.lock session.input.raw = raw
-    waited = ClientSignals[]
-    for p in @atomic session.participants
-        send_acked!(p.signals, SIGNAL_RAW_MODE, UInt8[raw]) == 1 && push!(waited, p.signals)
-    end
-    await_acks(waited)
+    foreach(p -> switch_raw_mode!(p.signals, raw), @atomic session.participants)
 end
 
 participant_size(p::Participant) = something(p.signals.size, DEFAULT_DISPLAYSIZE)

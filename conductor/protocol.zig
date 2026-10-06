@@ -247,11 +247,11 @@ pub fn keyFor(secret: *const [16]u8, kind: KeyKind, id: u32) u64 {
 }
 
 // Signals: id:u8 + len:u8 + data, from the worker (or a view's conductor)
-// to the client, which acks some with the id and no data; and `size`, the
-// one the client sends unasked.
+// to the client, which acks a suspension with its id and no data; and
+// `size`, the one the client sends unasked.
 pub const signals = struct {
     pub const exit: u8 = 0x01;
-    pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw; acked
+    pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw
     pub const size: u8 = 0x03;       // client's: its terminal's `TerminalSize`, on each change
     pub const nodelay: u8 = 0x04;
     pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating (+ its number, u32)
