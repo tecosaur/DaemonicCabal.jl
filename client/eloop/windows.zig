@@ -10,6 +10,7 @@ const posix = std.posix;
 
 const platform = @import("../platform/windows.zig");
 const cooked = @import("../cooked.zig");
+const debuglog = @import("../debuglog.zig");
 
 const Location = enum(u64) {
     worker_stdout,
@@ -110,7 +111,9 @@ pub fn run(
                         platform.getStdoutHandle()
                     else
                         platform.getStderrHandle();
-                    if (!platform.writeFileAll(dst, bufs[idx][0..@intCast(bytes)])) {
+                    const data = bufs[idx][0..@intCast(bytes)];
+                    debuglog.event("{s}: {d} B {f}", .{ if (loc == .worker_stdout) "stdout" else "stderr", data.len, debuglog.preview(data) });
+                    if (!platform.writeFileAll(dst, data)) {
                         platform.close(stream_fds[idx]);
                         eof[idx] = true;
                         continue;

@@ -9,6 +9,7 @@ const posix = std.posix;
 
 const platform = @import("../platform/main.zig");
 const cooked = @import("../cooked.zig");
+const debuglog = @import("../debuglog.zig");
 const bsd = @import("../platform/bsd.zig");
 
 const EV_EOF = bsd.EV_EOF;
@@ -187,6 +188,7 @@ fn relay(src: posix.fd_t, dst: posix.fd_t, buf: []u8, ev: c.Kevent) bool {
     while (remaining > 0) {
         const n = posix.read(src, buf[0..@min(remaining, buf.len)]) catch return true;
         if (n == 0) return true;
+        debuglog.event("{s}: {d} B {f}", .{ if (dst == posix.STDOUT_FILENO) "stdout" else "stderr", n, debuglog.preview(buf[0..n]) });
         if (!platform.writeOutput(dst, buf[0..n])) {
             platform.close(src);
             return true;

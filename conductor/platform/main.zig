@@ -75,6 +75,8 @@ pub const dumpChildStderr = shared.dumpChildStderr;
 pub const processInputs = shared.processInputs;
 pub const requestSocketRecreate = shared.requestSocketRecreate;
 pub const sleepMs = shared.sleepMs;
+/// Nanoseconds on a clock that never steps back, for timing alone.
+pub const monotonicNs = shared.monotonicNs;
 pub const currentDir = shared.currentDir;
 pub const lookupHost = shared.lookupHost;
 pub const getChildPid = shared.getChildPid;
