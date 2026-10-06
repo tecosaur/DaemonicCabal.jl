@@ -103,9 +103,7 @@ pub const Config = struct {
                 return error.InvalidConfig;
             }
         }
-        const bind_address: []const u8 = if (env.get("JULIA_DAEMON_BIND")) |b|
-            b
-        else if (transport == .tcp)
+        const bind_address: []const u8 = if (transport == .tcp)
             (protocol.splitHostPort(socket_path) catch {
                 std.debug.print("Error: JULIA_DAEMON_SERVER={s} is not a valid host[:port]\n", .{socket_path});
                 return error.InvalidAddress;
@@ -226,6 +224,16 @@ test "what a setting takes, Config loads" {
     try std.testing.expectEqual(12.5, cfg.psi_threshold);
     try std.testing.expectEqual(settings.max_seconds, cfg.ping_timeout);
     try std.testing.expectEqual(std.math.maxInt(u32), cfg.worker_maxclients);
+}
+
+test "a TCP server's host is where everything listens" {
+    var env = try testEnv(.{ "JULIA_DAEMON_SERVER", "tcp://0.0.0.0:9591" });
+    defer env.deinit();
+    try env.put("JULIA_DAEMON_BIND", "10.0.0.1"); // retired, so ignored
+    const cfg = try Config.load(std.testing.allocator, &env);
+    defer cfg.deinit();
+    try std.testing.expectEqual(.tcp, cfg.transport);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.bind_address);
 }
 
 test "a runtime directory too long for its sockets is refused" {

@@ -23,8 +23,8 @@ The service's environment: `settings`, overridden by the arguments given
 (not `nothing`), then by `env`, with the worker project installed.
 
 `mode=:tcp` sets the server to `conductor_host:conductor_port` and the worker
-`ports` (none when empty); `mode=:sockets` drops any TCP server, bind address
-and ports for the default local socket.
+`ports` (none when empty); `mode=:sockets` drops any TCP server and ports for
+the default local socket.
 
 Throws an `ArgumentError` for an unknown `mode`, ports outside 1024-65535, or
 a value holding a line break.
@@ -58,7 +58,7 @@ function daemon_env(settings::Dict{String,String};
             d["JULIA_DAEMON_PORTS"] = "$(first(ports))-$(last(ports))"
         end
     elseif mode === :sockets
-        for key in ("JULIA_DAEMON_SERVER", "JULIA_DAEMON_BIND", "JULIA_DAEMON_PORTS")
+        for key in ("JULIA_DAEMON_SERVER", "JULIA_DAEMON_PORTS")
             delete!(d, key)
         end
     elseif !isnothing(mode)
@@ -181,7 +181,8 @@ function install(; worker_maxclients::Union{Integer,Nothing} = nothing,
     settings = filter(merge(service_environment(), ENV)) do (key, _)
         key in ("JULIA_NUM_THREADS", "JULIA_DEPOT_PATH") ||
             startswith(key, "JULIA_DAEMON_") &&
-            key ∉ ("JULIA_DAEMON_SERVICE", "JULIA_DAEMON_WORKER_PROJECT", "JULIA_DAEMON_SANDBOXED")
+            key ∉ ("JULIA_DAEMON_SERVICE", "JULIA_DAEMON_WORKER_PROJECT", "JULIA_DAEMON_SANDBOXED",
+                   "JULIA_DAEMON_BIND") # retired, so dropped from an older service
     end
     denv = daemon_env(settings; worker_maxclients, worker_ttl, worker_args,
                       mode, conductor_host, conductor_port, ports, env)

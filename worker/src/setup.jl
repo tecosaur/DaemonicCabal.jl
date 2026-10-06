@@ -407,8 +407,7 @@ end
 
 function create_socket(port::Integer=0)::Pair{Union{Sockets.PipeServer, Sockets.TCPServer}, String}
     if startswith(STATE.conductor_socket[], "tcp://")
-        bind_host = get(() -> first(split_host_port(STATE.conductor_socket[])), ENV, "JULIA_DAEMON_BIND")
-        server = Sockets.listen(resolve_host(bind_host), port)
+        server = Sockets.listen(resolve_host(first(split_host_port(STATE.conductor_socket[]))), port)
         _, actual_port = Sockets.getsockname(server)
         # The client dials the conductor's host; a bind address like 0.0.0.0 would fail remotely.
         server => ":$(actual_port)"
