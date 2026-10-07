@@ -11,6 +11,7 @@ const posix = std.posix;
 
 const main = @import("../main.zig");
 const Conductor = main.Conductor;
+const retire = @import("../retire.zig");
 const platform = @import("../platform/main.zig");
 const win = @import("../platform/windows.zig");
 const protocol = @import("../protocol.zig");
@@ -230,7 +231,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
                 switch (handleAccept(conductor, listener)) {
                     .gone => {
                         std.debug.print("Fatal: the listener is gone, shutting down\n", .{});
-                        conductor.gracefulShutdown();
+                        retire.gracefulShutdown(conductor);
                         return;
                     },
                     .starved => loop.accept_paused = true,
@@ -247,7 +248,7 @@ pub fn run(conductor: *Conductor, listener: *protocol.Listener) void {
             }
         } else if (key == @intFromEnum(EventLocation.signal)) {
             std.debug.print("\nShutdown requested, stopping workers...\n", .{});
-            conductor.gracefulShutdown();
+            retire.gracefulShutdown(conductor);
             return;
         } else if (!loop.takeTimer(key, bytes)) {
             continue;

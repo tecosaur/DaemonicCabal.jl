@@ -10,6 +10,7 @@ const Io = std.Io;
 const platform = @import("../platform/main.zig");
 const protocol = @import("../protocol.zig");
 const Conductor = @import("../main.zig").Conductor;
+const retire = @import("../retire.zig");
 
 const SIGNAL_SHUTDOWN: u8 = 'S';
 const SIGNAL_RECREATE: u8 = 'R';
@@ -65,7 +66,7 @@ pub fn handle(conductor: *Conductor, loop: anytype, listener: *protocol.Listener
     for (signals) |sig| switch (sig) {
         SIGNAL_SHUTDOWN => {
             std.debug.print("\nShutdown requested, stopping workers...\n", .{});
-            conductor.gracefulShutdown();
+            retire.gracefulShutdown(conductor);
             return true;
         },
         SIGNAL_RECREATE => {

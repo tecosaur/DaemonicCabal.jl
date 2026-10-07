@@ -25,6 +25,7 @@ const pal = @import("palette.zig");
 const status = @import("status.zig");
 
 const Conductor = main.Conductor;
+const retire = @import("retire.zig");
 const all = settings.all;
 const tabs = settings.tabs;
 
@@ -271,7 +272,7 @@ fn browseKey(c: *Conductor, v: *Viewer, key: tui.Key) void {
                 _ = save(c, v);
             },
             'r' => if (p.retirable) {
-                const n = c.retireIdleWorkers(model.workers_changed_ns);
+                const n = retire.retireIdleWorkers(c, model.workers_changed_ns);
                 v.message.set(.note, "Retired {d} idle worker{s} with the old settings: those that follow have the new.", .{ n, if (n == 1) "" else "s" });
             },
             'q' => quit(c, v),
@@ -445,7 +446,7 @@ fn apply(c: *Conductor, v: *Viewer) bool {
     c.cfg.reload(c.environ_map) catch |err| std.debug.print("Settings: rereading them failed: {}\n", .{err});
     if (renew) {
         s.model.workers_changed_ns = c.nowNs();
-        c.renewReserve();
+        retire.renewReserve(c);
     }
     v.message.set(.note, "Applied {d} change{s}.", .{ count, if (count == 1) "" else "s" });
     for (s.viewers.items) |other| if (other != v) {
@@ -764,7 +765,7 @@ fn fleetOf(c: *const Conductor) changes.Fleet {
     var it = c.workers.valueIterator();
     while (it.next()) |list| for (list.items) |w| {
         fleet.oldest_spawn_ns = @min(fleet.oldest_spawn_ns orelse w.spawned_ns, w.spawned_ns);
-        fleet.idle_stale = fleet.idle_stale or Conductor.isRetirable(w, c.settings.model.workers_changed_ns);
+        fleet.idle_stale = fleet.idle_stale or retire.isRetirable(w, c.settings.model.workers_changed_ns);
     };
     return fleet;
 }
