@@ -517,7 +517,13 @@ fn connectToWorker(conductor: posix.socket_t, w: *SocketWriter, env: EnvInfo, kv
         switch (reply) {
             protocol.client.env_request => sendFullEnv(w, env, kvs),
             protocol.client.starting_worker => showLaunching(true),
-            protocol.client.spawn_request => try spawnWorker(reader, kvs),
+            // Only a conductor on this host, whose socket it reached, asks: over
+            // TCP the request could be anyone's, and name any command.
+            protocol.client.spawn_request => if (transport_mode == .local) try spawnWorker(reader, kvs) else {
+                showLaunching(false);
+                platform.eprint("Refusing the daemon's request to start a process here: it came over TCP.\n", .{});
+                exitClient(1);
+            },
             protocol.client.socket_paths => break,
             else => replyFailure(error.BadReply),
         }
