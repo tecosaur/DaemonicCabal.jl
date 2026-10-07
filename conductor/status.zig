@@ -35,8 +35,9 @@ const Writer = struct {
 };
 
 /// Who asks: the host sees everything, a sandboxed client only its sandbox
-/// (see `Conductor.isVisible`).
-pub const Scope = union(enum) { host, remote_sandbox, mount_ns: u64 };
+/// (see `Conductor.isVisible`): a remote client its own host's, or with
+/// hosts not isolated (null) every remote host's.
+pub const Scope = union(enum) { host, remote_sandbox: ?std.Io.net.IpAddress, mount_ns: u64 };
 
 /// `format` is the `--status=<value>` argument; `palette` is set when the
 /// client answered the colour probe.
