@@ -69,6 +69,8 @@ pub fn handle(conductor: *Conductor, loop: anytype, listener: *protocol.Listener
             return true;
         },
         SIGNAL_RECREATE => {
+            // A local client's, finding no socket, while ours is a TCP listener.
+            if (conductor.cfg.transport != .local) continue;
             std.debug.print("Recreating socket due to SIGUSR1\n", .{});
             // A failed recreate leaves it closed, marked so.
             if (listener.fd() != platform.no_socket) {

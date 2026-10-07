@@ -25,6 +25,8 @@ function systemd_service_content(env::Dict{String,String})
     ExecStart=$exec
     $env_lines
     Restart=on-failure
+    # The conductor's exit when another already runs.
+    RestartPreventExitStatus=75
     Delegate=yes
 
     [Install]
