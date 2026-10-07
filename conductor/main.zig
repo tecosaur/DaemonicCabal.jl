@@ -805,8 +805,15 @@ pub const Conductor = struct {
     fn sandboxFor(self: *Conductor, socket: posix.socket_t, is_remote: bool, peer: ?Io.net.IpAddress, request: *const ClientRequest) !?SandboxKind {
         const wants_sandbox = request.parsed.hasSwitch("--sandbox");
         // A client in another mount namespace is sandboxed by something we cannot
-        // see into, so it spawns its own worker there.
-        const foreign_ns = if (is_remote) null else platform.peerForeignMountNs(socket);
+        // see into, so it spawns its own worker there. Over TCP a sandbox lacks
+        // the host key, so is remote.
+        const namespace: platform.PeerNamespace = if (is_remote or self.cfg.transport == .tcp) .own else platform.peerNamespace(socket);
+        if (namespace == .unknown) {
+            std.debug.print("Client {d}: its mount namespace cannot be read, refusing\n", .{self.client_id});
+            try self.serveString(socket, "The daemon cannot tell whether this client is inside a sandbox, so refuses it.\n", 1);
+            return null;
+        }
+        const foreign_ns = if (namespace == .foreign) namespace.foreign else null;
         const sandbox: SandboxKind = if (is_remote and (self.cfg.sandbox_remote_clients or wants_sandbox))
             .{ .remote = hostOf(peer) }
         else if (foreign_ns) |ns| blk: {

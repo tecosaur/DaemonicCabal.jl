@@ -101,16 +101,38 @@ pub fn peerPid(socket: posix.socket_t) ?posix.pid_t {
     return if (cred.pid != 0) cred.pid else null; // zeros on a TCP socket
 }
 
-var own_mount_ns: ?u64 = null;
+// asm-generic's, which every Linux target we build for uses.
+const SO_PEERPIDFD = 77;
+
+/// The peer's mount namespace, or null where it can't be told. With
+/// SO_PEERPIDFD (Linux 6.5) a peer that has exited is never read, its pid
+/// perhaps another process's by then; before it, a pid read is trusted.
 pub fn peerMountNs(socket: posix.socket_t) ?u64 {
-    return processMountNs(peerPid(socket) orelse return null);
+    var pidfd: posix.fd_t = -1;
+    var len: posix.socklen_t = @sizeOf(posix.fd_t);
+    const rc = linux.getsockopt(socket, linux.SOL.SOCKET, SO_PEERPIDFD, @ptrCast(&pidfd), &len);
+    const pinned: ?posix.fd_t = switch (linux.errno(rc)) {
+        .SUCCESS => pidfd,
+        .NOPROTOOPT => null,
+        else => return null, // ESRCH: gone already
+    };
+    defer if (pinned) |fd| {
+        _ = linux.close(fd);
+    };
+    const ns = processMountNs(peerPid(socket) orelse return null) orelse return null;
+    // Alive after the read, the pid was still the peer's during it.
+    if (pinned) |fd| if (pidfdExited(fd)) return null;
+    return ns;
 }
 
-pub fn peerForeignMountNs(socket: posix.socket_t) ?u64 {
-    const peer = peerMountNs(socket) orelse return null;
-    const own = own_mount_ns orelse (processMountNs(linux.getpid()) orelse return null);
+pub const PeerNamespace = union(enum) { own, foreign: u64, unknown };
+
+var own_mount_ns: ?u64 = null;
+pub fn peerNamespace(socket: posix.socket_t) PeerNamespace {
+    const peer = peerMountNs(socket) orelse return .unknown;
+    const own = own_mount_ns orelse (processMountNs(linux.getpid()) orelse return .unknown);
     own_mount_ns = own;
-    return if (peer == own) null else peer;
+    return if (peer == own) .own else .{ .foreign = peer };
 }
 
 /// Forked twice so the parent is init: the worker's parent-death signal then
