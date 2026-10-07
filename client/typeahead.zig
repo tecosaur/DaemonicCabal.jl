@@ -25,7 +25,9 @@ const bulk = 4096;
 /// Columns kept clear at the right edge, so a guess never wraps a row.
 const margin = 2;
 /// More than `Typeahead.frame` adds around the output it's given.
-pub const frame_overhead = 160;
+pub const frame_overhead = 160 + 2 * (hint_cap * 3 + 16);
+/// The longest completion hint followed, in columns.
+const hint_cap = 64;
 /// How long a key is assumed to take to be drawn, until a guess's has been timed.
 const unmeasured_echo_ns = 500 * std.time.ns_per_ms;
 
@@ -194,6 +196,14 @@ pub const Typeahead = struct {
     typed_from: ?u16 = null,
     moves: u32 = 0, // the row's, as `reach` and `typed_from` were known
     last_key: u21 = 0, // the last sent, guessed or not, as the line editor repeats
+    // The completion hint the line editor last drew at the input's end, as
+    // far as the typing since has kept to it: hidden under the guesses (put
+    // back as they're taken back), and what's left of it after the typing
+    // guessed drawn after the cursor, for the worker's next redraw to draw.
+    hint: [hint_cap]u16 = undefined,
+    hint_len: u16 = 0,
+    hint_hidden: bool = false,
+    tail_shown: u16 = 0,
     echo_ns: u64 = 0, // the slowest the worker has lately drawn a guess, 0 until it has
     // Keys went unguessed: none is guessed until the worker has surely drawn
     // them, as a guess drawn early would be in the wrong place.
@@ -215,7 +225,12 @@ pub const Typeahead = struct {
         while (i < keys.len) {
             const key = nextKey(keys, &i).?;
             defer self.last_key = key;
-            const effect = self.guess(key, ctx) orelse return self.unguessed(ctx);
+            const effect = self.guess(key, ctx) orelse {
+                self.removeTail(w);
+                return self.unguessed(ctx);
+            };
+            self.removeTail(w);
+            if (self.guessed == 0) self.hideHint(w);
             if (effect == .insert and self.typed_from == null) self.typed_from = self.base_col;
             self.keys[self.guessed] = key;
             self.sent_ns[self.guessed] = ctx.now_ns;
@@ -223,18 +238,26 @@ pub const Typeahead = struct {
             var out: Out = .{ .w = w };
             out.add(effect);
             out.flush();
+            self.showTail(ctx, w);
         }
     }
 
     /// Before the worker's `output`: the guesses taken off the screen, which
     /// is then as the worker drew it, until `afterOutput`; unless `output`
     /// clears them itself.
-    pub fn beforeOutput(self: *const Typeahead, output: []const u8, w: *std.Io.Writer) void {
-        if (!clearsRow(output)) self.takeBack(w);
+    pub fn beforeOutput(self: *Typeahead, output: []const u8, w: *std.Io.Writer) void {
+        if (!clearsRow(output)) return self.takeBack(w);
+        self.tail_shown = 0;
+        self.hint_hidden = false;
     }
 
-    // Each guess undone, the last first.
-    fn takeBack(self: *const Typeahead, w: *std.Io.Writer) void {
+    // Each guess undone, the last first, and the hint they hid put back.
+    fn takeBack(self: *Typeahead, w: *std.Io.Writer) void {
+        self.removeTail(w);
+        defer if (self.hint_hidden) {
+            drawHint(self.hint[0..self.hint_len], w);
+            self.hint_hidden = false;
+        };
         var effects: [cap]Effect = undefined;
         const n = self.played(&effects);
         var out: Out = .{ .w = w };
@@ -275,20 +298,71 @@ pub const Typeahead = struct {
         // Another row, or none known.
         if (self.row.cells() == null or self.row.moves != self.moves) self.unknown();
         self.moves = self.row.moves;
-        if (self.guessed == 0) return;
+        if (self.guessed == 0) {
+            self.hint_len = 0; // what's left of a hint, the output after it shows
+            return;
+        }
         if (self.row.marked and !self.row.input_open) return self.forget();
         const drawn = self.drawnGuesses() orelse {
             self.unknown();
             return self.forget();
         };
         self.letGo(drawn, ctx);
-        if (self.guessed == 0) return;
+        if (self.guessed == 0) return self.holdTail(ctx, w);
         const s = self.replayed() orelse return self.forget();
         if (!self.allows(&s, ctx)) return self.forget();
+        self.hideHint(w);
         var effects: [cap]Effect = undefined;
         var out: Out = .{ .w = w };
         for (effects[0..self.played(&effects)]) |e| out.add(e);
         out.flush();
+        self.showTail(ctx, w);
+    }
+
+    // The worker's hint at the cursor taken off the screen, for the guesses
+    // to be drawn in its place, its text kept.
+    fn hideHint(self: *Typeahead, w: *std.Io.Writer) void {
+        const col = self.row.col orelse return;
+        const text = self.row.hintAt(col) orelse return;
+        if (text.len > hint_cap or std.mem.findScalar(u16, text, opaque_char) != null) return;
+        w.writeAll("\x1b[K") catch {};
+        @memcpy(self.hint[0..text.len], text);
+        self.hint_len = @intCast(text.len);
+        self.hint_hidden = true;
+        @memset(self.base[col..][0..text.len], ' ');
+    }
+
+    // What's left of the hint after the guesses, if they're all typing that
+    // keeps to its start.
+    fn tail(self: *const Typeahead) ?[]const u16 {
+        const at = hintKept(self.hint[0..self.hint_len], self.keys[0..self.guessed]) orelse return null;
+        return if (at < self.hint_len) self.hint[at..self.hint_len] else null;
+    }
+
+    // What's left of the hint drawn after the cursor, where it fits.
+    fn showTail(self: *Typeahead, ctx: Context, w: *std.Io.Writer) void {
+        const rest = self.tail() orelse return;
+        const cursor = (self.replayed() orelse return).col;
+        if (cursor + rest.len + margin > ctx.width) return;
+        drawHint(rest, w);
+        self.tail_shown = @intCast(rest.len);
+    }
+
+    fn removeTail(self: *Typeahead, w: *std.Io.Writer) void {
+        if (self.tail_shown == 0) return;
+        w.writeAll("\x1b[K") catch {};
+        self.tail_shown = 0;
+    }
+
+    // Typing a redraw has drawn, but not yet the hint it leaves: that shown,
+    // as the hint the worker is likely to draw next, until its next output.
+    fn holdTail(self: *Typeahead, ctx: Context, w: *std.Io.Writer) void {
+        const col = self.row.col orelse return;
+        if (self.row.hintAt(col) != null or self.row.contentEnd() != col) {
+            self.hint_len = 0;
+            return;
+        }
+        self.showTail(ctx, w);
     }
 
     // The first `drawn.keys` guesses, as the row now shows, let go.
@@ -296,6 +370,10 @@ pub const Typeahead = struct {
         const n = drawn.keys;
         if (n == 0) return;
         self.timeEcho(ctx.now_ns -| self.sent_ns[n - 1]);
+        // What the drawn typing leaves of the hint, if it kept to it.
+        const kept = hintKept(self.hint[0..self.hint_len], self.keys[0..n]) orelse 0;
+        std.mem.copyForwards(u16, self.hint[0 .. self.hint_len - kept], self.hint[kept..self.hint_len]);
+        self.hint_len = if (kept > 0) self.hint_len - kept else 0;
         std.mem.copyForwards(u21, self.keys[0 .. self.guessed - n], self.keys[n..self.guessed]);
         std.mem.copyForwards(u64, self.sent_ns[0 .. self.guessed - n], self.sent_ns[n..self.guessed]);
         self.guessed -= n;
@@ -321,7 +399,7 @@ pub const Typeahead = struct {
     /// taken back and shown again within a synchronized update (mode 2026),
     /// so the row is never painted without them.
     pub fn frame(self: *Typeahead, output: []const u8, ctx: Context, w: *std.Io.Writer) void {
-        if (self.guessed == 0) {
+        if (self.idle()) {
             w.writeAll(output) catch {};
             return self.afterOutput(output, ctx, w);
         }
@@ -349,6 +427,7 @@ pub const Typeahead = struct {
     // them, typed at the end of the row, as a line editor without a redraw
     // draws them.
     fn echoed(self: *const Typeahead, output: []const u8) ?u8 {
+        if (self.hint_hidden or self.tail_shown > 0) return null;
         for (self.keys[0..self.guessed]) |key| if (!isText(key)) return null;
         var i: usize = 0;
         var n: u8 = 0;
@@ -392,12 +471,20 @@ pub const Typeahead = struct {
     pub fn resized(self: *Typeahead) void {
         self.row = .{};
         self.moves = 0;
+        self.tail_shown = 0;
+        self.hint_hidden = false;
         self.unknown();
         self.forget();
     }
 
     fn forget(self: *Typeahead) void {
         self.guessed = 0;
+        self.hint_len = 0;
+    }
+
+    /// Whether nothing of its own is on screen: no guesses, nor a hint.
+    pub fn idle(self: *const Typeahead) bool {
+        return self.guessed == 0 and self.tail_shown == 0;
     }
 
     // What's known of the input's extent, given up.
@@ -483,6 +570,29 @@ pub const Typeahead = struct {
     }
 };
 
+// The columns of `hint` that `keys` type, if they're all typing that keeps
+// to its start.
+fn hintKept(hint: []const u16, keys: []const u21) ?u16 {
+    var at: u16 = 0;
+    for (keys) |key| {
+        if (!isText(key) or at >= hint.len or hint[at] != cellOf(key)) return null;
+        at += unicode.codepointWidth(key);
+    }
+    return at;
+}
+
+// `cells` drawn in light black as a completion hint is, the cursor left
+// where it was.
+fn drawHint(cells: []const u16, w: *std.Io.Writer) void {
+    w.writeAll("\x1b[90m") catch {};
+    for (cells) |c| if (c != wide_tail) {
+        var buf: [4]u8 = undefined;
+        w.writeAll(buf[0 .. std.unicode.utf8Encode(c, &buf) catch 0]) catch {};
+    };
+    w.writeAll("\x1b[39m") catch {};
+    csi(w, cells.len, 'D');
+}
+
 // The next key in `keys`, past it, as guessed; null for one that isn't.
 fn nextKey(keys: []const u8, i: *usize) ?u21 {
     const named = [_]struct { []const u8, u21 }{
@@ -556,6 +666,7 @@ pub const Row = struct {
     // place, from its start (B) to its command's (C).
     marked: bool = false,
     input_open: bool = false,
+    hinting: bool = false, // drawing in light black, as a completion hint is
     fresh: bool = false, // moved onto a row cleared, nothing drawn on it yet
     // The rows below the cursor's known cleared, as a line editor clears its
     // input's rows from the last up before redrawing them.
@@ -574,7 +685,18 @@ pub const Row = struct {
         // Where a continuation line's text starts: on a row moved onto
         // cleared, where its first character is drawn.
         start: ?u16 = null,
+        // A completion hint: where it starts, and its columns.
+        hint_at: ?u16 = null,
+        hint_len: u16 = 0,
     };
+
+    /// The completion hint drawn from column `col`, if one is: what a line
+    /// editor draws in light black after the input's end.
+    pub fn hintAt(self: *const Row, col: u16) ?[]const u16 {
+        const l = self.line();
+        if (!l.known or l.hint_at != col) return null;
+        return l.cells[col..][0..l.hint_len];
+    }
 
     pub fn line(self: *const Row) *const Line {
         return &self.here;
@@ -734,6 +856,15 @@ pub const Row = struct {
         if (c + n > width) return self.lost(); // wrapped
         if (self.fresh) l.start = c;
         self.fresh = false;
+        if (self.hinting) {
+            if (l.hint_at == null or c != l.hint_at.? + l.hint_len) {
+                l.hint_at = c;
+                l.hint_len = 0;
+            }
+            l.hint_len += n;
+        } else if (l.hint_at) |at| {
+            if (c < at + l.hint_len and c + n > at) l.hint_at = null; // drawn over
+        }
         if (l.known) {
             // Drawn over, a wide character's other half is blank.
             if (l.cells[c] == wide_tail and c > 0) l.cells[c - 1] = ' ';
@@ -749,7 +880,7 @@ pub const Row = struct {
         if (self.private) return; // modes such as bracketed paste: no movement
         const n = @max(self.param, 1);
         switch (final) {
-            'm' => {},
+            'm' => self.hinting = self.param == 90 and self.params == 0,
             'K' => self.erase(self.param),
             'J' => {
                 self.erase(self.param);
@@ -775,6 +906,10 @@ pub const Row = struct {
     // far as the cursor's column is.
     fn erase(self: *Row, mode: u16) void {
         const l = self.edited();
+        // A hint erased at all goes whole: none is followed cut short.
+        if (l.hint_at) |at| if (mode != 0 or (self.col orelse 0) < at + l.hint_len) {
+            l.hint_at = null;
+        };
         // The row redrawn from its start, prompt and all.
         if (mode == 2 or self.col == 0) {
             l.input_col = null;
@@ -802,6 +937,7 @@ pub const Row = struct {
     fn shift(self: *Row, n: u16, direction: enum { left, right }, width: u16) void {
         const c = self.col orelse return;
         const l = self.edited();
+        l.hint_at = null;
         if (!l.known) return;
         const row = l.cells[c..width];
         const k = @min(n, row.len);
@@ -938,7 +1074,7 @@ pub fn relay(dst: std.posix.fd_t, data: []const u8) bool {
     var rest = data;
     while (rest.len > 0) {
         // With no guesses to frame it in, it's only followed, and goes as it came.
-        if (state.guessed == 0) {
+        if (state.idle()) {
             var none: std.Io.Writer = .fixed(&.{});
             state.afterOutput(rest, ctx, &none);
             return platform.writeOutput(dst, rest);
@@ -1251,6 +1387,53 @@ test "the cursor's row of a long input is guessed on, and after a move a row up 
     h.output(comptime sixRows(2, 2, "l2z", 10), atMs(2050));
     _ = h.written();
     try testing.expectEqualStrings("\x1b[@y", h.keys("y", atMs(3000)));
+}
+
+// As Julia's line editor draws `line` with a completion hint after it: the
+// old hint cleared, the line redrawn, the hint, and the cursor back.
+fn hinted(comptime line: []const u8, comptime hint: []const u8) []const u8 {
+    return std.fmt.comptimePrint("\x1b[0K{s}\x1b[90m{s}\x1b[39m\x1b[{d}D", .{ comptime redraw(line), hint, hint.len });
+}
+
+test "a row knows a completion hint drawn after the cursor" {
+    var row: Row = .{};
+    row.feed(comptime hinted("fun", "ction"), 80);
+    try testing.expectEqualStrings("ction", textOf(row.hintAt(10).?));
+    try testing.expect(row.hintAt(9) == null);
+    // Erased, or drawn over, it's gone.
+    row.feed("\x1b[0K", 80);
+    try testing.expect(row.hintAt(10) == null);
+}
+
+test "typing that keeps to a hint shows what's left of it, until the worker's own" {
+    var h: Harness = .{};
+    h.init(redraw("fun"));
+    try testing.expectEqualStrings("\x1b[@c", h.keys("c", prompt_ctx));
+    // The hint for "fun" arrives after the "c": hidden, and what "c" leaves of it shown.
+    h.output(comptime hinted("fun", "ction"), prompt_ctx);
+    try testing.expectEqualStrings("|\x1b[K\x1b[@c\x1b[90mtion\x1b[39m\x1b[4D", h.written());
+    // Drawn without a hint yet: what's left of it held, not blinking off.
+    h.output(redraw("func"), prompt_ctx);
+    try testing.expectEqualStrings("|\x1b[90mtion\x1b[39m\x1b[4D", h.written());
+    try testing.expect(!h.t.idle());
+    // The worker's own hint replaces it.
+    h.output(comptime hinted("func", "tion"), prompt_ctx);
+    try testing.expectEqualStrings("|", h.written());
+    try testing.expect(h.t.idle());
+    // Typed on, still keeping to it.
+    try testing.expectEqualStrings("\x1b[K\x1b[@t\x1b[90mion\x1b[39m\x1b[3D", h.keys("t", prompt_ctx));
+    try testing.expectEqualStrings("\x1b[K\x1b[@i\x1b[90mon\x1b[39m\x1b[2D", h.keys("i", prompt_ctx));
+}
+
+test "typing that leaves a hint hides it, and taken back, it's put back" {
+    var h: Harness = .{};
+    h.init(comptime hinted("fun", "ction"));
+    try testing.expectEqualStrings("\x1b[K\x1b[@x", h.keys("x", prompt_ctx));
+    h.output("\x1b[39m", prompt_ctx);
+    try testing.expectEqualStrings("\x1b[D\x1b[P\x1b[90mction\x1b[39m\x1b[5D|\x1b[K\x1b[@x", h.written());
+    // A key not guessed takes it all back.
+    try testing.expectEqualStrings("\x1b[D\x1b[P\x1b[90mction\x1b[39m\x1b[5D", h.keys("\t", prompt_ctx));
+    try testing.expect(h.t.idle());
 }
 
 test "a key typed at the prompt is shown at once, and let go as the worker draws it" {
