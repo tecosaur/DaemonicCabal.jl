@@ -1052,6 +1052,8 @@ pub const Conductor = struct {
         worker_key: []const u8,
         sandbox: SandboxKind,
         id: u32,
+        /// Hung up while its worker was starting, which others wait on.
+        gone: bool = false,
     };
 
     /// Clients for the same pool key queue as waiters, re-selected once it is up.
@@ -1209,7 +1211,7 @@ pub const Conductor = struct {
     }
 
     fn discardHold(self: *Conductor, hold: *HeldClient) void {
-        platform.close(hold.socket);
+        if (!hold.gone) platform.close(hold.socket);
         hold.request.deinit(self.allocator);
         self.unholdClient(hold);
     }
@@ -1537,8 +1539,8 @@ pub const Conductor = struct {
         if (connected) |w| self.completeSpawn(p, w) else self.event_loop.watchFd(@intFromPtr(p) | tag_spawn_listener, p.spawn.listenerFd());
     }
 
-    // Without the client it started for, the worker underway is not worth
-    // keeping, and its waiters select again.
+    // Without the client it started for, the worker underway is worth keeping
+    // only for those waiting on it.
     fn onHeldClientGone(self: *Conductor, hold: *HeldClient) void {
         for (self.pending_spawns.items) |p| {
             const starts = p.purpose == .client and p.purpose.client == hold;
@@ -1554,7 +1556,12 @@ pub const Conductor = struct {
             }
             if (starts) {
                 std.debug.print("Client {d}: left while worker {d} was starting\n", .{ hold.id, p.spawn.worker.id });
-                return self.failSpawn(p, error.ClientGone);
+                // A worker the client spawned in its sandbox is its own.
+                if (p.waiters.items.len == 0 or hold.sandbox == .client) return self.failSpawn(p, error.ClientGone);
+                self.event_loop.unwatchFd(@intFromPtr(hold) | tag_spawn_client, hold.socket);
+                platform.close(hold.socket);
+                hold.gone = true;
+                return;
             }
             std.debug.print("Client {d}: left while waiting for worker {d}\n", .{ hold.id, p.spawn.worker.id });
             _ = p.waiters.orderedRemove(waiting.?);
@@ -1567,7 +1574,7 @@ pub const Conductor = struct {
         _ = removePending(&self.pending_spawns, p);
         self.event_loop.unwatchFd(@intFromPtr(p) | tag_spawn_listener, p.spawn.listenerFd());
         if (p.spawn.worker.stderrFd()) |fd| self.event_loop.unwatchFd(@intFromPtr(p) | tag_spawn_stderr, fd);
-        if (p.purpose == .client) self.event_loop.unwatchFd(@intFromPtr(p.purpose.client) | tag_spawn_client, p.purpose.client.socket);
+        if (p.purpose == .client and !p.purpose.client.gone) self.event_loop.unwatchFd(@intFromPtr(p.purpose.client) | tag_spawn_client, p.purpose.client.socket);
         for (p.waiters.items) |hold| self.event_loop.unwatchFd(@intFromPtr(hold) | tag_spawn_client, hold.socket);
     }
 
@@ -1613,7 +1620,11 @@ pub const Conductor = struct {
     }
 
     fn settleSpawn(self: *Conductor, p: *PendingSpawn, how: Resumption) void {
-        if (p.purpose == .client) self.resumeHeld(p.purpose.client, how);
+        // A worker seated for a client gone is the waiters' to select.
+        if (p.purpose == .client) {
+            const hold = p.purpose.client;
+            if (hold.gone) self.discardHold(hold) else self.resumeHeld(hold, how);
+        }
         for (p.waiters.items) |hold| self.resumeHeld(hold, .select);
         p.waiters.deinit(self.allocator);
         self.allocator.destroy(p);
