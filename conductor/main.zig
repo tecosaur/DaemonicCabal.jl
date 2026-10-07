@@ -2720,6 +2720,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(" - Sandbox reuse per host: disabled\n", .{});
     if (!cfg.sandbox_isolate_hosts)
         std.debug.print(" - Sandbox host isolation: disabled\n", .{});
+    if (!cfg.sandbox_hide_secrets)
+        std.debug.print(" - Sandbox depot secrets: visible\n", .{});
     // Needed even in TCP mode: the worker setup socket is always local.
     _ = try Io.Dir.cwd().createDirPathStatus(io, cfg.runtime_dir, platform.runtime_dir_permissions);
     try platform.secureRuntimeDir(cfg.runtime_dir);

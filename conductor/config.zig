@@ -38,6 +38,7 @@ pub const Config = struct {
     sandbox_session_bypass: bool,
     sandbox_reuse: bool, // per remote host
     sandbox_isolate_hosts: bool,
+    sandbox_hide_secrets: bool,
 
     pub const PortRange = struct { base: u16, count: u16 };
 

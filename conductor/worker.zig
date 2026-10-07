@@ -270,6 +270,7 @@ pub const Worker = struct {
                     .extra_rw_binds = s.rw_binds,
                     .max_memory = cfg.sandbox_max_memory,
                     .max_cpu = cfg.sandbox_max_cpu,
+                    .hide_secrets = cfg.sandbox_hide_secrets,
                 };
                 std.debug.print("Spawning sandboxed worker\n", .{});
                 const sandbox_pid = try sandbox.spawnSandboxed(allocator, &sandbox_cfg);
