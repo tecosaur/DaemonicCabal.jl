@@ -71,18 +71,17 @@ function prepare_module(client::ClientInfo)
     # Process-wide, so not left to the next run.
     setglobal!(Base.MainInclude, :ans, nothing)
     setglobal!(Base.MainInclude, :err, nothing)
-    # A client module's own shadow Base's. Main (a session) sets Base's: 1.10 and
-    # 1.11 won't let Main assign a name it has taken from Base.
-    program = something(client.programfile, getval(client.switches, "--module", ""))
-    if mod === Main
-        append!(empty!(Base.ARGS), client.args)
-        setglobal!(Base, :PROGRAM_FILE, program)
-    else
+    # A client module's own shadow Base's, which `enter_environment!` sets as
+    # well, for code that reads them there. 1.10 and 1.11 won't let Main (a
+    # session) assign a name it has taken from Base.
+    if mod !== Main
         Core.eval(mod, :(ARGS = $(copy(client.args))))
-        Core.eval(mod, :(PROGRAM_FILE = $program))
+        Core.eval(mod, :(PROGRAM_FILE = $(program_name(client))))
     end
     mod
 end
+
+program_name(client::ClientInfo) = something(client.programfile, getval(client.switches, "--module", ""))
 
 function revise_code()
     load_revise() || return
@@ -396,9 +395,10 @@ function run_exit_hooks!(ending::RunEnd)
     end
 end
 
-# The process's cwd and ENV, which its clients' runs share. Each run's are set
-# as it starts; as it ends, its variables and the cwd go to the latest run still
-# going, else back to what they were before any set them.
+# The process's cwd, ENV, `Base.ARGS` and `Base.PROGRAM_FILE`, which its
+# clients' runs share. Each run's are set as it starts; as it ends, its
+# variables, the cwd and the arguments go to the latest run still going, else
+# back to what they were before any set them (no arguments).
 const ENVIRONS = (
     lock = ReentrantLock(),
     runs = ClientInfo[],  # oldest first
@@ -416,8 +416,14 @@ function enter_environment!(client::ClientInfo)
             get!(() -> get(ENV, key, nothing), ENVIRONS.env, key)
             ENV[key] = value
         end
+        set_arguments(client)
         push!(ENVIRONS.runs, client)
     end
+end
+
+function set_arguments(client::Union{Nothing, ClientInfo})
+    append!(empty!(Base.ARGS), if isnothing(client) String[] else client.args end)
+    setglobal!(Base, :PROGRAM_FILE, if isnothing(client) "" else program_name(client) end)
 end
 
 function leave_environment!(client::ClientInfo)
@@ -428,6 +434,7 @@ function leave_environment!(client::ClientInfo)
             value = if isnothing(holder) ENVIRONS.env[key] else getval(ENVIRONS.runs[holder].env, key, nothing) end
             if isnothing(value) delete!(ENV, key) else ENV[key] = value end
         end
+        set_arguments(if isempty(ENVIRONS.runs) nothing else last(ENVIRONS.runs) end)
         dir = if isempty(ENVIRONS.runs) ENVIRONS.cwd[] else last(ENVIRONS.runs).cwd end
         isempty(ENVIRONS.runs) && empty!(ENVIRONS.env)
         try
