@@ -210,7 +210,7 @@ pub fn execInSandbox(
     var cgroup_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const cgroup = try createCgroup(&cgroup_buf, config);
     const pid1 = callFork() orelse {
-        removeCgroup(config.worker_id);
+        _ = removeCgroup(config.worker_id);
         return SandboxError.ForkFailed;
     };
     if (pid1 != 0) return pid1;
@@ -597,11 +597,22 @@ pub fn delegateCgroups(max_memory: ?[]const u8, max_cpu: ?u32) SandboxError!void
     cgroup_root = root;
 }
 
-pub fn removeCgroup(worker_id: u32) void {
-    const root = cgroup_root orelse return;
+pub fn cgroupRoot() ?[]const u8 {
+    return cgroup_root;
+}
+
+/// Whether the sandbox's cgroup is gone. One still holding processes, as a
+/// sandbox's do for a moment after its waiter is reaped, has them killed
+/// (Linux 5.14+), and can be removed once they have died.
+pub fn removeCgroup(worker_id: u32) bool {
+    const root = cgroup_root orelse return true;
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cg = fmtPath(&buf, "{s}/sandbox-{d}", .{ root, worker_id }) orelse return;
-    _ = linux.unlinkat(linux.AT.FDCWD, cg, linux.AT.REMOVEDIR);
+    const cg = fmtPath(&buf, "{s}/sandbox-{d}", .{ root, worker_id }) orelse return true;
+    const e = errnoFromRc(linux.unlinkat(linux.AT.FDCWD, cg, linux.AT.REMOVEDIR)) orelse return true;
+    if (e != .BUSY) return e == .NOENT;
+    var kill_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (fmtPath(&kill_buf, "{s}/cgroup.kill", .{cg})) |kill| writeFile(kill, "1") catch {};
+    return false;
 }
 
 /// Null when no limits are configured.
@@ -609,7 +620,7 @@ fn createCgroup(buf: []u8, config: *const SandboxConfig) SandboxError!?[:0]const
     const root = cgroup_root orelse return null;
     const cg = fmtPath(buf, "{s}/sandbox-{d}", .{ root, config.worker_id }) orelse return SandboxError.PathTooLong;
     try cgroupMkdir(cg);
-    errdefer removeCgroup(config.worker_id);
+    errdefer _ = removeCgroup(config.worker_id);
     if (config.max_memory) |mem| try cgroupWrite(cg, "memory.max", mem);
     if (config.max_cpu) |cpu| {
         var val_buf: [32]u8 = undefined;

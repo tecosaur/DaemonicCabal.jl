@@ -139,6 +139,8 @@ pub const Conductor = struct {
     /// Read only once readable, so a silent peer costs nothing.
     pending_connections: PendingConnectionList,
     pending_kills: PendingKillList,
+    /// Sandboxes' cgroups their processes still held as they were removed.
+    cgroups_left: std.ArrayList(u32) = .empty,
     /// LRFU, keyed like `workers`; survives every death but a max-TTL cull.
     crf: std.StringHashMap(worker.Crf),
     pressure_monitor: pressure.Monitor,
@@ -202,6 +204,8 @@ pub const Conductor = struct {
             self.cleanupWorker(pk.w);
         }
         self.pending_kills.deinit(self.allocator);
+        self.retryCgroups();
+        self.cgroups_left.deinit(self.allocator);
         var crf_it = self.crf.keyIterator();
         while (crf_it.next()) |k| self.allocator.free(k.*);
         self.crf.deinit();
@@ -257,12 +261,39 @@ pub const Conductor = struct {
             if (w.process.stderr) |f| f.close(self.io);
             w.process.stderr = null;
         }
-        if (w.launch == .sandboxed) {
-            self.removeSandboxDir(w.id);
-            if (builtin.target.os.tag == .linux) worker.sandbox.removeCgroup(w.id);
-        }
+        if (w.launch == .sandboxed) self.dropSandbox(w.id);
         w.deinit();
         self.allocator.destroy(w);
+    }
+
+    /// What a sandbox left in the runtime directory and the cgroup tree.
+    fn dropSandbox(self: *Conductor, worker_id: u32) void {
+        self.removeSandboxDir(worker_id);
+        if (builtin.target.os.tag != .linux or worker.sandbox.removeCgroup(worker_id)) return;
+        self.cgroups_left.append(self.allocator, worker_id) catch {};
+    }
+
+    fn retryCgroups(self: *Conductor) void {
+        if (builtin.target.os.tag != .linux) return;
+        var i: usize = 0;
+        while (i < self.cgroups_left.items.len) {
+            if (worker.sandbox.removeCgroup(self.cgroups_left.items[i])) _ = self.cgroups_left.swapRemove(i) else i += 1;
+        }
+    }
+
+    /// Those of sandboxes a conductor before this one left.
+    fn cleanupCgroups(self: *Conductor) void {
+        if (builtin.target.os.tag != .linux) return;
+        const root = worker.sandbox.cgroupRoot() orelse return;
+        var dir = Io.Dir.openDirAbsolute(self.io, root, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var iter = dir.iterate();
+        while (iter.next(self.io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            const id = std.mem.cutPrefix(u8, entry.name, "sandbox-") orelse continue;
+            if (!worker.sandbox.removeCgroup(std.fmt.parseInt(u32, id, 10) catch continue))
+                std.debug.print("Warning: a sandbox cgroup from before, {s}, still holds processes\n", .{entry.name});
+        }
     }
 
     fn removeSandboxDir(self: *Conductor, worker_id: u32) void {
@@ -1438,6 +1469,8 @@ pub const Conductor = struct {
     }
 
     fn beginSpawn(self: *Conductor, purpose: @FieldType(PendingSpawn, "purpose"), julia_channel: ?[]const u8, threads: args.Threads, interactive: bool, launch: worker.Worker.Launch) !*PendingSpawn {
+        // Made by `begin` before anything that may fail.
+        errdefer if (launch == .sandboxed) self.dropSandbox(self.next_worker_id);
         const p = try self.allocator.create(PendingSpawn);
         errdefer self.allocator.destroy(p);
         p.* = .{
@@ -1509,6 +1542,7 @@ pub const Conductor = struct {
         if (err != error.ClientGone) p.spawn.worker.log("spawn failed: {}", .{err});
         self.detachSpawn(p);
         p.spawn.abandon(self.io);
+        if (p.spawn.worker.launch == .sandboxed) self.dropSandbox(p.spawn.worker.id);
         // A child it left, precompiling, may hold the pipe open.
         if (self.drainStderr(&p.spawn.worker, false)) p.spawn.worker.process.stderr.?.close(self.io);
         var output_buf: [1024]u8 = undefined;
@@ -1556,6 +1590,7 @@ pub const Conductor = struct {
         while (self.pending_spawns.pop()) |p| {
             self.detachSpawn(p);
             p.spawn.abandon(self.io);
+            if (p.spawn.worker.launch == .sandboxed) self.dropSandbox(p.spawn.worker.id);
             p.spawn.worker.recent.deinit(self.allocator);
             for (p.waiters.items) |hold| self.resumeHeld(hold, .{ .refuse = .{ .err = error.DaemonShuttingDown } });
             p.waiters.clearRetainingCapacity();
@@ -2000,6 +2035,7 @@ pub const Conductor = struct {
     }
 
     pub fn sweepPendingKills(self: *Conductor) void {
+        self.retryCgroups();
         const now = self.currentTime();
         var i: usize = 0;
         while (i < self.pending_kills.items.len) {
@@ -2726,5 +2762,6 @@ pub fn main(init: std.process.Init) !void {
     _ = try Io.Dir.cwd().createDirPathStatus(io, cfg.runtime_dir, platform.runtime_dir_permissions);
     try platform.secureRuntimeDir(cfg.runtime_dir);
     conductor.cleanupRuntimeDir();
+    conductor.cleanupCgroups();
     try conductor.run();
 }
