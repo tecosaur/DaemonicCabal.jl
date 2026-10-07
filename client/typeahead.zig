@@ -516,10 +516,15 @@ fn csi(w: *std.Io.Writer, n: usize, final: u8) void {
 
 // Whether `output` starts by clearing the cursor's row from its start, as
 // the line editor's redraws do: where the guesses are, and from wherever
-// they left the cursor.
+// they left the cursor. Erasing on from the cursor first, as a hint is
+// cleared before one, changes nothing of that.
 fn clearsRow(output: []const u8) bool {
+    var rest = output;
+    while (true) {
+        rest = std.mem.cutPrefix(u8, rest, "\x1b[K") orelse std.mem.cutPrefix(u8, rest, "\x1b[0K") orelse break;
+    }
     for ([_][]const u8{ "\r\x1b[K", "\r\x1b[0K", "\r\x1b[2K", "\x1b[2K\r" }) |start| {
-        if (std.mem.startsWith(u8, output, start)) return true;
+        if (std.mem.startsWith(u8, rest, start)) return true;
     }
     return false;
 }
@@ -1594,6 +1599,17 @@ test "a resize forgets the row, so guessing waits for a redraw" {
     h.t.resized();
     const none = h.keys("a", prompt_ctx);
     try testing.expectEqualStrings("", none);
+}
+
+test "a redraw after clearing a hint takes nothing back first" {
+    var h: Harness = .{};
+    h.init(empty_prompt);
+    _ = h.keys("ab", prompt_ctx);
+    h.output(comptime "\x1b[0K" ++ redraw("a"), prompt_ctx);
+    try testing.expectEqualStrings("|\x1b[@b", h.written());
+    // A lone erase, though, is the worker's cursor's.
+    h.output("\x1b[0K", prompt_ctx);
+    try testing.expectEqualStrings("\x1b[D\x1b[P|\x1b[@b", h.written());
 }
 
 test "output around guesses goes out as one synchronized update" {
