@@ -24,6 +24,21 @@ const Location = enum(u64) {
 // A regular-file stdin must read on from its position, not from offset 0 forever.
 const at_file_position: u64 = std.math.maxInt(u64);
 
+// The poll leading each read of local stdin, its own completion no Location's.
+const stdin_ready: u64 = std.math.maxInt(u64);
+
+const Read = union(enum) { data: usize, end, again };
+
+// A read's result: what it read, its stream's end, or nothing yet.
+fn readResult(res: i32) Read {
+    if (res > 0) return .{ .data = @intCast(res) };
+    if (res == 0) return .end;
+    return switch (@as(linux.E, @enumFromInt(-res))) {
+        .AGAIN, .INTR, .CANCELED => .again,
+        else => .end,
+    };
+}
+
 /// Returns the worker's exit code.
 pub fn run(
     ring: *linux.IoUring,
@@ -52,10 +67,11 @@ pub fn run(
             const loc = std.enums.fromInt(Location, cqe.user_data) orelse continue;
             const i = @intFromEnum(loc);
             // A poll's result is its events, not data.
-            const data: []u8 = if (loc == .worker_stdin) &.{} else bufs[i][0..@intCast(@max(0, cqe.res))];
+            const read: Read = if (loc == .worker_stdin) .again else readResult(cqe.res);
+            const data: []u8 = if (read == .data) bufs[i][0..read.data] else &.{};
             switch (loc) {
                 .worker_stdout, .worker_stderr => {
-                    if (cqe.res <= 0) {
+                    if (read == .end) {
                         ended[i] = true;
                         continue;
                     }
@@ -68,9 +84,11 @@ pub fn run(
                 },
                 .local_stdin, .worker_stdin => {
                     if (exit_code != null) continue;
-                    if (loc == .local_stdin) {
-                        if (cqe.res <= 0) _ = stdin_fwd.end() else stdin_fwd.forward(data);
-                    }
+                    if (loc == .local_stdin) switch (read) {
+                        .data => stdin_fwd.forward(data),
+                        .end => _ = stdin_fwd.end(),
+                        .again => {},
+                    };
                     if (!stdin_fwd.flush()) {
                         _ = try ring.poll_add(@intFromEnum(Location.worker_stdin), stdin_fd, posix.POLL.OUT);
                     } else if (!stdin_fwd.ended) {
@@ -79,7 +97,7 @@ pub fn run(
                     continue;
                 },
                 .signals => {
-                    if (cqe.res <= 0) {
+                    if (read == .end) {
                         if (exit_code == null) exit_code = 1;
                         continue;
                     }
@@ -101,6 +119,13 @@ pub fn run(
 }
 
 fn queueRead(ring: *linux.IoUring, loc: Location, fd: posix.fd_t, buf: []u8) !void {
-    const offset = if (loc == .local_stdin) at_file_position else 0;
-    _ = try ring.read(@intFromEnum(loc), fd, .{ .buffer = buf }, offset);
+    if (loc != .local_stdin) {
+        _ = try ring.read(@intFromEnum(loc), fd, .{ .buffer = buf }, 0);
+        return;
+    }
+    // Read once readable: inherited, stdin may be non-blocking, where a read
+    // alone would fail at once rather than wait.
+    const poll = try ring.poll_add(stdin_ready, fd, posix.POLL.IN);
+    poll.flags |= linux.IOSQE_IO_LINK;
+    _ = try ring.read(@intFromEnum(loc), fd, .{ .buffer = buf }, at_file_position);
 }
