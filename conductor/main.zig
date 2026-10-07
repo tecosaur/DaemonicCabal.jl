@@ -767,7 +767,7 @@ pub const Conductor = struct {
         if (request.parsed.hasSwitch("--status")) {
             const scope: status.Scope = switch (sandbox) {
                 .none, .local => .host, // --sandbox makes no sandbox of a status request
-                .remote => .remote_sandbox,
+                .remote => |host| .{ .remote_sandbox = if (self.cfg.sandbox_isolate_hosts) host orelse return error.UnknownHost else null },
                 .client => |c| .{ .mount_ns = c.ns },
             };
             try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty, request.size, scope);
@@ -862,7 +862,13 @@ pub const Conductor = struct {
         const tkey = args.packThreads(resolveThreads(request));
         return switch (sandbox) {
             .none => self.allocator.print("{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
-            .remote => self.allocator.print("__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
+            // Isolated, each host's workers apart; one of unknown address shares with no other.
+            .remote => |host| if (!self.cfg.sandbox_isolate_hosts)
+                self.allocator.print("__sandbox__\x00\x00{s}\x00{d}", .{ ch, tkey })
+            else if (host) |h|
+                self.allocator.print("__sandbox__\x00{f}\x00{s}\x00{d}", .{ h, ch, tkey })
+            else
+                self.allocator.print("__sandbox__\x00?{d}\x00{s}\x00{d}", .{ self.client_id, ch, tkey }),
             // Keyed by mount namespace: a worker never serves another sandbox or the host.
             .client => |c| self.allocator.print("__ns{d}__\x00{s}\x00{s}\x00{d}", .{ c.ns, project_path, ch, tkey }),
             // Workers share only when their mounts match.
@@ -1608,7 +1614,8 @@ pub const Conductor = struct {
     pub fn isVisible(scope: status.Scope, pool_key: []const u8, w: *const worker.Worker) bool {
         return switch (scope) {
             .host => true,
-            .remote_sandbox => std.mem.startsWith(u8, pool_key, "__sandbox__\x00"),
+            .remote_sandbox => |host| std.mem.startsWith(u8, pool_key, "__sandbox__\x00") and
+                (host == null or std.meta.eql(w.origin, host)),
             .mount_ns => |ns| switch (w.launch) {
                 .direct => false,
                 .client => blk: {
@@ -2711,6 +2718,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(" - Sandbox session bypass: enabled\n", .{});
     if (!cfg.sandbox_reuse)
         std.debug.print(" - Sandbox reuse per host: disabled\n", .{});
+    if (!cfg.sandbox_isolate_hosts)
+        std.debug.print(" - Sandbox host isolation: disabled\n", .{});
     // Needed even in TCP mode: the worker setup socket is always local.
     _ = try Io.Dir.cwd().createDirPathStatus(io, cfg.runtime_dir, platform.runtime_dir_permissions);
     try platform.secureRuntimeDir(cfg.runtime_dir);
