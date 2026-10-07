@@ -53,7 +53,12 @@ pub const SandboxConfig = struct {
     extra_rw_binds: []const []const u8 = &.{},
     max_memory: ?[]const u8,
     max_cpu: ?u32,
+    /// Covers each depot's `depot_secrets`.
+    hide_secrets: bool = true,
 };
+
+/// A depot's REPL history and other logs, and its Pkg servers' tokens.
+const depot_secrets = [_][]const u8{ "logs", "servers" };
 
 const max_depots: usize = 8;
 
@@ -506,6 +511,7 @@ fn mountHome(config: *const SandboxConfig, home: []const u8) SandboxError![]cons
             const src = fmtPath(&src_buf, "/oldroot{s}", .{depot.path}) orelse continue;
             try robindOptional(src, dst);
         }
+        if (config.hide_secrets) try hideDepotSecrets(depot);
     }
     const written = depots.writablePath();
     if (written.len > 0) {
@@ -514,6 +520,20 @@ fn mountHome(config: *const SandboxConfig, home: []const u8) SandboxError![]cons
             _ = linux.symlink(target, "/newroot/home/sandbox/.julia");
     }
     return written;
+}
+
+/// An empty tmpfs over each of the depot's secrets it has, writable only in
+/// the written depot.
+fn hideDepotSecrets(depot: DepotMount) SandboxError!void {
+    for (depot_secrets) |name| {
+        var src_buf: [384]u8 = undefined;
+        var dst_buf: [384]u8 = undefined;
+        const src = fmtPath(&src_buf, "/oldroot{s}/{s}", .{ depot.path, name }) orelse return SandboxError.PathTooLong;
+        if (!pathExists(src)) continue;
+        const dst = fmtPath(&dst_buf, "/newroot{s}/{s}", .{ depot.path, name }) orelse return SandboxError.PathTooLong;
+        const flags: u32 = MS_NOSUID | MS_NODEV | @as(u32, if (depot.writable) 0 else MS_RDONLY);
+        mountTmpfs(dst, flags, "mode=0700,size=16m") catch return SandboxError.MountFailed;
+    }
 }
 
 fn pathDepth(path: []const u8) usize {

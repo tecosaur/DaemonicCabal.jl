@@ -133,6 +133,7 @@ pub const all = [_]Setting{
     .{ .key = "JULIA_DAEMON_SANDBOX_SESSION_BYPASS", .label = "session bypass", .tab = .sandbox, .depth = 2, .kind = .flag, .default = "0", .effect = .now, .field = "sandbox_session_bypass", .used = sandboxing, .about = "Let a remote client's --session=<label> join a local, unsandboxed worker." },
     .{ .key = "JULIA_DAEMON_SANDBOX_MAX_MEMORY", .label = "memory limit", .tab = .sandbox, .depth = 1, .heading = "Every sandbox", .kind = .bytes, .default = null, .unset = "no limit", .effect = .restart, .field = "sandbox_max_memory", .about = "Each sandbox's memory limit, remote clients' and --sandbox's alike. Limits need a delegated cgroup, as the installed service has." },
     .{ .key = "JULIA_DAEMON_SANDBOX_MAX_CPU", .label = "CPU limit", .tab = .sandbox, .depth = 1, .kind = .count, .default = null, .unset = "no limit", .effect = .restart, .field = "sandbox_max_cpu", .about = "Each sandbox's CPU limit, as a percentage: 200 is two cores." },
+    .{ .key = "JULIA_DAEMON_SANDBOX_HIDE_SECRETS", .label = "hide depot secrets", .tab = .sandbox, .depth = 1, .kind = .flag, .default = "1", .effect = .now, .field = "sandbox_hide_secrets", .about = "Cover each depot's logs (REPL history among them) and servers (Pkg server tokens) with an empty directory inside a sandbox." },
 };
 
 const pressure_on: Use = struct {
