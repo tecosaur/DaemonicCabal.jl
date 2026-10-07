@@ -277,10 +277,9 @@ pub const Conductor = struct {
         g_socket_path = try self.allocator.dupeSentinel(u8, self.cfg.socket_path, 0);
         try eventLoopImpl.installSignalHandlers();
         defer eventLoopImpl.cleanupSignalHandlers();
-        if (self.cfg.transport == .local) {
-            g_pid_path = try self.allocator.printSentinel("{s}/conductor.pid", .{self.cfg.runtime_dir}, 0);
-        }
-        const pid_file = if (self.cfg.transport == .local) self.writePidFile() else null;
+        // Over TCP too, for `refuseIfRunning`: only a local client signals it.
+        g_pid_path = try self.allocator.printSentinel("{s}/conductor.pid", .{self.cfg.runtime_dir}, 0);
+        const pid_file = self.writePidFile();
         defer if (pid_file) |file| {
             file.close(self.io);
             Io.Dir.deleteFileAbsolute(self.io, g_pid_path) catch {};
@@ -2646,6 +2645,25 @@ pub const Conductor = struct {
 
 // --- Entry point ---
 
+/// What a conductor exits with when another already runs in its runtime
+/// directory (sysexits' EX_TEMPFAIL), which the systemd unit doesn't restart.
+const exit_already_running = 75;
+
+/// Exits when a conductor holds the pid file in `cfg`'s runtime directory:
+/// starting would clear its sockets from under it.
+fn refuseIfRunning(cfg: *const config.Config) void {
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = std.mem.print(&path_buf, "{s}/conductor.pid", .{cfg.runtime_dir}) catch return;
+    var pid_buf: [16]u8 = undefined;
+    const held = platform.readSmallFile(path, &pid_buf, true) orelse return;
+    std.debug.print(
+        \\Not starting: a conductor (pid {s}) is already running, holding {s}.
+        \\Stop it first, or give this one a JULIA_DAEMON_RUNTIME of its own.
+        \\
+    , .{ std.mem.trim(u8, held, " \r\n"), path });
+    std.process.exit(exit_already_running);
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
@@ -2653,6 +2671,7 @@ pub fn main(init: std.process.Init) !void {
     const console = platform.setupConsoleIo(platform.getStderrHandle(), platform.getStderrHandle());
     defer platform.restoreConsoleIo(console);
     const cfg = try config.Config.load(allocator, init.environ_map);
+    refuseIfRunning(&cfg);
     var conductor = try Conductor.init(io, allocator, cfg, init.environ_map);
     defer conductor.deinit();
     std.debug.print("Starting Julia Daemon Conductor. Configuration:\n", .{});
