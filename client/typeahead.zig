@@ -91,6 +91,14 @@ pub const Typeahead = struct {
     /// taken back and shown again within a synchronized update (mode 2026),
     /// so the row is never painted without them.
     pub fn frame(self: *Typeahead, output: []const u8, ctx: Context, w: *std.Io.Writer) void {
+        // Nothing may be written into the middle of the worker's own escape
+        // sequence or character, which the next piece ends.
+        if (self.guessed > 0 and !endsBetween(self.row, output, ctx.width)) {
+            self.drop(w);
+            w.writeAll(output) catch {};
+            self.row.feed(output, ctx.width);
+            return;
+        }
         const guessing = self.guessed > 0;
         if (guessing) w.writeAll("\x1b[?2026h") catch {};
         self.beforeOutput(w);
@@ -131,6 +139,7 @@ pub const Typeahead = struct {
 
     fn canGuess(self: *const Typeahead, ctx: Context) bool {
         if (!ctx.at_prompt or ctx.now_ns < self.unguessed_until_ns or self.guessed == cap) return false;
+        if (self.row.parse != .ground) return false; // mid-sequence, as output last left it
         return self.fits(ctx, self.guessed + 1);
     }
 
@@ -153,6 +162,22 @@ pub const Typeahead = struct {
         return drawn;
     }
 };
+
+// Whether `output`, following what `row` has seen, ends between escape
+// sequences and between UTF-8 characters.
+fn endsBetween(row: Row, output: []const u8, width: u16) bool {
+    var probe = row;
+    probe.feed(output, width);
+    if (probe.parse != .ground) return false;
+    var i = output.len;
+    while (i > 0 and output.len - i < 4) {
+        i -= 1;
+        if (output[i] < 0x80) return true;
+        const len = std.unicode.utf8ByteSequenceLength(output[i]) catch continue; // a continuation byte
+        return output.len - i >= len;
+    }
+    return true;
+}
 
 /// The cursor's row as the worker drew it: the cursor's column and what's
 /// in each cell, each unknown once output does what isn't followed.
@@ -641,6 +666,22 @@ test "output around guesses goes out as one synchronized update" {
     _ = h.written();
     h.t.frame("x", prompt_ctx, &h.w);
     try testing.expectEqualStrings("x", h.written());
+}
+
+test "nothing goes into a sequence or character the worker's output splits" {
+    var h: Harness = .{};
+    h.init();
+    _ = h.keys("ab", prompt_ctx);
+    h.t.frame("\x1b[3", prompt_ctx, &h.w);
+    try testing.expectEqualStrings("\x1b[2D\x1b[2P\x1b[3", h.written());
+    try testing.expectEqualStrings("", h.keys("c", prompt_ctx));
+    h.t.frame("1mx", prompt_ctx, &h.w);
+    try testing.expectEqualStrings("1mx", h.written());
+    var u: Harness = .{};
+    u.init();
+    _ = u.keys("ab", prompt_ctx);
+    u.t.frame("\xc3", prompt_ctx, &u.w);
+    try testing.expectEqualStrings("\x1b[2D\x1b[2P\xc3", u.written());
 }
 
 test "framing never adds more than its overhead" {
