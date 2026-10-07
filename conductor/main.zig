@@ -813,7 +813,12 @@ pub const Conductor = struct {
         if (sandbox == .remote and self.cfg.sandbox_session_bypass) if (labelOf(&request)) |label| {
             if (self.findLabelled(label, .host)) |found| {
                 std.debug.print("Client {d}: session bypass — joining local worker {d} (label '{s}')\n", .{ self.client_id, found.w.id, label });
-                if (try self.assignClientToExistingWorker(socket, &request, found.w)) return .done;
+                const seated = self.assignClientToExistingWorker(socket, &request, found.w) catch |err| {
+                    if (err != error.SessionBusy) return err;
+                    self.reportNoWorker(socket, err, sandbox, "");
+                    return .done;
+                };
+                if (seated) return .done;
             }
         };
         const worker_key = try self.poolKey(&request, sandbox);
@@ -964,8 +969,12 @@ pub const Conductor = struct {
             try self.serveString(socket, msg, 1);
             return .done;
         };
-        if (!try self.assignClientToExistingWorker(socket, request, w))
-            try self.serveString(socket, "The session's worker could not take a watcher.\n", 1);
+        const seated = self.assignClientToExistingWorker(socket, request, w) catch |err| {
+            if (err != error.SessionBusy) return err;
+            self.reportNoWorker(socket, err, sandbox, "");
+            return .done;
+        };
+        if (!seated) try self.serveString(socket, "The session's worker could not take a watcher.\n", 1);
         return .done;
     }
 
@@ -975,7 +984,10 @@ pub const Conductor = struct {
         if (err == error.ClientGone) return;
         var msg_buf: [2048]u8 = undefined;
         // Julia moved or upgraded since the service was set up, most likely.
-        const msg = (if (err == error.FileNotFound)
+        const msg = (if (err == error.SessionBusy)
+            std.mem.print(&msg_buf, "The session's worker is too busy to answer: its code holds the worker's message loop.\n" ++
+                "Try again once it yields, or end the session with --restart.\n", .{})
+        else if (err == error.FileNotFound)
             std.mem.print(&msg_buf, "Could not run a Julia worker: its executable, {s}, cannot be found.\n" ++
                 "Run juliaclient --reconfigure to set another (Workers, Julia executable), or DaemonicCabal.install() again.\n", .{self.cfg.worker_executable})
         else if (output.len > 0)
@@ -1233,6 +1245,10 @@ pub const Conductor = struct {
         // A watch runs no code, so it carries no environment: whatever reaches a
         // worker is readable by the session's own code.
         if (watcher) info.env = &.{};
+        if (!self.answersNow(w)) {
+            self.releasePortSet(port_set);
+            return error.SessionBusy;
+        }
         const assignment = self.tryAssignWorker(w, &info, .session_label) orelse {
             self.releasePortSet(port_set);
             return false;
@@ -1250,6 +1266,7 @@ pub const Conductor = struct {
         // 1. Labeled session: join its worker (global, or scoped to an explicit --project)
         if (label) |l| {
             if (self.findSession(list.items, l, request.parsed.hasSwitch("--project") or sandbox != .none)) |f| {
+                if (!self.answersNow(f.w)) return error.SessionBusy;
                 // A host client carries into a sandbox only what the sandbox itself starts with.
                 var info = client_info.*;
                 const entering = sandbox == .none and f.w.launch == .sandboxed;
@@ -1302,6 +1319,16 @@ pub const Conductor = struct {
         if (w.session_label != null and !self.isLabelExpired(w, now)) return false;
         if (w.interactive != interactive) return false;
         return true;
+    }
+
+    /// Whether a session's worker answers at once, as one whose code holds its
+    /// message loop won't: a request it then answered too late would retire
+    /// it, ending the session, where the client joining it is turned away.
+    fn answersNow(self: *Conductor, w: *worker.Worker) bool {
+        self.event_loop.cancelPendingPing(w);
+        if (w.answersWithin(end_probe_ms)) return true;
+        w.log("too busy to answer a client joining its session", .{});
+        return false;
     }
 
     fn tryAssignWorker(self: *Conductor, w: *worker.Worker, client_info: *const worker.ClientInfo, reason: AssignReason) ?WorkerAssignment {
