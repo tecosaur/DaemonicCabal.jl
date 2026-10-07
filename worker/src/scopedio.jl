@@ -71,6 +71,15 @@ Base.wait_close(io::ScopedStdin) = wait_close(Base.pipe_reader(io))
 Base.iswritable(::ScopedStdin) = false
 Base.flush(::ScopedStdin) = nothing
 
+# About to wait for input, what's written goes: a REPL's redraw, complete.
+function awaiting_input(io::ScopedStdin)
+    reader = Base.pipe_reader(io)
+    bytesavailable(reader) == 0 && flush_pending_stdout()
+    reader
+end
+Base.eof(io::ScopedStdin) = eof(awaiting_input(io))
+Base.read(io::ScopedStdin, ::Type{UInt8}) = read(awaiting_input(io), UInt8)
+
 # As a TTY's, a terminal's input goes on past a Ctrl-D.
 function Base.reseteof(::ScopedStdin)
     input = ACTIVE_TERM[].stdin
