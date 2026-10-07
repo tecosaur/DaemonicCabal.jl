@@ -26,6 +26,11 @@ pub const writeFile = if (os != .windows) impl.write else impl.writeFile;
 /// gone: left unread, the worker's writes then fail as they would to it.
 pub const writeOutput = if (os != .windows) impl.writeAll else impl.writeFileAll;
 pub const kill = impl.kill;
+/// Signals the process group `pgid` leads; false where it has none (or on
+/// Windows, which has no such groups).
+pub fn killGroup(pgid: std.posix.pid_t, sig: SIG) bool {
+    return if (os == .windows) false else impl.kill(-pgid, sig) == 0;
+}
 pub const defaultRuntimeDir = impl.defaultRuntimeDir;
 pub const rotateLog = impl.rotateLog;
 pub fn getStdinHandle() std.posix.fd_t {

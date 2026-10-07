@@ -414,7 +414,8 @@ pub const Worker = struct {
 
         pub fn abandon(self: *Spawn, io: Io) void {
             if (self.worker.launch != .client) if (self.worker.process.id) |pid| {
-                _ = platform.kill(pid, platform.SIG.KILL);
+                // Precompilation runs in processes of its own.
+                self.worker.signalGroup(platform.SIG.KILL);
                 // A nonblocking reap would race the kill, and its stderr is read to EOF next.
                 platform.waitForExit(pid);
             };
@@ -459,11 +460,28 @@ pub const Worker = struct {
         };
     }
 
-    /// Reaps a child of ours as a side effect.
-    pub fn exited(self: *const Worker) bool {
+    /// Reaps a child of ours as a side effect, forgetting its pid, which may
+    /// be reused.
+    pub fn exited(self: *Worker) bool {
         if (self.pidfd) |fd| return platform.pidfdExited(fd);
         const pid = self.process.id orelse return true;
-        return platform.reapIfExited(pid);
+        if (!platform.reapIfExited(pid)) return false;
+        // Windows' is a handle, which `deinit` closes.
+        if (builtin.target.os.tag != .windows) self.process.id = null;
+        return true;
+    }
+
+    /// The process group a direct worker leads, which the processes its
+    /// clients' code starts join; null once it is reaped.
+    pub fn processGroup(self: *const Worker) ?posix.pid_t {
+        if (self.launch != .direct) return null;
+        return self.process.id;
+    }
+
+    /// `signal`, to the worker's process group too.
+    pub fn signalGroup(self: *const Worker, sig: platform.SIG) void {
+        if (self.processGroup()) |group| if (platform.killGroup(group, sig)) return;
+        self.signal(sig);
     }
 
     /// Null once a pidfd-backed worker has exited: its pid may be reused.
@@ -483,7 +501,7 @@ pub const Worker = struct {
 
     /// Waits to reap a child of ours: only where one stuck dying may hold us up.
     pub fn killAndReap(self: *const Worker) void {
-        self.signal(platform.SIG.KILL);
+        self.signalGroup(platform.SIG.KILL);
         if (self.pidfd == null) if (self.process.id) |pid| platform.waitForExit(pid);
     }
 

@@ -105,6 +105,10 @@ pub const PendingKill = struct {
 
 pub const PendingKillList = std.array_list.Aligned(PendingKill, null);
 
+/// What a retired worker's code left running, its process group sent SIGTERM
+/// as the worker was reaped, and SIGKILL at `deadline`.
+pub const OrphanGroup = struct { pgid: posix.pid_t, deadline: i64 };
+
 const AssignReason = enum {
     session_label,
     ppid_affinity,
@@ -141,6 +145,7 @@ pub const Conductor = struct {
     pending_kills: PendingKillList,
     /// Sandboxes' cgroups their processes still held as they were removed.
     cgroups_left: std.ArrayList(u32) = .empty,
+    orphan_groups: std.ArrayList(OrphanGroup) = .empty,
     /// LRFU, keyed like `workers`; survives every death but a max-TTL cull.
     crf: std.StringHashMap(worker.Crf),
     pressure_monitor: pressure.Monitor,
@@ -206,6 +211,7 @@ pub const Conductor = struct {
         self.pending_kills.deinit(self.allocator);
         self.retryCgroups();
         self.cgroups_left.deinit(self.allocator);
+        self.orphan_groups.deinit(self.allocator);
         var crf_it = self.crf.keyIterator();
         while (crf_it.next()) |k| self.allocator.free(k.*);
         self.crf.deinit();
@@ -2038,28 +2044,50 @@ pub const Conductor = struct {
         self.retryCgroups();
         const now = self.currentTime();
         var i: usize = 0;
+        while (i < self.orphan_groups.items.len) {
+            const orphans = self.orphan_groups.items[i];
+            if (now < orphans.deadline) {
+                i += 1;
+                continue;
+            }
+            _ = platform.killGroup(orphans.pgid, platform.SIG.KILL);
+            _ = self.orphan_groups.swapRemove(i);
+        }
+        i = 0;
         while (i < self.pending_kills.items.len) {
             var pk = &self.pending_kills.items[i];
-            if (pk.w.exited()) {
+            if (self.reaped(pk.w)) {
                 self.cleanupWorker(pk.w);
                 _ = self.pending_kills.swapRemove(i);
                 continue;
             }
             if (now >= pk.deadline) switch (pk.stage) {
                 .soft => {
-                    pk.w.signal(platform.SIG.TERM);
+                    pk.w.signalGroup(platform.SIG.TERM);
                     pk.stage = .term;
                     pk.deadline = now + retire_grace_s;
                 },
-                // Reaped by `exited` above: one wedged past SIGTERM may be slow to die.
+                // Reaped above: one wedged past SIGTERM may be slow to die.
                 .term => {
-                    pk.w.signal(platform.SIG.KILL);
+                    pk.w.signalGroup(platform.SIG.KILL);
                     pk.stage = .kill;
                 },
                 .kill => {},
             };
             i += 1;
         }
+    }
+
+    /// `w.exited()`, ending what its code left running as it is reaped. The
+    /// group outlives its leader while it has members, so its id can't yet
+    /// be another's.
+    fn reaped(self: *Conductor, w: *worker.Worker) bool {
+        const group = w.processGroup();
+        if (!w.exited()) return false;
+        const pgid = group orelse return true;
+        if (platform.killGroup(pgid, platform.SIG.TERM))
+            self.orphan_groups.append(self.allocator, .{ .pgid = pgid, .deadline = self.currentTime() + retire_grace_s }) catch {};
+        return true;
     }
 
     fn removeActiveClientsForWorker(self: *Conductor, w: *worker.Worker) void {
@@ -2361,15 +2389,15 @@ pub const Conductor = struct {
     // Only the living: anyWorkerAlive reaped the rest, whose pids may be reused.
     fn signalAllWorkers(self: *Conductor, sig: platform.SIG) void {
         var it = self.liveWorkers();
-        while (it.next()) |w| if (!w.exited()) w.signal(sig);
+        while (it.next()) |w| if (!self.reaped(w)) w.signalGroup(sig);
         // Workers mid-retirement are no longer in the pool but still dying.
-        for (self.pending_kills.items) |pk| if (!pk.w.exited()) pk.w.signal(sig);
+        for (self.pending_kills.items) |pk| if (!self.reaped(pk.w)) pk.w.signalGroup(sig);
     }
 
     fn anyWorkerAlive(self: *Conductor) bool {
         var it = self.liveWorkers();
-        while (it.next()) |w| if (!w.exited()) return true;
-        for (self.pending_kills.items) |pk| if (!pk.w.exited()) return true;
+        while (it.next()) |w| if (!self.reaped(w)) return true;
+        for (self.pending_kills.items) |pk| if (!self.reaped(pk.w)) return true;
         return false;
     }
 
