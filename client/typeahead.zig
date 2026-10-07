@@ -41,8 +41,8 @@ const input_start = 0x1C; // Home: the input's start; a code no key sends
 const unknown = 0;
 const wide_tail = 0xDFFF; // the second column of a wide character
 // A character with marks joined to it, which the line editor may edit one
-// code point at a time, or past the BMP: known not blank, but not guessed
-// over.
+// code point at a time, or past the BMP: known not blank, and moved over as
+// the line editor's moves skip marks, but neither typed nor deleted.
 const opaque_char = 0xDFFE;
 
 const Cells = [max_cols]u16;
@@ -93,6 +93,7 @@ const Sim = struct {
             backspace => blk: {
                 const n = s.charBefore() orelse return null;
                 const char = s.cells[s.col - n];
+                if (char == opaque_char) return null;
                 s.col -= n;
                 std.mem.copyForwards(u16, s.cells[s.col .. max_cols - n], s.cells[s.col + n ..]);
                 if (s.reach > s.col) s.reach -= n;
@@ -101,7 +102,7 @@ const Sim = struct {
             left => .{ .move = -@as(i16, @intCast(s.charBefore() orelse return null)) },
             right => blk: {
                 const n: u16 = if (s.col + 1 < max_cols and s.cells[s.col + 1] == wide_tail) 2 else 1;
-                if (s.col + n > s.reach or s.cells[s.col] == opaque_char) return null;
+                if (s.col + n > s.reach) return null;
                 break :blk .{ .move = @intCast(n) };
             },
             line_start, input_start => blk: {
@@ -130,7 +131,7 @@ const Sim = struct {
     fn charBefore(s: *const Sim) ?u16 {
         if (s.col == 0) return null;
         const n: u16 = if (s.cells[s.col - 1] == wide_tail) 2 else 1;
-        if (n > s.col or s.cells[s.col - n] == unknown or s.cells[s.col - n] == opaque_char) return null;
+        if (n > s.col or s.cells[s.col - n] == unknown) return null;
         return n;
     }
 };
@@ -1516,14 +1517,16 @@ test "characters past ASCII are guessed, and wide ones over two columns" {
     try testing.expectEqual(0, h.t.guessed);
 }
 
-test "a character with marks joined is followed, but not guessed over" {
+test "characters with marks joined, or past the BMP, are moved over, but not deleted" {
     var h: Harness = .{};
-    h.init(marked("x\u{302}y"));
-    try testing.expectEqual(9, h.t.row.col.?);
+    h.init(marked("x\u{302}y😀"));
+    try testing.expectEqual(11, h.t.row.col.?);
     try testing.expectEqualStrings("\x1b[@z", h.keys("z", prompt_ctx));
-    try testing.expectEqualStrings("\x1b[D", h.keys("\x1b[D", prompt_ctx));
-    try testing.expectEqualStrings("\x1b[D", h.keys("\x1b[D", prompt_ctx));
-    try testing.expectEqualStrings("", h.keys("\x1b[D", prompt_ctx));
+    // Back over `z`, the emoji's two columns, `y`, and `x̂`; then on over it.
+    try testing.expectEqualStrings("\x1b[D\x1b[2D\x1b[D\x1b[D", h.keys("\x1b[D\x1b[D\x1b[D\x1b[D", prompt_ctx));
+    try testing.expectEqualStrings("\x1b[C", h.keys("\x1b[C", prompt_ctx));
+    // A backspace there might delete only the mark.
+    try testing.expectEqualStrings("", h.keys("\x7f", prompt_ctx));
 }
 
 test "home is guessed where the line's start is known" {
