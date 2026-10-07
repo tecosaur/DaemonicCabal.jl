@@ -94,7 +94,7 @@ pub const releaseChild = if (os == .windows) impl.releaseChild else struct {
 // Linux-only; elsewhere "unavailable", so no peer is ever refused.
 const linux_only = if (os == .linux) impl else struct {
     pub fn peerPid(_: std.posix.socket_t) ?std.posix.pid_t { return null; }
-    pub fn peerForeignMountNs(_: std.posix.socket_t) ?u64 { return null; }
+    pub fn peerNamespace(_: std.posix.socket_t) PeerNamespace { return .own; }
     pub fn peerMountNs(_: std.posix.socket_t) ?u64 { return null; }
     pub fn childMountNs(_: std.process.Child) ?u64 { return null; }
     pub fn parentPid(_: std.posix.pid_t) ?std.posix.pid_t { return null; }
@@ -105,8 +105,9 @@ const linux_only = if (os == .linux) impl else struct {
 };
 /// As this process's pid namespace sees it.
 pub const peerPid = linux_only.peerPid;
-/// Null when the same as ours, or unknown.
-pub const peerForeignMountNs = linux_only.peerForeignMountNs;
+/// Whether the peer shares our mount namespace; elsewhere it always does.
+pub const PeerNamespace = if (os == .linux) impl.PeerNamespace else union(enum) { own, foreign: u64, unknown };
+pub const peerNamespace = linux_only.peerNamespace;
 pub const peerMountNs = linux_only.peerMountNs;
 pub const childMountNs = linux_only.childMountNs;
 pub const parentPid = linux_only.parentPid;
