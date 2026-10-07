@@ -200,11 +200,14 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
     recording = if isnothing(sync_session) own_run else sync_session.screen end
     recorded(io, stream) = if isnothing(own_run) io else RecordedOutput(io, own_run, stream) end
     run_stderr = recorded(client_stderr, :stderr)
-    # Buffering would strand a REPL prompt written just before the frontend
-    # blocks on stdin. Pre-1.11 `redirect_stdio` needs a stream owning an fd.
-    # Recording sits under the buffer, so it copies whole chunks.
-    run_stdout, owned_streams = if VERSION >= v"1.11" && !is_repl_client(client) && client_stdout isa StreamIO
-        buffered = BufferedOutput(recorded(client_stdout, :stdout))
+    # Buffered, a line editor's redraw goes as one write, not the several it
+    # makes, each a moment on screen half drawn over a remote link; it's
+    # flushed as the REPL waits for a key (`ScopedStdin`). Pre-1.11
+    # `redirect_stdio` needs a stream owning an fd. Recording sits under the
+    # buffer, so it copies whole chunks.
+    run_stdout, owned_streams = if VERSION >= v"1.11" && client_stdout isa StreamIO
+        delay = if is_repl_client(client) REPL_FLUSH_DELAY_S else OUTPUT_FLUSH_DELAY_S end
+        buffered = BufferedOutput(recorded(client_stdout, :stdout); delay)
         buffered, map(s -> if s === client_stdout buffered else s end, owned_streams)
     else
         recorded(client_stdout, :stdout), owned_streams

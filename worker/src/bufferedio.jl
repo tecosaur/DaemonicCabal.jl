@@ -3,6 +3,9 @@
 
 const OUTPUT_BUFFER_THRESHOLD = 8192
 const OUTPUT_FLUSH_DELAY_S = 0.01  # the longest output waits for more to join it
+# A REPL's: flushed as it waits for a key, this is only for output while it
+# waits (a completion hint, drawn in parts), to go as one write.
+const REPL_FLUSH_DELAY_S = 0.002
 
 const OutputBuffer = @static if VERSION >= v"1.11-" Memory{UInt8} else Vector{UInt8} end
 # Buffers whose writes were interrupted, which libuv may still be reading.
@@ -15,10 +18,12 @@ mutable struct BufferedOutput{S <: IO} <: IO
     buf::OutputBuffer
     pos::Int
     armed::Bool  # a deadline flush is pending
+    const delay::Float64  # how long output waits for more to join it
     const lock::ReentrantLock
 end
 
-BufferedOutput(sink::IO) = BufferedOutput(sink, OutputBuffer(undef, OUTPUT_BUFFER_THRESHOLD), 0, false, ReentrantLock())
+BufferedOutput(sink::IO; delay::Float64=OUTPUT_FLUSH_DELAY_S) =
+    BufferedOutput(sink, OutputBuffer(undef, OUTPUT_BUFFER_THRESHOLD), 0, false, delay, ReentrantLock())
 
 Base.lock(o::BufferedOutput) = lock(o.lock)
 Base.unlock(o::BufferedOutput) = unlock(o.lock)
@@ -73,7 +78,7 @@ end
 # Under `o.lock`.
 function arm_deadline!(o::BufferedOutput)
     o.armed = true
-    Timer(OUTPUT_FLUSH_DELAY_S) do _
+    Timer(o.delay) do _
         @lock o.lock begin
             o.armed = false
             o.pos > 0 && isopen(o.sink) && flush(o)
