@@ -29,6 +29,10 @@ const logring = @import("logring.zig");
 const terminal = @import("terminal.zig");
 
 const Conductor = main.Conductor;
+const replies = @import("replies.zig");
+const eviction = @import("eviction.zig");
+const tracking = @import("tracking.zig");
+const assign = @import("assign.zig");
 const ClientStreams = Conductor.ClientStreams;
 
 const debounce_ms = 100;
@@ -148,7 +152,7 @@ pub fn subscribe(c: *Conductor, streams: ClientStreams, palette: ?pal.Palette, s
     sub.* = .{ .term = .{ .streams = streams, .palette = palette, .id = c.client_id, .size = .of(size) }, .scope = scope, .oneshot = oneshot };
     try c.live.list.append(c.allocator, sub);
     if (oneshot) {
-        c.refreshStats(null); // first reading; the deferred fire takes the second
+        eviction.refreshStats(c, null); // first reading; the deferred fire takes the second
         c.event_loop.armLiveTimer(debounce_ms);
         c.live.armed = true;
         return;
@@ -277,7 +281,7 @@ fn fire(c: *Conductor) void {
     const all_oneshot = for (c.live.list.items) |sub| {
         if (!sub.oneshot) break false;
     } else true;
-    c.refreshStats(if (all_oneshot) null else cpu_half_life);
+    eviction.refreshStats(c, if (all_oneshot) null else cpu_half_life);
     pruneSnapshots(c);
     if (!all_oneshot) recordTrends(c);
     var behind = false;
@@ -320,7 +324,7 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     sub.cursor_drawn = false; // until a pane marks one
     const render = struct {
         fn f(conductor: *Conductor, s: *const Subscriber) !status.Report {
-            return conductor.renderStatus("live", true, s.term.palette, s.scope, s.focus, focusedTrend(conductor, s), !s.oneshot and s.focus == null);
+            return replies.renderStatus(conductor, "live", true, s.term.palette, s.scope, s.focus, focusedTrend(conductor, s), !s.oneshot and s.focus == null);
         }
     }.f;
     var report = try render(c, sub);
@@ -546,8 +550,8 @@ fn terminate(c: *Conductor, sub: *Subscriber, focus: u32) void {
     }
     const worker_id = w.id;
     const labelled = whole and w.session_label != null;
-    const ending = c.endClients(w, ids.items);
-    if (labelled and ending != .retired) c.clearLabel(w);
+    const ending = tracking.endClients(c, w, ids.items);
+    if (labelled and ending != .retired) assign.clearLabel(c, w);
     const now = c.currentTime();
     switch (ending) {
         .ended => sub.note.set(now, "ended client {d}{s}", .{ info.pid, if (whole) " and its session" else "" }),
@@ -864,7 +868,7 @@ fn attach(c: *Conductor, sub: *Subscriber, w: *worker.Worker, follow: bool) Prev
 fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool, size: terminal.Size) !*Attachment {
     const port_set = if (c.port_pool) |*pool| pool.allocate() orelse protocol.PortPool.none else protocol.PortPool.none;
     var tracked = false;
-    errdefer if (!tracked) c.releasePortSet(port_set);
+    errdefer if (!tracked) assign.releasePortSet(c, port_set);
     c.client_counter += 1;
     const id = c.client_counter;
     const pid: u32 = @intCast(platform.getpid());
@@ -888,7 +892,7 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool, size: terminal
         .port_set = port_set,
     };
     const paths = w.runClient(c.allocator, &info, if (c.cfg.transport == .local) c.cfg.socket_dir else null) catch |err| {
-        _ = c.handleRunClientError(w, err);
+        _ = assign.handleRunClientError(c, w, err);
         return err;
     };
     defer paths.deinit(c.allocator);
@@ -904,7 +908,7 @@ fn openAttachment(c: *Conductor, w: *worker.Worker, follow: bool, size: terminal
     }
     const a = try c.allocator.create(Attachment);
     errdefer c.allocator.destroy(a);
-    try c.trackClient(id, .{ .worker = w, .pid = pid, .port_set = port_set, .watcher = true, .internal = true });
+    try tracking.trackClient(c, id, .{ .worker = w, .pid = pid, .port_set = port_set, .watcher = true, .internal = true });
     tracked = true;
     a.* = .{
         .id = id,

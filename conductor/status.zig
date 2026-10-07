@@ -14,6 +14,8 @@ const pal = @import("palette.zig");
 const tui = @import("tui.zig");
 
 const Conductor = main.Conductor;
+const eviction = @import("eviction.zig");
+const assign = @import("assign.zig");
 const Worker = worker.Worker;
 
 // Zig 0.17's ArrayList has no generic `.writer()`.
@@ -35,7 +37,7 @@ const Writer = struct {
 };
 
 /// Who asks: the host sees everything, a sandboxed client only its sandbox
-/// (see `Conductor.isVisible`): a remote client its own host's, or with
+/// (see `assign.isVisible`): a remote client its own host's, or with
 /// hosts not isolated (null) every remote host's.
 pub const Scope = union(enum) { host, remote_sandbox: ?std.Io.net.IpAddress, mount_ns: u64 };
 
@@ -122,7 +124,7 @@ pub fn focusesWorkers(c: *const Conductor) bool {
 }
 
 /// What one request sees, gathered once: the host every worker, a sandboxed
-/// caller only its own sandbox's (`Conductor.isVisible`). The reserve is the host's.
+/// caller only its own sandbox's (`assign.isVisible`). The reserve is the host's.
 const View = struct {
     workers: []const Placed, // pool by pool
     projects: []const Project, // the host's pools, as the tree groups them
@@ -141,7 +143,7 @@ const View = struct {
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             const pool = entry.value_ptr.items;
-            for (pool) |wk| if (Conductor.isVisible(scope, key, wk)) try workers.append(gpa, .{ .key = key, .wk = wk });
+            for (pool) |wk| if (assign.isVisible(scope, key, wk)) try workers.append(gpa, .{ .key = key, .wk = wk });
             if (pool.len > 0 and pool[0].launch == .direct and scope == .host)
                 try projects.append(gpa, .{ .key = key, .workers = pool });
         }
@@ -149,7 +151,7 @@ const View = struct {
         for (c.pending_spawns.items) |p| {
             const visible = switch (p.purpose) {
                 .reserve => scope == .host,
-                .client => |hold| Conductor.isVisible(scope, hold.worker_key, &p.spawn.worker),
+                .client => |hold| assign.isVisible(scope, hold.worker_key, &p.spawn.worker),
             };
             if (visible) starting += 1;
         }
@@ -705,7 +707,7 @@ fn writeIdleState(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worke
     try w.writeAll("idle ");
     try writeDuration(w, now - wk.last_active);
     if (c.cfg.max_ttl > 0) {
-        const budget: i64 = @intCast(c.idleBudget(wk, key orelse ""));
+        const budget: i64 = @intCast(eviction.idleBudget(c, wk, key orelse ""));
         try w.writeAll(" · culls in ");
         try writeCullCountdown(w, s, ctx, budget - (now - wk.last_active), @intCast(c.cfg.max_ttl));
     }
@@ -713,7 +715,7 @@ fn writeIdleState(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worke
 
 // `in_dim` restores the line's dim span afterward.
 fn writeActivity(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, key: ?[]const u8, now: i64, in_dim: bool) !void {
-    const activity = c.workerActivity(wk, key, now);
+    const activity = eviction.workerActivity(c, wk, key, now);
     try w.writeAll(" · activity ");
     if (ctx.tints) |t| {
         if (in_dim) try s.open(w, ansi.reset);
@@ -925,7 +927,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     try w.print(",\"interactive\":{},\"launch\":\"{s}\"", .{ wk.interactive, @tagName(wk.launch) });
     try w.print(",\"created_at\":{d},\"last_active\":{d},\"last_pinged\":{d}", .{ wk.created_at, wk.last_active, wk.last_pinged });
     try w.print(",\"ping_pending\":{},\"active_clients\":{d},\"watchers\":{d}", .{ wk.ping_pending, wk.busyClients(), countClients(c, wk) -| wk.busyClients() });
-    try w.print(",\"activity\":{d:.4},\"cull_budget_s\":{d}", .{ c.workerActivity(wk, key, now), c.idleBudget(wk, key orelse "") });
+    try w.print(",\"activity\":{d:.4},\"cull_budget_s\":{d}", .{ eviction.workerActivity(c, wk, key, now), eviction.idleBudget(c, wk, key orelse "") });
     if (stats) |st| {
         try w.print(",\"mem_bytes\":{d},\"cpu_seconds\":{d:.3}", .{ st.mem_bytes, st.cpu_seconds });
     } else {
