@@ -36,14 +36,21 @@ const right = 0x06; // ^F
 const line_start = 0x01; // ^A: the line's start, then on again the input's
 const input_start = 0x1C; // Home: the input's start; a code no key sends
 
-// A cell's contents: a character, or one of these.
+// A cell's contents: a character of the Basic Multilingual Plane, or, from
+// the surrogates no character uses, one of these.
 const unknown = 0;
-const wide_tail = 0x1FFFFF; // the second column of a wide character
+const wide_tail = 0xDFFF; // the second column of a wide character
 // A character with marks joined to it, which the line editor may edit one
-// code point at a time: known not blank, but not guessed over.
-const composite = 0x1FFFFE;
+// code point at a time, or past the BMP: known not blank, but not guessed
+// over.
+const opaque_char = 0xDFFE;
 
-const Cells = [max_cols]u21;
+const Cells = [max_cols]u16;
+
+// What a cell holds of `char`.
+fn cellOf(char: u21) u16 {
+    return if (char <= 0xFFFF and (char < 0xD800 or char > 0xDFFF)) @intCast(char) else opaque_char;
+}
 
 /// What guessing depends on beyond the keys and output it's given.
 pub const Context = struct {
@@ -87,14 +94,14 @@ const Sim = struct {
                 const n = s.charBefore() orelse return null;
                 const char = s.cells[s.col - n];
                 s.col -= n;
-                std.mem.copyForwards(u21, s.cells[s.col .. max_cols - n], s.cells[s.col + n ..]);
+                std.mem.copyForwards(u16, s.cells[s.col .. max_cols - n], s.cells[s.col + n ..]);
                 if (s.reach > s.col) s.reach -= n;
                 break :blk .{ .delete = char };
             },
             left => .{ .move = -@as(i16, @intCast(s.charBefore() orelse return null)) },
             right => blk: {
                 const n: u16 = if (s.col + 1 < max_cols and s.cells[s.col + 1] == wide_tail) 2 else 1;
-                if (s.col + n > s.reach or s.cells[s.col] == composite) return null;
+                if (s.col + n > s.reach or s.cells[s.col] == opaque_char) return null;
                 break :blk .{ .move = @intCast(n) };
             },
             line_start, input_start => blk: {
@@ -103,9 +110,9 @@ const Sim = struct {
             },
             else => blk: {
                 const n: u16 = unicode.codepointWidth(key);
-                if (s.col + n >= max_cols) return null;
-                std.mem.copyBackwards(u21, s.cells[s.col + n ..], s.cells[s.col .. max_cols - n]);
-                s.cells[s.col] = key;
+                if (s.col + n >= max_cols or cellOf(key) == opaque_char) return null;
+                std.mem.copyBackwards(u16, s.cells[s.col + n ..], s.cells[s.col .. max_cols - n]);
+                s.cells[s.col] = cellOf(key);
                 if (n == 2) s.cells[s.col + 1] = wide_tail;
                 if (s.reach >= s.col) s.reach += n;
                 s.inserts += n;
@@ -123,7 +130,7 @@ const Sim = struct {
     fn charBefore(s: *const Sim) ?u16 {
         if (s.col == 0) return null;
         const n: u16 = if (s.cells[s.col - 1] == wide_tail) 2 else 1;
-        if (n > s.col or s.cells[s.col - n] == unknown or s.cells[s.col - n] == composite) return null;
+        if (n > s.col or s.cells[s.col - n] == unknown or s.cells[s.col - n] == opaque_char) return null;
         return n;
     }
 };
@@ -175,6 +182,9 @@ pub const Typeahead = struct {
     // on from `base_col`.
     base: Cells = undefined,
     base_col: u16 = 0,
+    // Where the base row's line, and the input, start, where known.
+    base_line: ?u16 = null,
+    base_input: ?u16 = null,
     // How far the row is known to be input: as far as the guesses the
     // worker has drawn reached, until it may have changed.
     reach: ?u16 = null,
@@ -192,6 +202,7 @@ pub const Typeahead = struct {
     /// takes the guesses back, and stops guessing until the worker has had
     /// time to draw it.
     pub fn onKeys(self: *Typeahead, keys: []const u8, ctx: Context, w: *std.Io.Writer) void {
+        self.row.typed();
         var i: usize = 0;
         while (i < keys.len) if (nextKey(keys, &i) == null) {
             self.drop(w);
@@ -261,7 +272,7 @@ pub const Typeahead = struct {
     // `afterOutput`, its output followed already.
     fn settle(self: *Typeahead, ctx: Context, w: *std.Io.Writer) void {
         // Another row, or none known.
-        if (self.row.cells == null or self.row.moves != self.moves) self.unknown();
+        if (self.row.cells() == null or self.row.moves != self.moves) self.unknown();
         self.moves = self.row.moves;
         if (self.guessed == 0) return;
         if (self.row.marked and !self.row.input_open) return self.forget();
@@ -287,9 +298,21 @@ pub const Typeahead = struct {
         std.mem.copyForwards(u21, self.keys[0 .. self.guessed - n], self.keys[n..self.guessed]);
         std.mem.copyForwards(u64, self.sent_ns[0 .. self.guessed - n], self.sent_ns[n..self.guessed]);
         self.guessed -= n;
-        self.base = self.row.cells.?;
-        self.base_col = self.row.col.?;
+        _ = self.rebase();
         self.reach = drawn.reach;
+    }
+
+    // The row as it now is, for the guesses to be played on; false where
+    // it isn't known.
+    fn rebase(self: *Typeahead) bool {
+        self.base = (self.row.cells() orelse return false).*;
+        self.base_col = self.row.col orelse return false;
+        // A continuation line's start, else the input's own, which is the
+        // start of its first line.
+        const l = self.row.line();
+        self.base_input = if (l.start == null and self.row.marked) l.input_col else null;
+        self.base_line = l.start orelse self.base_input;
+        return true;
     }
 
     /// The worker's `output` as one update to the terminal, into `w`, which
@@ -301,24 +324,22 @@ pub const Typeahead = struct {
             w.writeAll(output) catch {};
             return self.afterOutput(output, ctx, w);
         }
-        // Followed once, to know how it ends before anything goes around it.
-        var fed = self.row;
-        fed.feed(output, ctx.width);
+        // Followed first, to know how it ends before anything goes around it:
+        // what's taken back is played on the base, not the row.
+        self.row.feed(output, ctx.width);
         // Nothing may be written into the middle of the worker's own escape
         // sequence or character, which the next piece ends.
-        if (fed.parse != .ground or fed.pending_bytes > 0) {
+        if (self.row.parse != .ground or self.row.pending_bytes > 0) {
             self.beforeOutput(output, w);
             self.reach = null;
             self.forget();
             w.writeAll(output) catch {};
-            self.row = fed;
             return self.settle(ctx, w);
         }
-        if (self.echoed(&fed, output)) |shown| return self.echo(&fed, output, shown, ctx, w);
+        if (self.echoed(output)) |shown| return self.echo(output, shown, ctx, w);
         w.writeAll("\x1b[?2026h") catch {};
         self.beforeOutput(output, w);
         w.writeAll(output) catch {};
-        self.row = fed;
         self.settle(ctx, w);
         w.writeAll("\x1b[?2026l") catch {};
     }
@@ -326,7 +347,7 @@ pub const Typeahead = struct {
     // How many guesses `output` echoes, if it's nothing but the first of
     // them, typed at the end of the row, as a line editor without a redraw
     // draws them.
-    fn echoed(self: *const Typeahead, fed: *const Row, output: []const u8) ?u8 {
+    fn echoed(self: *const Typeahead, output: []const u8) ?u8 {
         for (self.keys[0..self.guessed]) |key| if (!isText(key)) return null;
         var i: usize = 0;
         var n: u8 = 0;
@@ -335,14 +356,14 @@ pub const Typeahead = struct {
             if (n == self.guessed or char.cp != self.keys[n]) return null;
             i += char.len;
         }
-        const drawn = self.drawnGuessesOn(fed) orelse return null;
+        const drawn = self.drawnGuesses() orelse return null;
         return if (n > 0 and drawn.keys == n) n else null;
     }
 
     // The cursor back to where the worker draws, its echo drawn over the
     // guesses it shows, and on past those it doesn't yet: nothing taken off
     // the screen, or put back.
-    fn echo(self: *Typeahead, fed: *const Row, output: []const u8, shown: u8, ctx: Context, w: *std.Io.Writer) void {
+    fn echo(self: *Typeahead, output: []const u8, shown: u8, ctx: Context, w: *std.Io.Writer) void {
         var all: i16 = 0;
         for (self.keys[0..self.guessed]) |key| all += unicode.codepointWidth(key);
         var rest: i16 = 0;
@@ -353,8 +374,7 @@ pub const Typeahead = struct {
         w.writeAll(output) catch {};
         out.add(.{ .move = rest });
         out.flush();
-        const drawn = self.drawnGuessesOn(fed).?;
-        self.row = fed.*;
+        const drawn = self.drawnGuesses().?;
         self.moves = self.row.moves;
         self.letGo(drawn, ctx);
     }
@@ -405,11 +425,8 @@ pub const Typeahead = struct {
         if (self.row.parse != .ground) return null; // mid-sequence, as output last left it
         if (self.row.marked and !self.row.input_open) return null;
         // Again, it's the input's start, which may be another row.
-        if (key == line_start and self.last_key == line_start and self.row.line_start != null) return null;
-        if (self.guessed == 0) {
-            self.base = self.row.cells orelse return null;
-            self.base_col = self.row.col orelse return null;
-        }
+        if (key == line_start and self.last_key == line_start and self.row.line().start != null) return null;
+        if (self.guessed == 0 and !self.rebase()) return null;
         var sim = self.replayed() orelse return null;
         const effect = sim.apply(key) orelse return null;
         return if (self.allows(&sim, ctx)) effect else null;
@@ -428,15 +445,9 @@ pub const Typeahead = struct {
             .col = self.base_col,
             .low = self.base_col,
             .reach = @max(self.base_col, self.reach orelse 0),
-            .line_start = self.lineStart(),
-            .input_start = if (self.row.line_start == null and self.row.marked) self.row.input_col else null,
+            .line_start = self.base_line,
+            .input_start = self.base_input,
         };
-    }
-
-    // Where the cursor's line of the input starts, if it's known: a
-    // continuation line's text, or the input's own.
-    fn lineStart(self: *const Typeahead) ?u16 {
-        return self.row.line_start orelse if (self.row.marked) self.row.input_col else null;
     }
 
     // Whether the keys `sim` played can be shown: what they insert keeps the
@@ -448,27 +459,23 @@ pub const Typeahead = struct {
         const end = self.row.contentEnd() orelse return false;
         if (@max(end, col) + s.inserts + margin > ctx.width) return false;
         if (s.low >= self.base_col) return true;
-        return s.low >= (self.lineStart() orelse self.typed_from orelse return false);
+        return s.low >= (self.base_line orelse self.typed_from orelse return false);
     }
 
     const Drawn = struct { keys: u8, reach: u16 };
 
+    // How many of the guesses the row shows, the most it matches: its
+    // cursor where they'd leave it, and its cells as they'd leave them as
+    // far as they reached. Null when it matches none. What's past that, such
+    // as a completion hint, isn't guessed.
     fn drawnGuesses(self: *const Typeahead) ?Drawn {
-        return self.drawnGuessesOn(&self.row);
-    }
-
-    // How many of the guesses `row` shows, the most it matches: its cursor
-    // where they'd leave it, and its cells as they'd leave them as far as
-    // they reached. Null when it matches none. What's past that, such as a
-    // completion hint, isn't guessed.
-    fn drawnGuessesOn(self: *const Typeahead, row: *const Row) ?Drawn {
-        const col = row.col orelse return null;
-        const cells = &(row.cells orelse return null);
+        const col = self.row.col orelse return null;
+        const cells = self.row.cells() orelse return null;
         var s = self.onBase();
         var found: ?Drawn = null;
         for (0..self.guessed + 1) |k| {
             if (k > 0) _ = s.apply(self.keys[k - 1]) orelse break;
-            if (col == s.col and std.mem.eql(u21, cells[0..s.reach], s.cells[0..s.reach]))
+            if (col == s.col and std.mem.eql(u16, cells[0..s.reach], s.cells[0..s.reach]))
                 found = .{ .keys = @intCast(k), .reach = s.reach };
         }
         return found;
@@ -516,11 +523,20 @@ fn clearsRow(output: []const u8) bool {
     return false;
 }
 
-/// The cursor's row as the worker drew it: the cursor's column and what's
-/// in each cell, each unknown once output does what isn't followed.
+/// The cursor's row as the worker drew it: the cursor's column, what's in
+/// each cell, and each unknown once output does what isn't followed.
 pub const Row = struct {
     col: ?u16 = null,
-    cells: ?Cells = null,
+    here: Line = .{},
+    // Rows counted from where the cursor started, as it moves up and down.
+    y: i32 = 0,
+    // The row the cursor was on as a key was last typed, which a line editor
+    // redraws its input around: drawn as it draws its input down from the
+    // prompt, it's kept, for when it moves back up to the cursor, and the
+    // rows either side, for a move to one.
+    typed_y: i32 = 0,
+    kept: [3]Line = @splat(.{}),
+    kept_y: ?i32 = null, // the middle's
     parse: Parse = .ground,
     param: u16 = 0, // a CSI's first parameter
     params: u8 = 0, // how many digits or separators it has had
@@ -534,13 +550,7 @@ pub const Row = struct {
     // place, from its start (B) to its command's (C).
     marked: bool = false,
     input_open: bool = false,
-    // Where the input starts on the row, while it's known: forgotten as the
-    // cursor leaves the row, or it's erased from its start.
-    input_col: ?u16 = null,
-    // Where a continuation line's text starts: on a row moved onto cleared,
-    // where its first character is drawn.
-    line_start: ?u16 = null,
-    fresh: bool = false, // moved onto cleared, nothing drawn yet
+    fresh: bool = false, // moved onto a row cleared, nothing drawn on it yet
     // The rows below the cursor's known cleared, as a line editor clears its
     // input's rows from the last up before redrawing them.
     blank_below: u8 = 0,
@@ -548,6 +558,36 @@ pub const Row = struct {
     moves: u32 = 0,
 
     const Parse = enum { ground, escape, csi, osc, osc_escape };
+
+    pub const Line = struct {
+        cells: Cells = undefined,
+        known: bool = false,
+        // Where the input starts on it, from the mark's B: forgotten as it's
+        // erased from its start.
+        input_col: ?u16 = null,
+        // Where a continuation line's text starts: on a row moved onto
+        // cleared, where its first character is drawn.
+        start: ?u16 = null,
+    };
+
+    pub fn line(self: *const Row) *const Line {
+        return &self.here;
+    }
+
+    fn edited(self: *Row) *Line {
+        return &self.here;
+    }
+
+    /// A key typed on the cursor's row, which the line editor's redraws are
+    /// around.
+    pub fn typed(self: *Row) void {
+        self.typed_y = self.y;
+    }
+
+    /// The cursor's row's cells, if they're known.
+    pub fn cells(self: *const Row) ?*const Cells {
+        return if (self.line().known) &self.line().cells else null;
+    }
 
     pub fn feed(self: *Row, bytes: []const u8, width: u16) void {
         if (width == 0 or width > max_cols) {
@@ -574,6 +614,7 @@ pub const Row = struct {
             }
             self.pending_bytes = 0;
             self.blank_below = 0;
+            self.kept_y = null;
             rest = rest[nl..];
         };
         for (rest) |byte| self.step(byte, width);
@@ -581,10 +622,10 @@ pub const Row = struct {
 
     /// The column after the row's last non-blank cell, if the row is known.
     pub fn contentEnd(self: *const Row) ?u16 {
-        const cells = self.cells orelse return null;
+        const c = self.cells() orelse return null;
         var end: usize = max_cols;
-        while (end > 0 and cells[end - 1] == ' ') end -= 1;
-        if (end > 0 and std.mem.findScalar(u21, cells[0..end], unknown) != null) return null;
+        while (end > 0 and c[end - 1] == ' ') end -= 1;
+        if (end > 0 and std.mem.findScalar(u16, c[0..end], unknown) != null) return null;
         return @intCast(end);
     }
 
@@ -672,26 +713,27 @@ pub const Row = struct {
     }
 
     // `char` drawn at the cursor; one that joins the one before makes it
-    // a composite.
+    // opaque.
     fn put(self: *Row, char: u21, width: u16) void {
         const n = unicode.codepointWidth(char);
         const c = self.col orelse return;
+        const l = self.edited();
         if (n == 0) {
-            const cells = &(self.cells orelse return);
-            const before = c -| @as(u16, if (c >= 2 and cells[c - 1] == wide_tail) 2 else 1);
-            if (c == 0 or cells[before] == unknown) return self.lost();
-            cells[before] = composite;
+            if (!l.known) return;
+            const before = c -| @as(u16, if (c >= 2 and l.cells[c - 1] == wide_tail) 2 else 1);
+            if (c == 0 or l.cells[before] == unknown) return self.lost();
+            l.cells[before] = opaque_char;
             return;
         }
         if (c + n > width) return self.lost(); // wrapped
-        if (self.fresh) self.line_start = c;
+        if (self.fresh) l.start = c;
         self.fresh = false;
-        if (self.cells) |*cells| {
+        if (l.known) {
             // Drawn over, a wide character's other half is blank.
-            if (cells[c] == wide_tail and c > 0) cells[c - 1] = ' ';
-            if (c + n < max_cols and cells[c + n] == wide_tail) cells[c + n] = ' ';
-            cells[c] = char;
-            if (n == 2) cells[c + 1] = wide_tail;
+            if (l.cells[c] == wide_tail and c > 0) l.cells[c - 1] = ' ';
+            if (c + n < max_cols and l.cells[c + n] == wide_tail) l.cells[c + n] = ' ';
+            l.cells[c] = cellOf(char);
+            if (n == 2) l.cells[c + 1] = wide_tail;
         }
         // The last column leaves a wrap pending, which isn't followed.
         self.col = if (c + n < width) c + n else null;
@@ -706,6 +748,7 @@ pub const Row = struct {
             'J' => {
                 self.erase(self.param);
                 if (self.param != 1) self.blank_below = std.math.maxInt(u8); // and below
+                if (self.param != 0) self.kept_y = null; // and above
             },
             'C' => if (self.col) |c| {
                 self.col = @min(c +| n, width - 1);
@@ -716,13 +759,7 @@ pub const Row = struct {
             'G' => self.col = @min(n - 1, width - 1),
             '@' => self.shift(n, .right, width),
             'P' => self.shift(n, .left, width),
-            // Another row, its column kept: from a cleared row one up, that
-            // row is known cleared below.
-            'A' => {
-                const cleared = n == 1 and self.contentEnd() == 0;
-                self.blank_below = if (cleared) self.blank_below +| 1 else 0;
-                self.onto(false);
-            },
+            'A' => self.up(n),
             'B' => self.down(n),
             else => self.lost(),
         }
@@ -731,62 +768,93 @@ pub const Row = struct {
     // Erase in line: 0 from the cursor on, 1 up to it, 2 all; known blank as
     // far as the cursor's column is.
     fn erase(self: *Row, mode: u16) void {
+        const l = self.edited();
         // The row redrawn from its start, prompt and all.
         if (mode == 2 or self.col == 0) {
-            self.input_col = null;
-            self.line_start = null;
+            l.input_col = null;
+            l.start = null;
             self.fresh = false;
         }
-        if (mode == 2) {
-            self.cells = @splat(' ');
-            return;
-        }
+        if (mode == 2) return self.blank();
         const c = self.col orelse return;
         switch (mode) {
             0 => {
-                if (c == 0) self.cells = @splat(' ');
-                if (self.cells) |*cells| @memset(cells[c..], ' ');
+                if (c == 0) return self.blank();
+                if (l.known) @memset(l.cells[c..], ' ');
             },
-            1 => if (self.cells) |*cells| @memset(cells[0 .. c + 1], ' '),
+            1 => if (l.known) @memset(l.cells[0 .. c + 1], ' '),
             else => self.lost(),
         }
     }
 
+    fn blank(self: *Row) void {
+        const l = self.edited();
+        l.cells = @splat(' ');
+        l.known = true;
+    }
+
     fn shift(self: *Row, n: u16, direction: enum { left, right }, width: u16) void {
         const c = self.col orelse return;
-        const cells = if (self.cells) |*cells| cells[c..width] else return;
-        const k = @min(n, cells.len);
+        const l = self.edited();
+        if (!l.known) return;
+        const row = l.cells[c..width];
+        const k = @min(n, row.len);
         switch (direction) {
             .right => {
-                std.mem.copyBackwards(u21, cells[k..], cells[0 .. cells.len - k]);
-                @memset(cells[0..k], ' ');
+                std.mem.copyBackwards(u16, row[k..], row[0 .. row.len - k]);
+                @memset(row[0..k], ' ');
             },
             .left => {
-                std.mem.copyForwards(u21, cells[0 .. cells.len - k], cells[k..]);
-                @memset(cells[cells.len - k ..], ' ');
+                std.mem.copyForwards(u16, row[0 .. row.len - k], row[k..]);
+                @memset(row[row.len - k ..], ' ');
             },
         }
     }
 
+    // Where the cursor is, and so every row, no longer known.
     fn lost(self: *Row) void {
         self.col = null;
         self.blank_below = 0;
-        self.onto(false);
+        self.kept_y = null;
+        self.here = .{};
+        self.moves +%= 1;
     }
 
-    // `n` rows down, onto one known blank if it was cleared.
+    // Row `y`'s place among those kept, if it's one.
+    fn keptAt(self: *Row, y: i32) ?*Line {
+        const middle = self.kept_y orelse return null;
+        if (y < middle - 1 or y > middle + 1) return null;
+        return &self.kept[@intCast(y - middle + 1)];
+    }
+
+    // `n` rows up, its column kept: from a cleared row one up, that row is
+    // known cleared below; onto the one kept, it's known again.
+    fn up(self: *Row, n: u16) void {
+        const cleared = n == 1 and self.contentEnd() == 0;
+        self.blank_below = if (cleared) self.blank_below +| 1 else 0;
+        self.fresh = false;
+        self.moves +%= 1;
+        self.y -%= n;
+        self.here = if (self.keptAt(self.y)) |kept| kept.* else .{};
+    }
+
+    // `n` rows down, onto one known blank if it was cleared; the row typed
+    // on, kept as it's left.
     fn down(self: *Row, n: u16) void {
+        if (self.here.known and @abs(self.y -% self.typed_y) <= 1) {
+            if (self.kept_y != self.typed_y) {
+                self.kept = @splat(.{});
+                self.kept_y = self.typed_y;
+            }
+            self.keptAt(self.y).?.* = self.here;
+        }
         const cleared = n <= self.blank_below;
         self.blank_below = if (cleared) self.blank_below - @as(u8, @intCast(n)) else 0;
-        self.onto(cleared);
-    }
-
-    fn onto(self: *Row, cleared: bool) void {
-        self.cells = if (cleared) @splat(' ') else null;
-        self.input_col = null;
-        self.line_start = null;
-        self.fresh = cleared;
         self.moves +%= 1;
+        self.y +%= n;
+        self.here = .{};
+        if (cleared) self.blank();
+        self.fresh = cleared;
     }
 
     fn endOsc(self: *Row) void {
@@ -797,11 +865,11 @@ pub const Row = struct {
         switch (mark[4]) {
             'B' => {
                 self.input_open = true;
-                self.input_col = self.col;
+                self.edited().input_col = self.col;
             },
             'C', 'D' => {
                 self.input_open = false;
-                self.input_col = null;
+                self.edited().input_col = null;
             },
             else => {},
         }
@@ -914,13 +982,13 @@ fn show(bytes: []const u8) void {
 const testing = std.testing;
 
 // What `cells` show, as UTF-8, a wide character's second column left out.
-fn textOf(cells: []const u21) []const u8 {
+fn textOf(cells: []const u16) []const u8 {
     const S = struct {
         var buf: [max_cols * 4]u8 = undefined;
     };
     var n: usize = 0;
     for (cells) |c| {
-        if (c != wide_tail) n += std.unicode.utf8Encode(c, S.buf[n..]) catch 0;
+        if (c != wide_tail) n += std.unicode.utf8Encode(if (c == opaque_char) '?' else c, S.buf[n..]) catch 0;
     }
     return S.buf[0..n];
 }
@@ -994,7 +1062,7 @@ test "a row follows the line editor's redraw" {
     var row: Row = .{};
     row.feed(redraw("1+1"), 80);
     try testing.expectEqual(10, row.col.?);
-    try testing.expectEqualStrings("julia> 1+1", textOf(row.cells.?[0..10]));
+    try testing.expectEqualStrings("julia> 1+1", textOf(row.cells().?[0..10]));
     try testing.expectEqual(10, row.contentEnd().?);
     // A completion hint after the cursor counts as the row's content.
     row.feed("\x1b[90mreads\x1b[39m\x1b[5D", 80);
@@ -1006,7 +1074,7 @@ test "a row follows what it can't, until the next redraw" {
     var row: Row = .{};
     row.feed(redraw("x"), 80);
     row.feed("\x1b7", 80); // a saved cursor
-    try testing.expect(row.col == null and row.cells == null);
+    try testing.expect(row.col == null and row.cells() == null);
     row.feed(redraw("x"), 80);
     try testing.expectEqual(8, row.col.?);
     row.feed("é", 80);
@@ -1014,28 +1082,28 @@ test "a row follows what it can't, until the next redraw" {
     row.feed("\t", 80);
     try testing.expect(row.col == null);
     row.feed("\n", 80);
-    try testing.expect(row.col.? == 0 and row.cells == null);
+    try testing.expect(row.col.? == 0 and row.cells() == null);
     // Split mid-sequence, as output may be.
     row.feed("\r\x1b[0", 80);
     row.feed("K\x1b[3", 80);
     row.feed("2mab\x1b]0;title\x07\x1b[1D", 80);
     try testing.expectEqual(1, row.col.?);
-    try testing.expectEqualStrings("ab", textOf(row.cells.?[0..2]));
+    try testing.expectEqualStrings("ab", textOf(row.cells().?[0..2]));
 }
 
 test "a row reads the line editor's marks" {
     var row: Row = .{};
     row.feed(marked("1+1"), 80);
     try testing.expect(row.marked and row.input_open);
-    try testing.expectEqual(7, row.input_col.?);
+    try testing.expectEqual(7, row.line().input_col.?);
     try testing.expectEqual(10, row.col.?);
     // Redrawn from its start, the row's input is placed again.
     row.feed("\r\x1b[0K", 80);
-    try testing.expect(row.input_col == null);
+    try testing.expect(row.line().input_col == null);
     row.feed("julia> \x1b]133;B\x1b\\", 80);
-    try testing.expectEqual(7, row.input_col.?);
+    try testing.expectEqual(7, row.line().input_col.?);
     row.feed("\x1b[0m\x1b]133;C\x07", 80);
-    try testing.expect(!row.input_open and row.input_col == null);
+    try testing.expect(!row.input_open and row.line().input_col == null);
 }
 
 test "a row follows only the line output ends on, and the last mark before it" {
@@ -1044,7 +1112,7 @@ test "a row follows only the line output ends on, and the last mark before it" {
     row.feed("\x1b]133;C\x07\x1b[1m2\x1b[0m\n" ++ more_output ++ "ta\x1b[1mil", 80);
     try testing.expect(row.marked and !row.input_open);
     try testing.expectEqual(4, row.col.?);
-    try testing.expect(row.cells == null);
+    try testing.expect(row.cells() == null);
     // A prompt's start, then its line run on: still open.
     row.feed("\r\x1b[0K\x1b]133;A\x07julia> \x1b]133;B\x07ab\ncd", 80);
     try testing.expect(row.input_open);
@@ -1068,11 +1136,11 @@ fn twoRows(comptime last: []const u8) []const u8 {
 test "a row is known cleared once cleared above the cursor's, and moved onto" {
     var row: Row = .{};
     row.feed(twoRows("b"), 80);
-    try testing.expectEqualStrings("       b ", textOf(row.cells.?[0..9]));
+    try testing.expectEqualStrings("       b ", textOf(row.cells().?[0..9]));
     try testing.expectEqual(8, row.col.?);
     // Moved onto a row not cleared, it isn't known.
     row.feed("\x1b[2B", 80);
-    try testing.expect(row.cells == null);
+    try testing.expect(row.cells() == null);
     // Erased below, every row below is cleared.
     row.feed("\r\x1b[J\n", 80);
     try testing.expectEqual(0, row.contentEnd().?);
@@ -1094,6 +1162,89 @@ test "the last row of an input over several is guessed on, back to where its lin
     // At its start, a backspace joins it to the line before.
     try testing.expectEqualStrings("\x1b[D\x1b[P\x1b[D\x1b[P", h.keys("\x7f\x7f", atMs(1200)));
     try testing.expectEqualStrings("", h.keys("\x7f", atMs(1200)));
+}
+
+// The same, its cursor on the first row, `col` columns in: drawn down from
+// the prompt, then moved up to it.
+fn onFirstRow(comptime first: []const u8, comptime col: usize) []const u8 {
+    return std.fmt.comptimePrint("\x1b[1B\r\x1b[0K\x1b[1A\r\x1b[0K\x1b]133;A\x07\x1b[32m\x1b[1mjulia> \x1b[0m\x1b[0m\x1b]133;B\x07\r\x1b[7C{s}\n\r\x1b[7Cbc\x1b[1A\r\x1b[{d}C", .{ first, col });
+}
+
+test "a row drawn, then moved back up to, is known again" {
+    var row: Row = .{};
+    row.feed(onFirstRow("foo(", 10), 80);
+    try testing.expectEqualStrings("julia> foo(", textOf(row.cells().?[0..11]));
+    try testing.expectEqual(10, row.col.?);
+    try testing.expectEqual(7, row.line().input_col.?);
+    // Further up than it drew, it isn't.
+    row.feed("\x1b[1A", 80);
+    try testing.expect(row.cells() == null);
+}
+
+test "the cursor's row of an input over several is guessed on, wherever it is" {
+    var h: Harness = .{};
+    h.init(onFirstRow("foo(", 10));
+    try testing.expectEqualStrings("\x1b[@x", h.keys("x", prompt_ctx));
+    try testing.expectEqualStrings("\x1b[D\x1b[P", h.keys("\x7f", prompt_ctx));
+    try testing.expectEqualStrings("\x1b[D\x1b[P", h.keys("\x7f", prompt_ctx));
+    try testing.expectEqualStrings("\x1b[@y", h.keys("y", prompt_ctx));
+    // Drawn by the worker: let go, each, so their echo timed.
+    h.output(onFirstRow("foy(", 10), atMs(50));
+    _ = h.written();
+    try testing.expectEqual(0, h.t.guessed);
+    try testing.expectEqual(50 * std.time.ns_per_ms, h.t.echo_ns);
+    // Back to the input's start, but not past it.
+    try testing.expectEqualStrings("\x1b[3D", h.keys("\x1b[H", atMs(60)));
+    try testing.expectEqualStrings("", h.keys("\x1b[D", atMs(60)));
+}
+
+// An input over six rows, `l0` to `l5` but row `at` reading `text`, redrawn
+// with its cursor moved from row `from` to row `at`, `col` columns in, as
+// Julia's line editor does: down to the last row, cleared up to the
+// prompt's, drawn down, then up.
+fn sixRows(comptime from: usize, comptime at: usize, comptime text: []const u8, comptime col: usize) []const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var out: []const u8 = "";
+        if (from < 5) out = out ++ std.fmt.comptimePrint("\x1b[{d}B", .{5 - from});
+        for (0..5) |_| out = out ++ "\r\x1b[0K\x1b[1A";
+        out = out ++ "\r\x1b[0K\x1b[32m\x1b[1mjulia> \x1b[0m\x1b[0m";
+        for (0..6) |i| {
+            if (i > 0) out = out ++ "\n";
+            out = out ++ "\r\x1b[7C" ++ (if (i == at) text else std.fmt.comptimePrint("l{d}", .{i}));
+        }
+        if (at < 5) out = out ++ std.fmt.comptimePrint("\x1b[{d}A", .{5 - at});
+        return out ++ std.fmt.comptimePrint("\r\x1b[{d}C", .{col});
+    }
+}
+
+test "the cursor's row of a long input is guessed on, and after a move a row up or down" {
+    var h: Harness = .{};
+    // Last typed on the second row from the top, four up from the last.
+    h.t.row.y = 1;
+    h.t.row.typed_y = 1;
+    h.init(comptime sixRows(1, 1, "ab", 9));
+    try testing.expectEqualStrings("\x1b[@c", h.keys("c", prompt_ctx));
+    h.output(comptime sixRows(1, 1, "abc", 10), atMs(50));
+    _ = h.written();
+    try testing.expectEqual(0, h.t.guessed);
+    try testing.expectEqual(50 * std.time.ns_per_ms, h.t.echo_ns);
+    // Up a row, unguessed, onto one kept: typing goes on being guessed.
+    try testing.expectEqualStrings("", h.keys("\x1b[A", atMs(100)));
+    h.output(comptime sixRows(1, 0, "l0", 9), atMs(150));
+    _ = h.written();
+    try testing.expectEqualStrings("\x1b[@x", h.keys("x", atMs(1000)));
+    // Two rows on, not kept: the next key's redraw keeps it, for the keys after.
+    h.output(comptime sixRows(0, 0, "l0x", 10), atMs(1050));
+    _ = h.written();
+    _ = h.keys("\x1b[B\x1b[B", atMs(1100));
+    h.output(comptime sixRows(0, 2, "l2", 9), atMs(1150));
+    _ = h.written();
+    try testing.expect(h.t.row.cells() == null);
+    try testing.expectEqualStrings("", h.keys("z", atMs(2000)));
+    h.output(comptime sixRows(2, 2, "l2z", 10), atMs(2050));
+    _ = h.written();
+    try testing.expectEqualStrings("\x1b[@y", h.keys("y", atMs(3000)));
 }
 
 test "a key typed at the prompt is shown at once, and let go as the worker draws it" {
@@ -1341,10 +1492,10 @@ test "a row follows characters past ASCII, wide ones over two columns" {
     var row: Row = .{};
     row.feed(redraw("é日b"), 80);
     try testing.expectEqual(11, row.col.?);
-    try testing.expectEqualStrings("julia> é日b", textOf(row.cells.?[0..11]));
+    try testing.expectEqualStrings("julia> é日b", textOf(row.cells().?[0..11]));
     // Drawn over, a wide character's other half goes blank.
     row.feed("\x1b[3Dx", 80);
-    try testing.expectEqualStrings("julia> éx b", textOf(row.cells.?[0..11]));
+    try testing.expectEqualStrings("julia> éx b", textOf(row.cells().?[0..11]));
 }
 
 test "characters past ASCII are guessed, and wide ones over two columns" {
