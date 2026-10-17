@@ -485,7 +485,7 @@ fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, env
     w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color, .env_follows = env_follows }));
     w.writeSlice(&.{ 0, 0, 0 });
     w.writeInt(u32, @intCast(platform.getpid()));
-    w.writeInt(u32, @intCast(platform.getppid()));
+    w.writeInt(u32, platform.launcherPid());
     w.writeSlice(&host_key);
     w.writeSlice(&terminal_size.encode());
     // CWD, read straight into the buffer behind its length

@@ -1212,7 +1212,13 @@ test "the dynamic port range parsed from netsh's output, in English and German" 
     try std.testing.expectEqual(@as(?[2]u16, null), parseDynamicPorts("keine Zahl\n-----\n"));
 }
 
-pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
+/// Windows keeps no parent link, so no wrappers are walked past: `launcherPid`
+/// is `getppid`'s 0.
+pub fn launcherPid() u32 {
+    return getppid();
+}
+
+pub fn launcherName(pid: u32, buf: []u8) ?[]const u8 {
     const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
     const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, .FALSE, pid) orelse return null;
     defer win32.CloseHandle(handle);

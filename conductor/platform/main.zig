@@ -130,7 +130,10 @@ pub const readPsiSomeAvg10 = shared.readPsiSomeAvg10;
 pub const readMemInfo = shared.readMemInfo;
 /// The ports the system picks a listener's from, given port 0.
 pub const ephemeralPorts = impl.ephemeralPorts;
-pub const getParentName = shared.getParentName;
+/// What ran a process, wrappers such as `timeout` passed over: its name, and
+/// for ourselves its pid, which a client sends as its shell's.
+pub const launcherName = shared.launcherName;
+pub const launcherPid = shared.launcherPid;
 pub const setTcpNodelay = shared.setTcpNodelay;
 pub const setTcpKeepalive = shared.setTcpKeepalive;
 pub const getTerminalSize = shared.getTerminalSize;

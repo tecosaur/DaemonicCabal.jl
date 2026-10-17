@@ -190,13 +190,18 @@ pub fn ephemeralPorts(_: std.mem.Allocator, _: std.Io) ?[2]u16 {
     };
 }
 
-pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
+/// macOS's alone: the others' are under a MIB with no name to look it up by.
+pub fn parentPid(pid: posix.pid_t) ?posix.pid_t {
     if (builtin.target.os.tag != .macos) return null;
     const ppid = (darwinBsdInfo(pid) orelse return null).pbi_ppid;
-    if (ppid == 0) return null;
-    const parent = darwinBsdInfo(@intCast(ppid)) orelse return null;
+    return if (ppid > 0) @intCast(ppid) else null;
+}
+
+pub fn processName(pid: posix.pid_t, out: []u8) ?[]const u8 {
+    if (builtin.target.os.tag != .macos) return null;
+    const info = darwinBsdInfo(pid) orelse return null;
     // The full name, where the command is cut at MAXCOMLEN.
-    const field = if (parent.pbi_name[0] != 0) &parent.pbi_name else &parent.pbi_comm;
+    const field = if (info.pbi_name[0] != 0) &info.pbi_name else &info.pbi_comm;
     const name = std.mem.sliceTo(field, 0);
     const n = @min(name.len, out.len);
     @memcpy(out[0..n], name[0..n]);

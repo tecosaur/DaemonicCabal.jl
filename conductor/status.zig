@@ -794,7 +794,7 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             try s.wrap(w, ansi.dim, if (info.watcher) "Watcher " else "Client ");
             try w.print("{d}", .{info.pid});
             var name_buf: [64]u8 = undefined;
-            if (platform.getParentName(info.pid, &name_buf)) |name| {
+            if (platform.launcherName(info.pid, &name_buf)) |name| {
                 try w.writeAll(" (");
                 _ = try writeUntrusted(w, name);
                 try w.writeByte(')');

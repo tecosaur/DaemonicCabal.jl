@@ -374,8 +374,49 @@ pub fn waitForExit(pid: posix.pid_t) void {
 /// `cpu_seconds` is cumulative, not a rate.
 pub const ProcessStats = struct { mem_bytes: u64, cpu_seconds: f64 };
 pub const getProcessStats = impl.getProcessStats;
-pub fn getParentName(pid: u32, buf: []u8) ?[]const u8 {
-    return impl.getParentName(@intCast(pid), buf);
+
+/// Commands that run another as their child and wait on it, so stand between
+/// a client and the shell that ran it. Those that exec theirs (env, nice,
+/// nohup, ...) leave no trace to pass.
+const wrapper_commands = [_][]const u8{
+    "timeout", "time",   "sudo",   "flock",    "strace",
+    "ltrace",  "unbuffer", "rlwrap", "xvfb-run", "caffeinate",
+};
+const max_wrappers = 8; // a launcher nested deeper is none we'd recognise
+
+pub const Launcher = struct { pid: u32, name: []const u8 };
+
+/// What ran `pid`: its nearest ancestor that isn't a wrapper
+/// (`wrapper_commands`), else the furthest one readable; its name is held
+/// in `buf`. Null where `pid`'s parent can't be read.
+pub fn launcherOf(pid: u32, buf: []u8) ?Launcher {
+    var ancestor = impl.parentPid(@intCast(pid)) orelse return null;
+    var name = impl.processName(ancestor, buf) orelse return null;
+    for (0..max_wrappers) |_| {
+        const wrapped = for (wrapper_commands) |command| {
+            if (std.mem.eql(u8, name, command)) break true;
+        } else false;
+        if (!wrapped) break;
+        const next = impl.parentPid(ancestor) orelse break;
+        // Read apart, so a failed read leaves `name` whole.
+        var next_buf: [64]u8 = undefined;
+        const next_name = impl.processName(next, &next_buf) orelse break;
+        const n = @min(next_name.len, buf.len);
+        @memcpy(buf[0..n], next_name[0..n]);
+        ancestor = next;
+        name = buf[0..n];
+    }
+    return .{ .pid = @intCast(ancestor), .name = name };
+}
+
+pub fn launcherName(pid: u32, buf: []u8) ?[]const u8 {
+    return (launcherOf(pid, buf) orelse return null).name;
+}
+
+/// Ours, as `launcherOf` finds it, else our parent.
+pub fn launcherPid() u32 {
+    var buf: [64]u8 = undefined;
+    return if (launcherOf(@intCast(impl.getpid()), &buf)) |l| l.pid else @intCast(impl.getppid());
 }
 
 /// Whether `getProcessStats().mem_bytes` is already the reclaimable figure.
@@ -542,4 +583,18 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
         .flags = 0,
     };
     posix.sigaction(posix.SIG.PIPE, &pipe_act, null);
+}
+
+test "a launcher is found past the wrappers between it and its child" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{ .argv = &.{ "timeout", "10", "sh", "-c", "echo $$; exec sleep 10" }, .stdout = .pipe });
+    defer child.kill(io);
+    var reader_buf: [64]u8 = undefined;
+    var reader = child.stdout.?.reader(io, &reader_buf);
+    const sh = try std.fmt.parseInt(u32, try reader.interface.takeDelimiterExclusive('\n'), 10);
+    var name_buf: [64]u8 = undefined;
+    const found = launcherOf(sh, &name_buf).?;
+    try std.testing.expectEqual(@as(u32, @intCast(std.os.linux.getpid())), found.pid);
+    try std.testing.expect(!std.mem.eql(u8, found.name, "timeout"));
 }

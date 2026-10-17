@@ -220,9 +220,8 @@ fn readProc(comptime fmt: []const u8, pid: posix.pid_t, buf: []u8) ?[]const u8 {
     return readFile(path.ptr, buf);
 }
 
-pub fn getParentName(pid: posix.pid_t, out: []u8) ?[]const u8 {
-    const ppid = parentPid(pid) orelse return null;
-    const comm = readProc("/proc/{d}/comm", ppid, out) orelse return null;
+pub fn processName(pid: posix.pid_t, out: []u8) ?[]const u8 {
+    const comm = readProc("/proc/{d}/comm", pid, out) orelse return null;
     return std.mem.trimEnd(u8, comm, "\n");
 }
 
