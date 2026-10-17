@@ -111,6 +111,7 @@ const options = [_]Option{
     .{ .long = "--session", .arity = .optional, .honoured = .always, .own = true },
     .{ .long = "--sync", .arity = .optional, .honoured = .always, .own = true },
     .{ .long = "--pin", .arity = .none, .honoured = .always, .own = true },
+    .{ .long = "--unpin", .arity = .none, .honoured = .always, .own = true },
     .{ .long = "--status", .arity = .optional, .honoured = .always, .own = true },
     .{ .long = "--watch", .arity = .optional, .honoured = .always, .own = true },
     .{ .long = "--revise", .arity = .optional, .honoured = .always, .own = true },

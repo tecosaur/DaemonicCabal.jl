@@ -100,6 +100,7 @@ const client_switches_help =
     \\                            replaying up to <pages> of it (0 for all)
     \\ --pin                      Keep the --session=<label> until --restart ends it,
     \\                            however long it idles
+    \\ --unpin                    Let the --session=<label> end when idle again, and exit
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
     \\ --restart                  Kill workers for the project (or just the
     \\                            --session=<label>'s) and exit

@@ -83,11 +83,12 @@ Give the session a label, and any terminal can use it:
 #+end_example
 
 A labelled session ends once left idle for a while. =--pin= keeps it, however
-long it idles, until =--restart= ends it:
+long it idles, until =--restart= ends it, or =--unpin= lets it end as others do:
 
 #+begin_example
 ~$ juliaclient --session=shared --pin -e 'data = [1,2,3]'
-~$ juliaclient --session=shared --restart  # ends it
+~$ juliaclient --session=shared --unpin    # ends once idle again
+~$ juliaclient --session=shared --restart  # ends it now
 #+end_example
 
 A session keeps its worker when its code changes, with a warning; add =--revise=

@@ -32,7 +32,7 @@ const retire = @import("retire.zig");
 const eviction = @import("eviction.zig");
 const replies = @import("replies.zig");
 
-const LabelledWorker = struct { w: *worker.Worker, pool_key: []const u8 };
+pub const LabelledWorker = struct { w: *worker.Worker, pool_key: []const u8 };
 
 /// The pools a session is looked for in: the host's own; those the host
 /// may enter too, the sandboxes the conductor built (a sandboxed pool

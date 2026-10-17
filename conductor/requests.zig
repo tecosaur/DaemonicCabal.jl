@@ -331,6 +331,10 @@ pub fn handleClient(c: *Conductor, socket: posix.socket_t, is_remote: bool, peer
         try serveRestart(c, socket, &request, worker_key, sandbox);
         return .done;
     }
+    if (request.parsed.hasSwitch("--unpin")) {
+        try serveUnpin(c, socket, &request, worker_key, sandbox);
+        return .done;
+    }
     const outcome = assign.assignClientToWorker(c, socket, &request, worker_key, sandbox, null, null) catch |err| {
         reportNoWorker(c, socket, err, sandbox, "");
         return .done;
@@ -415,9 +419,13 @@ pub fn poolKey(c: *Conductor, request: *const ClientRequest, sandbox: SandboxKin
     };
 }
 
-/// Why a `--sync` or `--pin` request is refused, if it is.
+/// Why a `--sync`, `--pin` or `--unpin` request is refused, if it is.
 pub fn sessionRefusal(request: *const ClientRequest) ?[]const u8 {
-    if (request.parsed.hasSwitch("--pin") and assign.labelOf(request) == null) return "--pin requires --session=<label>\n";
+    const pin = request.parsed.hasSwitch("--pin");
+    const unpin = request.parsed.hasSwitch("--unpin");
+    if (pin and unpin) return "--pin and --unpin can't be given together\n";
+    if (pin and assign.labelOf(request) == null) return "--pin requires --session=<label>\n";
+    if (unpin and assign.labelOf(request) == null) return "--unpin requires --session=<label>\n";
     const pages = request.parsed.getSwitch("--sync") orelse return null;
     if (assign.labelOf(request) == null) return "--sync requires --session=<label>\n";
     if (pages.len > 0) _ = std.fmt.parseInt(u16, pages, 10) catch
@@ -436,6 +444,38 @@ pub fn serveRestart(c: *Conductor, socket: posix.socket_t, request: *const Clien
     const msg = try c.allocator.print("Reset: killed {d} worker(s) for project\n", .{nkilled});
     defer c.allocator.free(msg);
     try replies.serveString(c, socket, msg, 0);
+}
+
+/// Unpins the request's session, as `--restart` would find it to end.
+pub fn serveUnpin(c: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandbox: SandboxKind) !void {
+    const label = assign.labelOf(request).?; // as `sessionRefusal` requires
+    const found = findManaged(c, request, worker_key, label, sandbox) orelse {
+        const msg = try c.allocator.print("No session '{s}' is running\n", .{label});
+        defer c.allocator.free(msg);
+        return replies.serveString(c, socket, msg, 1);
+    };
+    const w = found.w;
+    const was_pinned = w.session_pinned;
+    if (was_pinned) {
+        w.log("unpinning session '{s}'", .{label});
+        w.session_pinned = false;
+        c.noteLiveChange();
+    }
+    const msg = try if (was_pinned)
+        c.allocator.print("Unpinned session '{s}'\n", .{label})
+    else
+        c.allocator.print("Session '{s}' wasn't pinned\n", .{label});
+    defer c.allocator.free(msg);
+    try replies.serveString(c, socket, msg, 0);
+}
+
+/// The session `label` that `--restart` or `--unpin` acts on: in the
+/// request's pool when it names its project or is sandboxed, else anywhere,
+/// as the host may manage even a session it cannot join.
+fn findManaged(c: *Conductor, request: *const ClientRequest, worker_key: []const u8, label: []const u8, sandbox: SandboxKind) ?assign.LabelledWorker {
+    const pool: []const *worker.Worker = if (c.workers.getPtr(worker_key)) |list| list.items else &.{};
+    const scoped = request.parsed.hasSwitch("--project") or sandbox != .none;
+    return if (scoped) assign.findSession(c, pool, label, true) else assign.findLabelled(c, label, .any);
 }
 
 /// With a label, that session; without, the one a `--session` run of the
@@ -518,10 +558,8 @@ pub fn spawnFailureHint(c: *Conductor, err: anyerror, sandbox: SandboxKind) []co
 /// Ends session `label` wherever a client of `request`'s would join it,
 /// and a worker still starting for it; the rest of the pool is left alone.
 pub fn restartSession(c: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, label: []const u8, sandbox: SandboxKind) !void {
-    const pool: []const *worker.Worker = if (c.workers.getPtr(worker_key)) |list| list.items else &.{};
     const scoped = request.parsed.hasSwitch("--project") or sandbox != .none;
-    // The host may end even a session it cannot join.
-    const running = if (scoped) assign.findSession(c, pool, label, true) else assign.findLabelled(c, label, .any);
+    const running = findManaged(c, request, worker_key, label, sandbox);
     if (running) |f| {
         f.w.log("retired: --restart of session '{s}'", .{label});
         retire.retireWorker(c, f.w);
@@ -539,8 +577,9 @@ pub fn restartSession(c: *Conductor, socket: posix.socket_t, request: *const Cli
     try replies.serveString(c, socket, msg, 0);
 }
 
-test "--pin and --sync need a session's label" {
+test "--pin, --unpin and --sync need a session's label, and pinning one way" {
     const pin_refused = "--pin requires --session=<label>\n";
+    const unpin_refused = "--unpin requires --session=<label>\n";
     const cases = [_]struct { argv: []const []const u8, why: ?[]const u8 }{
         .{ .argv = &.{ "julia", "--pin" }, .why = pin_refused },
         .{ .argv = &.{ "julia", "--session", "--pin" }, .why = pin_refused },
@@ -548,6 +587,10 @@ test "--pin and --sync need a session's label" {
         .{ .argv = &.{ "julia", "--session=lab", "--sync", "--pin" }, .why = null },
         .{ .argv = &.{ "julia", "--sync", "--pin" }, .why = pin_refused },
         .{ .argv = &.{ "julia", "--sync" }, .why = "--sync requires --session=<label>\n" },
+        .{ .argv = &.{ "julia", "--unpin" }, .why = unpin_refused },
+        .{ .argv = &.{ "julia", "--session", "--unpin" }, .why = unpin_refused },
+        .{ .argv = &.{ "julia", "--session=lab", "--unpin" }, .why = null },
+        .{ .argv = &.{ "julia", "--session=lab", "--pin", "--unpin" }, .why = "--pin and --unpin can't be given together\n" },
     };
     for (cases) |case| {
         var request: ClientRequest = undefined;
