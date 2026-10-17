@@ -417,7 +417,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
         else
             tui.lastLines(sub.tail.items, lines_buf[0..@min(lines_buf.len, rows - 2)]),
     };
-    var footer_buf: [160]u8 = undefined;
+    var footer_buf: [256]u8 = undefined;
     const cursor_sgr = pal.Sgr.muted(sub.term.palette); // the grey the tree dims with
     // Output mid-line, such as a prompt, leaves the cursor on its last.
     sub.cursor_drawn = sub.view == .transcript and sub.preview == .transcript and
@@ -439,7 +439,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
 
 // The pane's bottom border: the terminate prompt, an action's outcome, or
 // the keys the pane's view takes.
-fn paneFooter(c: *Conductor, sub: *const Subscriber, info: main.ActiveClientInfo, snap: ?*const Snapshot, buf: *[160]u8) []const u8 {
+fn paneFooter(c: *Conductor, sub: *const Subscriber, info: main.ActiveClientInfo, snap: ?*const Snapshot, buf: *[256]u8) []const u8 {
     if (sub.confirming) |id| {
         const whole = info.session and (info.sync or info.worker.session_label != null);
         return std.mem.print(buf, "terminate client {d}{s}? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } }), .{
@@ -453,10 +453,13 @@ fn paneFooter(c: *Conductor, sub: *const Subscriber, info: main.ActiveClientInfo
     else
         comptime hints(&.{ .{ "⏎", "expand" }, .{ "s", "again" }, .{ "Esc", "transcript" }, .{ "q", "quit" } });
     if (sub.view == .log) return comptime hints(&.{ .{ "⏎", "expand" }, .{ "Esc", "transcript" }, .{ "q", "quit" } });
-    return if (info.session)
-        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "expand" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } })
+    const views = if (info.session)
+        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "expand" }, .{ "s", "stacktrace" }, .{ "l", "log" } })
     else
-        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "s", "stacktrace" }, .{ "l", "log" }, .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } });
+        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "s", "stacktrace" }, .{ "l", "log" } });
+    const w = info.worker;
+    const pin = if (w.session_label == null) "" else if (w.session_pinned) comptime hints(&.{.{ "p", "unpin" }}) ++ " · " else comptime hints(&.{.{ "p", "pin" }}) ++ " · ";
+    return std.mem.print(buf, "{s} · {s}" ++ comptime hints(&.{ .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } }), .{ views, pin }) catch views;
 }
 
 fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
@@ -493,6 +496,7 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
                     repaint(c, sub);
                 },
                 's' => if (sub.focus) |focus| takeSnapshot(c, sub, focus),
+                'p' => if (sub.focus) |focus| togglePin(c, sub, focus),
                 'l' => if (sub.focus != null) {
                     sub.view = if (sub.view == .log) .transcript else .log;
                     repaint(c, sub);
@@ -558,6 +562,16 @@ fn terminate(c: *Conductor, sub: *Subscriber, focus: u32) void {
         .interrupted => sub.note.set(now, "ended client {d}, with a forced interrupt", .{info.pid}),
         .retired => sub.note.set(now, "retired worker #{d}: client {d} would not stop", .{ worker_id, info.pid }),
     }
+    noteChange(c);
+}
+
+// A labelled session's pin, as `--pin` sets it.
+fn togglePin(c: *Conductor, sub: *Subscriber, focus: u32) void {
+    const w = (c.active_clients.get(focus) orelse return).worker;
+    const label = w.session_label orelse return;
+    w.session_pinned = !w.session_pinned;
+    w.log("{s} session '{s}'", .{ if (w.session_pinned) "pinning" else "unpinning", label });
+    sub.note.set(c.currentTime(), "session {s}", .{if (w.session_pinned) "pinned" else "unpinned"});
     noteChange(c);
 }
 

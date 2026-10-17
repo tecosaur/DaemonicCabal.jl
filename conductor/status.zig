@@ -534,8 +534,8 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     if (wk.active_clients > 0) try renderClients(c, w, s, ctx, wk, now, nested, is_last);
 }
 
-// "● #6 [label] v1.11 (interactive)", padded to its column; an inactive
-// worker's line is left dim.
+// "● #6 [label] v1.11 (interactive)", padded to its column, `∞[label]`
+// where pinned, the `∞` magenta always; an inactive worker's line is left dim.
 fn writeIdentity(c: *Conductor, w: Writer, s: Style, wk: *const Worker, health: Health) !void {
     try writeHealthDot(s, w, health);
     try w.writeByte(' ');
@@ -546,8 +546,13 @@ fn writeIdentity(c: *Conductor, w: Writer, s: Style, wk: *const Worker, health: 
         try s.open(w, ansi.dim);
         try w.print("#{s}", .{id_text});
         if (wk.session_label) |label| {
-            try w.writeAll(" [");
-            col += 3 + try writeUntrusted(w, label);
+            try w.writeByte(' ');
+            if (wk.session_pinned) {
+                try s.wrap(w, ansi.magenta, "∞");
+                try s.open(w, ansi.dim);
+            }
+            try w.writeByte('[');
+            col += 3 + @as(usize, @intFromBool(wk.session_pinned)) + try writeUntrusted(w, label);
             try w.writeByte(']');
         }
     } else {
@@ -555,9 +560,10 @@ fn writeIdentity(c: *Conductor, w: Writer, s: Style, wk: *const Worker, health: 
         try s.wrap(w, ansi.bold, id_text);
         if (wk.session_label) |label| {
             try w.writeByte(' ');
+            if (wk.session_pinned) try s.wrap(w, ansi.magenta, "∞");
             try s.wrap(w, ansi.dim, "[");
             try s.open(w, ansi.cyan);
-            col += 3 + try writeUntrusted(w, label);
+            col += 3 + @as(usize, @intFromBool(wk.session_pinned)) + try writeUntrusted(w, label);
             try s.close(w);
             try s.wrap(w, ansi.dim, "]");
         }
