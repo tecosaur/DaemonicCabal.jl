@@ -417,14 +417,21 @@ function json_event(event::TranscriptEvent)
     take!(io)
 end
 
+# A run's divider is dim, the run it names magenta italic, as the live view
+# draws it (`conductor/tui.zig`'s `runRule` reads its lead).
 function render_text(event::TranscriptEvent, color::Bool)
-    dim(text) = if color "\e[2m$text\e[22m" else text end
+    divider(rest) = if color
+        "\e[2m──╼ \e[22;3;35mrun $(event.run)\e[23;39;2m$rest\e[22m"
+    else
+        "──╼ run $(event.run)$rest"
+    end
     io = IOBuffer()
     if event.kind === :run
-        println(io, dim("── run $(event.run) · $(Libc.strftime("%H:%M:%S", event.time)) · juliaclient $(String(copy(event.data)))"))
+        command = String(copy(event.data))
+        println(io, divider(" · $(Libc.strftime("%H:%M:%S", event.time)) · juliaclient$(isempty(command) ? "" : " ")$command"))
     elseif event.kind === :exit
         code = String(copy(event.data))
-        code == "0" || println(io, dim("── run $(event.run) exited with code $code"))
+        code == "0" || println(io, divider(" exited with code $code"))
     elseif event.kind === :input  # piped, so at the julia> prompt
         println(io, if color "\e[32;1mjulia>\e[m " else "julia> " end, String(copy(input_parts(event)[2])))
     elseif event.kind ∈ (:stdout, :stderr, :prompt)

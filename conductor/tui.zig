@@ -251,16 +251,9 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
         try out.appendSlice(gpa, dim);
         for (pane.gutter) |part| try out.appendSlice(gpa, part);
         const line = if (row < pane.body.len) pane.body[row] else "";
-        // A run's divider is drawn dim, as the border it joins, the run it
-        // names in magenta italic.
+        // A run's divider joins the border, in the worker's styling.
         const rule = runRule(line);
-        var marked: std.ArrayList(u8) = .empty;
-        defer marked.deinit(gpa);
-        if (rule) |r| {
-            const named = "run ".len + (std.mem.findNone(u8, r["run ".len..], "0123456789") orelse r.len - "run ".len);
-            try marked.print(gpa, "\x1b[3;35m{s}\x1b[0;2m{s}", .{ r[0..named], r[named..] });
-        }
-        const text = if (rule != null) marked.items else line;
+        const text = rule orelse line;
         const room = if (rule != null) inner - 2 else inner;
         if (rule != null) {
             try out.appendSlice(gpa, "├─╼ ");
@@ -278,13 +271,19 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
     try writeBorder(out, gpa, .{ dim, reset }, pane.gutter, "╰─", "╯", pane.footer, "", width);
 }
 
-// What follows `── ` in the dim line the worker heads each run with, and
-// ends a failed one with. Sequences that draw nothing may lead it: its dim,
-// and whatever the run before left off with.
+// What follows `──╼ ` in the line the worker heads each run with, and ends a
+// failed one with (`render_text`): `run N`, and on. Sequences that draw
+// nothing may lead either part: its styling, and whatever the run before
+// left off with.
 fn runRule(line: []const u8) ?[]const u8 {
-    var text = line;
-    while (text.len > 0 and text[0] == 0x1b) text = text[escapeLength(text)..];
-    return if (std.mem.startsWith(u8, text, "── run ")) text["── ".len..] else null;
+    const rest = std.mem.cutPrefix(u8, skipEscapes(line), "──╼ ") orelse return null;
+    return if (std.mem.startsWith(u8, skipEscapes(rest), "run ")) rest else null;
+}
+
+fn skipEscapes(text: []const u8) []const u8 {
+    var rest = text;
+    while (rest.len > 0 and rest[0] == 0x1b) rest = rest[escapeLength(rest)..];
+    return rest;
 }
 
 // "╭─ label ──── aside ─╮", the label cut to fit.
@@ -919,7 +918,13 @@ test "pane: a run's divider joins the left border" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     // A REPL leaving bracketed paste as it ends puts that before the next run's.
-    const body = [_][]const u8{ "julia>", "\x1b[2m── run 2 · 17:43:56 · juliaclient\x1b[22m", "\x1b[2m── run 2 exited with code 1\x1b[22m", "\x1b[?2004l\x1b[2m── run 3 · 17:44:02 · juliaclient\x1b[22m", "── runs" };
+    const body = [_][]const u8{
+        "julia>",
+        "\x1b[2m──╼ \x1b[22;3;35mrun 2\x1b[23;39;2m · 17:43:56 · juliaclient\x1b[22m",
+        "\x1b[2m──╼ \x1b[22;3;35mrun 2\x1b[23;39;2m exited with code 1\x1b[22m",
+        "\x1b[?2004l\x1b[2m──╼ \x1b[22;3;35mrun 3\x1b[23;39;2m · 17:44:02 · juliaclient\x1b[22m",
+        "──╼ runs",
+    };
     const pane = Pane{ .title = "t", .footer = "", .body = &body };
     try writePane(&out, gpa, false, pane, 40, 7);
     try std.testing.expectEqualStrings(
@@ -928,7 +933,7 @@ test "pane: a run's divider joins the left border" {
         \\├─╼ run 2 · 17:43:56 · juliaclient     │
         \\├─╼ run 2 exited with code 1           │
         \\├─╼ run 3 · 17:44:02 · juliaclient     │
-        \\│ ── runs                              │
+        \\│ ──╼ runs                             │
         \\╰──────────────────────────────────────╯
         \\
     , out.items);
