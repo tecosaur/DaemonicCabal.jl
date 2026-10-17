@@ -105,9 +105,10 @@ const client_switches_help =
     \\ --restart                  Kill workers for the project (or just the
     \\                            --session=<label>'s) and exit
     \\ --sandbox                  Run in an isolated sandbox (Linux only)
-    \\ --status[=live|json]       Show the state of the workers, as JSON, or live:
+    \\ --status[=once|json]       Show the state of the workers, live at a terminal:
     \\                            ↓ focuses a session, to preview, follow,
-    \\                            show its stacktrace, interrupt or terminate it
+    \\                            show its stacktrace, interrupt or terminate it;
+    \\                            or once, or as JSON
     \\ --watch[=json][,once]      Follow the session's transcript (this project's,
     \\                            or --session=<label>'s), as JSON lines, or once
     \\ --reconfigure              Show the daemon's settings, to change them live

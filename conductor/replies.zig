@@ -96,10 +96,14 @@ pub fn serveStatus(c: *Conductor, client_socket: posix.socket_t, switch_value: ?
     var streams = try openClientStreams(c, client_socket, true);
     var held = false;
     defer if (!held) streams.deinit();
-    const is_live = tty and format != null and std.mem.eql(u8, format.?, "live");
-    const palette: ?pal.Palette = if (tty and (format == null or is_live)) probePalette(c, &streams) else null;
-    if (is_live or (tty and format == null)) {
-        try live.subscribe(c, streams, palette, size, scope, !is_live);
+    // At a terminal a bare `--status` is the live view, and `once` its one
+    // frame, drawn a beat late so its CPU meter resolves. Elsewhere either is
+    // the plain tree.
+    const is_live = tty and (format == null or std.mem.eql(u8, format.?, "live"));
+    const is_once = tty and format != null and std.mem.eql(u8, format.?, "once");
+    const palette: ?pal.Palette = if (is_live or is_once) probePalette(c, &streams) else null;
+    if (is_live or is_once) {
+        try live.subscribe(c, streams, palette, size, scope, is_once);
         held = true;
         return;
     }

@@ -57,10 +57,11 @@ where it doesn't.
 * Live monitoring
 
 To see what the daemon is up to, run =juliaclient --status=: it lists the
-workers, the project each one serves, and their sessions and clients. With
-=--status=live=, the list updates as things change, and you can select a
-session to preview its output, see where it's stuck (even in a loop that never
-yields), or interrupt or terminate it.
+workers, the project each one serves, and their sessions and clients. At a
+terminal, the list updates as things change, and you can select a session to
+preview its output, see where it's stuck (even in a loop that never yields),
+or interrupt or terminate it; =--status=once= shows the list just once, and
+=--status=json= as JSON.
 
 * Sessions
 
