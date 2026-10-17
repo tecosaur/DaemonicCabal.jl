@@ -321,7 +321,7 @@ pub fn handleClient(c: *Conductor, socket: posix.socket_t, is_remote: bool, peer
     const worker_key = try poolKey(c, &request, sandbox);
     defer c.allocator.free(worker_key);
     if (request.parsed.hasSwitch("--watch")) return serveWatch(c, socket, &request, worker_key, sandbox);
-    if (syncRefusal(&request)) |why| {
+    if (sessionRefusal(&request)) |why| {
         std.debug.print("Client {d}: refused: {s}", .{ c.client_id, why });
         try replies.serveString(c, socket, why, 1);
         return .done;
@@ -415,8 +415,9 @@ pub fn poolKey(c: *Conductor, request: *const ClientRequest, sandbox: SandboxKin
     };
 }
 
-/// Why a `--sync` request is refused, if it is.
-pub fn syncRefusal(request: *const ClientRequest) ?[]const u8 {
+/// Why a `--sync` or `--pin` request is refused, if it is.
+pub fn sessionRefusal(request: *const ClientRequest) ?[]const u8 {
+    if (request.parsed.hasSwitch("--pin") and assign.labelOf(request) == null) return "--pin requires --session=<label>\n";
     const pages = request.parsed.getSwitch("--sync") orelse return null;
     if (assign.labelOf(request) == null) return "--sync requires --session=<label>\n";
     if (pages.len > 0) _ = std.fmt.parseInt(u16, pages, 10) catch
@@ -536,4 +537,22 @@ pub fn restartSession(c: *Conductor, socket: posix.socket_t, request: *const Cli
     const msg = try c.allocator.print("Reset: {s} session '{s}'\n", .{ if (ended) "ended" else "no running", label });
     defer c.allocator.free(msg);
     try replies.serveString(c, socket, msg, 0);
+}
+
+test "--pin and --sync need a session's label" {
+    const pin_refused = "--pin requires --session=<label>\n";
+    const cases = [_]struct { argv: []const []const u8, why: ?[]const u8 }{
+        .{ .argv = &.{ "julia", "--pin" }, .why = pin_refused },
+        .{ .argv = &.{ "julia", "--session", "--pin" }, .why = pin_refused },
+        .{ .argv = &.{ "julia", "--session=lab", "--pin" }, .why = null },
+        .{ .argv = &.{ "julia", "--session=lab", "--sync", "--pin" }, .why = null },
+        .{ .argv = &.{ "julia", "--sync", "--pin" }, .why = pin_refused },
+        .{ .argv = &.{ "julia", "--sync" }, .why = "--sync requires --session=<label>\n" },
+    };
+    for (cases) |case| {
+        var request: ClientRequest = undefined;
+        request.parsed = try args.parse(case.argv);
+        const why = sessionRefusal(&request);
+        if (case.why) |expected| try std.testing.expectEqualStrings(expected, why.?) else try std.testing.expectEqual(null, why);
+    }
 }

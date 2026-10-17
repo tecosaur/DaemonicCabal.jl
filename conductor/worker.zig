@@ -147,6 +147,8 @@ pub const Worker = struct {
     julia_channel: ?[]const u8,
     threads: args.Threads,
     session_label: ?[]const u8,
+    /// Kept by `--pin`: the label never expires, so nothing else claims or culls it.
+    session_pinned: bool = false,
     /// Whether a `--session` client has run here: its `Main` outlives it.
     hosts_session: bool = false,
     created_at: i64,

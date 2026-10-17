@@ -172,6 +172,10 @@ pub fn seatClient(c: *Conductor, socket: posix.socket_t, request: *const ClientR
     const w = assignment.w;
     w.last_pinged = c.currentTime();
     w.recordPpid(request.ppid, c.cfg.worker_maxclients);
+    if (w.session_label != null and !w.session_pinned and request.parsed.hasSwitch("--pin")) {
+        w.log("pinning session '{s}'", .{w.session_label.?});
+        w.session_pinned = true;
+    }
     tracking.registerClient(c, c.client_id, request, w, port_set) catch |err| {
         std.debug.print("Client {d}: cannot track: {}\n", .{ c.client_id, err });
     };
@@ -501,7 +505,7 @@ pub fn getWorkerList(c: *Conductor, key: []const u8) !*WorkerList {
 }
 
 pub fn isLabelExpired(c: *Conductor, w: *worker.Worker, now: i64) bool {
-    if (w.session_label == null or w.busyClients() > 0) return false;
+    if (w.session_label == null or w.session_pinned or w.busyClients() > 0) return false;
     const idle_time: u64 = @intCast(@max(0, now - w.last_active));
     return idle_time >= c.cfg.label_ttl;
 }
@@ -512,6 +516,7 @@ pub fn clearLabel(c: *Conductor, w: *worker.Worker) void {
         w.dropSession(label); // tear down the now-orphaned session REPL before reuse
         c.allocator.free(label);
         w.session_label = null;
+        w.session_pinned = false;
     }
 }
 

@@ -242,3 +242,38 @@ pub fn workerValue(c: *Conductor, w: *worker.Worker, key: []const u8, now: i64, 
 pub fn lessByValue(_: void, a: Candidate, b: Candidate) bool {
     return a.value < b.value;
 }
+
+test "a pinned session's worker outlasts its label's TTL, the TTL cull and pressure" {
+    var c: Conductor = undefined;
+    c.cfg.max_ttl = 7200;
+    c.cfg.min_ttl = 120;
+    c.cfg.label_ttl = 90;
+    c.cfg.worker_maxclients = 1;
+    c.crf = .init(std.testing.allocator);
+    defer c.crf.deinit();
+    c.reserve = null;
+    var w: worker.Worker = .{
+        .allocator = std.testing.allocator,
+        .id = 1,
+        .process = undefined,
+        .socket = platform.no_socket,
+        .project = null,
+        .julia_channel = null,
+        .threads = @import("args.zig").threads_none,
+        .session_label = "lab",
+        .created_at = 0,
+        .spawned_ns = 0,
+        .last_active = 0,
+        .last_pinged = 0,
+        .active_clients = 0,
+    };
+    const long_idle = 2 * 7200;
+    try std.testing.expect(assign.isLabelExpired(&c, &w, long_idle));
+    try std.testing.expect(isExpired(&c, &w, "", long_idle));
+    try std.testing.expect(assign.isWorkerAvailable(&c, &w, false, long_idle));
+    w.session_pinned = true;
+    try std.testing.expect(!assign.isLabelExpired(&c, &w, long_idle));
+    try std.testing.expect(!isExpired(&c, &w, "", long_idle));
+    try std.testing.expect(!inPressureBand(&c, &w, "", 600));
+    try std.testing.expect(!assign.isWorkerAvailable(&c, &w, false, long_idle));
+}

@@ -695,7 +695,7 @@ fn closeStat(w: Writer, s: Style, dim_line: bool, styled: bool) !void {
     if (dim_line) try s.open(w, ansi.dim);
 }
 
-// "  idle 41m · culls in 1h19m", within the line's dim span.
+// "  idle 41m · culls in 1h19m" (or "· pinned"), within the line's dim span.
 fn writeIdleState(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, key: ?[]const u8, now: i64, after_activity: bool) !void {
     const is_reserve = c.reserve == wk;
     try w.writeAll(if (after_activity) " · " else "   ");
@@ -706,7 +706,9 @@ fn writeIdleState(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worke
     }
     try w.writeAll("idle ");
     try writeDuration(w, now - wk.last_active);
-    if (c.cfg.max_ttl > 0) {
+    if (wk.session_pinned) {
+        try w.writeAll(" · pinned");
+    } else if (c.cfg.max_ttl > 0) {
         const budget: i64 = @intCast(eviction.idleBudget(c, wk, key orelse ""));
         try w.writeAll(" · culls in ");
         try writeCullCountdown(w, s, ctx, budget - (now - wk.last_active), @intCast(c.cfg.max_ttl));
@@ -920,7 +922,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     try writeJsonStringOrNull(w, wk.julia_channel);
     try w.writeAll(",\"session_label\":");
     try writeJsonStringOrNull(w, wk.session_label);
-    try w.writeAll(",\"threads\":");
+    try w.print(",\"pinned\":{},\"threads\":", .{wk.session_pinned});
     const threads_str = try argspec.renderThreads(c.allocator, wk.threads);
     defer if (threads_str) |t| c.allocator.free(t);
     try writeJsonStringOrNull(w, threads_str);

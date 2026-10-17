@@ -98,6 +98,8 @@ const client_switches_help =
     \\                            multiple clients can share the same session.
     \\ --sync[=<pages>]           Attach to shared REPL (requires --session=<label>),
     \\                            replaying up to <pages> of it (0 for all)
+    \\ --pin                      Keep the --session=<label> until --restart ends it,
+    \\                            however long it idles
     \\ --revise[=yes|no*]         Enable or disable Revise.jl integration
     \\ --restart                  Kill workers for the project (or just the
     \\                            --session=<label>'s) and exit
