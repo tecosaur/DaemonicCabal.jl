@@ -630,7 +630,8 @@ const mem_trend_headroom = 1.5; // beyond what the bars need, so a small rise ke
 
 // "mem ▃▃▄▅▅ 822M ── cpu ▁▁█▇▅ 37%": each bar tinted as the row tints its
 // value, memory on the trend's held scale, CPU spanning a core, or its peak
-// where busier. Not yet sampled, a slot is a dim `░`. Faded, all of it is dim.
+// where busier. Not yet sampled, a slot is a dim `░`. Faded, all of it is
+// grey: dim, uncoloured.
 fn writeTrend(ctx: Ctx, s: Style, w: Writer, wk: *const Worker, trend: *const Trend) !void {
     var cpu_peak: f64 = 1;
     for (0..trend.count) |i| cpu_peak = @max(cpu_peak, trend.at(i).cpu);
@@ -680,14 +681,12 @@ fn writeBar(ctx: Ctx, s: Style, w: Writer, tint: Tint, colour_frac: f64, height:
 // As the row tints its figures; without the terminal's palette, the
 // 8-colour steps of the same scale. Caller closes.
 fn openTrendTint(ctx: Ctx, s: Style, w: Writer, tint: Tint, frac: f64) !void {
-    if (ctx.tints) |t| {
-        try t.open(w, tint, frac);
-    } else if (s.enabled) {
-        try w.writeAll(if (tint == .mem)
-            (if (frac < 0.5) ansi.green else if (frac < 0.8) ansi.yellow else ansi.red)
-        else if (frac < 0.5) ansi.blue else ansi.magenta);
-    }
-    if (ctx.faded) try s.open(w, ansi.dim);
+    if (ctx.faded) return s.open(w, ansi.dim);
+    if (ctx.tints) |t| return t.open(w, tint, frac);
+    if (!s.enabled) return;
+    try w.writeAll(if (tint == .mem)
+        (if (frac < 0.5) ansi.green else if (frac < 0.8) ansi.yellow else ansi.red)
+    else if (frac < 0.5) ansi.blue else ansi.magenta);
 }
 
 // After the first focusable row, just added to `ctx.focusable`.
@@ -698,15 +697,11 @@ fn writeHint(ctx: Ctx, s: Style, w: Writer) !void {
     try s.wrap(w, ansi.dim, " to inspect");
 }
 
-// Pair with `closeStat`. False when the value just inherits the line's dim.
+// Pair with `closeStat`. False when the value just inherits the line's dim,
+// as an idle worker's do: grey, as the rest of its line.
 fn openStat(w: Writer, s: Style, ctx: Ctx, dim_line: bool, tint: Tint, t_frac: f64) !bool {
-    if (ctx.tints) |t| {
-        if (dim_line) try s.open(w, ansi.dim);
-        try t.open(w, tint, t_frac);
-        return true;
-    }
     if (dim_line) return false;
-    try s.open(w, ansi.dim);
+    if (ctx.tints) |t| try t.open(w, tint, t_frac) else try s.open(w, ansi.dim);
     return true;
 }
 
