@@ -252,15 +252,15 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
         for (pane.gutter) |part| try out.appendSlice(gpa, part);
         const line = if (row < pane.body.len) pane.body[row] else "";
         // A run's divider is drawn dim, as the border it joins, the run it
-        // names italic.
+        // names in magenta italic.
         const rule = runRule(line);
-        var italic: std.ArrayList(u8) = .empty;
-        defer italic.deinit(gpa);
+        var marked: std.ArrayList(u8) = .empty;
+        defer marked.deinit(gpa);
         if (rule) |r| {
             const named = "run ".len + (std.mem.findNone(u8, r["run ".len..], "0123456789") orelse r.len - "run ".len);
-            try italic.print(gpa, "\x1b[3m{s}\x1b[23m{s}", .{ r[0..named], r[named..] });
+            try marked.print(gpa, "\x1b[3;35m{s}\x1b[0;2m{s}", .{ r[0..named], r[named..] });
         }
-        const text = if (rule != null) italic.items else line;
+        const text = if (rule != null) marked.items else line;
         const room = if (rule != null) inner - 2 else inner;
         if (rule != null) {
             try out.appendSlice(gpa, "├─╼ ");
@@ -269,10 +269,8 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
             if (pane.dim_body) try out.appendSlice(gpa, dim);
         }
         const cursor = pane.cursor_last and pane.cursor_shown and row + 1 == pane.body.len;
-        // A dimmed body is grey throughout, its own colours dropped; a
-        // divider, grey already, keeps its italic.
-        const coloured = styled and (rule != null or !pane.dim_body);
-        const used = try appendLine(out, gpa, text, room, coloured, if (cursor) pane.cursor_sgr else null, rule != null);
+        // A dimmed body is grey throughout, its own colours dropped.
+        const used = try appendLine(out, gpa, text, room, styled and !pane.dim_body, if (cursor) pane.cursor_sgr else null);
         if (styled) try out.appendSlice(gpa, reset);
         try out.appendNTimes(gpa, ' ', room - used);
         try out.print(gpa, " {s}│{s}\n", .{ dim, reset });
@@ -315,14 +313,13 @@ fn writeBorder(out: *std.ArrayList(u8), gpa: std.mem.Allocator, style: [2][]cons
 /// (CSI C, D, G) and erasing (CSI K, X). Colour (SGR) is kept when `colour`,
 /// and other escape sequences leave nothing. Invalid UTF-8 shows as U+FFFD.
 pub fn appendColumns(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool) !usize {
-    return appendLine(out, gpa, line, max, colour, null, false);
+    return appendLine(out, gpa, line, max, colour, null);
 }
 
 /// As `appendColumns`, with where the line leaves the cursor marked `▎`, in
 /// `cursor`'s SGR colour, when given and nothing is drawn there: a prompt
-/// awaiting input. `faint` keeps a dim already open through the line's
-/// own colours.
-pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool, cursor: ?[]const u8, faint: bool) !usize {
+/// awaiting input.
+pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool, cursor: ?[]const u8) !usize {
     var row = Row{};
     row.draw(line, @min(max, Row.max_cols));
     if (cursor) |sgr| row.markCursor(@min(max, Row.max_cols), sgr);
@@ -331,7 +328,6 @@ pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const
         if (colour and cell.style != style) {
             var buf: [Sgr.max_bytes]u8 = undefined;
             try out.appendSlice(gpa, row.styles.get(cell.style).sequence(&buf));
-            if (faint) try out.appendSlice(gpa, "\x1b[2m");
             style = cell.style;
         }
         try out.appendSlice(gpa, row.shown(k));
@@ -863,19 +859,19 @@ test "cursor: marked where nothing is drawn, not over text" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    _ = try appendLine(&out, gpa, "julia> ", 40, false, "90", false);
+    _ = try appendLine(&out, gpa, "julia> ", 40, false, "90");
     try std.testing.expectEqualStrings("julia> ▎", out.items);
     out.clearRetainingCapacity();
-    _ = try appendLine(&out, gpa, "julia> ", 40, true, "90", false);
+    _ = try appendLine(&out, gpa, "julia> ", 40, true, "90");
     try std.testing.expectEqualStrings("julia> \x1b[0;90m▎\x1b[0m", out.items);
     out.clearRetainingCapacity();
-    _ = try appendLine(&out, gpa, "julia> 1+1\x1b[2D", 40, false, "90", false);
+    _ = try appendLine(&out, gpa, "julia> 1+1\x1b[2D", 40, false, "90");
     try std.testing.expectEqualStrings("julia> 1+1", out.items);
     out.clearRetainingCapacity();
-    _ = try appendLine(&out, gpa, "a b\x1b[2D", 40, false, "90", false);
+    _ = try appendLine(&out, gpa, "a b\x1b[2D", 40, false, "90");
     try std.testing.expectEqualStrings("a▎b", out.items);
     out.clearRetainingCapacity();
-    _ = try appendLine(&out, gpa, "ab\x1b[3C", 40, false, "90", false);
+    _ = try appendLine(&out, gpa, "ab\x1b[3C", 40, false, "90");
     try std.testing.expectEqualStrings("ab   ▎", out.items);
 }
 
@@ -932,10 +928,16 @@ test "pane: a run's divider joins the left border" {
         \\╰──────────────────────────────────────╯
         \\
     , out.items);
-    // Styled, the run it names is italic, and all of it dim.
+    // Styled, the run it names is magenta and italic, the rest dim; in a
+    // dimmed pane, all of it grey.
     out.clearRetainingCapacity();
     try writePane(&out, gpa, true, pane, 40, 6);
-    try std.testing.expect(std.mem.find(u8, out.items, "├─╼ \x1b[0;3m\x1b[2mrun 2\x1b[0m\x1b[2m · 17:43:56") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "├─╼ \x1b[0;3;35mrun 2\x1b[0;2m · 17:43:56") != null);
+    out.clearRetainingCapacity();
+    var dimmed = pane;
+    dimmed.dim_body = true;
+    try writePane(&out, gpa, true, dimmed, 40, 6);
+    try std.testing.expect(std.mem.find(u8, out.items, "├─╼ run 2 · 17:43:56") != null);
 }
 
 test "pane: framed to its size, labels in the borders" {
