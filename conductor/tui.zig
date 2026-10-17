@@ -241,16 +241,38 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
     for (0..height -| 2) |row| {
         try out.appendSlice(gpa, dim);
         for (pane.gutter) |part| try out.appendSlice(gpa, part);
-        try out.print(gpa, "│{s} ", .{reset});
-        if (pane.dim_body) try out.appendSlice(gpa, dim);
-        const text = if (row < pane.body.len) pane.body[row] else "";
+        const line = if (row < pane.body.len) pane.body[row] else "";
+        // A run's divider is drawn dim, as the border it joins, the run it
+        // names italic.
+        const rule = runRule(line);
+        var italic: std.ArrayList(u8) = .empty;
+        defer italic.deinit(gpa);
+        if (rule) |r| {
+            const named = "run ".len + (std.mem.findNone(u8, r["run ".len..], "0123456789") orelse r.len - "run ".len);
+            try italic.print(gpa, "\x1b[3m{s}\x1b[23m{s}", .{ r[0..named], r[named..] });
+        }
+        const text = if (rule != null) italic.items else line;
+        const room = if (rule != null) inner - 2 else inner;
+        if (rule != null) {
+            try out.appendSlice(gpa, "├─╼ ");
+        } else {
+            try out.print(gpa, "│{s} ", .{reset});
+            if (pane.dim_body) try out.appendSlice(gpa, dim);
+        }
         const cursor = pane.cursor_last and pane.cursor_shown and row + 1 == pane.body.len;
-        const used = try appendLine(out, gpa, text, inner, styled, if (cursor) pane.cursor_sgr else null);
+        const used = try appendLine(out, gpa, text, room, styled, if (cursor) pane.cursor_sgr else null);
         if (styled) try out.appendSlice(gpa, reset);
-        try out.appendNTimes(gpa, ' ', inner - used);
+        try out.appendNTimes(gpa, ' ', room - used);
         try out.print(gpa, " {s}│{s}\n", .{ dim, reset });
     }
     try writeBorder(out, gpa, .{ dim, reset }, pane.gutter, "╰─", "╯", pane.footer, "", width);
+}
+
+// What follows `── ` in the dim line the worker heads each run with, and
+// ends a failed one with.
+fn runRule(line: []const u8) ?[]const u8 {
+    const text = std.mem.cutPrefix(u8, line, "\x1b[2m") orelse line;
+    return if (std.mem.startsWith(u8, text, "── run ")) text["── ".len..] else null;
 }
 
 // "╭─ label ──── aside ─╮", the label cut to fit.
@@ -863,6 +885,28 @@ test "pane: an aside at the top border's end, the title cut for it" {
         \\╰──────────────────────╯
         \\
     , out.items);
+}
+
+test "pane: a run's divider joins the left border" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const body = [_][]const u8{ "julia>", "\x1b[2m── run 2 · 17:43:56 · juliaclient\x1b[22m", "\x1b[2m── run 2 exited with code 1\x1b[22m", "── runs" };
+    const pane = Pane{ .title = "t", .footer = "", .body = &body };
+    try writePane(&out, gpa, false, pane, 40, 6);
+    try std.testing.expectEqualStrings(
+        \\╭─ t ──────────────────────────────────╮
+        \\│ julia>                               │
+        \\├─╼ run 2 · 17:43:56 · juliaclient     │
+        \\├─╼ run 2 exited with code 1           │
+        \\│ ── runs                              │
+        \\╰──────────────────────────────────────╯
+        \\
+    , out.items);
+    // Styled, the run it names is italic, and all of it dim.
+    out.clearRetainingCapacity();
+    try writePane(&out, gpa, true, pane, 40, 6);
+    try std.testing.expect(std.mem.find(u8, out.items, "├─╼ \x1b[0;3m\x1b[2mrun 2\x1b[0m\x1b[2m · 17:43:56") != null);
 }
 
 test "pane: framed to its size, labels in the borders" {
