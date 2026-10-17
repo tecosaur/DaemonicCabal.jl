@@ -130,8 +130,9 @@ pub const readPsiSomeAvg10 = shared.readPsiSomeAvg10;
 pub const readMemInfo = shared.readMemInfo;
 /// The ports the system picks a listener's from, given port 0.
 pub const ephemeralPorts = impl.ephemeralPorts;
-/// What ran a process, wrappers such as `timeout` passed over: its name, and
-/// for ourselves its pid, which a client sends as its shell's.
+/// What ran a process, wrappers such as `timeout` passed over: its name,
+/// followed by theirs (`zsh, timeout`), and for ourselves its pid, which a
+/// client sends as its shell's.
 pub const launcherName = shared.launcherName;
 pub const launcherPid = shared.launcherPid;
 pub const setTcpNodelay = shared.setTcpNodelay;

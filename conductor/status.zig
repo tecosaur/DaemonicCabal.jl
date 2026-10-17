@@ -793,7 +793,7 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             const label_start = w.list.items.len;
             try s.wrap(w, ansi.dim, if (info.watcher) "Watcher " else "Client ");
             try w.print("{d}", .{info.pid});
-            var name_buf: [64]u8 = undefined;
+            var name_buf: [128]u8 = undefined;
             if (platform.launcherName(info.pid, &name_buf)) |name| {
                 try w.writeAll(" (");
                 _ = try writeUntrusted(w, name);

@@ -387,26 +387,34 @@ const max_wrappers = 8; // a launcher nested deeper is none we'd recognise
 pub const Launcher = struct { pid: u32, name: []const u8 };
 
 /// What ran `pid`: its nearest ancestor that isn't a wrapper
-/// (`wrapper_commands`), else the furthest one readable; its name is held
-/// in `buf`. Null where `pid`'s parent can't be read.
+/// (`wrapper_commands`), else the furthest one readable. Its `name`, held in
+/// `buf`, is followed by those of the wrappers passed, outermost first, as
+/// they were typed: `zsh, timeout, nice`. Null where `pid`'s parent can't
+/// be read.
 pub fn launcherOf(pid: u32, buf: []u8) ?Launcher {
+    // Nearest first: `names[found - 1]` is the launcher's.
+    var name_bufs: [max_wrappers + 1][64]u8 = undefined;
+    var names: [max_wrappers + 1][]const u8 = undefined;
     var ancestor = impl.parentPid(@intCast(pid)) orelse return null;
-    var name = impl.processName(ancestor, buf) orelse return null;
-    for (0..max_wrappers) |_| {
+    names[0] = impl.processName(ancestor, &name_bufs[0]) orelse return null;
+    var found: usize = 1;
+    while (found <= max_wrappers) {
         const wrapped = for (wrapper_commands) |command| {
-            if (std.mem.eql(u8, name, command)) break true;
+            if (std.mem.eql(u8, names[found - 1], command)) break true;
         } else false;
         if (!wrapped) break;
         const next = impl.parentPid(ancestor) orelse break;
-        // Read apart, so a failed read leaves `name` whole.
-        var next_buf: [64]u8 = undefined;
-        const next_name = impl.processName(next, &next_buf) orelse break;
-        const n = @min(next_name.len, buf.len);
-        @memcpy(buf[0..n], next_name[0..n]);
+        names[found] = impl.processName(next, &name_bufs[found]) orelse break;
         ancestor = next;
-        name = buf[0..n];
+        found += 1;
     }
-    return .{ .pid = @intCast(ancestor), .name = name };
+    var w = std.Io.Writer.fixed(buf);
+    var i = found;
+    while (i > 0) : (i -= 1) {
+        if (i < found) w.writeAll(", ") catch break;
+        w.writeAll(names[i - 1]) catch break;
+    }
+    return .{ .pid = @intCast(ancestor), .name = w.buffered() };
 }
 
 pub fn launcherName(pid: u32, buf: []u8) ?[]const u8 {
@@ -585,16 +593,25 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     posix.sigaction(posix.SIG.PIPE, &pipe_act, null);
 }
 
-test "a launcher is found past the wrappers between it and its child" {
+test "a launcher is found past the wrappers between it and its child, and named with them" {
     if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
-    var child = try std.process.spawn(io, .{ .argv = &.{ "timeout", "10", "sh", "-c", "echo $$; exec sleep 10" }, .stdout = .pipe });
-    defer child.kill(io);
-    var reader_buf: [64]u8 = undefined;
-    var reader = child.stdout.?.reader(io, &reader_buf);
-    const sh = try std.fmt.parseInt(u32, try reader.interface.takeDelimiterExclusive('\n'), 10);
-    var name_buf: [64]u8 = undefined;
-    const found = launcherOf(sh, &name_buf).?;
-    try std.testing.expectEqual(@as(u32, @intCast(std.os.linux.getpid())), found.pid);
-    try std.testing.expect(!std.mem.eql(u8, found.name, "timeout"));
+    var own_buf: [64]u8 = undefined;
+    const own = impl.processName(std.os.linux.getpid(), &own_buf).?;
+    const cases = [_]struct { argv: []const []const u8, wrappers: []const u8 }{
+        .{ .argv = &.{ "timeout", "10", "sh", "-c", "echo $$; exec sleep 10" }, .wrappers = ", timeout" },
+        .{ .argv = &.{ "timeout", "10", "nice", "timeout", "10", "sh", "-c", "echo $$; exec sleep 10" }, .wrappers = ", timeout, timeout" },
+    };
+    for (cases) |case| {
+        var child = try std.process.spawn(io, .{ .argv = case.argv, .stdout = .pipe });
+        defer child.kill(io);
+        var reader_buf: [64]u8 = undefined;
+        var reader = child.stdout.?.reader(io, &reader_buf);
+        const sh = try std.fmt.parseInt(u32, try reader.interface.takeDelimiterExclusive('\n'), 10);
+        var name_buf: [128]u8 = undefined;
+        const found = launcherOf(sh, &name_buf).?;
+        try std.testing.expectEqual(@as(u32, @intCast(std.os.linux.getpid())), found.pid);
+        var want_buf: [128]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "{s}{s}", .{ own, case.wrappers }), found.name);
+    }
 }
