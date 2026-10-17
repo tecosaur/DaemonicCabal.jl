@@ -45,6 +45,7 @@ const max_tail_bytes = 64 << 10;
 const max_pane_rows = 16; // a preview: ⏎ shows the whole
 const note_s = 4; // how long an action's outcome stays in the pane's border
 const resample_s = 5; // a snapshot still sampling is not asked for again sooner
+const replay_wait_ms = 1000; // a watch replays its transcript at once: none by then is none recorded
 const alternate_screen = "\x1b[?7h\x1b[?1049h\x1b[H\x1b[2J";
 const main_screen = "\x1b[0m\x1b[?1049l\x1b[?7l";
 const profile_follows = "The profile follows once the session yields.";
@@ -131,6 +132,7 @@ const Subscriber = struct {
     note: Note = .{},
     view: View = .transcript, // what the pane shows of the focus
     output_ns: i64 = 0, // when the preview's session last wrote: its cursor blinks from then
+    attached_ns: i64 = 0, // when the preview's watch began, its replay due
     cursor_drawn: bool = false, // the last frame's pane marked a cursor
     paging: bool = false, // the view, full-screen
     scroll: usize = 0, // the pager's top line
@@ -423,7 +425,7 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: tui.Focus, out: *std.ArrayL
     var hint_buf: [480]u8 = undefined;
     const hint = latestEntry(c, f.worker, &hint_buf);
     const body: []const []const u8 = if (sub.view != .transcript) view_lines.items else switch (sub.preview) {
-        .pending => &.{},
+        .pending => &.{"Loading records…"},
         .unsessioned => &.{"Transcripts are only available in sessions."},
         .busy => &.{ "Its worker is busy, so the transcript waits until it yields.", hint },
         .unrecorded => &.{
@@ -431,10 +433,12 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: tui.Focus, out: *std.ArrayL
             "⏎ expands it, recording it from then on; JULIA_DAEMON_RECORD records sessions from their start.",
         },
         .failed => &.{ "The transcript's watch ended in error; trying again.", hint },
-        .transcript => if (sub.tail.items.len == 0)
-            &.{"Nothing recorded yet."}
+        .transcript => if (sub.tail.items.len > 0)
+            tui.lastLines(sub.tail.items, lines_buf[0..@min(lines_buf.len, rows - 2)])
+        else if (c.nowNs() - sub.attached_ns < replay_wait_ms * std.time.ns_per_ms)
+            &.{"Loading records…"}
         else
-            tui.lastLines(sub.tail.items, lines_buf[0..@min(lines_buf.len, rows - 2)]),
+            &.{"Nothing recorded yet."},
     };
     var footer_buf: [256]u8 = undefined;
     const cursor_sgr = pal.Sgr.muted(sub.term.palette); // the grey the tree dims with
@@ -916,6 +920,7 @@ fn attach(c: *Conductor, sub: *Subscriber, w: *worker.Worker, follow: bool) Prev
         return .{ .failed = c.currentTime() };
     };
     sub.attachment = a;
+    sub.attached_ns = c.nowNs();
     watch(c, &a.output);
     watch(c, &a.signals);
     return .transcript;
