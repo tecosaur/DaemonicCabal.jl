@@ -279,9 +279,11 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
 }
 
 // What follows `── ` in the dim line the worker heads each run with, and
-// ends a failed one with.
+// ends a failed one with. Sequences that draw nothing may lead it: its dim,
+// and whatever the run before left off with.
 fn runRule(line: []const u8) ?[]const u8 {
-    const text = std.mem.cutPrefix(u8, line, "\x1b[2m") orelse line;
+    var text = line;
+    while (text.len > 0 and text[0] == 0x1b) text = text[escapeLength(text)..];
     return if (std.mem.startsWith(u8, text, "── run ")) text["── ".len..] else null;
 }
 
@@ -916,14 +918,16 @@ test "pane: a run's divider joins the left border" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    const body = [_][]const u8{ "julia>", "\x1b[2m── run 2 · 17:43:56 · juliaclient\x1b[22m", "\x1b[2m── run 2 exited with code 1\x1b[22m", "── runs" };
+    // A REPL leaving bracketed paste as it ends puts that before the next run's.
+    const body = [_][]const u8{ "julia>", "\x1b[2m── run 2 · 17:43:56 · juliaclient\x1b[22m", "\x1b[2m── run 2 exited with code 1\x1b[22m", "\x1b[?2004l\x1b[2m── run 3 · 17:44:02 · juliaclient\x1b[22m", "── runs" };
     const pane = Pane{ .title = "t", .footer = "", .body = &body };
-    try writePane(&out, gpa, false, pane, 40, 6);
+    try writePane(&out, gpa, false, pane, 40, 7);
     try std.testing.expectEqualStrings(
         \\╭─ t ──────────────────────────────────╮
         \\│ julia>                               │
         \\├─╼ run 2 · 17:43:56 · juliaclient     │
         \\├─╼ run 2 exited with code 1           │
+        \\├─╼ run 3 · 17:44:02 · juliaclient     │
         \\│ ── runs                              │
         \\╰──────────────────────────────────────╯
         \\
@@ -931,12 +935,12 @@ test "pane: a run's divider joins the left border" {
     // Styled, the run it names is magenta and italic, the rest dim; in a
     // dimmed pane, all of it grey.
     out.clearRetainingCapacity();
-    try writePane(&out, gpa, true, pane, 40, 6);
+    try writePane(&out, gpa, true, pane, 40, 7);
     try std.testing.expect(std.mem.find(u8, out.items, "├─╼ \x1b[0;3;35mrun 2\x1b[0;2m · 17:43:56") != null);
     out.clearRetainingCapacity();
     var dimmed = pane;
     dimmed.dim_body = true;
-    try writePane(&out, gpa, true, dimmed, 40, 6);
+    try writePane(&out, gpa, true, dimmed, 40, 7);
     try std.testing.expect(std.mem.find(u8, out.items, "├─╼ run 2 · 17:43:56") != null);
 }
 
