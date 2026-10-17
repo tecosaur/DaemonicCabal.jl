@@ -48,7 +48,7 @@ pub const Options = struct {
     tty: bool = false,
     palette: ?*const pal.Palette = null,
     scope: Scope = .host,
-    focus: ?u32 = null, // a client id, marked in the tree
+    focus: ?tui.Focus = null, // marked in the tree
     trend: ?*const Trend = null, // the focused worker's, charted beside its row
     hint: bool = false, // "↓ to inspect" on the first focusable row
 };
@@ -117,8 +117,8 @@ pub const Trend = struct {
 };
 
 /// Whether the live view focuses workers rather than clients: where each
-/// holds one session, the worker is the session. Its focus then names the
-/// worker's first client.
+/// holds one session, the worker is the session, its first client acting
+/// for it. Otherwise a worker is focused only once its clients have gone.
 pub fn focusesWorkers(c: *const Conductor) bool {
     return c.cfg.worker_maxclients == 1;
 }
@@ -169,20 +169,20 @@ const View = struct {
     }
 };
 
-/// `lines` is for the live view's cursor-up redraw; `clients` are the tree's
-/// focusable clients, top to bottom (none for JSON); `placement` is where
+/// `lines` is for the live view's cursor-up redraw; `focusable` are the
+/// tree's focusable rows, top to bottom (none for JSON); `placement` is where
 /// the focused row is, for the live view's pane; `aside` charts the focused
 /// worker's `trend`, to stand for the row's `stats`.
 pub const Report = struct {
     bytes: []u8,
     lines: usize,
-    clients: []u32,
+    focusable: []tui.Focus,
     placement: ?Placement = null,
     aside: []u8 = &.{},
 
     pub fn deinit(self: Report, gpa: std.mem.Allocator) void {
         gpa.free(self.bytes);
-        gpa.free(self.clients);
+        gpa.free(self.focusable);
         gpa.free(self.aside);
     }
 };
@@ -212,8 +212,8 @@ pub const Placement = struct {
 pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(c.allocator);
-    var clients: std.ArrayList(u32) = .empty;
-    errdefer clients.deinit(c.allocator);
+    var focusable: std.ArrayList(tui.Focus) = .empty;
+    errdefer focusable.deinit(c.allocator);
     var placement: ?Placement = null;
     var aside: std.ArrayList(u8) = .empty;
     errdefer aside.deinit(c.allocator);
@@ -224,15 +224,15 @@ pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
         try renderJson(c, w, view, now);
     } else {
         const tints: ?Tints = if (!opts.tty) null else if (opts.palette) |p| .{ .palette = p } else null;
-        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .clients = &clients, .placement = &placement, .trend = opts.trend, .aside = &aside, .hint = opts.hint };
+        const ctx = Ctx{ .tints = tints, .mem_ceiling = memCeiling(view), .focus = opts.focus, .focusable = &focusable, .placement = &placement, .trend = opts.trend, .aside = &aside, .hint = opts.hint };
         try renderTree(c, w, Style{ .enabled = opts.tty }, ctx, view, now);
     }
     const lines = std.mem.count(u8, buf.items, "\n");
     const bytes = try buf.toOwnedSlice(c.allocator);
     errdefer c.allocator.free(bytes);
-    const owned_clients = try clients.toOwnedSlice(c.allocator);
-    errdefer c.allocator.free(owned_clients);
-    return .{ .bytes = bytes, .lines = lines, .clients = owned_clients, .placement = placement, .aside = try aside.toOwnedSlice(c.allocator) };
+    const owned_focusable = try focusable.toOwnedSlice(c.allocator);
+    errdefer c.allocator.free(owned_focusable);
+    return .{ .bytes = bytes, .lines = lines, .focusable = owned_focusable, .placement = placement, .aside = try aside.toOwnedSlice(c.allocator) };
 }
 
 // --- Styling -----------------------------------------------------------------
@@ -315,12 +315,17 @@ const Tints = struct {
 const Ctx = struct {
     tints: ?Tints, // the terminal's palette, for a styled tree
     mem_ceiling: u64,
-    focus: ?u32,
-    clients: *std.ArrayList(u32), // focusable, in drawing order
+    focus: ?tui.Focus,
+    focusable: *std.ArrayList(tui.Focus), // in drawing order
     placement: *?Placement,
     trend: ?*const Trend,
     aside: *std.ArrayList(u8),
     hint: bool,
+    faded: bool = false, // the trend's, of an idle worker
+
+    fn isFocused(self: Ctx, focus: tui.Focus) bool {
+        return if (self.focus) |f| std.meta.eql(f, focus) else false;
+    }
 };
 
 // --- Health ------------------------------------------------------------------
@@ -497,9 +502,12 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     const dim_line = health == .inactive;
     const pad = if (nested) indent ++ indent else indent;
     const start = w.list.items.len;
-    const session = if (focusesWorkers(c)) firstClient(c, wk) else null;
-    if (session) |id| try ctx.clients.append(w.gpa, id);
-    const focused = session != null and ctx.focus == session;
+    const holds_session = wk.session_label != null or wk.hosts_session;
+    const has_client = firstClient(c, wk) != null;
+    const focusable = if (focusesWorkers(c)) has_client or holds_session else holds_session and !has_client;
+    const focus = tui.Focus{ .worker = wk.id };
+    if (focusable) try ctx.focusable.append(w.gpa, focus);
+    const focused = focusable and ctx.isFocused(focus);
     try w.writeAll(pad);
     try s.wrap(w, ansi.dim, if (is_last) "╰─ " else "├─ ");
     const label_start = w.list.items.len;
@@ -511,14 +519,18 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *Worker, key: 
     const stats_start = w.list.items.len;
     try writeStats(w, s, ctx, wk, dim_line);
     const stats_end = w.list.items.len;
-    if (focused) if (ctx.trend) |trend| try writeTrend(ctx, s, Writer{ .list = ctx.aside, .gpa = w.gpa }, wk, trend);
+    if (focused) if (ctx.trend) |trend| {
+        var trend_ctx = ctx;
+        trend_ctx.faded = dim_line;
+        try writeTrend(trend_ctx, s, Writer{ .list = ctx.aside, .gpa = w.gpa }, wk, trend);
+    };
     const showed_activity = c.pressure_monitor.active();
     if (showed_activity) try writeActivity(c, w, s, ctx, wk, key, now, dim_line);
     if (health == .inactive) try writeIdleState(c, w, s, ctx, wk, key, now, showed_activity);
     if (dim_line) try s.close(w);
     const label_end = w.list.items.len;
     if (focused) try s.wrap(w, ansi.bold ++ ansi.cyan, "  ◀");
-    if (session != null) try writeHint(ctx, s, w);
+    if (focusable) try writeHint(ctx, s, w);
     try w.writeByte('\n');
     if (focused) ctx.placement.* = .{
         .start = start,
@@ -618,7 +630,7 @@ const mem_trend_headroom = 1.5; // beyond what the bars need, so a small rise ke
 
 // "mem ▃▃▄▅▅ 822M ── cpu ▁▁█▇▅ 37%": each bar tinted as the row tints its
 // value, memory on the trend's held scale, CPU spanning a core, or its peak
-// where busier. Not yet sampled, a slot is a dim `░`.
+// where busier. Not yet sampled, a slot is a dim `░`. Faded, all of it is dim.
 fn writeTrend(ctx: Ctx, s: Style, w: Writer, wk: *const Worker, trend: *const Trend) !void {
     var cpu_peak: f64 = 1;
     for (0..trend.count) |i| cpu_peak = @max(cpu_peak, trend.at(i).cpu);
@@ -626,7 +638,7 @@ fn writeTrend(ctx: Ctx, s: Style, w: Writer, wk: *const Worker, trend: *const Tr
     const ceiling: f64 = @floatFromInt(@max(ctx.mem_ceiling, 1));
     const mem_frac = @min(1.0, @as(f64, @floatFromInt(wk.mem)) / ceiling);
     const cpu_frac = @min(1.0, wk.cpu.util);
-    try w.writeAll("mem ");
+    if (ctx.faded) try s.wrap(w, ansi.dim, "mem ") else try w.writeAll("mem ");
     try writeUnsampled(ctx, s, w, .mem, mem_frac, Trend.bar_count - trend.count);
     for (0..trend.count) |i| {
         const mem = trend.at(i).mem;
@@ -637,7 +649,7 @@ fn writeTrend(ctx: Ctx, s: Style, w: Writer, wk: *const Worker, trend: *const Tr
     try writeBytes(w, wk.mem);
     try s.close(w);
     try s.wrap(w, ansi.dim, " ── ");
-    try w.writeAll("cpu ");
+    if (ctx.faded) try s.wrap(w, ansi.dim, "cpu ") else try w.writeAll("cpu ");
     try writeUnsampled(ctx, s, w, .cpu, cpu_frac, Trend.bar_count - trend.count);
     for (0..trend.count) |i| {
         const cpu = trend.at(i).cpu;
@@ -668,16 +680,19 @@ fn writeBar(ctx: Ctx, s: Style, w: Writer, tint: Tint, colour_frac: f64, height:
 // As the row tints its figures; without the terminal's palette, the
 // 8-colour steps of the same scale. Caller closes.
 fn openTrendTint(ctx: Ctx, s: Style, w: Writer, tint: Tint, frac: f64) !void {
-    if (ctx.tints) |t| return t.open(w, tint, frac);
-    if (!s.enabled) return;
-    try w.writeAll(if (tint == .mem)
-        (if (frac < 0.5) ansi.green else if (frac < 0.8) ansi.yellow else ansi.red)
-    else if (frac < 0.5) ansi.blue else ansi.magenta);
+    if (ctx.tints) |t| {
+        try t.open(w, tint, frac);
+    } else if (s.enabled) {
+        try w.writeAll(if (tint == .mem)
+            (if (frac < 0.5) ansi.green else if (frac < 0.8) ansi.yellow else ansi.red)
+        else if (frac < 0.5) ansi.blue else ansi.magenta);
+    }
+    if (ctx.faded) try s.open(w, ansi.dim);
 }
 
-// After the first focusable row, just added to `ctx.clients`.
+// After the first focusable row, just added to `ctx.focusable`.
 fn writeHint(ctx: Ctx, s: Style, w: Writer) !void {
-    if (!ctx.hint or ctx.clients.items.len != 1) return;
+    if (!ctx.hint or ctx.focusable.items.len != 1) return;
     try s.wrap(w, ansi.dim, " · ");
     try s.wrap(w, ansi.bold, "↓");
     try s.wrap(w, ansi.dim, " to inspect");
@@ -771,8 +786,9 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
             if (info.worker != wk or info.watcher != watchers or info.internal) continue;
             seen += 1;
             const focusable = !watchers and !by_worker;
-            const focused = !by_worker and ctx.focus == entry.key_ptr.*;
-            if (focusable) try ctx.clients.append(w.gpa, entry.key_ptr.*);
+            const focus = tui.Focus{ .client = entry.key_ptr.* };
+            const focused = focusable and ctx.isFocused(focus);
+            if (focusable) try ctx.focusable.append(w.gpa, focus);
             const start = w.list.items.len;
             const last = seen == total;
             try w.writeAll(base);
@@ -812,7 +828,7 @@ fn renderClients(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker
 }
 
 // The worker's client of lowest id, watchers aside: the session it holds.
-fn firstClient(c: *Conductor, wk: *const Worker) ?u32 {
+pub fn firstClient(c: *Conductor, wk: *const Worker) ?u32 {
     var first: ?u32 = null;
     var it = c.active_clients.iterator();
     while (it.next()) |entry| {

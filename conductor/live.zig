@@ -3,7 +3,7 @@
 //
 // `--status` redrawn in place at a terminal: the styled one-shot, which waits
 // a beat so its CPU meter resolves, and `--status=live`, a small TUI whose
-// keys move a focus over the clients and act on it.
+// keys move a focus over the clients and sessions and act on it.
 //
 // A change with no timer armed repaints at once; a burst only sets `dirty`.
 // Each fire re-arms fast if dirty, else at the heartbeat, until no
@@ -33,6 +33,7 @@ const replies = @import("replies.zig");
 const eviction = @import("eviction.zig");
 const tracking = @import("tracking.zig");
 const assign = @import("assign.zig");
+const retire = @import("retire.zig");
 const ClientStreams = Conductor.ClientStreams;
 
 const debounce_ms = 100;
@@ -75,7 +76,25 @@ const Snapshot = struct {
 
 const Size = terminal.Size;
 
-/// What the pane shows of the focused client.
+/// What a focus stands for: a session's worker, and the client acting for it
+/// while one does; `session` is whether it has a transcript.
+const Focused = struct { worker: *worker.Worker, client: ?u32, session: bool };
+
+fn resolve(c: *Conductor, focus: tui.Focus) ?Focused {
+    switch (focus) {
+        .client => |id| {
+            const info = c.active_clients.get(id) orelse return null;
+            return .{ .worker = info.worker, .client = id, .session = info.session };
+        },
+        .worker => |id| {
+            const w = c.findWorkerById(id) orelse return null;
+            const client = status.firstClient(c, w) orelse return .{ .worker = w, .client = null, .session = true };
+            return .{ .worker = w, .client = client, .session = c.active_clients.get(client).?.session };
+        },
+    }
+}
+
+/// What the pane shows of the focus.
 const Preview = union(enum) {
     pending,
     unsessioned, // a plain client, which has no transcript
@@ -100,15 +119,15 @@ const Subscriber = struct {
     scope: status.Scope,
     oneshot: bool, // draw one CPU-resolved frame, then disconnect
     // The live view's:
-    focus: ?u32 = null, // a client id
+    focus: ?tui.Focus = null,
     focus_row: usize = 0, // its place in the tree, for when it leaves
-    order: []u32 = &.{}, // the focusable clients last drawn, top to bottom
+    order: []tui.Focus = &.{}, // the focusable rows last drawn, top to bottom
     following: bool = false, // the focused session, full-screen
-    target: ?u32 = null, // the client `preview` and `tail` are of
+    target: ?tui.Focus = null, // what `preview` and `tail` are of
     preview: Preview = .pending,
     tail: std.ArrayList(u8) = .empty,
     attachment: ?*Attachment = null,
-    confirming: ?u32 = null, // the client `t` would terminate, awaiting y/n
+    confirming: ?tui.Focus = null, // what `t` would terminate, awaiting y/n
     note: Note = .{},
     view: View = .transcript, // what the pane shows of the focus
     output_ns: i64 = 0, // when the preview's session last wrote: its cursor blinks from then
@@ -328,8 +347,8 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
         }
     }.f;
     var report = try render(c, sub);
-    const kept = tui.keepFocus(report.clients, sub.focus, sub.focus_row);
-    if (kept != sub.focus) {
+    const kept = tui.keepFocus(report.focusable, sub.focus, sub.focus_row);
+    if (!std.meta.eql(kept, sub.focus)) {
         sub.focus = kept;
         report.deinit(c.allocator);
         report = try render(c, sub);
@@ -341,7 +360,7 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     defer frame.deinit(c.allocator);
     var lines = report.lines;
     const placed = if (sub.focus) |focus| placed: {
-        sub.focus_row = std.mem.findScalar(u32, report.clients, focus) orelse 0;
+        sub.focus_row = tui.findFocus(report.focusable, focus) orelse 0;
         break :placed report.placement;
     } else null;
     // The pane encloses the focused row, its top border; the frame stays a
@@ -369,16 +388,16 @@ fn composeFrame(c: *Conductor, sub: *Subscriber, out: *std.ArrayList(u8)) !usize
     if (shown < lines) try out.appendSlice(c.allocator, "\x1b[0m"); // a style open across the cut
     try out.appendSlice(c.allocator, "\x1b[?2026l");
     c.allocator.free(sub.order);
-    sub.order = report.clients;
-    report.clients = &.{};
+    sub.order = report.focusable;
+    report.focusable = &.{};
     return shown;
 }
 
 // The focused row, as the tree drew it at `at`, is the pane's title; a
 // worker's charts, where they fit, stand at its end for the row's own
-// memory and CPU.
-fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8), at: status.Placement, report: status.Report, rows: usize) !void {
-    const info = c.active_clients.get(focus) orelse return;
+// memory and CPU. A session no client runs is drawn dim.
+fn writePane(c: *Conductor, sub: *Subscriber, focus: tui.Focus, out: *std.ArrayList(u8), at: status.Placement, report: status.Report, rows: usize) !void {
+    const f = resolve(c, focus) orelse return;
     // The tree's column alignment is no use in a title.
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(c.allocator);
@@ -397,12 +416,12 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
     defer view_lines.deinit(c.allocator);
     var view_text: std.ArrayList(u8) = .empty;
     defer view_text.deinit(c.allocator);
-    const snap = if (sub.view == .stacktrace) findSnapshot(c, info.worker.id) else null;
-    if (snap) |sn| try snapshotLines(c.allocator, sn, focus, &view_lines);
-    if (sub.view == .log) try logLines(c, info.worker, rows - 2, &view_text, &view_lines);
+    const snap = if (sub.view == .stacktrace) findSnapshot(c, f.worker.id) else null;
+    if (snap) |sn| try snapshotLines(c.allocator, sn, f.client orelse 0, &view_lines);
+    if (sub.view == .log) try logLines(c, f.worker, rows - 2, &view_text, &view_lines);
     // Where the transcript can't be read, the latest the worker's log has.
     var hint_buf: [480]u8 = undefined;
-    const hint = latestEntry(c, info.worker, &hint_buf);
+    const hint = latestEntry(c, f.worker, &hint_buf);
     const body: []const []const u8 = if (sub.view != .transcript) view_lines.items else switch (sub.preview) {
         .pending => &.{},
         .unsessioned => &.{"Transcripts are only available in sessions."},
@@ -420,14 +439,14 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
     var footer_buf: [256]u8 = undefined;
     const cursor_sgr = pal.Sgr.muted(sub.term.palette); // the grey the tree dims with
     // Output mid-line, such as a prompt, leaves the cursor on its last.
-    sub.cursor_drawn = sub.view == .transcript and sub.preview == .transcript and
+    sub.cursor_drawn = f.client != null and sub.view == .transcript and sub.preview == .transcript and
         sub.tail.items.len > 0 and sub.tail.items[sub.tail.items.len - 1] != '\n';
     try tui.writePane(out, c.allocator, true, .{
         .title = if (fits) charted.items else row.items,
         .aside = if (fits) report.aside else "",
-        .footer = paneFooter(c, sub, info, snap, &footer_buf),
+        .footer = paneFooter(c, sub, f, snap, &footer_buf),
         .body = body,
-        .dim_body = sub.view == .transcript and (sub.preview != .transcript or sub.tail.items.len == 0),
+        .dim_body = f.client == null or sub.view == .transcript and (sub.preview != .transcript or sub.tail.items.len == 0),
         .cursor_last = sub.cursor_drawn,
         // Steady while the session writes, then a second off, a second on.
         .cursor_shown = @mod(@divTrunc(c.nowNs() - sub.output_ns, std.time.ns_per_s), 2) == 0,
@@ -439,13 +458,15 @@ fn writePane(c: *Conductor, sub: *Subscriber, focus: u32, out: *std.ArrayList(u8
 
 // The pane's bottom border: the terminate prompt, an action's outcome, or
 // the keys the pane's view takes.
-fn paneFooter(c: *Conductor, sub: *const Subscriber, info: main.ActiveClientInfo, snap: ?*const Snapshot, buf: *[256]u8) []const u8 {
-    if (sub.confirming) |id| {
-        const whole = info.session and (info.sync or info.worker.session_label != null);
-        return std.mem.print(buf, "terminate client {d}{s}? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } }), .{
-            if (c.active_clients.get(id)) |target| target.pid else id,
-            if (whole) " and its session" else "",
-        }) catch "terminate? " ++ comptime hints(&.{ .{ "y", "" }, .{ "n", "" } });
+fn paneFooter(c: *Conductor, sub: *const Subscriber, f: Focused, snap: ?*const Snapshot, buf: *[256]u8) []const u8 {
+    if (sub.confirming) |target| {
+        const yes_no = comptime hints(&.{ .{ "y", "" }, .{ "n", "" } });
+        const t = resolve(c, target) orelse return "terminate? " ++ yes_no;
+        const info = c.active_clients.get(t.client orelse return "terminate this session? " ++ yes_no).?;
+        return std.mem.print(buf, "terminate client {d}{s}? " ++ yes_no, .{
+            info.pid,
+            if (endsSession(info)) " and its session" else "",
+        }) catch "terminate? " ++ yes_no;
     }
     if (sub.note.text(c.currentTime())) |note| return note;
     if (snap) |sn| return if (sn.report == null)
@@ -453,13 +474,26 @@ fn paneFooter(c: *Conductor, sub: *const Subscriber, info: main.ActiveClientInfo
     else
         comptime hints(&.{ .{ "⏎", "expand" }, .{ "s", "again" }, .{ "Esc", "transcript" }, .{ "q", "quit" } });
     if (sub.view == .log) return comptime hints(&.{ .{ "⏎", "expand" }, .{ "Esc", "transcript" }, .{ "q", "quit" } });
-    const views = if (info.session)
+    // A session no client runs has no code to interrupt or sample.
+    const views = if (f.client == null)
+        comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "expand" }, .{ "l", "log" } })
+    else if (f.session)
         comptime hints(&.{ .{ "↑↓", "focus" }, .{ "⏎", "expand" }, .{ "s", "stacktrace" }, .{ "l", "log" } })
     else
         comptime hints(&.{ .{ "↑↓", "focus" }, .{ "s", "stacktrace" }, .{ "l", "log" } });
-    const w = info.worker;
+    const w = f.worker;
     const pin = if (w.session_label == null) "" else if (w.session_pinned) comptime hints(&.{.{ "p", "unpin" }}) ++ " · " else comptime hints(&.{.{ "p", "pin" }}) ++ " · ";
-    return std.mem.print(buf, "{s} · {s}" ++ comptime hints(&.{ .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } }), .{ views, pin }) catch views;
+    const actions = if (f.client == null)
+        comptime hints(&.{ .{ "t", "terminate" }, .{ "q", "quit" } })
+    else
+        comptime hints(&.{ .{ "i", "interrupt" }, .{ "t", "terminate" }, .{ "q", "quit" } });
+    return std.mem.print(buf, "{s} · {s}{s}", .{ views, pin, actions }) catch views;
+}
+
+// Whether terminating the client ends its session too: one its worker holds
+// (labelled, or `--sync`).
+fn endsSession(info: main.ActiveClientInfo) bool {
+    return info.session and (info.sync or info.worker.session_label != null);
 }
 
 fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
@@ -478,9 +512,9 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
             pagerKey(c, sub, key);
             continue;
         }
-        if (sub.confirming) |id| {
+        if (sub.confirming) |target| {
             sub.confirming = null;
-            if (key == .char and key.char == 'y') terminate(c, sub, id);
+            if (key == .char and key.char == 'y') terminate(c, sub, target);
             repaint(c, sub);
             continue;
         }
@@ -490,12 +524,12 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
                     sub.term.gone = true;
                     return;
                 },
-                'i' => if (sub.focus) |focus| interrupt(c, sub, focus),
+                'i' => if (focusedClient(c, sub)) |client| interrupt(c, sub, client),
                 't' => if (sub.focus) |focus| {
                     sub.confirming = focus;
                     repaint(c, sub);
                 },
-                's' => if (sub.focus) |focus| takeSnapshot(c, sub, focus),
+                's' => if (focusedClient(c, sub)) |client| takeSnapshot(c, sub, c.active_clients.get(client).?.worker),
                 'p' => if (sub.focus) |focus| togglePin(c, sub, focus),
                 'l' => if (sub.focus != null) {
                     sub.view = if (sub.view == .log) .transcript else .log;
@@ -530,6 +564,11 @@ fn onKeys(c: *Conductor, sub: *Subscriber, bytes: []const u8) void {
     }
 }
 
+// The client acting for the focus, if one is.
+fn focusedClient(c: *Conductor, sub: *const Subscriber) ?u32 {
+    return (resolve(c, sub.focus orelse return null) orelse return null).client;
+}
+
 // As a client's Ctrl-C, for whichever of the focused client's evaluations runs.
 fn interrupt(c: *Conductor, sub: *Subscriber, focus: u32) void {
     const info = c.active_clients.get(focus) orelse return;
@@ -539,11 +578,18 @@ fn interrupt(c: *Conductor, sub: *Subscriber, focus: u32) void {
 }
 
 // The focused client's run, or its whole session when the session is the
-// worker's own (labelled or `--sync`), which then goes with its label.
-fn terminate(c: *Conductor, sub: *Subscriber, focus: u32) void {
-    const info = c.active_clients.get(focus) orelse return;
-    const w = info.worker;
-    const whole = info.session and (info.sync or w.session_label != null);
+// worker's own (labelled or `--sync`), which then goes with its label. A
+// session no client runs ends with its worker, as `--restart` ends it.
+fn terminate(c: *Conductor, sub: *Subscriber, target: tui.Focus) void {
+    const f = resolve(c, target) orelse return;
+    const w = f.worker;
+    const focus = f.client orelse {
+        retire.retireWorker(c, w);
+        sub.note.set(c.currentTime(), "ended the session", .{});
+        return noteChange(c);
+    };
+    const info = c.active_clients.get(focus).?;
+    const whole = endsSession(info);
     var buf: [256]u32 = undefined;
     var ids: std.ArrayList(u32) = .initBuffer(&buf);
     var it = c.active_clients.iterator();
@@ -566,8 +612,8 @@ fn terminate(c: *Conductor, sub: *Subscriber, focus: u32) void {
 }
 
 // A labelled session's pin, as `--pin` sets it.
-fn togglePin(c: *Conductor, sub: *Subscriber, focus: u32) void {
-    const w = (c.active_clients.get(focus) orelse return).worker;
+fn togglePin(c: *Conductor, sub: *Subscriber, focus: tui.Focus) void {
+    const w = (resolve(c, focus) orelse return).worker;
     const label = w.session_label orelse return;
     w.session_pinned = !w.session_pinned;
     w.log("{s} session '{s}'", .{ if (w.session_pinned) "pinning" else "unpinning", label });
@@ -578,8 +624,7 @@ fn togglePin(c: *Conductor, sub: *Subscriber, focus: u32) void {
 // Julia's runtime writes the stacks to stderr at once and samples a profile,
 // whose report the worker sends once it yields. Where Julia takes no such
 // signal, the worker is asked, and samples itself.
-fn takeSnapshot(c: *Conductor, sub: *Subscriber, focus: u32) void {
-    const w = (c.active_clients.get(focus) orelse return).worker;
+fn takeSnapshot(c: *Conductor, sub: *Subscriber, w: *worker.Worker) void {
     sub.view = .stacktrace;
     const now = c.currentTime();
     const snap = snapshotOf(c, w.id) orelse return;
@@ -621,19 +666,18 @@ fn clientSection(report: []const u8, client: u32) []const u8 {
 // the view changes; a scroll of less than a screen moves what is shown (in a
 // scroll region, above the status line) and draws only the lines it brings in.
 fn drawPager(c: *Conductor, sub: *Subscriber) void {
-    const focus = sub.focus orelse return;
-    const info = c.active_clients.get(focus) orelse return;
+    const f = resolve(c, sub.focus orelse return) orelse return;
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(c.allocator);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(c.allocator);
     const shown: u64 = switch (sub.view) {
         .log => shown: {
-            logLines(c, info.worker, logring.max_entries, &text, &lines) catch return;
-            break :shown logShown(&info.worker.recent, c.currentTime(), sub.term.size);
+            logLines(c, f.worker, logring.max_entries, &text, &lines) catch return;
+            break :shown logShown(&f.worker.recent, c.currentTime(), sub.term.size);
         },
         else => shown: {
-            const snap = findSnapshot(c, info.worker.id) orelse return;
+            const snap = findSnapshot(c, f.worker.id) orelse return;
             pagerLines(c.allocator, snap, &lines) catch return;
             break :shown pagerShown(snap, sub.term.size);
         },
@@ -648,7 +692,7 @@ fn drawPager(c: *Conductor, sub: *Subscriber) void {
     const bottom = @min(lines.items.len, top + rows);
     writePager(c, sub, &out, lines.items, top, bottom, rows, if (same) sub.pager_top.? else null) catch return;
     out.print(c.allocator, "\x1b[{d};1H\x1b[2K\x1b[7m worker #{d} · lines {d}–{d} of {d} · \x1b[1m↑↓ PgUp PgDn g G\x1b[22m · \x1b[1mq\x1b[22m back \x1b[0m\x1b[?2026l", .{
-        sub.term.size.rows, info.worker.id, top + 1, bottom, lines.items.len,
+        sub.term.size.rows, f.worker.id, top + 1, bottom, lines.items.len,
     }) catch return;
     sub.term.send(c.allocator, out.items);
     sub.pager_top = top;
@@ -809,9 +853,8 @@ fn recordTrends(c: *Conductor) void {
 }
 
 fn focusedTrend(c: *Conductor, sub: *const Subscriber) ?*const status.Trend {
-    const focus = sub.focus orelse return null;
-    const info = c.active_clients.get(focus) orelse return null;
-    return c.live.trends.getPtr(info.worker.id);
+    const f = resolve(c, sub.focus orelse return null) orelse return null;
+    return c.live.trends.getPtr(f.worker.id);
 }
 
 // --- The focused client's session ---
@@ -821,7 +864,7 @@ fn focusedTrend(c: *Conductor, sub: *const Subscriber) ?*const status.Trend {
 /// its worker was busy or its session unrecorded.
 fn retarget(c: *Conductor, sub: *Subscriber) void {
     if (sub.following) return;
-    if (sub.target != sub.focus) {
+    if (!std.meta.eql(sub.target, sub.focus)) {
         detach(c, sub);
         sub.target = sub.focus;
         sub.preview = .pending;
@@ -829,21 +872,20 @@ fn retarget(c: *Conductor, sub: *Subscriber) void {
     }
     const focus = sub.focus orelse return;
     if (sub.attachment != null) return;
-    const info = c.active_clients.get(focus) orelse return;
+    const f = resolve(c, focus) orelse return;
     switch (sub.preview) {
         .pending => {},
         .busy, .unrecorded, .failed => |since| if (c.currentTime() - since < 1) return,
         else => return,
     }
-    sub.preview = if (info.session) attach(c, sub, info.worker, false) else .unsessioned;
+    sub.preview = if (f.session) attach(c, sub, f.worker, false) else .unsessioned;
 }
 
 fn enterFollow(c: *Conductor, sub: *Subscriber) void {
-    const focus = sub.focus orelse return;
-    const info = c.active_clients.get(focus) orelse return;
-    if (!info.session) return;
+    const f = resolve(c, sub.focus orelse return) orelse return;
+    if (!f.session) return;
     detach(c, sub);
-    switch (attach(c, sub, info.worker, true)) {
+    switch (attach(c, sub, f.worker, true)) {
         .transcript => {},
         else => |failed| {
             sub.preview = failed;

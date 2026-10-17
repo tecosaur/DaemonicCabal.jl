@@ -12,6 +12,7 @@ const status = @import("status.zig");
 const live = @import("live.zig");
 const reconfigure = @import("reconfigure.zig");
 const pal = @import("palette.zig");
+const tui = @import("tui.zig");
 
 const main = @import("main.zig");
 const Conductor = main.Conductor;
@@ -111,7 +112,7 @@ pub fn serveStatus(c: *Conductor, client_socket: posix.socket_t, switch_value: ?
     streams.finish(report.bytes, 0);
 }
 
-pub fn renderStatus(c: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette, scope: status.Scope, focus: ?u32, trend: ?*const status.Trend, hint: bool) !status.Report {
+pub fn renderStatus(c: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette, scope: status.Scope, focus: ?tui.Focus, trend: ?*const status.Trend, hint: bool) !status.Report {
     return status.render(c, .{
         .format = format,
         .tty = tty,

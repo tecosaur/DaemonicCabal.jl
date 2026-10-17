@@ -152,14 +152,18 @@ fn isWordByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte >= 0x80;
 }
 
-/// The focus after `key` over `order`, the focusable clients top to bottom:
+/// A live view's focus: a client's row, or a worker's, which stands for the
+/// session it holds, with or without a client.
+pub const Focus = union(enum) { client: u32, worker: u32 };
+
+/// The focus after `key` over `order`, the focusable rows top to bottom:
 /// down from none takes the first, up from the first lets go.
-pub fn moveFocus(order: []const u32, focus: ?u32, key: Key) ?u32 {
+pub fn moveFocus(order: []const Focus, focus: ?Focus, key: Key) ?Focus {
     const current = focus orelse return switch (key) {
         .down => if (order.len > 0) order[0] else null,
         else => null,
     };
-    const i = std.mem.findScalar(u32, order, current) orelse return null;
+    const i = findFocus(order, current) orelse return null;
     return switch (key) {
         .down => order[@min(i + 1, order.len - 1)],
         .up => if (i == 0) null else order[i - 1],
@@ -168,12 +172,17 @@ pub fn moveFocus(order: []const u32, focus: ?u32, key: Key) ?u32 {
     };
 }
 
-/// The focus once `order` has changed: kept while its client is listed, else
-/// the client now at its row, else none.
-pub fn keepFocus(order: []const u32, focus: ?u32, row: usize) ?u32 {
+/// The focus once `order` has changed: kept while its row is listed, else
+/// the row now at its place, else none.
+pub fn keepFocus(order: []const Focus, focus: ?Focus, row: usize) ?Focus {
     const current = focus orelse return null;
-    if (std.mem.findScalar(u32, order, current) != null) return current;
+    if (findFocus(order, current) != null) return current;
     return if (order.len > 0) order[@min(row, order.len - 1)] else null;
+}
+
+pub fn findFocus(order: []const Focus, focus: Focus) ?usize {
+    for (order, 0..) |f, i| if (std.meta.eql(f, focus)) return i;
+    return null;
 }
 
 /// The last lines of `text`, at most `out.len`, oldest first; a final
@@ -260,7 +269,10 @@ pub fn writePane(out: *std.ArrayList(u8), gpa: std.mem.Allocator, styled: bool, 
             if (pane.dim_body) try out.appendSlice(gpa, dim);
         }
         const cursor = pane.cursor_last and pane.cursor_shown and row + 1 == pane.body.len;
-        const used = try appendLine(out, gpa, text, room, styled, if (cursor) pane.cursor_sgr else null);
+        // A dimmed body is grey throughout, its own colours dropped; a
+        // divider, grey already, keeps its italic.
+        const coloured = styled and (rule != null or !pane.dim_body);
+        const used = try appendLine(out, gpa, text, room, coloured, if (cursor) pane.cursor_sgr else null, rule != null);
         if (styled) try out.appendSlice(gpa, reset);
         try out.appendNTimes(gpa, ' ', room - used);
         try out.print(gpa, " {s}│{s}\n", .{ dim, reset });
@@ -303,13 +315,14 @@ fn writeBorder(out: *std.ArrayList(u8), gpa: std.mem.Allocator, style: [2][]cons
 /// (CSI C, D, G) and erasing (CSI K, X). Colour (SGR) is kept when `colour`,
 /// and other escape sequences leave nothing. Invalid UTF-8 shows as U+FFFD.
 pub fn appendColumns(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool) !usize {
-    return appendLine(out, gpa, line, max, colour, null);
+    return appendLine(out, gpa, line, max, colour, null, false);
 }
 
 /// As `appendColumns`, with where the line leaves the cursor marked `▎`, in
 /// `cursor`'s SGR colour, when given and nothing is drawn there: a prompt
-/// awaiting input.
-pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool, cursor: ?[]const u8) !usize {
+/// awaiting input. `faint` keeps a dim already open through the line's
+/// own colours.
+pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const u8, max: usize, colour: bool, cursor: ?[]const u8, faint: bool) !usize {
     var row = Row{};
     row.draw(line, @min(max, Row.max_cols));
     if (cursor) |sgr| row.markCursor(@min(max, Row.max_cols), sgr);
@@ -318,6 +331,7 @@ pub fn appendLine(out: *std.ArrayList(u8), gpa: std.mem.Allocator, line: []const
         if (colour and cell.style != style) {
             var buf: [Sgr.max_bytes]u8 = undefined;
             try out.appendSlice(gpa, row.styles.get(cell.style).sequence(&buf));
+            if (faint) try out.appendSlice(gpa, "\x1b[2m");
             style = cell.style;
         }
         try out.appendSlice(gpa, row.shown(k));
@@ -704,24 +718,29 @@ test "keys: an ESC before another key is Alt with it, skipped, not Escape" {
 }
 
 test "focus moves down from none and lets go up from the first" {
-    const order = [_]u32{ 7, 3, 9 };
-    try std.testing.expectEqual(@as(?u32, 7), moveFocus(&order, null, .down));
-    try std.testing.expectEqual(@as(?u32, null), moveFocus(&order, null, .up));
-    try std.testing.expectEqual(@as(?u32, 3), moveFocus(&order, 7, .down));
-    try std.testing.expectEqual(@as(?u32, 9), moveFocus(&order, 9, .down));
-    try std.testing.expectEqual(@as(?u32, null), moveFocus(&order, 7, .up));
-    try std.testing.expectEqual(@as(?u32, 7), moveFocus(&order, 3, .up));
-    try std.testing.expectEqual(@as(?u32, null), moveFocus(&order, 3, .escape));
-    try std.testing.expectEqual(@as(?u32, null), moveFocus(&.{}, null, .down));
+    const a = Focus{ .client = 7 };
+    const b = Focus{ .worker = 7 };
+    const z = Focus{ .client = 9 };
+    const order = [_]Focus{ a, b, z };
+    try std.testing.expectEqual(@as(?Focus, a), moveFocus(&order, null, .down));
+    try std.testing.expectEqual(@as(?Focus, null), moveFocus(&order, null, .up));
+    try std.testing.expectEqual(@as(?Focus, b), moveFocus(&order, a, .down));
+    try std.testing.expectEqual(@as(?Focus, z), moveFocus(&order, z, .down));
+    try std.testing.expectEqual(@as(?Focus, null), moveFocus(&order, a, .up));
+    try std.testing.expectEqual(@as(?Focus, a), moveFocus(&order, b, .up));
+    try std.testing.expectEqual(@as(?Focus, null), moveFocus(&order, b, .escape));
+    try std.testing.expectEqual(@as(?Focus, null), moveFocus(&.{}, null, .down));
 }
 
-test "a vanished focus passes to the client at its row" {
-    const order = [_]u32{ 7, 9 };
-    try std.testing.expectEqual(@as(?u32, 9), keepFocus(&order, 9, 1));
-    try std.testing.expectEqual(@as(?u32, 9), keepFocus(&order, 3, 1));
-    try std.testing.expectEqual(@as(?u32, 9), keepFocus(&order, 3, 5));
-    try std.testing.expectEqual(@as(?u32, null), keepFocus(&.{}, 3, 0));
-    try std.testing.expectEqual(@as(?u32, null), keepFocus(&order, null, 0));
+test "a vanished focus passes to the row in its place" {
+    const a = Focus{ .client = 7 };
+    const z = Focus{ .worker = 9 };
+    const order = [_]Focus{ a, z };
+    try std.testing.expectEqual(@as(?Focus, z), keepFocus(&order, z, 1));
+    try std.testing.expectEqual(@as(?Focus, z), keepFocus(&order, .{ .client = 9 }, 1));
+    try std.testing.expectEqual(@as(?Focus, z), keepFocus(&order, .{ .client = 3 }, 5));
+    try std.testing.expectEqual(@as(?Focus, null), keepFocus(&.{}, a, 0));
+    try std.testing.expectEqual(@as(?Focus, null), keepFocus(&order, null, 0));
 }
 
 test "a frame taller than the screen scrolls only to keep the focus in view" {
@@ -844,19 +863,19 @@ test "cursor: marked where nothing is drawn, not over text" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    _ = try appendLine(&out, gpa, "julia> ", 40, false, "90");
+    _ = try appendLine(&out, gpa, "julia> ", 40, false, "90", false);
     try std.testing.expectEqualStrings("julia> ▎", out.items);
     out.clearRetainingCapacity();
-    _ = try appendLine(&out, gpa, "julia> ", 40, true, "90");
+    _ = try appendLine(&out, gpa, "julia> ", 40, true, "90", false);
     try std.testing.expectEqualStrings("julia> \x1b[0;90m▎\x1b[0m", out.items);
     out.clearRetainingCapacity();
-    _ = try appendLine(&out, gpa, "julia> 1+1\x1b[2D", 40, false, "90");
+    _ = try appendLine(&out, gpa, "julia> 1+1\x1b[2D", 40, false, "90", false);
     try std.testing.expectEqualStrings("julia> 1+1", out.items);
     out.clearRetainingCapacity();
-    _ = try appendLine(&out, gpa, "a b\x1b[2D", 40, false, "90");
+    _ = try appendLine(&out, gpa, "a b\x1b[2D", 40, false, "90", false);
     try std.testing.expectEqualStrings("a▎b", out.items);
     out.clearRetainingCapacity();
-    _ = try appendLine(&out, gpa, "ab\x1b[3C", 40, false, "90");
+    _ = try appendLine(&out, gpa, "ab\x1b[3C", 40, false, "90", false);
     try std.testing.expectEqualStrings("ab   ▎", out.items);
 }
 
@@ -885,6 +904,16 @@ test "pane: an aside at the top border's end, the title cut for it" {
         \\╰──────────────────────╯
         \\
     , out.items);
+}
+
+test "pane: a dimmed body is grey, its own colours dropped" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const pane = Pane{ .title = "t", .footer = "", .body = &.{"\x1b[31mred\x1b[0m plain"}, .dim_body = true };
+    try writePane(&out, gpa, true, pane, 20, 3);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[2mred plain") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "31m") == null);
 }
 
 test "pane: a run's divider joins the left border" {
