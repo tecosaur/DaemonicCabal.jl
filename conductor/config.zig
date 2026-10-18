@@ -82,19 +82,7 @@ pub const Config = struct {
         errdefer allocator.free(socket_path);
         const transport = parsed.mode;
         {
-            // The longest socket made there: locally a client's reply socket or a
-            // worker's own, over TCP only a worker's setup socket. A sandboxed
-            // worker's (Linux only) sit a subdirectory deeper.
-            const sandbox_dir = if (builtin.os.tag == .linux)
-                std.fmt.comptimePrint("/sandbox-{d}", .{std.math.maxInt(u32)})
-            else
-                "";
-            // A worker names its own with its random id, then a random suffix.
-            const worker_socket = if (builtin.os.tag.isDarwin()) "/w-abcdef-abcdefgh.sock" else "/worker-abcdef-abcdefgh.sock";
-            const name_len = switch (transport) {
-                .local => @max("/0123456789abcdef-signals.sock".len, sandbox_dir.len + worker_socket.len),
-                .tcp => sandbox_dir.len + "/0123456789abcdef-wsetup.sock".len,
-            };
+            const name_len = longestSocketName(transport);
             const most = platform.max_local_addr - 1;
             if (socket_dir.len + name_len > most) {
                 std.debug.print(
@@ -190,6 +178,22 @@ fn parsePortRange(s: ?[]const u8) !?Config.PortRange {
     return .{ .base = range[0], .count = settings.portSets(range) };
 }
 
+/// The longest path a socket made in the runtime directory takes beyond it:
+/// locally a client's reply socket or a worker's own, over TCP only a worker's
+/// setup socket. A sandboxed worker's (Linux only) sit a subdirectory deeper.
+fn longestSocketName(transport: protocol.TransportMode) usize {
+    const sandbox_dir = if (builtin.os.tag == .linux)
+        std.fmt.comptimePrint("/sandbox-{d}", .{std.math.maxInt(u32)})
+    else
+        "";
+    // A worker names its own with its random id, then a random suffix.
+    const worker_socket = if (builtin.os.tag.isDarwin()) "/w-abcdef-abcdefgh.sock" else "/worker-abcdef-abcdefgh.sock";
+    return switch (transport) {
+        .local => @max("/0123456789abcdef-signals.sock".len, sandbox_dir.len + worker_socket.len),
+        .tcp => sandbox_dir.len + "/0123456789abcdef-wsetup.sock".len,
+    };
+}
+
 fn testEnv(setting: [2][]const u8) !std.process.Environ.Map {
     var env: std.process.Environ.Map = .init(std.testing.allocator);
     errdefer env.deinit();
@@ -239,7 +243,7 @@ test "a TCP server's host is where everything listens" {
 }
 
 test "a runtime directory too long for its sockets is refused" {
-    const name_len = "/0123456789abcdef-signals.sock".len;
+    const name_len = comptime longestSocketName(.local);
     const longest = "/" ++ @as([platform.max_local_addr - 1 - name_len - 1]u8, @splat('d'));
     var fits = try testEnv(.{ "JULIA_DAEMON_RUNTIME", longest });
     defer fits.deinit();
