@@ -137,6 +137,7 @@ end
 struct ClientInfo
     tty::Bool
     color::Bool
+    stderr_tty::Bool
     force::Bool  # bypass capacity (labelled sessions, watchers)
     size::Union{Nothing, Tuple{Int, Int}}  # its terminal's, as it started; nothing without one
     id::Int      # conductor-assigned
@@ -168,7 +169,7 @@ function read_client_run(conn::IO)
     programfile = if read(conn, UInt8) != 0 read_string(conn) end
     args = String[read_string(conn) for _ in 1:read(conn, UInt32)]
     port_set = Int(read(conn, UInt16))
-    ClientInfo((flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x04) != 0,
+    ClientInfo((flags & 0x01) != 0, (flags & 0x02) != 0, (flags & 0x08) != 0, (flags & 0x04) != 0,
                size, id, key, cwd, env, switches, programfile, args, port_set)
 end
 

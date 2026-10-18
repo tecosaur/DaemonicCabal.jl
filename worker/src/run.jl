@@ -47,7 +47,7 @@ function warm_repl_path()
                 write(cin.in, "1+1\n")
                 close(cin.in)
             catch end)
-            client = ClientInfo(true, true, false, nothing, 0, 0, pwd(),
+            client = ClientInfo(true, true, true, false, nothing, 0, 0, pwd(),
                                 ["TERM" => "xterm-256color", "JULIA_DAEMON_REVISE" => "no"],
                                 [("--history-file", "no")],
                                 nothing, String[], PORT_SET_NONE)
@@ -275,7 +275,8 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
                 client_vterm = VirtualTerm(
                     input, run_stdout, run_stderr, signals,
                     term, sync_session,
-                    get(TERMINFOS, term, nothing), color, nothing; stdout_is_terminal)
+                    get(TERMINFOS, term, nothing), color, nothing;
+                    stdout_is_terminal, stderr_is_terminal = client.stderr_tty)
                 @with(ACTIVE_TERM => client_vterm,
                       CLIENT_MODULE => mod,
                       CLIENT_INTERACTIVE => interactive,

@@ -482,7 +482,7 @@ fn keepConductor(connection: protocol.Connection, runtime_dir: []const u8) posix
 
 fn sendClientInfo(w: *SocketWriter, env: EnvInfo, is_tty: bool, color: bool, env_follows: bool, forwarded: []const [*:0]const u8) !void {
     w.writeInt(u32, protocol.client.magic);
-    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color, .env_follows = env_follows }));
+    w.writeInt(u8, @bitCast(protocol.client.Flags{ .tty = is_tty, .color = color, .env_follows = env_follows, .stderr_tty = platform.isatty(platform.getStderrHandle()) }));
     w.writeSlice(&.{ 0, 0, 0 });
     w.writeInt(u32, @intCast(platform.getpid()));
     w.writeInt(u32, platform.launcherPid());

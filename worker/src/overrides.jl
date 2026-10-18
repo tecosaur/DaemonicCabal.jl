@@ -218,6 +218,21 @@ end
     extra::Base.Redirectable...,
 ) = Base.Redirectable[in, out, err, extra...]
 
+# Precompilation draws its progress only on a `Base.TTY`, which a client's
+# streams never are here: on one that stands for a terminal, it does too.
+@static if VERSION >= v"1.11"
+    function client_can_fancyprint(io::IO)
+        forced = get(io, :force_fancyprint, nothing)
+        isnothing(forced) || return forced
+        stream = first(Base.unwrapcontext(io))
+        terminal = stream isa Base.TTY ||
+            (stream isa ScopedStderr && ACTIVE_TERM[].stderr_is_terminal) ||
+            (stream isa Union{ScopedStdout, TerminalStdout} && ACTIVE_TERM[].stdout_is_terminal)
+        terminal && get(ENV, "CI", nothing) != "true"
+    end
+    @eval Base.Precompilation.can_fancyprint(io::IO) = $client_can_fancyprint(io)
+end
+
 # Base writes Core's streams to fds 1 and 2, the conductor's. `Core.print` still
 # does, for Base's last-resort errors.
 @static if VERSION >= v"1.11"

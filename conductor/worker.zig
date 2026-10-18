@@ -783,7 +783,7 @@ pub const Worker = struct {
         const send_buf = try allocator.alloc(u8, payload_size);
         defer allocator.free(send_buf);
         var w = BufWriter{ .buf = send_buf };
-        w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .color = client_info.color, .force = client_info.force }));
+        w.writeInt(u8, @bitCast(protocol.worker.Flags{ .tty = client_info.tty, .color = client_info.color, .force = client_info.force, .stderr_tty = client_info.stderr_tty }));
         w.writeInt(u32, client_info.id);
         w.writeInt(u64, client_info.key);
         w.writeSlice(&client_info.size.encode());
@@ -868,6 +868,7 @@ pub fn socketDir(buf: []u8, socket_dir: []const u8, launch: Worker.LaunchKind, i
 pub const ClientInfo = struct {
     tty: bool,
     color: bool,
+    stderr_tty: bool = false,
     force: bool, // bypass the worker's capacity check
     size: protocol.TerminalSize = .{}, // the client's terminal's, as it started
     id: u32, // conductor-assigned

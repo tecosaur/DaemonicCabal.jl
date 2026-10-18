@@ -63,6 +63,7 @@ pub fn clientInfo(c: *const Conductor, request: *const ClientRequest, port_set: 
     return .{
         .tty = request.flags.tty,
         .color = request.flags.color,
+        .stderr_tty = request.flags.stderr_tty,
         .force = labelOf(request) != null,
         .size = request.size,
         .id = c.client_id,

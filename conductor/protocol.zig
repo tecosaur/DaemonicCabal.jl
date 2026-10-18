@@ -153,7 +153,8 @@ pub const client = struct {
         color: bool = false,
         /// The full environment follows the args, as `env_request` would ask.
         env_follows: bool = false,
-        _reserved: u5 = 0,
+        stderr_tty: bool = false,
+        _reserved: u4 = 0,
     };
 };
 
@@ -222,7 +223,8 @@ pub const worker = struct {
         tty: bool,
         color: bool = false,
         force: bool = false, // bypass the capacity check, for labelled sessions
-        _reserved: u5 = 0,
+        stderr_tty: bool = false,
+        _reserved: u4 = 0,
     };
 };
 

@@ -13,6 +13,7 @@ mutable struct VirtualTerm
     const term::String
     const sync_session::Union{Nothing, SyncSession}
     const stdout_is_terminal::Bool
+    const stderr_is_terminal::Bool
     terminfo::Union{Nothing, Base.TermInfo}
     have_color::Union{Nothing, Bool}
     have_truecolor::Union{Nothing, Bool}
@@ -21,8 +22,8 @@ mutable struct VirtualTerm
     redirect_err::Union{Nothing, IO}
 end
 VirtualTerm(stdin, stdout, stderr, signals, term, sync_session, terminfo, have_color, have_truecolor;
-            stdout_is_terminal::Bool=true) =
-    VirtualTerm(stdin, stdout, stderr, signals, term, sync_session, stdout_is_terminal,
+            stdout_is_terminal::Bool=true, stderr_is_terminal::Bool=false) =
+    VirtualTerm(stdin, stdout, stderr, signals, term, sync_session, stdout_is_terminal, stderr_is_terminal,
                 terminfo, have_color, have_truecolor, nothing, nothing, nothing)
 
 function unsafe_pipe!(pipe::Base.PipeEndpoint, stream::Union{Base.TTY, Base.PipeEndpoint})
