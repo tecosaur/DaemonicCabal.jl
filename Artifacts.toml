@@ -1,72 +1,106 @@
 [[execbundle]]
 arch = "x86_64"
 os = "linux"
-git-tree-sha1 = "9855c7292594fe8c8389b5027b010925c5eca2bc"
+git-tree-sha1 = "b8ec551f7b611d20031ecf7d4fbfeeebe751d049"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/linux-x86_64.tar.gz"
-    sha256 = "5f94b7530ca246cf2997153e28d15468f23c9262aaef6b4afa84a1f6be1e41d3"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/linux-x86_64.tar.gz"
+    sha256 = "972e96c8d182083e6eca6dbb9289fc907f91c680d5600e91896b4d68378471d1"
 [[execbundle]]
 arch = "aarch64"
 os = "linux"
-git-tree-sha1 = "c893abea14300ddd19875d49a2503675568e509b"
+git-tree-sha1 = "65a85a1a958f69129c37dd6631e43fb96d8e3b06"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/linux-aarch64.tar.gz"
-    sha256 = "a18ce59d84798d6806288cb5933df5d812012f4db652b0198cfa46583f9eec3a"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/linux-aarch64.tar.gz"
+    sha256 = "6bbb74596cd5007d499f35347a5c97bce5b0ae65c968bf41e25770e06c4ab781"
 [[execbundle]]
 arch = "x86_64"
 os = "macos"
-git-tree-sha1 = "0caa21a6cce6cefad50d5c2f2ceb9ab41a7825ca"
+git-tree-sha1 = "cec8c94184d3d3cc590e616786e92463c5cb96f6"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/macos-x86_64.tar.gz"
-    sha256 = "1b842e57828234342694d5a05b37ad332ddd2377b383e6b2ad5af274a9b29e54"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/macos-x86_64.tar.gz"
+    sha256 = "52b2c1d735178e38473a28d3a53038fa6536f5de8dddca6ef809f77636e55431"
 [[execbundle]]
 arch = "aarch64"
 os = "macos"
-git-tree-sha1 = "31992b68e18841a9594a9c4aa9689227d521f2fa"
+git-tree-sha1 = "14f77cd54a3d3c421a802e98f4d6fedab711a86a"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/macos-aarch64.tar.gz"
-    sha256 = "afc3fa8eba547f7e3288ae576afb397a95b691cbaaa896f5a8125ef9f9911818"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/macos-aarch64.tar.gz"
+    sha256 = "cec3143061f36d8b80aa8e8779ce83b925a35168745ef5816bb4a8d0ac8bffe9"
 [[execbundle]]
 arch = "x86_64"
 os = "freebsd"
-git-tree-sha1 = "53508e250df04f91c4228da9e609a2a6776fdd77"
+git-tree-sha1 = "7835c870460d9511f535136d256ef88d0c888956"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/freebsd-x86_64.tar.gz"
-    sha256 = "86097281c5b1bf10b02eda3c7ebc7d864576655e9f4accdfe53997c2ae9c16dc"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/freebsd-x86_64.tar.gz"
+    sha256 = "081a1aac03e821fe136e019a637abb0d909bee0d4e84e638a099bcfa5af2a8b5"
 [[execbundle]]
 arch = "aarch64"
 os = "freebsd"
-git-tree-sha1 = "581d3a8d8434966ca691e1259c326d0dbc5e1b9e"
+git-tree-sha1 = "2979bfd1a10a1fd30c53007d46271c75e8797808"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/freebsd-aarch64.tar.gz"
-    sha256 = "b271d765edb45f0bd5d45c777d30d0f6090afb97acdd20efdc986e88bd7ce6cd"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/freebsd-aarch64.tar.gz"
+    sha256 = "3236b0547a2764f661d6405e7f2e0e2c0f01dbc4d0007479939beb4bb0077b6b"
 [[execbundle]]
 arch = "arm"
 os = "freebsd"
-git-tree-sha1 = "ba57fb363b2045a09c70bb35296a71abd6e65fa8"
+git-tree-sha1 = "53415aef44fea7d60f3d7c9de9d52ec443c10da8"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/freebsd-arm.tar.gz"
-    sha256 = "ce078816e1a242457eecca20ca7a60678b5469fa2549fb762fefd7ab9307ff88"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/freebsd-arm.tar.gz"
+    sha256 = "09c754eea84df4e8fe85142089e78aa11e58d7a866a7ef2bf52101c99b9d0942"
 [[execbundle]]
 arch = "x86_64"
 os = "openbsd"
-git-tree-sha1 = "15b7bf5dc4a05448e8292469929c6adacba0e124"
+git-tree-sha1 = "6939cb95bea9a3a21de238f1bdc6b9505f72add5"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/openbsd-x86_64.tar.gz"
-    sha256 = "f01cb0d023fe05f6918d604f88e39b4841fa0848eeb2ba209e351f584b3f5cb6"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/openbsd-x86_64.tar.gz"
+    sha256 = "581868c121c6338e691f25452a728abc81d35384b58c37dbe263b784967979ca"
 [[execbundle]]
 arch = "aarch64"
 os = "openbsd"
-git-tree-sha1 = "fe766ae95a5f9616bce761d857afbe207f6d8905"
+git-tree-sha1 = "7adf5db9a21173a1729ea0b8ed4aa16982e27a1b"
 
     [[execbundle.download]]
-    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.5.0/openbsd-aarch64.tar.gz"
-    sha256 = "891ac2f383887dd0e27fe249a1980a584f7c94bdccab6fe5332d4703e82a943b"
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/openbsd-aarch64.tar.gz"
+    sha256 = "473a28e2c576fb4d6f17c0c5995cea35cb9d1519252358e2561925c8b9aa1847"
+[[execbundle]]
+arch = "x86_64"
+os = "windows"
+git-tree-sha1 = "f9ff35362558e210718e06270279c8da5018473d"
+
+    [[execbundle.download]]
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/windows-x86_64.tar.gz"
+    sha256 = "7312d81c3260552fa17ff5a0e6838d6415abbd480f18ec3c07f30213f964069b"
+[[execbundle]]
+arch = "aarch64"
+os = "windows"
+git-tree-sha1 = "4d337dd69287e521de9e015f1671ac83aa64d262"
+
+    [[execbundle.download]]
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/windows-aarch64.tar.gz"
+    sha256 = "bb3221005d068d0af83e3f3792426fde9a102a4d15f56dbd8e12ca9e3905ba8d"
+[[execbundle]]
+libc = "musl"
+arch = "x86_64"
+os = "linux"
+git-tree-sha1 = "b8ec551f7b611d20031ecf7d4fbfeeebe751d049"
+
+    [[execbundle.download]]
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/linux-x86_64.tar.gz"
+    sha256 = "972e96c8d182083e6eca6dbb9289fc907f91c680d5600e91896b4d68378471d1"
+[[execbundle]]
+libc = "musl"
+arch = "aarch64"
+os = "linux"
+git-tree-sha1 = "65a85a1a958f69129c37dd6631e43fb96d8e3b06"
+
+    [[execbundle.download]]
+    url = "https://github.com/tecosaur/DaemonicCabal.jl/releases/download/0.6.0/linux-aarch64.tar.gz"
+    sha256 = "6bbb74596cd5007d499f35347a5c97bce5b0ae65c968bf41e25770e06c4ab781"
