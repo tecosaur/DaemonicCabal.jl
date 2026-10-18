@@ -218,19 +218,35 @@ end
     extra::Base.Redirectable...,
 ) = Base.Redirectable[in, out, err, extra...]
 
-# Precompilation draws its progress only on a `Base.TTY`, which a client's
-# streams never are here: on one that stands for a terminal, it does too.
+# Precompilation and Pkg draw their progress only on a `Base.TTY`, which a
+# client's streams never are here: on one that stands for a terminal, they do too.
 @static if VERSION >= v"1.11"
+    function stands_for_terminal(io::IO)
+        stream = first(Base.unwrapcontext(io))
+        stream isa Base.TTY ||
+            (stream isa ScopedStderr && ACTIVE_TERM[].stderr_is_terminal) ||
+            (stream isa Union{ScopedStdout, TerminalStdout} && ACTIVE_TERM[].stdout_is_terminal)
+    end
     function client_can_fancyprint(io::IO)
         forced = get(io, :force_fancyprint, nothing)
         isnothing(forced) || return forced
-        stream = first(Base.unwrapcontext(io))
-        terminal = stream isa Base.TTY ||
-            (stream isa ScopedStderr && ACTIVE_TERM[].stderr_is_terminal) ||
-            (stream isa Union{ScopedStdout, TerminalStdout} && ACTIVE_TERM[].stdout_is_terminal)
-        terminal && get(ENV, "CI", nothing) != "true"
+        stands_for_terminal(io) && get(ENV, "CI", nothing) != "true"
     end
     @eval Base.Precompilation.can_fancyprint(io::IO) = $client_can_fancyprint(io)
+end
+
+# Pkg asks its own `usable_io`, which no key overrides, so it is redefined as
+# Pkg loads: only where it reads as 1.11 to 1.13 have it, a `Base.TTY` test.
+@static if v"1.11" <= VERSION < v"1.14"
+    const PKG_ID = Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg")
+    function on_pkg_load(id::Base.PkgId)
+        id == PKG_ID || return
+        pkg = Base.loaded_modules[id]
+        isdefined(pkg, :usable_io) || return
+        @eval pkg usable_io(io) = $stands_for_terminal(io)
+    end
+    push!(Base.package_callbacks, on_pkg_load)
+    haskey(Base.loaded_modules, PKG_ID) && on_pkg_load(PKG_ID)
 end
 
 # Base writes Core's streams to fds 1 and 2, the conductor's. `Core.print` still
