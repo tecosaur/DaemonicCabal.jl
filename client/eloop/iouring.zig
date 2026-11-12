@@ -8,6 +8,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 
 const platform = @import("../platform/main.zig");
+const platform_linux = @import("../platform/linux.zig");
 const cooked = @import("../cooked.zig");
 const debuglog = @import("../debuglog.zig");
 const typeahead = @import("../typeahead.zig");
@@ -58,7 +59,7 @@ pub fn run(
     // Signals EOF without an exit code means the worker crashed.
     var exit_code: ?u8 = null;
     while (true) {
-        _ = ring.submit_and_wait(1) catch |err| switch (err) {
+        platform_linux.awaitIoUring(ring) catch |err| switch (err) {
             error.SignalInterrupt => continue,
             else => return err,
         };

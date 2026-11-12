@@ -175,9 +175,9 @@ pub fn run(conductor: *Conductor, loop: *EventLoop, listener: *protocol.Listener
         };
     }
     while (true) {
-        _ = ring.submit_and_wait(1) catch |err| {
+        platform_linux.awaitIoUring(ring) catch |err| {
             if (err == error.SignalInterrupt) continue;
-            std.debug.print("Fatal: io_uring submit_and_wait failed: {}\n", .{err});
+            std.debug.print("Fatal: io_uring wait failed: {}\n", .{err});
             return;
         };
         var need_rearm_ping_timer = false;

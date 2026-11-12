@@ -90,6 +90,16 @@ pub fn initIoUring(entries: u16) !linux.IoUring {
     return ring;
 }
 
+// Linux 6.15's, which std lacks.
+const IORING_ENTER_NO_IOWAIT = 1 << 7;
+const IORING_FEAT_NO_IOWAIT = 1 << 17;
+
+/// Submits what is queued and waits for a completion, not as iowait where the kernel allows.
+pub fn awaitIoUring(ring: *linux.IoUring) !void {
+    const no_iowait: u32 = if (ring.features & IORING_FEAT_NO_IOWAIT != 0) IORING_ENTER_NO_IOWAIT else 0;
+    _ = try ring.enter(ring.flush_sq(), 1, linux.IORING_ENTER_GETEVENTS | no_iowait);
+}
+
 fn canExec(path: [*:0]const u8) bool {
     return linux.faccessat(linux.AT.FDCWD, path, linux.X_OK, 0) == 0;
 }
