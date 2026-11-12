@@ -82,6 +82,7 @@ function install_files()
     @info "Installing to $dest"
     mkpath(dest)
     cp(SOURCE_WORKER_PROJECT, installed_worker_project())
+    rm(joinpath(installed_worker_project(), "Manifest.toml"), force=true)
     make_tree_readonly(installed_worker_project())
     for (name, path) in (("julia-conductor$EXE", installed_conductor()), ("juliaclient$EXE", installed_client()))
         bundled = joinpath(artifact"execbundle", name)

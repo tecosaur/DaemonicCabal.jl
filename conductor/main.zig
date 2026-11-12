@@ -780,6 +780,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try Io.Dir.cwd().createDirPathStatus(io, cfg.runtime_dir, platform.runtime_dir_permissions);
     try platform.secureRuntimeDir(cfg.runtime_dir);
     conductor.cleanupRuntimeDir();
+    worker.Worker.removeManifests(io, cfg.worker_project);
     retire.cleanupCgroups(&conductor);
     try conductor.run();
 }

@@ -337,6 +337,33 @@ pub const Worker = struct {
         };
     }
 
+    /// DaemonWorker needs only stdlibs, so its project's manifest can only go stale.
+    pub fn removeManifests(io: Io, project: []const u8) void {
+        var dir = Io.Dir.cwd().openDir(io, project, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            const name = std.mem.cutPrefix(u8, entry.name, "Julia") orelse entry.name;
+            if (!std.mem.startsWith(u8, name, "Manifest") or !std.mem.endsWith(u8, name, ".toml")) continue;
+            if (deleteFromReadOnly(io, dir, entry.name)) {
+                std.debug.print("Removed {s} from the worker project {s}: DaemonWorker loads without one, and a stale one breaks it\n", .{ entry.name, project });
+            } else |err| {
+                std.debug.print("Warning: could not remove {s} from the worker project {s} ({}); if workers fail to precompile DaemonWorker, remove it by hand\n", .{ entry.name, project, err });
+            }
+        }
+    }
+
+    /// An installed worker project is read-only.
+    fn deleteFromReadOnly(io: Io, dir: Io.Dir, name: []const u8) !void {
+        dir.deleteFile(io, name) catch |err| {
+            if (!@hasDecl(Io.Dir.Permissions, "toMode")) return err;
+            const permissions = (try dir.stat(io)).permissions;
+            try dir.setPermissions(io, .fromMode(permissions.toMode() | 0o200));
+            defer dir.setPermissions(io, permissions) catch {};
+            try dir.deleteFile(io, name);
+        };
+    }
+
     /// Escapes `"`, `\` and `$` for embedding in `--eval` source.
     fn juliaString(bytes: []const u8) std.fmt.Alt([]const u8, formatJuliaString) {
         return .{ .data = bytes };
@@ -918,4 +945,24 @@ fn resolveInPath(io: Io, name: []const u8, path_env: []const u8) ?[]const u8 {
         return candidate;
     }
     return null;
+}
+
+test "a worker project's manifests are removed, read-only or not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const names = [_][]const u8{ "Manifest.toml", "JuliaManifest.toml", "Manifest-v1.13.toml", "Project.toml", "Manifest.txt" };
+    for (names) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const permissions = (try tmp.dir.stat(io)).permissions;
+    if (@hasDecl(Io.Dir.Permissions, "toMode")) try tmp.dir.setPermissions(io, .fromMode(0o555));
+    Worker.removeManifests(io, root);
+    for (names, [_]bool{ false, false, false, true, true }) |name, kept| {
+        const found = if (tmp.dir.access(io, name, .{})) |_| true else |_| false;
+        try std.testing.expectEqual(kept, found);
+    }
+    if (@hasDecl(Io.Dir.Permissions, "toMode")) try std.testing.expectEqual(@as(std.posix.mode_t, 0o555), (try tmp.dir.stat(io)).permissions.toMode() & 0o777);
+    try tmp.dir.setPermissions(io, permissions);
+    Worker.removeManifests(io, "/nonexistent/worker");
 }

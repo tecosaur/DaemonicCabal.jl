@@ -182,7 +182,10 @@ pub fn detachSpawn(c: *Conductor, p: *PendingSpawn) void {
 }
 
 pub fn failSpawn(c: *Conductor, p: *PendingSpawn, err: anyerror) void {
-    if (err != error.ClientGone) p.spawn.worker.log("spawn failed: {}", .{err});
+    if (err != error.ClientGone) {
+        p.spawn.worker.log("spawn failed: {}", .{err});
+        worker.Worker.removeManifests(c.io, c.cfg.worker_project);
+    }
     detachSpawn(c, p);
     p.spawn.abandon(c.io);
     if (p.spawn.worker.launch == .sandboxed) retire.dropSandbox(c, p.spawn.worker.id);
