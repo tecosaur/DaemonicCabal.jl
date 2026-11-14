@@ -7,9 +7,10 @@ using BaseDirs
 using Pkg.Artifacts
 using Serialization
 
+export @remote, remotecall_fetch
+
 @static if VERSION >= v"1.11"
-    eval(Expr(:public, :install, :uninstall, :connect, :Connection, :remotecall_fetch, Symbol("@remote"),
-              :RemoteException, :ConnectionError, :VersionMismatch))
+    eval(Expr(:public, :install, :uninstall, :connect, :Connection, :RemoteException, :ConnectionError, :VersionMismatch))
 end
 
 const EXE = Sys.iswindows() ? ".exe" : ""

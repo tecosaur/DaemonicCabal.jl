@@ -72,8 +72,8 @@ close it after.
 # Examples
 ```julia
 conn = DaemonicCabal.connect("server.example.com:9591"; project = "~/work/Analysis")
-DaemonicCabal.@remote conn using Statistics
-DaemonicCabal.@remote conn mean(data)
+@remote conn using Statistics
+@remote conn mean(data)
 close(conn)
 ```
 """
