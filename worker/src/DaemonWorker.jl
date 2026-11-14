@@ -7,6 +7,7 @@ using Base.Threads
 using InteractiveUtils
 using Logging
 using Profile
+using Serialization
 using REPL
 using Sockets
 
@@ -64,6 +65,7 @@ end
 include("bufferedio.jl")
 @static VERSION >= v"1.11" && include("scopedio.jl")
 include("protocol.jl")
+include("remotewire.jl")
 include("setup.jl")
 include("peek.jl")
 include("run.jl")
