@@ -69,6 +69,11 @@ include("remotewire.jl")
 include("setup.jl")
 include("peek.jl")
 include("run.jl")
+@static if VERSION >= v"1.11"
+    include("remote.jl")
+else
+    serve_remote() = error("remote calls need Julia 1.11 or newer on the worker; this one runs $VERSION")
+end
 
 function __init__()
     !haskey(ENV, "JULIA_DAEMON_SANDBOXED") && isyes(get(ENV, "JULIA_DAEMON_REVISE", "no")) && load_revise()

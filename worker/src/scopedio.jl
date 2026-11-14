@@ -51,6 +51,8 @@ const WORKER_TERM = VirtualTerm(
 
 const ACTIVE_TERM = ScopedValue{VirtualTerm}(WORKER_TERM)
 const CLIENT_MODULE = ScopedValue{Module}(Main)
+# A client's stdout as it came, unbuffered and unrecorded; nothing under --sync.
+const CLIENT_RAW_STDOUT = ScopedValue{Union{Nothing, StreamIO}}(nothing)
 const CLIENT_INTERACTIVE = ScopedValue(false)
 const CLIENT_REPL = ScopedValue(Ref{REPL.LineEditREPL}())
 const CLIENT_RECORDING = ScopedValue{Union{Nothing, Recording}}(nothing)

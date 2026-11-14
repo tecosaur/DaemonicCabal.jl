@@ -279,6 +279,7 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
                     stdout_is_terminal, stderr_is_terminal = client.stderr_tty)
                 @with(ACTIVE_TERM => client_vterm,
                       CLIENT_MODULE => mod,
+                      CLIENT_RAW_STDOUT => (client_stdout isa StreamIO ? client_stdout : nothing),
                       CLIENT_INTERACTIVE => interactive,
                       CLIENT_REPL => repl_ref,
                       CLIENT_RECORDING => recording,
@@ -450,11 +451,11 @@ function leave_environment!(client::ClientInfo)
 end
 
 # Stock julia's trace ends where it entered user code; ours would run on
-# through the worker, from the entry point in this file outward.
-function scrub_backtrace(stack::Base.ExceptionStack)
+# through the worker, from its entry point in `entry_file` outward.
+function scrub_backtrace(stack::Base.ExceptionStack, entry_file::String=@__FILE__)
     function scrub(bt)
         bt isa Vector{Base.StackTraces.StackFrame} || return bt
-        entry = findfirst(f -> String(f.file) == @__FILE__, bt)
+        entry = findfirst(f -> String(f.file) == entry_file, bt)
         isnothing(entry) && return bt
         bt = bt[1:entry-1]
         # As Julia leaves out, from 1.14, the `eval` it runs the code through.
