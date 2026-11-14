@@ -279,7 +279,7 @@ function runclient(client::ClientInfo, client_stdin::Union{StreamIO, TerminalInp
                     stdout_is_terminal, stderr_is_terminal = client.stderr_tty)
                 @with(ACTIVE_TERM => client_vterm,
                       CLIENT_MODULE => mod,
-                      CLIENT_RAW_STDOUT => (client_stdout isa StreamIO ? client_stdout : nothing),
+                      CLIENT_RAW_STDOUT => (if client_stdout isa StreamIO client_stdout else nothing end),
                       CLIENT_INTERACTIVE => interactive,
                       CLIENT_REPL => repl_ref,
                       CLIENT_RECORDING => recording,

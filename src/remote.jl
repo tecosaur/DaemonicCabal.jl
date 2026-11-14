@@ -19,8 +19,8 @@ struct Connection
     session::Union{Nothing, String}
     process::Base.Process
     lock::ReentrantLock
-    outgoing::Serializer{IOBuffer}
-    incoming::Serializer{IOBuffer}
+    outgoing::ModuleSerializer
+    incoming::ModuleSerializer
 end
 
 """
@@ -128,7 +128,7 @@ end
 
 function Connection(cmd::Cmd; address = nothing, project = nothing, session = nothing)
     process = open(pipeline(detach(cmd); stderr), "r+")
-    conn = Connection(address, project, session, process, ReentrantLock(), Serializer(IOBuffer()), Serializer(IOBuffer()))
+    conn = Connection(address, project, session, process, ReentrantLock(), ModuleSerializer(Main), ModuleSerializer(Main))
     payload = try
         read_frame(process)
     catch err
@@ -185,32 +185,43 @@ end
 function request(conn::Connection, message)
     @lock conn.lock begin
         isopen(conn) || throw(ended(conn))
+        frame = encode_frame(conn.outgoing, message)
         payload = try
-            write_frame(conn.process, conn.outgoing, message)
-            read_reply(conn)
+            exchange(conn, frame)
         catch err
-            err isa Union{EOFError, Base.IOError} || rethrow()
-            throw(ended(conn))
+            err isa Union{EOFError, Base.IOError} && throw(ended(conn))
+            # Anything else leaves the stream out of step, for good.
+            if !(err isa InterruptException)
+                kill(conn.process)
+                wait(conn.process)
+            end
+            rethrow()
         end
         reply = decode_frame(conn.incoming, payload)
         first(reply) === :value && return last(reply)
         _, text, exception_payload = reply
-        # The text carries an exception this side can't deserialize.
+        # The text stands in for an exception that won't deserialize here.
         exception = try
-            decode_frame(Serializer(IOBuffer()), exception_payload)
-        catch
+            decode_frame(ModuleSerializer(Main), exception_payload)
+        catch err
+            err isa InterruptException && rethrow()
             nothing
         end
         throw(RemoteException(description(conn), text, exception))
     end
 end
 
-# A Ctrl-C while waiting interrupts the remote call, whose reply is still
-# read whole, keeping the stream in step.
-function read_reply(conn::Connection)
+# Each frame sent has its reply read whole, a Ctrl-C meanwhile interrupting
+# the remote call instead, so the stream stays in step.
+function exchange(conn::Connection, frame::Vector{UInt8})
     interrupted = false
+    unsent = true
     while true
         try
+            if unsent
+                unsent = false
+                write(conn.process, frame)
+            end
             eof(conn.process)
             break
         catch err
@@ -249,7 +260,7 @@ function splice_values(ex::Expr)
     Expr(ex.head, map(splice_values, ex.args)...)
 end
 
-here(ex) = Expr(:$, Expr(:call, GlobalRef(Core, :QuoteNode), ex))
+here(ex) = Expr(:$, Expr(:call, GlobalRef(Core, :QuoteNode), if Meta.isexpr(ex, :$) only(ex.args) else ex end))
 
 function remote_call(ex::Expr)
     f, args... = ex.args

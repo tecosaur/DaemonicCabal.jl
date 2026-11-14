@@ -3,48 +3,8 @@
 
 # Requests are `(:call, f, args, kwargs)` or `(:eval, expr)`; replies
 # `(:value, v)` or `(:error, text, exception)`, the exception serialized
-# apart so a caller lacking its type still has the text.
-
-# Stock `Serializer`'s fields: the caller's `Main` is `mod`, both ways.
-mutable struct ModuleSerializer <: AbstractSerializer
-    io::IOBuffer
-    counter::Int
-    table::IdDict{Any, Any}
-    pending_refs::Vector{Int}
-    known_object_data::Dict{UInt64, Any}
-    version::Int
-    const mod::Module
-end
-ModuleSerializer(mod::Module) =
-    ModuleSerializer(IOBuffer(), 0, IdDict{Any, Any}(), Int[], Dict{UInt64, Any}(), Serialization.ser_version, mod)
-
-Serialization.lookup_object_number(s::ModuleSerializer, n::UInt64) = get(s.known_object_data, n, nothing)
-function Serialization.remember_object(s::ModuleSerializer, @nospecialize(o), n::UInt64)
-    s.known_object_data[n] = o
-    nothing
-end
-
-Serialization.serialize_mod_names(s::ModuleSerializer, m::Module) =
-    invoke(Serialization.serialize_mod_names, Tuple{AbstractSerializer, Module}, s, if m === s.mod Main else m end)
-
-# Stock's test for Main's anonymous functions, whose types go whole.
-function Serialization.should_send_whole_type(s::ModuleSerializer, t::DataType)
-    (; name, singletonname) = t.name
-    t.name.module === s.mod || return invoke(Serialization.should_send_whole_type, Tuple{Any, DataType}, s, t)
-    t.super === Function && startswith(String(name), '#') &&
-        (!isdefined(s.mod, singletonname) || t != typeof(getglobal(s.mod, singletonname)))
-end
-
-# Stock's, the current format only, but an unloaded package is required.
-function Serialization.deserialize_module(s::ModuleSerializer)
-    uuid = deserialize(s)
-    pkg = Base.PkgId(if isnothing(uuid) nothing else Base.UUID(uuid) end, String(deserialize(s)::Symbol))
-    mod = if pkg == Base.PkgId("Main") s.mod else get(() -> Base.require(pkg), Base.loaded_modules, pkg) end
-    while (inner = deserialize(s)) !== ()
-        mod = getglobal(mod, inner)::Module
-    end
-    mod
-end
+# apart so a caller lacking its type still has the text. Only a request is
+# the client's code: a Ctrl-C reaching the loop around it is passed on.
 
 """
     serve_remote()
@@ -53,11 +13,15 @@ Serve `DaemonicCabal.connect`'s remote calls on this client's stdin and
 stdout until its stdin ends, what they print going to its stderr.
 """
 function serve_remote()
-    input = ACTIVE_TERM[].stdin
+    term = ACTIVE_TERM[]
     output = CLIENT_RAW_STDOUT[]
-    input isa StreamIO && !isnothing(output) ||
+    term.stdin isa StreamIO && !isnothing(output) ||
         error("serve_remote needs a juliaclient run with piped stdin and stdout, not a terminal or --sync")
-    redirect_stdout(() -> serve_remote(input, output, CLIENT_MODULE[]), stderr)
+    # Its stdout is its stderr, so no redirect a call makes, or undoes, reaches the replies.
+    replyless = VirtualTerm(term.stdin, term.stderr, term.stderr, term.signals, term.term, term.sync_session,
+                            term.terminfo, term.have_color, term.have_truecolor;
+                            stdout_is_terminal = term.stderr_is_terminal, term.stderr_is_terminal)
+    @with ACTIVE_TERM => replyless serve_remote(term.stdin, output, CLIENT_MODULE[])
 end
 
 """
@@ -69,22 +33,15 @@ the caller's `Main`. Each request runs in `evaluate(thunk)`.
 function serve_remote(input::IO, output::IO, mod::Module; evaluate = as_client_code)
     incoming = ModuleSerializer(mod)
     outgoing = ModuleSerializer(mod)
-    write_frame(output, outgoing, REMOTE_HELLO)
-    while !eof(input)
-        payload = read_frame(input)
-        reply = evaluate() do
-            try
-                (:value, perform_request(Base.invokelatest(decode_frame, incoming, payload), mod))
-            catch
-                error_reply(mod)
-            end
+    send_frame(output, encode_frame(outgoing, REMOTE_HELLO))
+    while (payload = receive_frame(input)) !== nothing
+        # The latest world throughout, so what a request defines is seen as its reply is made.
+        reply = try
+            (:value, evaluate(() -> perform_request(Base.invokelatest(decode_frame, incoming, payload), mod)))
+        catch
+            unbroken(() -> Base.invokelatest(error_reply, mod))
         end
-        try
-            write_frame(output, outgoing, reply)
-        catch err
-            err isa Base.IOError && rethrow()
-            write_frame(output, outgoing, error_reply(mod))
-        end
+        send_frame(output, unbroken(() -> Base.invokelatest(encode_reply, outgoing, reply, mod)))
     end
 end
 
@@ -111,8 +68,53 @@ function error_reply(mod::Module)
         s = ModuleSerializer(mod)
         serialize(s, last(stack).exception)
         take!(s.io)
-    catch
+    catch err
+        err isa InterruptException && pass_interrupt()
         UInt8[]
     end
     (:error, sprint(Base.show_exception_stack, stack; context = :module => mod), exception)
+end
+
+function encode_reply(s::ModuleSerializer, reply::Tuple, mod::Module)
+    try
+        encode_frame(s, reply)
+    catch
+        encode_frame(s, error_reply(mod))
+    end
+end
+
+# Nothing at the input's end. Only the waits can be interrupted, and are
+# retried, so a frame is never half read.
+function receive_frame(input::IO)
+    await(n) = uninterrupted(() -> shielded(() -> Base.wait_readnb(input, n)))
+    await(8)
+    bytesavailable(input) < 8 && return nothing
+    payload_length = Int(ltoh(read(input, UInt64)))
+    await(payload_length)
+    bytesavailable(input) < payload_length && return nothing
+    read(input, payload_length)
+end
+
+# One write queues the frame whole, so an interrupted wait for it loses
+# nothing, but libuv writes on from `frame`: kept until a flush finds it sent.
+function send_frame(output::IO, frame::Vector{UInt8})
+    GC.@preserve frame try
+        shielded(() -> write(output, frame))
+    catch err
+        err isa InterruptException || rethrow()
+        pass_interrupt()
+        uninterrupted(() -> shielded(() -> flush(output)))
+    end
+end
+
+# `f` run to its end, a Ctrl-C held off it passed on after.
+function unbroken(f)
+    result = Ref{Any}()
+    try
+        shielded(() -> result[] = f())
+    catch err
+        err isa InterruptException && isassigned(result) || rethrow()
+        pass_interrupt()
+    end
+    result[]
 end
