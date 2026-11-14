@@ -5,9 +5,11 @@ module DaemonicCabal
 
 using BaseDirs
 using Pkg.Artifacts
+using Serialization
 
 @static if VERSION >= v"1.11"
-    eval(Expr(:public, :install, :uninstall))
+    eval(Expr(:public, :install, :uninstall, :connect, :Connection, :remotecall_fetch, Symbol("@remote"),
+              :RemoteException, :ConnectionError, :VersionMismatch))
 end
 
 const EXE = Sys.iswindows() ? ".exe" : ""
@@ -22,6 +24,11 @@ const DEFAULTS = (
 # Installation
 
 include("installers/common.jl")
+
+# Remote calls
+
+include(joinpath(dirname(@__DIR__), "worker", "src", "remotewire.jl"))
+include("remote.jl")
 
 @static if Sys.islinux()
     include("installers/linux.jl")
@@ -50,6 +57,12 @@ BaseDirs.@promise_no_assign @doc """
 
 Run Julia code in warm, long-lived workers, through `juliaclient`: a drop-in
 replacement for `julia`.
+
+# Remote calls
+
+From any Julia session, [`connect`](@ref) to a worker, local or at a
+trusted daemon over TCP, and run code there with [`@remote`](@ref) or
+[`remotecall_fetch`](@ref), getting its value back.
 
 # Setup
 
