@@ -219,7 +219,7 @@ end
 
 # A client's run is `with_client_scope`, each evaluation of its code
 # `as_client_code`, and the worker's rendering of what it asked `shielded`.
-# From 1.14 a Ctrl-C cancels a scope (cancellation.jl), reaching the worker as
+# From 1.15 a Ctrl-C cancels a scope (cancellation.jl), reaching the worker as
 # `interrupt_client`; before, it is a SIGINT thrown into whichever task thread 0
 # runs, passed on (`pass_interrupt`) when it lands on the worker's own.
 @static if isdefined(Base, :sigint_new_episode!)

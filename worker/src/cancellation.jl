@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-# From 1.14 a Ctrl-C cancels a scope, whose tasks' waits then throw
+# From 1.15 a Ctrl-C cancels a scope, whose tasks' waits then throw
 # `CancellationRequest` on whatever thread. Each session has a source, and
 # each evaluation of a client's code one under it; a client's Ctrl-C reaches
 # the worker as `cancel_client` and cancels its own evaluation's. The process's
