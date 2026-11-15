@@ -102,13 +102,15 @@ pub fn prepareClient(c: *Conductor, request: *const ClientRequest, sandbox: Sand
 
 /// `direct` is the worker started for the client; `existing_hold` resumes a hold.
 pub fn assignClientToWorker(c: *Conductor, socket: posix.socket_t, request: *ClientRequest, worker_key: []const u8, sandbox: SandboxKind, existing_hold: ?*HeldClient, direct: ?*worker.Worker) !Outcome {
+    const running = requests.defaultJuliaVersion(c);
+    if (!request.julia.runsOn(running)) return refuseOtherJulia(c, socket, request.julia.fallen_back, running.?, "");
     const list = try getWorkerList(c, worker_key);
     const session_label = request.parsed.getSwitch("--session");
     std.debug.print("Client {d}; pid: {d}{s}{s}{s}{s}, project: {s}{s}\n", .{
         c.client_id,
         request.pid,
-        if (request.parsed.julia_channel != null) ", julia: " else "",
-        request.parsed.julia_channel orelse "",
+        if (request.julia.launch() != .default) ", julia: " else "",
+        request.julia.launch().name() orelse "",
         if (session_label != null) ", session: " else "",
         if (session_label) |l| (if (l.len > 0) l else ".") else "",
         request.project orelse "(default)",
@@ -216,7 +218,7 @@ pub fn resumeHeld(c: *Conductor, hold: *HeldClient, how: Resumption) void {
     c.client_id = hold.id;
     const output = if (how == .refuse) how.refuse.output else "";
     const attempt: anyerror!Outcome = switch (how) {
-        .refuse => |refusal| refusal.err,
+        .refuse => |refusal| if (hold.request.julia == .version and isFailedStart(refusal.err)) fallBackToDefault(c, hold, refusal) else refusal.err,
         .select => assignClientToWorker(c, hold.socket, &hold.request, hold.worker_key, hold.sandbox, hold, null),
         .on => |w| assignClientToWorker(c, hold.socket, &hold.request, hold.worker_key, hold.sandbox, hold, w),
     };
@@ -225,6 +227,41 @@ pub fn resumeHeld(c: *Conductor, hold: *HeldClient, how: Resumption) void {
         break :blk Outcome.done;
     };
     if (outcome == .done) discardHold(c, hold);
+}
+
+/// Not a refusal for shutting down or restarting.
+pub fn isFailedStart(err: anyerror) bool {
+    return switch (err) {
+        error.DaemonShuttingDown, error.Restarted, error.ClientGone, error.SettingsChanged => false,
+        else => true,
+    };
+}
+
+/// A version's channel failed to start: the default, unless shown to be another version.
+fn fallBackToDefault(c: *Conductor, hold: *HeldClient, refusal: Refusal) !Outcome {
+    const tried = hold.request.julia.version;
+    std.debug.print("Client {d}: {s} failed to start ({})\n", .{ c.client_id, tried.channel, refusal.err });
+    hold.request.julia.deinit(c.allocator);
+    hold.request.julia = .{ .fallen_back = tried.wanted };
+    const running = requests.defaultJuliaVersion(c);
+    if (!hold.request.julia.runsOn(running)) return refuseOtherJulia(c, hold.socket, tried.wanted, running.?, refusal.output);
+    const key = try requests.poolKey(c, &hold.request, hold.sandbox);
+    c.allocator.free(hold.worker_key);
+    hold.worker_key = key;
+    return assignClientToWorker(c, hold.socket, &hold.request, hold.worker_key, hold.sandbox, hold, null);
+}
+
+/// `output` is what the channel's failed start wrote, if to hand.
+fn refuseOtherJulia(c: *Conductor, socket: posix.socket_t, wanted: args.Version, running: [3]u8, output: []const u8) Outcome {
+    std.debug.print("Client {d}: no Julia {s}: the default is {d}.{d}.{d}\n", .{ c.client_id, wanted.text, running[0], running[1], running[2] });
+    const wrote = std.mem.trimEnd(u8, output, "\n");
+    var msg_buf: [2048]u8 = undefined;
+    const msg = std.mem.print(&msg_buf, "No Julia {s} here: the daemon's workers run {d}.{d}.{d}, and +{s} failed to start{s}{s}\n" ++
+        "Install it there with `juliaup add {s}`, or set JULIA_DAEMON_WORKER_EXECUTABLE to a Julia {s}.\n", .{
+        wanted.text, running[0], running[1], running[2], wanted.text, if (wrote.len > 0) ":\n" else ".", wrote, wanted.text, wanted.text,
+    }) catch "No Julia of the version asked for here.\n";
+    replies.serveString(c, socket, msg, 1) catch |err| std.debug.print("Client {d}: could not report the failure: {}\n", .{ c.client_id, err });
+    return .done;
 }
 
 /// False when the worker already died; the caller falls back to selection.
@@ -294,7 +331,7 @@ pub fn selectWorker(c: *Conductor, list: *WorkerList, request: *const ClientRequ
     }
     // 4. The warm reserve, for a plain non-interactive request it matches.
     if (sandbox == .none and !want_interactive) {
-        if (try spawns.claimReserve(c, list, request.project orelse "", request.parsed.julia_channel, resolveThreads(request), label)) |w| {
+        if (try spawns.claimReserve(c, list, request.project orelse "", request.julia.launch(), resolveThreads(request), label)) |w| {
             if (tryAssignWorker(c, w, client_info, .new_worker)) |a| return a;
         }
     }

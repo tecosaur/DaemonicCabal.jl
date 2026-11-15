@@ -258,7 +258,7 @@ test "a pinned session's worker outlasts its label's TTL, the TTL cull and press
         .process = undefined,
         .socket = platform.no_socket,
         .project = null,
-        .julia_channel = null,
+        .julia = .default,
         .threads = @import("args.zig").threads_none,
         .session_label = "lab",
         .created_at = 0,

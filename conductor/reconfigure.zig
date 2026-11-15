@@ -746,15 +746,7 @@ fn checkPorts(io: std.Io, host: []const u8, low: u16, high: u16, held: Held, buf
 
 /// Where `name` is found on the daemon's PATH, into `buf`.
 fn findOnPath(c: *const Conductor, name: []const u8, buf: []u8) ?[]const u8 {
-    const path_env = c.environ_map.get("PATH") orelse return null;
-    var dirs = std.mem.tokenizeScalar(u8, path_env, std.Io.Dir.path.delimiter);
-    while (dirs.next()) |dir| {
-        for ([_][]const u8{ "", ".exe" }) |suffix| {
-            const candidate = std.mem.print(buf, "{s}{c}{s}{s}", .{ dir, std.Io.Dir.path.sep, name, suffix }) catch continue;
-            if (std.Io.Dir.cwd().access(c.io, candidate, .{ .execute = true })) |_| return candidate else |_| {}
-        }
-    }
-    return null;
+    return main.worker.findOnPath(c.io, c.environ_map.get("PATH") orelse return null, name, buf);
 }
 
 // --- Workers ---

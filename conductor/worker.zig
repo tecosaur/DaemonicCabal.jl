@@ -144,7 +144,8 @@ pub const Worker = struct {
     process: std.process.Child,
     socket: posix.socket_t,
     project: ?[]const u8,
-    julia_channel: ?[]const u8,
+    julia: Julia,
+    julia_version: ?[3]u8 = null,
     threads: args.Threads,
     session_label: ?[]const u8,
     /// Kept by `--pin`: the label never expires, so nothing else claims or culls it.
@@ -182,6 +183,36 @@ pub const Worker = struct {
     /// client's code, and must not hold the conductor by trickling one out.
     reply_timeout_ms: u32 = 5000,
 
+    pub const Julia = union(enum) {
+        default,
+        channel: []const u8,
+        executable: []const u8,
+
+        pub fn name(self: Julia) ?[]const u8 {
+            return switch (self) {
+                .default => null,
+                .channel, .executable => |text| text,
+            };
+        }
+
+        pub fn eql(a: Julia, b: Julia) bool {
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            return a == .default or std.mem.eql(u8, a.name().?, b.name().?);
+        }
+
+        pub fn dupe(self: Julia, allocator: Allocator) !Julia {
+            return switch (self) {
+                .default => .default,
+                .channel => |ch| .{ .channel = try allocator.dupe(u8, ch) },
+                .executable => |exe| .{ .executable = try allocator.dupe(u8, exe) },
+            };
+        }
+
+        pub fn free(self: Julia, allocator: Allocator) void {
+            if (self.name()) |text| allocator.free(text);
+        }
+    };
+
     pub const Launch = union(enum) {
         direct,
         sandboxed: struct {
@@ -199,7 +230,7 @@ pub const Worker = struct {
         io: Io,
         cfg: *const config.Config,
         id: u32,
-        julia_channel: ?[]const u8,
+        julia: Julia,
         threads: args.Threads,
         interactive: bool,
         launch: Launch,
@@ -211,8 +242,10 @@ pub const Worker = struct {
         if (launch == .sandboxed) Io.Dir.createDirAbsolute(io, socket_dir, .default_dir) catch {};
         var setup = try protocol.createListener(io, .local, socket_dir, "wsetup.sock", "");
         errdefer setup.close(io);
-        const channel_copy: ?[]const u8 = if (julia_channel) |ch| try allocator.dupe(u8, ch) else null;
-        errdefer if (channel_copy) |ch| allocator.free(ch);
+        if (julia == .executable and launch != .direct) return error.ExecutableRefused;
+        const julia_copy = try julia.dupe(allocator);
+        errdefer julia_copy.free(allocator);
+        const julia_channel = if (julia == .channel) julia.channel else null;
         // The worker takes a TCP address only in full, so it needn't parse ours.
         var address_buf: [protocol.max_socket_path + 16]u8 = undefined;
         const conductor_address = if (cfg.transport == .tcp) blk: {
@@ -240,8 +273,9 @@ pub const Worker = struct {
         };
         // Raw execve (sandbox, client spawn) needs an absolute path.
         const bare = std.mem.findScalar(u8, cfg.worker_executable, '/') == null;
+        var resolve_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const resolved: ?[]const u8 = if (!bare) cfg.worker_executable else if (environ) |env|
-            (if (env.get("PATH")) |p| resolveInPath(io, cfg.worker_executable, p) else null)
+            (if (env.get("PATH")) |p| findOnPath(io, p, cfg.worker_executable, &resolve_buf) else null)
         else
             null;
         const child: std.process.Child = switch (launch) {
@@ -285,7 +319,7 @@ pub const Worker = struct {
                 try argv.append(allocator, if (launch == .client) resolved orelse {
                     std.debug.print("Worker {d}: cannot resolve '{s}' on the daemon's PATH to name it to the client's sandbox; set JULIA_DAEMON_WORKER_EXECUTABLE to an absolute path\n", .{ id, cfg.worker_executable });
                     return error.ExecutableNotFound;
-                } else cfg.worker_executable);
+                } else if (julia == .executable) julia.executable else cfg.worker_executable);
                 if (julia_channel) |ch| try argv.append(allocator, ch);
                 const project_arg: ?[]const u8 = if (cfg.worker_project.len > 0)
                     try allocator.print("--project={s}", .{cfg.worker_project})
@@ -319,7 +353,7 @@ pub const Worker = struct {
                 .process = child,
                 .socket = platform.no_socket,
                 .project = null,
-                .julia_channel = channel_copy,
+                .julia = julia_copy,
                 .threads = threads,
                 .session_label = null,
                 .created_at = now,
@@ -423,7 +457,7 @@ pub const Worker = struct {
             w.last_active = w.created_at;
             w.last_pinged = w.created_at;
             const connected = w.*;
-            self.worker.julia_channel = null; // moved into `connected`
+            self.worker.julia = .default; // moved into `connected`
             return connected;
         }
 
@@ -451,7 +485,7 @@ pub const Worker = struct {
             platform.dumpChildStderr(io, self.worker.allocator, &self.worker.process, self.worker.id);
             platform.releaseChild(&self.worker.process);
             self.listener.close(io);
-            if (self.worker.julia_channel) |ch| self.worker.allocator.free(ch);
+            self.worker.julia.free(self.worker.allocator);
         }
     };
 
@@ -543,7 +577,7 @@ pub const Worker = struct {
 
     pub fn deinit(self: *Worker) void {
         if (self.project) |p| self.allocator.free(p);
-        if (self.julia_channel) |ch| self.allocator.free(ch);
+        self.julia.free(self.allocator);
         if (self.session_label) |l| self.allocator.free(l);
         if (self.pidfd) |fd| platform.close(fd);
         platform.releaseChild(&self.process);
@@ -633,7 +667,7 @@ pub const Worker = struct {
         }
     }
 
-    pub const Pong = struct { seq: u8, clients: u16 };
+    pub const Pong = struct { seq: u8, clients: u16, julia_version: [3]u8 };
 
     /// A pong, read whole within the reply timeout.
     pub fn readPong(self: *Worker) !Pong {
@@ -646,7 +680,9 @@ pub const Worker = struct {
     fn readPongPayload(self: *Worker) !Pong {
         var payload: [protocol.worker.pong_size - protocol.worker.header_size]u8 = undefined;
         try self.readAll(&payload);
-        return .{ .seq = payload[0], .clients = std.mem.readInt(u16, payload[1..3], .little) };
+        const pong = Pong{ .seq = payload[0], .clients = std.mem.readInt(u16, payload[1..3], .little), .julia_version = payload[3..6].* };
+        self.julia_version = pong.julia_version;
+        return pong;
     }
 
     pub fn ping(self: *Worker) !void {
@@ -935,14 +971,14 @@ pub fn freeEnv(allocator: Allocator, env: []const EnvVar) void {
     allocator.free(env);
 }
 
-var resolve_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-fn resolveInPath(io: Io, name: []const u8, path_env: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, path_env, ':');
-    while (it.next()) |dir| {
-        if (dir.len == 0) continue;
-        const candidate = std.mem.print(&resolve_buf, "{s}/{s}", .{ dir, name }) catch continue;
-        Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
-        return candidate;
+/// Where `name` is found on `path_env`, into `buf`.
+pub fn findOnPath(io: Io, path_env: []const u8, name: []const u8, buf: []u8) ?[]const u8 {
+    var dirs = std.mem.tokenizeScalar(u8, path_env, std.Io.Dir.path.delimiter);
+    while (dirs.next()) |dir| {
+        for ([_][]const u8{ "", ".exe" }) |suffix| {
+            const candidate = std.mem.print(buf, "{s}{c}{s}{s}", .{ dir, std.Io.Dir.path.sep, name, suffix }) catch continue;
+            if (std.Io.Dir.cwd().access(io, candidate, .{ .execute = true })) |_| return candidate else |_| {}
+        }
     }
     return null;
 }

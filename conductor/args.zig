@@ -118,6 +118,7 @@ const options = [_]Option{
     .{ .long = "--restart", .arity = .none, .honoured = .always, .own = true },
     .{ .long = "--reconfigure", .arity = .none, .honoured = .always, .own = true },
     .{ .long = "--sandbox", .arity = .none, .honoured = .always, .own = true },
+    .{ .long = "--julia", .arity = .required, .honoured = .always, .own = true },
 };
 
 pub const Switch = struct {
@@ -151,6 +152,8 @@ pub const Problem = union(enum) {
     invalid_value: struct { option: *const Option, value: []const u8 },
     invalid_threads: ThreadsRefusal,
     needs_own_julia: *const Option,
+    invalid_julia: []const u8,
+    conflicting_julia,
 
     pub fn format(self: Problem, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -168,6 +171,8 @@ pub const Problem = union(enum) {
                 .auto_interactive => "julia: -t,--threads=auto,<m>; m must be an integer >= 0",
             }),
             .needs_own_julia => |option| try w.print("option `{s}` needs a Julia process of its own: run it with `julia`", .{option.long}),
+            .invalid_julia => |value| try w.print("juliaclient: --julia takes a version (1.14), a JuliaUp channel (+1.14) or a binary, not `{s}`", .{value}),
+            .conflicting_julia => try w.writeAll("juliaclient: give a JuliaUp channel as +<channel> or --julia, not both"),
         }
     }
 };
@@ -208,7 +213,51 @@ pub fn Parsed(comptime Word: type) type {
             const value = self.getSwitch("--threads") orelse return threads_none;
             return switchThreads(value).threads; // refused as parsed
         }
+
+        pub fn julia(self: *const Self) Julia {
+            if (self.julia_channel) |ch| return .{ .channel = ch };
+            const value = self.getSwitch("--julia") orelse return .any;
+            return readJulia(value).?; // refused as parsed
+        }
     };
+}
+
+pub const Julia = union(enum) {
+    any,
+    version: Version,
+    channel: []const u8,
+    executable: []const u8,
+};
+
+/// `major.minor[.patch][-prerelease]`: the prerelease only names its channel.
+pub const Version = struct {
+    major: u8,
+    minor: u8,
+    patch: ?u8 = null,
+    text: []const u8,
+
+    pub fn matches(self: Version, running: [3]u8) bool {
+        return self.major == running[0] and self.minor == running[1] and
+            (self.patch == null or self.patch.? == running[2]);
+    }
+};
+
+/// Null if malformed.
+fn readJulia(value: []const u8) ?Julia {
+    if (value.len == 0) return null;
+    if (value[0] == '+') return if (value.len > 1) .{ .channel = value } else null;
+    if (!std.ascii.isDigit(value[0])) return .{ .executable = value };
+    const release_end = std.mem.findScalar(u8, value, '-') orelse value.len;
+    if (release_end + 1 == value.len) return null;
+    var fields: [3]?u8 = @splat(null);
+    var parts = std.mem.splitScalar(u8, value[0..release_end], '.');
+    var n: usize = 0;
+    while (parts.next()) |part| : (n += 1) {
+        if (n == fields.len) return null;
+        fields[n] = std.fmt.parseInt(u8, part, 10) catch return null;
+    }
+    if (n < 2) return null;
+    return .{ .version = .{ .major = fields[0].?, .minor = fields[1].?, .patch = fields[2], .text = value } };
 }
 
 pub const ParsedArgs = Parsed([]const u8);
@@ -329,6 +378,10 @@ pub fn parseReporting(comptime Word: type, argv: []const Word, problem: *Problem
         problem.* = why;
         return error.InvalidArguments;
     };
+    if (parsed.julia_channel != null and parsed.hasSwitch("--julia")) {
+        problem.* = .conflicting_julia;
+        return error.InvalidArguments;
+    }
     const rest = switch (it.end.?) {
         .invalid => |why| {
             problem.* = why;
@@ -446,6 +499,7 @@ fn refusal(sw: Switch) ?Problem {
         .threads => {},
         .refused => |why| return .{ .invalid_threads = why },
     };
+    if (std.mem.eql(u8, option.long, "--julia") and readJulia(sw.value) == null) return .{ .invalid_julia = sw.value };
     return null;
 }
 

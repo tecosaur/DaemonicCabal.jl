@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 TEC <contact@tecosaur.net>
 # SPDX-License-Identifier: MPL-2.0
 
-const PROTOCOL_MAGIC = 0x4A445705  # "JDW\x05" little-endian
+const PROTOCOL_MAGIC = 0x4A445706  # "JDW\x06" little-endian
 const NOTIFICATION_MAGIC = 0x4A444E02  # "JDN\x02" little-endian
 
 # Notifications, over the conductor's main socket
@@ -72,8 +72,8 @@ function write_string(conn::IO, s::AbstractString)
 end
 
 function send_pong(conn::IO, seq::UInt8, active_clients::Integer)
-    write_header(conn, MSG_TYPE.pong, 3)
-    write(conn, seq, UInt16(active_clients))
+    write_header(conn, MSG_TYPE.pong, 6)
+    write(conn, seq, UInt16(active_clients), UInt8(VERSION.major), UInt8(VERSION.minor), UInt8(VERSION.patch))
     flush(conn)
 end
 

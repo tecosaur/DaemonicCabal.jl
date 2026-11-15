@@ -94,6 +94,10 @@ const client_switches_help =
     \\Client-specific switches:
     \\
     \\ -a, --address <addr>       Connect to conductor at <addr> instead of default
+    \\ --julia=<version|+channel|binary>
+    \\                            Run on that Julia: a version (1.14) is the daemon's
+    \\                            own where it matches, else JuliaUp's +1.14; a binary
+    \\                            only for a local, unsandboxed client
     \\ --session[=<label>]        Reuse worker state in Main module. With a label,
     \\                            multiple clients can share the same session.
     \\ --sync[=<pages>]           Attach to shared REPL (requires --session=<label>),
@@ -185,11 +189,12 @@ pub const TerminalSize = struct {
 
 // Conductor ↔ Worker Protocol
 pub const worker = struct {
-    pub const magic: u32 = 0x4A445705; // "JDW\x05"
+    pub const magic: u32 = 0x4A445706; // "JDW\x06"
     /// type(u8) + payload length(u32).
     pub const header_size = 5;
-    /// Header, then the ping's sequence byte echoed and the worker's client count (u16).
-    pub const pong_size = header_size + 1 + 2;
+    /// Header, then the ping's sequence byte echoed, the worker's client count
+    /// (u16), and its Julia's major, minor and patch (u8 each).
+    pub const pong_size = header_size + 1 + 2 + 3;
 
     pub const MessageType = enum(u8) {
         ping = 0x01,

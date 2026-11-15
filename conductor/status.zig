@@ -580,9 +580,9 @@ fn writeIdentity(c: *Conductor, w: Writer, s: Style, wk: *const Worker, health: 
             try s.wrap(w, ansi.dim, "]");
         }
     }
-    if (wk.julia_channel) |ch| {
+    if (wk.julia.name()) |name| {
         try w.writeByte(' ');
-        col += 1 + try writeChannel(w, ch);
+        col += 1 + try writeChannel(w, name);
     }
     if (wk.interactive) {
         try w.writeAll(" (interactive)");
@@ -936,7 +936,10 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     try w.print("{{\"id\":{d},\"pid\":{d},\"project\":", .{ wk.id, pid });
     try writeJsonStringOrNull(w, wk.project);
     try w.writeAll(",\"channel\":");
-    try writeJsonStringOrNull(w, wk.julia_channel);
+    try writeJsonStringOrNull(w, if (wk.julia == .channel) wk.julia.channel else null);
+    try w.writeAll(",\"executable\":");
+    try writeJsonStringOrNull(w, if (wk.julia == .executable) wk.julia.executable else null);
+    if (wk.julia_version) |v| try w.print(",\"julia_version\":\"{d}.{d}.{d}\"", .{ v[0], v[1], v[2] }) else try w.writeAll(",\"julia_version\":null");
     try w.writeAll(",\"session_label\":");
     try writeJsonStringOrNull(w, wk.session_label);
     try w.print(",\"pinned\":{},\"threads\":", .{wk.session_pinned});

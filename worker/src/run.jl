@@ -167,7 +167,7 @@ end
 function command_line(client::ClientInfo)
     words = String[]
     for (name, value) in client.switches
-        name ∈ ("--session", "--watch", "--address") && continue
+        name ∈ ("--session", "--watch", "--address", "--julia") && continue
         push!(words, name)
         isempty(value) || push!(words, value)
     end

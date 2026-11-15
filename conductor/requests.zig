@@ -318,6 +318,17 @@ pub fn handleClient(c: *Conductor, socket: posix.socket_t, is_remote: bool, peer
             if (seated) return .done;
         }
     };
+    resolveJulia(c, &request, sandbox) catch |err| {
+        const why = switch (err) {
+            error.ExecutableRefused => "--julia=<binary> runs a binary of this machine's, so only local, unsandboxed clients may name one.\n" ++
+                "Name a version instead (--julia=1.14), or a JuliaUp channel (+1.14).\n",
+            error.ExecutableNotFound => "--julia names a binary that isn't on your PATH: give its path instead.\n",
+            else => return err,
+        };
+        std.debug.print("Client {d}: refused --julia: {}\n", .{ c.client_id, err });
+        try replies.serveString(c, socket, why, 1);
+        return .done;
+    };
     const worker_key = try poolKey(c, &request, sandbox);
     defer c.allocator.free(worker_key);
     if (request.parsed.hasSwitch("--watch")) return serveWatch(c, socket, &request, worker_key, sandbox);
@@ -397,11 +408,48 @@ pub fn sandboxFor(c: *Conductor, socket: posix.socket_t, is_remote: bool, peer: 
     return sandbox;
 }
 
-/// The pool the request's workers are in: its project, Julia channel and
-/// thread counts, fixed as a worker starts, and its sandbox.
+/// A version is the default where a worker shows it matches, else its channel.
+pub fn resolveJulia(c: *Conductor, request: *ClientRequest, sandbox: SandboxKind) !void {
+    // Apart from `request`, which a failed `try` would leave with the tag and no payload.
+    const julia: ClientRequest.Julia = switch (request.parsed.julia()) {
+        .any => .default,
+        .channel => |ch| .{ .channel = ch },
+        .executable => |exe| .{ .executable = try resolveExecutable(c, request, sandbox, exe) },
+        .version => |version| blk: {
+            if (defaultJuliaVersion(c)) |running| if (version.matches(running)) break :blk .default;
+            break :blk .{ .version = .{ .wanted = version, .channel = try c.allocator.print("+{s}", .{version.text}) } };
+        },
+    };
+    request.julia = julia;
+}
+
+// As the client would find it: a relative path from its cwd, a bare name on its PATH.
+fn resolveExecutable(c: *Conductor, request: *const ClientRequest, sandbox: SandboxKind, exe: []const u8) ![]u8 {
+    if (sandbox != .none) return error.ExecutableRefused;
+    if (std.Io.Dir.path.isAbsolute(exe)) return c.allocator.dupe(u8, exe);
+    if (std.mem.findAny(u8, exe, "/\\") != null) return std.Io.Dir.path.resolveAlloc(c.allocator, &.{ request.cwd, exe });
+    const path_env = for (request.env) |e| {
+        if (std.mem.eql(u8, e.key, "PATH")) break e.value;
+    } else return error.ExecutableNotFound;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    return c.allocator.dupe(u8, worker.findOnPath(c.io, path_env, exe, &buf) orelse return error.ExecutableNotFound);
+}
+
+/// As told by a default worker started since the settings last changed.
+pub fn defaultJuliaVersion(c: *Conductor) ?[3]u8 {
+    var it = c.liveWorkers();
+    while (it.next()) |w| {
+        if (w.julia != .default or w.launch != .direct or w.spawned_ns < c.settings.model.workers_changed_ns) continue;
+        if (w.julia_version) |version| return version;
+    }
+    return null;
+}
+
+/// The pool the request's workers are in: its project, Julia and thread
+/// counts, fixed as a worker starts, and its sandbox.
 pub fn poolKey(c: *Conductor, request: *const ClientRequest, sandbox: SandboxKind) ![]u8 {
     const project_path = request.project orelse "";
-    const ch = request.parsed.julia_channel orelse "";
+    const ch = request.julia.launch().name() orelse "";
     const tkey = args.packThreads(assign.resolveThreads(request));
     return switch (sandbox) {
         .none => c.allocator.print("{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
@@ -437,7 +485,7 @@ pub fn sessionRefusal(request: *const ClientRequest) ?[]const u8 {
 pub fn serveRestart(c: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandbox: SandboxKind) !void {
     if (assign.labelOf(request)) |label| return restartSession(c, socket, request, worker_key, label, sandbox);
     const nkilled = retire.killWorkersForProject(c, worker_key);
-    const channel = request.parsed.julia_channel;
+    const channel = request.julia.launch().name();
     std.debug.print("Restart: killed {d} worker(s) for {s}{s}{s}\n", .{
         nkilled, request.project orelse "", if (channel != null) " " else "", channel orelse "",
     });

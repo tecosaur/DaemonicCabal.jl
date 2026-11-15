@@ -31,22 +31,17 @@ pub fn beginReserveSpawn(c: *Conductor) !void {
         args.parseThreads(v)
     else
         args.threads_none;
-    const p = try beginSpawn(c, .reserve, null, reserve_threads, false, .direct);
+    const p = try beginSpawn(c, .reserve, .default, reserve_threads, false, .direct);
     std.debug.print("Spawning reserve worker {d} (pid {d})\n", .{ p.spawn.worker.id, platform.getChildPid(p.spawn.worker.process) });
 }
 
 // Seated in `list` (and labelled) on return.
-pub fn claimReserve(c: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, threads: args.Threads, label: ?[]const u8) !?*worker.Worker {
+pub fn claimReserve(c: *Conductor, list: *WorkerList, proj: []const u8, julia: worker.Worker.Julia, threads: args.Threads, label: ?[]const u8) !?*worker.Worker {
     const r = c.reserve orelse return null;
-    if (!std.meta.eql(threads, r.threads)) return null;
-    const channel_matches = if (julia_channel) |ch|
-        r.julia_channel != null and std.mem.eql(u8, ch, r.julia_channel.?)
-    else
-        r.julia_channel == null;
-    if (!channel_matches) return null;
+    if (!std.meta.eql(threads, r.threads) or !julia.eql(r.julia)) return null;
     c.reserve = null;
     std.debug.print("Assigning reserve worker {d} to project {s}{s}{s}\n", .{
-        r.id, proj, if (julia_channel != null) " " else "", julia_channel orelse "",
+        r.id, proj, if (julia != .default) " " else "", julia.name() orelse "",
     });
     try seatWorker(c, list, r, proj, label);
     return r;
@@ -85,7 +80,7 @@ pub fn beginClientSpawn(c: *Conductor, hold: *HeldClient) !void {
             break :blk .{ .sandboxed = .{ .environ = c.environ_map, .ro_binds = projectRoBind(proj, &rw_bind, &ro_bind), .rw_binds = &rw_bind } };
         },
     };
-    const p = try beginSpawn(c, .{ .client = hold }, hold.request.parsed.julia_channel, assign.resolveThreads(&hold.request), interactive, launch);
+    const p = try beginSpawn(c, .{ .client = hold }, hold.request.julia.launch(), assign.resolveThreads(&hold.request), interactive, launch);
     if (hold.sandbox == .remote) p.spawn.worker.origin = hold.sandbox.remote;
     std.debug.print("Spawning {s}worker {d} (pid {d}) for project {s}{s}{s}\n", .{
         switch (hold.sandbox) {
@@ -96,8 +91,8 @@ pub fn beginClientSpawn(c: *Conductor, hold: *HeldClient) !void {
         p.spawn.worker.id,
         platform.getChildPid(p.spawn.worker.process),
         proj,
-        if (hold.request.parsed.julia_channel != null) " " else "",
-        hold.request.parsed.julia_channel orelse "",
+        if (hold.request.julia.launch() != .default) " " else "",
+        hold.request.julia.launch().name() orelse "",
     });
 }
 
@@ -108,13 +103,13 @@ pub fn projectRoBind(proj: []const u8, rw_binds: []const []const u8, buf: *[1][]
     return buf[0..1];
 }
 
-pub fn beginSpawn(c: *Conductor, purpose: @FieldType(PendingSpawn, "purpose"), julia_channel: ?[]const u8, threads: args.Threads, interactive: bool, launch: worker.Worker.Launch) !*PendingSpawn {
+pub fn beginSpawn(c: *Conductor, purpose: @FieldType(PendingSpawn, "purpose"), julia: worker.Worker.Julia, threads: args.Threads, interactive: bool, launch: worker.Worker.Launch) !*PendingSpawn {
     // Made by `begin` before anything that may fail.
     errdefer if (launch == .sandboxed) retire.dropSandbox(c, c.next_worker_id);
     const p = try c.allocator.create(PendingSpawn);
     errdefer c.allocator.destroy(p);
     p.* = .{
-        .spawn = try worker.Worker.begin(c.allocator, c.io, &c.cfg, c.next_worker_id, julia_channel, threads, interactive, launch, c.environ_map),
+        .spawn = try worker.Worker.begin(c.allocator, c.io, &c.cfg, c.next_worker_id, julia, threads, interactive, launch, c.environ_map),
         .purpose = purpose,
     };
     errdefer p.spawn.abandon(c.io);
@@ -217,8 +212,12 @@ pub fn completeSpawn(c: *Conductor, p: *PendingSpawn, connected: worker.Worker) 
             retire.enqueueKill(c, w);
         },
         .client => |hold| {
+            // For its version, as the reserve's first ping is.
+            if (!w.answersWithin(main.end_probe_ms)) w.log("no first pong, so its Julia's version is unknown", .{});
             const list = assign.getWorkerList(c, hold.worker_key) catch |err| return settleSpawn(c, p, .{ .refuse = .{ .err = err } });
-            seatWorker(c, list, w, hold.request.project orelse "", assign.labelOf(&hold.request)) catch |err| return settleSpawn(c, p, .{ .refuse = .{ .err = err } });
+            // One the client won't run on doesn't take its session.
+            const label = if (hold.request.julia.runsOn(w.julia_version)) assign.labelOf(&hold.request) else null;
+            seatWorker(c, list, w, hold.request.project orelse "", label) catch |err| return settleSpawn(c, p, .{ .refuse = .{ .err = err } });
             return settleSpawn(c, p, .{ .on = w });
         },
     }
@@ -231,7 +230,11 @@ pub fn settleSpawn(c: *Conductor, p: *PendingSpawn, how: Resumption) void {
         const hold = p.purpose.client;
         if (hold.gone) assign.discardHold(c, hold) else assign.resumeHeld(c, hold, how);
     }
-    for (p.waiters.items) |hold| assign.resumeHeld(c, hold, .select);
+    // Those of a version share its channel's failed start, and fall back with it.
+    for (p.waiters.items) |hold| {
+        const shares_failure = how == .refuse and assign.isFailedStart(how.refuse.err) and hold.request.julia == .version;
+        assign.resumeHeld(c, hold, if (shares_failure) how else .select);
+    }
     p.waiters.deinit(c.allocator);
     c.allocator.destroy(p);
 }

@@ -491,9 +491,43 @@ pub const Conductor = struct {
         project: ?[]const u8,
         raw_args: []const []const u8, // what `parsed` reads
         owned_env: ?[]worker.EnvVar = null, // a remote client's, kept out of the cache
+        julia: Julia = .default,
+
+        /// A version tries its channel first, then the default, which must match it.
+        pub const Julia = union(enum) {
+            default,
+            channel: []const u8,
+            executable: []u8, // resolved, as the client would find it
+            version: struct { wanted: args.Version, channel: []u8 },
+            fallen_back: args.Version,
+
+            pub fn launch(self: Julia) worker.Worker.Julia {
+                return switch (self) {
+                    .default, .fallen_back => .default,
+                    .channel => |ch| .{ .channel = ch },
+                    .executable => |exe| .{ .executable = exe },
+                    .version => |v| .{ .channel = v.channel },
+                };
+            }
+
+            /// Unless fallen back to the default, and `running` is known to be another version.
+            pub fn runsOn(self: Julia, running: ?[3]u8) bool {
+                if (self != .fallen_back) return true;
+                return if (running) |v| self.fallen_back.matches(v) else true;
+            }
+
+            pub fn deinit(self: Julia, allocator: Allocator) void {
+                switch (self) {
+                    .executable => |exe| allocator.free(exe),
+                    .version => |v| allocator.free(v.channel),
+                    else => {},
+                }
+            }
+        };
 
         pub fn deinit(self: *ClientRequest, allocator: Allocator) void {
             if (self.owned_env) |env| worker.freeEnv(allocator, env);
+            self.julia.deinit(allocator);
             allocator.free(self.cwd);
             if (self.project) |p| allocator.free(p);
             for (self.raw_args) |arg| allocator.free(arg);
