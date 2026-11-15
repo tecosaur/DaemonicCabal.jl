@@ -69,35 +69,17 @@ JuliaUp's channel for it.
 
 # Setup
 
-Install this package anywhere and run `DaemonicCabal.install()`. Re-run it
-after updating `DaemonicCabal` or Julia itself; `DaemonicCabal.uninstall()`
-undoes it.
-
-## Platform Support
-
-- **Linux**: a systemd user service
-- **macOS**: a launchd user agent (logging to `~/Library/Logs/julia-daemon.log`)
-- **Windows**: a Task Scheduler logon task, `Julia\\JuliaDaemon`
-- **FreeBSD/OpenBSD**: the client, with instructions to start the daemon by hand
+Install this package anywhere and run `DaemonicCabal.install()`, which sets
+the daemon up as a user service (systemd, launchd, or a Windows logon task;
+on the BSDs it prints how to start it). Re-run it after updating
+`DaemonicCabal` or Julia itself; `DaemonicCabal.uninstall()` undoes it.
 
 # Configuration
 
-The daemon reads `JULIA_DAEMON_*` environment variables, set in its service.
-`juliaclient --reconfigure` lists them all, changes them live, and saves them
-to the service. Among them:
-
-- `JULIA_DAEMON_WORKER_EXECUTABLE` [`julia`, as `install()` finds it] \n
-  The Julia binary workers run. As JuliaUp's `julia`, it lets a client ask
-  for another version with `juliaclient --julia=1.14` (or `+1.14`).
-- `JULIA_DAEMON_WORKER_ARGS` [`--startup-file=no`] \n
-  Arguments passed to the Julia worker processes.
-- `JULIA_DAEMON_WORKER_MAXCLIENTS` [`1`] \n
-  The maximum number of clients a worker serves at once, `0` for no limit.
-- `JULIA_DAEMON_MAX_TTL` [`7200`] \n
-  Seconds after which an idle worker is always culled; one may go sooner when
-  memory is scarce.
-- `JULIA_DAEMON_SERVER` [a local socket] \n
-  Where clients reach the conductor: a socket path, or `tcp://host:port`.
+The daemon reads `JULIA_DAEMON_*` environment variables, set in its service:
+`juliaclient --reconfigure` lists them, changes them live, and saves them.
+Where its worker executable is JuliaUp's `julia`, a client can ask for another
+Julia with `juliaclient --julia=1.14`.
 """ DaemonicCabal
 
 end
