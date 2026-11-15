@@ -63,7 +63,9 @@ replacement for `julia`.
 
 From any Julia session, [`connect`](@ref) to a worker, local or at a
 trusted daemon over TCP, and run code there with [`@remote`](@ref) or
-[`remotecall_fetch`](@ref), getting its value back.
+[`remotecall_fetch`](@ref), getting its value back. The worker runs the
+caller's Julia minor version: the daemon's own Julia where that matches, else
+JuliaUp's channel for it.
 
 # Setup
 
@@ -85,7 +87,8 @@ The daemon reads `JULIA_DAEMON_*` environment variables, set in its service.
 to the service. Among them:
 
 - `JULIA_DAEMON_WORKER_EXECUTABLE` [`julia`, as `install()` finds it] \n
-  The Julia binary workers run.
+  The Julia binary workers run. As JuliaUp's `julia`, it lets a client ask
+  for another version with `juliaclient --julia=1.14` (or `+1.14`).
 - `JULIA_DAEMON_WORKER_ARGS` [`--startup-file=no`] \n
   Arguments passed to the Julia worker processes.
 - `JULIA_DAEMON_WORKER_MAXCLIENTS` [`1`] \n

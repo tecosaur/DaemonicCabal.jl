@@ -66,8 +66,9 @@ Connect to a warm daemon worker for remote calls: at the conductor at
 `address` (anything `juliaclient -a` takes), or the local one. The worker
 runs `project` (a path on its machine), in the `session` of that label if
 given (else in a module of the connection's own), from the pool of
-`threads`. State persists from call to call. Given `f`, call `f(conn)` and
-close it after.
+`threads`, on our Julia's minor version: the daemon's own Julia where that
+matches, else JuliaUp's channel for it. State persists from call to call.
+Given `f`, call `f(conn)` and close it after.
 
 # Examples
 ```julia
@@ -83,6 +84,8 @@ function connect(address = nothing; project = nothing, session = nothing, thread
     isnothing(project) || push!(switches, "--project=$project")
     isnothing(session) || push!(switches, "--session=$session")
     isnothing(threads) || append!(switches, ("-t", string(threads)))
+    # Last, so a client predating it still reads the switches before.
+    push!(switches, "--julia=$(VERSION.major).$(VERSION.minor)")
     Connection(`$(client_symlink_path()) $switches -e $SERVE_REMOTE`; address, project, session)
 end
 
@@ -178,7 +181,8 @@ function Base.showerror(io::IO, e::VersionMismatch)
         print(io, "its remote-call protocol differs; run `DaemonicCabal.install()` with the same DaemonicCabal on both machines")
     else
         print(io, "it runs Julia ", theirs[2], " (serialization format ", theirs[3], "), this ", e.ours[2],
-              " (", e.ours[3], "); use the same Julia minor version on both")
+              " (", e.ours[3], "); use the same Julia minor version on both, or a daemon there whose",
+              " worker executable is JuliaUp's `julia`, which runs ours")
     end
 end
 
